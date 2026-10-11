@@ -79,7 +79,7 @@
 #   Ctrl+S → no dialog, and the file's time in Files changes.
 # If upstream changes: anchor on the web build's handling of the "saveAs" dialog request.
 - file: crates/ui-egui/src/lib.rs
-  find: '\} else if let Some\(dl\) = &self\.services\.download'
+  find: '\} else if (?:let Some\(dl\) = &self\.services\.download|self\.services\.download\.is_some\(\))'
   replace: |-
     } else if let Some(ask) = &self.services.save_as_async
                     && let Ok(r) = self.session.run("file.saveBytes", json!({"format": "xlsx"}))
