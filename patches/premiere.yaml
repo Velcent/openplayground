@@ -303,3 +303,17 @@
                     let playing = PLAYBACK_AT.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|t| t.elapsed() < Duration::from_millis(500));
                     let held = |j: &Job| playing && j.prio >= 40 && matches!(j.key.target, Target::Item(_));
                     let Some(best) = q.iter().enumerate().filter(|(_, j)| !held(j)).min_by_key(|(i, j)| (j.prio, *i)).map(|(i, _)| i) else { break };
+
+# ══ The header ════════════════════════════════════════════════════════════════════════════════════════
+# Rule 9: no Full screen button in FilmCraft's own header.
+# What it's for: the playground's bar above the app already has a fullscreen button, which also leaves
+#   fullscreen and keeps the tab that brings the bar back. FilmCraft's button, at the right end of its
+#   header, did the same thing a second time.
+# How: the header's `btn(ui, Icon::Fullscreen, …)` call and its handler go. The icons to its left move into
+#   its place, and Ctrl+` (Toggle Full Screen) still works.
+# Verify: open /premiere/: the right end of FilmCraft's header starts with the speaker icon.
+# If upstream changes: delete this rule once that button is gone. If it moved, re-anchor on the header's
+#   `Icon::Fullscreen` button.
+- file: crates/ui-egui/src/header.rs
+  find: '\n[ \t]*if btn\(ui, Icon::Fullscreen,[^{]*\{[^}]*\}'
+  replace: ''

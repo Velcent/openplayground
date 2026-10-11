@@ -67,16 +67,31 @@ test('Files fans out the stack; its Open Files item opens the explorer popup, an
   await page.getByRole('dialog', { name: 'Files' }).waitFor({ state: 'detached' })
 })
 
-test('fullscreen gives the app the whole screen: the bar steps aside until fullscreen ends', async () => {
+test('fullscreen folds the bar away with its tab showing, and the bar’s button leaves fullscreen', async () => {
   const page = await openPage(browser, `${site.url}${wordPath()}`)
   await page.getByRole('button', { name: 'Fullscreen' }).click()
   await page.waitForFunction(() => !!document.fullscreenElement)
-  assert.equal(await page.locator('.pg-bar').isVisible(), false)
+  await page.locator('.pg-bar').waitFor({ state: 'hidden' })
   assert.equal((await page.locator('body > canvas').first().boundingBox()).y, 0)
+  await page.getByRole('button', { name: 'Show the bar' }).click()
+  await page.locator('.pg-bar').waitFor()
+  assert.equal((await page.locator('body > canvas').first().boundingBox()).y, 36)
+  await page.getByRole('button', { name: 'Exit fullscreen' }).click()
+  await page.waitForFunction(() => !document.fullscreenElement)
+  await page.getByRole('button', { name: 'Fullscreen' }).waitFor()
+  assert.equal((await page.locator('body > canvas').first().boundingBox()).y, 36)
+})
+
+test('folding the bar in fullscreen isn’t kept: leaving fullscreen brings the bar back as it was', async () => {
+  const page = await openPage(browser, `${site.url}${wordPath()}`)
+  await page.getByRole('button', { name: 'Fullscreen' }).click()
+  await page.waitForFunction(() => !!document.fullscreenElement)
+  await page.getByRole('button', { name: 'Show the bar' }).click()
+  await page.getByRole('button', { name: 'Hide the bar' }).click()
   await page.evaluate(() => document.exitFullscreen()) // what Esc does
   await page.waitForFunction(() => !document.fullscreenElement)
   await page.locator('.pg-bar').waitFor()
-  assert.equal((await page.locator('body > canvas').first().boundingBox()).y, 36)
+  assert.equal(await page.evaluate(() => localStorage.getItem('pg-bar-hidden')), null)
 })
 
 test('without the app list, the bar still has Files and Fullscreen', async () => {

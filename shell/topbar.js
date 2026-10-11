@@ -12,7 +12,7 @@ const ago = (iso) => {
 }
 
 // The bar can be folded away (its arrow) and brought back (the tab at the top); the choice is kept in this browser.
-// app.js applies it before the page draws.
+// app.js applies it before the page draws. Fullscreen folds it too, without changing the kept choice.
 const BAR_HIDDEN = 'pg-bar-hidden'
 export const barHidden = () => {
   try {
@@ -23,6 +23,7 @@ export const barHidden = () => {
 }
 function setBarHidden(hidden) {
   document.documentElement.toggleAttribute('data-pg-bar-hidden', hidden)
+  if (document.fullscreenElement) return
   try {
     if (hidden) localStorage.setItem(BAR_HIDDEN, '1')
     else localStorage.removeItem(BAR_HIDDEN)
@@ -32,9 +33,22 @@ function setBarHidden(hidden) {
 export async function mountTopbar() {
   const here = currentApp()
 
-  // In fullscreen the bar hides (shell.css), so this only enters it; Esc leaves, as in any fullscreen page.
-  const fullscreen = h('button', { class: 'pg-bar-btn', type: 'button', 'aria-label': 'Fullscreen', title: 'Fullscreen (Esc to exit)' }, icon('expand'))
-  fullscreen.addEventListener('click', () => document.documentElement.requestFullscreen().catch(() => {}))
+  // Enters fullscreen, or leaves it (as Esc does). Fullscreen starts with the bar folded away, its tab showing.
+  const fullscreen = h('button', { class: 'pg-bar-btn', type: 'button' })
+  const showFullscreen = (on) => {
+    fullscreen.replaceChildren(icon(on ? 'shrink' : 'expand'))
+    fullscreen.setAttribute('aria-label', on ? 'Exit fullscreen' : 'Fullscreen')
+    fullscreen.title = on ? 'Exit fullscreen (Esc)' : 'Fullscreen'
+  }
+  showFullscreen(false)
+  fullscreen.addEventListener('click', () =>
+    (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen()).catch(() => {}),
+  )
+  document.addEventListener('fullscreenchange', () => {
+    const on = document.fullscreenElement === document.documentElement
+    showFullscreen(on)
+    document.documentElement.toggleAttribute('data-pg-bar-hidden', on || barHidden())
+  })
 
   // Everything that doesn't need apps.json goes up at once; the switcher and version join when the list arrives.
   const home = h('a', { class: 'pg-home', href: '/' }, h('img', { class: 'pg-mark', src: '/shell/artcraft-icon.svg', alt: '' }), h('span', { class: 'pg-label' }, 'Playground'))

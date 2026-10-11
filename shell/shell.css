@@ -58,11 +58,6 @@
   .pg-bar-tab { background: rgb(255 255 255 / 0.45); color: rgb(20 20 30 / 0.75); }
   :root[data-pg-bar-hidden] .pg-bar-tab:is(:hover, :focus-visible) { background: rgb(255 255 255 / 0.8); }
 }
-:root:fullscreen .pg-bar-tab { display: none; }
-
-/* Fullscreen (the bar's button) gives the app the whole screen: the bar steps aside until Esc ends it. */
-:root:fullscreen { --pg-bar: 0px; }
-:root:fullscreen .pg-bar { display: none; }
 
 /* App pages: the app's canvas (always the first canvas in <body>) sits below the bar. */
 body > canvas:first-of-type {
