@@ -21,7 +21,7 @@
 # Run `make fetch` after editing.
 
 groups:
-  - name: Creative
+  - name: Adobe Alternatives
     tools:
       - slug: photoshop
         name: PhotoCraft
@@ -124,7 +124,7 @@ groups:
         accent: "#FA0F00"
         base: "#3A0400"
 
-  - name: Office
+  - name: Microsoft Alternatives
     tools:
       - slug: word
         name: WordCraft
