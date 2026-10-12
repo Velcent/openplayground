@@ -51,3 +51,14 @@
 - file: apps/web/src/web.rs
   find: 'File ▸ Back Up Library… now and then'
   replace: 'File > Back Up Library now and then'
+
+# Rule 4: Library > Previews > Build / Discard Previews without the "time not implemented" crash.
+# What it's for: both run discard_full (crates/engine/src/cmd/previews.rs), which read std's SystemTime::now()
+#   first thing. In the browser build that panics ("time not implemented on this platform") and the app stops.
+# How: `now` is the Unix epoch instead. It only ages 1:1 previews kept on disk, which the browser build has
+#   none of; with the epoch no preview counts as old, so the age-based discard keeps them all.
+# Verify: open /lightroom-classic/, Library > Previews > Build Standard-Sized Previews (Visible): no crash.
+# If upstream changes: delete this rule once discard_full no longer calls std's SystemTime::now() on wasm32.
+- file: crates/engine/src/cmd/previews.rs
+  find: 'let now = std::time::SystemTime::now\(\);(\s*let mut d = Discarded::default\(\);)'
+  replace: 'let now = std::time::UNIX_EPOCH;$1'
