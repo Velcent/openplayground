@@ -6,8 +6,23 @@
   <meta name="color-scheme" content="dark">
   <title>Playground</title>
   <link rel="icon" href="/shell/artcraft-icon.svg" type="image/svg+xml">
-  <script>try { if (localStorage.getItem('channel') === 'head') document.documentElement.dataset.channel = 'head' } catch {}</script>
-  <script>try { if (localStorage.getItem('naming') === 'alternative') document.documentElement.dataset.naming = 'alternative' } catch {}</script>
+  <script>
+    // Before the first paint, the switches below: ?head= / ?alt= (true or false) if given, kept like a click,
+    // else the kept choice. Their script reads the result back from these attributes.
+    {
+      const q = new URLSearchParams(location.search)
+      const pick = (param, key, yes, no) => {
+        if (!q.has(param)) {
+          try { return localStorage.getItem(key) === yes } catch { return false }
+        }
+        const on = /^(1|true)$/.test(q.get(param))
+        try { localStorage.setItem(key, on ? yes : no) } catch {}
+        return on
+      }
+      if (pick('head', 'channel', 'head', 'release')) document.documentElement.dataset.channel = 'head'
+      if (pick('alt', 'naming', 'alternative', 'own')) document.documentElement.dataset.naming = 'alternative'
+    }
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400..700&family=Geist+Mono:wght@400;500&display=swap">
@@ -199,7 +214,9 @@
         }
         store('channel', channel)
       }
-      use(store('channel') === 'head' ? 'head' : 'release')
+      use(document.documentElement.dataset.channel === 'head' ? 'head' : 'release')
+      // ?head=true warns the first time too, like the switch.
+      if (toggle.checked && new URLSearchParams(location.search).has('head') && !store('warned')) dialog.showModal()
       toggle.addEventListener('change', () => {
         use(toggle.checked ? 'head' : 'release')
         if (toggle.checked && !store('warned')) dialog.showModal()
@@ -212,7 +229,7 @@
       // The "Alternative naming" switch: every card (and the app pages' switcher, shell/apps.js) goes by the
       // name and icon of the app it's an alternative to. Kept in this browser.
       const naming = document.getElementById('naming')
-      naming.checked = store('naming') === 'alternative'
+      naming.checked = document.documentElement.dataset.naming === 'alternative'
       naming.addEventListener('change', () => {
         if (naming.checked) document.documentElement.dataset.naming = 'alternative'
         else delete document.documentElement.dataset.naming

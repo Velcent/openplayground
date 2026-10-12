@@ -1,4 +1,5 @@
-# Dashboard groups, each with its tools. Each tool is served at /<slug>/ and listed in this order.
+# Dashboard groups, each with its tools. Each tool is served at /<slug>/ and listed in this order. A group's
+# `alternative:` is its heading under the dashboard's "Alternative naming".
 #
 #   repo:   GitHub repo to download the web build from
 #   tag:    release tag to pin (optional; default: the newest non-prerelease that has a matching asset, else
@@ -21,7 +22,8 @@
 # Run `make fetch` after editing.
 
 groups:
-  - name: Adobe Creative Cloud
+  - name: Creative
+    alternative: Adobe Creative Cloud
     tools:
       - slug: photoshop
         name: PhotoCraft
@@ -124,7 +126,8 @@ groups:
         accent: "#FA0F00"
         base: "#3A0400"
 
-  - name: Microsoft Office
+  - name: Office
+    alternative: Microsoft Office
     tools:
       - slug: word
         name: WordCraft

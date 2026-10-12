@@ -41,7 +41,7 @@ const card = (t) => {
 
 const group = (g) => `
     <section>
-      <h2>${g.name}</h2>
+      <h2>${g.alternative ? `<span class="as-own">${g.name}</span><span class="as-alt">${g.alternative}</span>` : g.name}</h2>
       <div class="tools">${g.tools.map(card).join('')}
       </div>
     </section>`
@@ -61,6 +61,7 @@ const appsJson = () => ({
   groups: parse(readFileSync('tools.yaml', 'utf8'))
     .groups.map((g) => ({
       name: g.name,
+      alternative: g.alternative ?? null,
       apps: g.tools.flatMap((t) => {
         const release = installed(t, 'release')
         const head = installed(t, 'head')

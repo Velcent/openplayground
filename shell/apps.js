@@ -9,17 +9,28 @@ const stored = (key) => {
   }
 }
 
-// With "Alternative naming" on, an app goes by the name and icon of the app it's an alternative to; `own`
-// keeps its project's.
-const named = (a) =>
-  stored('naming') === 'alternative' && a.alternative ? { ...a, name: a.alternative, icon: a.alternativeIcon ?? a.icon, own: { name: a.name, icon: a.icon } } : a
+// "Alternative naming": the dashboard's switch, or ?alt=true|false on any page (kept, like the switch).
+const alternativeNaming = () => {
+  const alt = new URLSearchParams(location.search).get('alt')
+  if (alt) {
+    try {
+      localStorage.setItem('naming', /^(1|true)$/.test(alt) ? 'alternative' : 'own')
+    } catch {}
+    return /^(1|true)$/.test(alt)
+  }
+  return stored('naming') === 'alternative'
+}
+
+// With it on, an app goes by the name and icon of the app it's an alternative to (`own` keeps its project's),
+// and a group by its alternative heading.
+const named = (a) => (a.alternative ? { ...a, name: a.alternative, icon: a.alternativeIcon ?? a.icon, own: { name: a.name, icon: a.icon } } : a)
 
 let data
-/** { groups: [{ name, apps: [{ slug, name, alternative, blurb, accent, icon, alternativeIcon, own?, opens, release, head }] }] } */
+/** { groups: [{ name, alternative, apps: [{ slug, name, alternative, blurb, accent, icon, alternativeIcon, own?, opens, release, head }] }] } */
 export const loadApps = () =>
   (data ??= fetch('/shell/apps.json')
     .then((r) => (r.ok ? r.json() : { groups: [] }))
-    .then((d) => ({ groups: d.groups.map((g) => ({ ...g, apps: g.apps.map(named) })) }))
+    .then((d) => (alternativeNaming() ? { groups: d.groups.map((g) => ({ ...g, name: g.alternative ?? g.name, apps: g.apps.map(named) })) } : d))
     .catch(() => ({ groups: [] })))
 
 export const flatApps = ({ groups }) => groups.flatMap((g) => g.apps)
