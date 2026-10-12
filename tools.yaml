@@ -152,6 +152,21 @@ groups:
         accent: "#FF8F6B"
         base: "#3D1308"
 
+      - slug: outlook
+        name: Outlook
+        blurb: Mail, calendar, people and tasks.
+        # Its browser build opens a sample mailbox kept in the browser (no mail server), and takes no files.
+        opens: []
+        imports: []
+        repo: MonkeySaint/mailcraft
+        # Its web zip is mailcraft-<version>-web.zip; its branch is master.
+        asset: '-web\.zip$'
+        branch: master
+        icon: icons/outlook.svg
+        patches: patches/outlook.yaml
+        accent: "#28A8EA"
+        base: "#0A2767"
+
   - name: Other
     tools:
       - slug: autocad
