@@ -124,7 +124,7 @@ groups:
         accent: "#FA0F00"
         base: "#3A0400"
 
-  - name: Microsoft
+  - name: Microsoft Office
     tools:
       - slug: word
         name: WordCraft
