@@ -71,6 +71,11 @@ export async function mountTopbar() {
   const app = groups.flatMap((g) => g.apps).find((a) => a.slug === here?.slug)
   if (!app) return
   const build = app[here.channel]
+  // "Alternative naming": the tab goes by the alternative's name and icon too.
+  if (app.own) {
+    document.title = app.name
+    document.querySelector('link[rel="icon"]')?.setAttribute('href', app.icon)
+  }
 
   const menu = h(
     'div',
@@ -82,7 +87,7 @@ export async function mountTopbar() {
           'a',
           { class: 'pg-app', role: 'menuitem', href: appHref(a), 'aria-current': a.slug === here.slug ? 'page' : null },
           h('img', { src: a.icon, alt: '' }),
-          h('span', {}, h('strong', {}, a.name), h('small', {}, a.alternative ? `Alternative to ${a.alternative}` : a.blurb)),
+          h('span', {}, h('strong', {}, a.name), h('small', {}, a.own ? `Using ${a.own.name}` : a.alternative ? `Alternative to ${a.alternative}` : a.blurb)),
           a.slug === here.slug ? icon('check') : null,
         ),
       ),

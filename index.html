@@ -7,6 +7,7 @@
   <title>Playground</title>
   <link rel="icon" href="/shell/artcraft-icon.svg" type="image/svg+xml">
   <script>try { if (localStorage.getItem('channel') === 'head') document.documentElement.dataset.channel = 'head' } catch {}</script>
+  <script>try { if (localStorage.getItem('naming') === 'alternative') document.documentElement.dataset.naming = 'alternative' } catch {}</script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400..700&family=Geist+Mono:wght@400;500&display=swap">
@@ -48,7 +49,7 @@
     main { max-width: 1120px; margin: 0 auto; padding: clamp(40px, 9vw, 112px) 16px 64px; }
     .host { margin: 0; font: 500 12px var(--mono); letter-spacing: 0.04em; color: var(--muted); }
     h1 {
-      position: relative; margin: 18px 0 clamp(36px, 6vw, 64px);
+      position: relative; margin: 18px 0 24px;
       font-size: clamp(36px, 6.6vw, 80px); font-weight: 600;
       line-height: 1.02; letter-spacing: -0.045em;
     }
@@ -108,8 +109,13 @@
     .switch input:checked { background: color-mix(in srgb, var(--warn) 35%, var(--line)); }
     .switch input:checked::before { transform: translateX(14px); background: var(--warn); }
     .switch input:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
-    .bar-end { display: flex; align-items: center; gap: 22px; }
-    .files-link { display: inline-flex; align-items: center; gap: 7px; padding-right: 22px; border-right: 1px solid var(--line); color: var(--muted); font-size: 13px; font-weight: 500; text-decoration: none; }
+    .naming input:checked { background: color-mix(in srgb, var(--text) 30%, var(--line)); }
+    .naming input:checked::before { background: var(--text); }
+    .switches { display: flex; flex-wrap: wrap; gap: 12px 28px; margin-bottom: clamp(32px, 5vw, 56px); }
+    /* "Alternative naming": each card shows one of its two names and icons (the app's, or the one it's an
+       alternative to). */
+    :root[data-naming="alternative"] .as-own, :root:not([data-naming="alternative"]) .as-alt { display: none; }
+    .files-link { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 13px; font-weight: 500; text-decoration: none; }
     .files-link svg { width: 15px; height: 15px; flex: none; }
     .files-link:hover { color: var(--text); }
     .files-link:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; border-radius: 2px; }
@@ -138,12 +144,13 @@
   <main>
     <div class="topbar">
       <p class="host">playground.daijro.dev</p>
-      <div class="bar-end">
-        <a class="files-link" href="/files/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></svg>Open Files</a>
-        <label class="switch"><input type="checkbox" role="switch" id="latest">Use latest commits</label>
-      </div>
+      <a class="files-link" href="/files/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></svg>Open Files</a>
     </div>
     <h1>Desktop apps,<br>in a browser tab.<span class="moon" aria-hidden="true"></span></h1>
+    <div class="switches">
+      <label class="switch naming"><input type="checkbox" role="switch" id="naming">Alternative naming</label>
+      <label class="switch"><input type="checkbox" role="switch" id="latest">Use latest commits</label>
+    </div>
     <nav aria-label="Apps">
       <!-- groups -->
     </nav>
@@ -200,6 +207,16 @@
       dialog.addEventListener('close', () => {
         store('warned', '1')
         if (dialog.returnValue === 'release') use('release')
+      })
+
+      // The "Alternative naming" switch: every card (and the app pages' switcher, shell/apps.js) goes by the
+      // name and icon of the app it's an alternative to. Kept in this browser.
+      const naming = document.getElementById('naming')
+      naming.checked = store('naming') === 'alternative'
+      naming.addEventListener('change', () => {
+        if (naming.checked) document.documentElement.dataset.naming = 'alternative'
+        else delete document.documentElement.dataset.naming
+        store('naming', naming.checked ? 'alternative' : 'own')
       })
     }
   </script>

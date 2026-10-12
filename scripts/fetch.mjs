@@ -21,6 +21,8 @@ const patch = (t, dir) => {
   // The dashboard's name as the tab title and its icon as the favicon.
   const icon = `site-icon${extname(t.icon)}`
   cpSync(t.icon, join(dir, icon))
+  // The icon of the app it's an alternative to, for the shell's "Alternative naming" (shell/apps.js).
+  if (existsSync(`icons/alternatives/${t.slug}.svg`)) cpSync(`icons/alternatives/${t.slug}.svg`, join(dir, 'alternative-icon.svg'))
   // Unzipped size of each .wasm, for the progress bar: a gzip file ends with it (mod 2^32).
   const wasm = {}
   for (const f of readdirSync(dir, { recursive: true })) {

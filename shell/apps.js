@@ -1,10 +1,25 @@
 // The site's apps, from /shell/apps.json (vite.config.js builds it from tools.yaml and the installed builds).
 
+// The dashboard's switches (index.html) keep their choices in localStorage: `channel` and `naming`.
+const stored = (key) => {
+  try {
+    return localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+// With "Alternative naming" on, an app goes by the name and icon of the app it's an alternative to; `own`
+// keeps its project's.
+const named = (a) =>
+  stored('naming') === 'alternative' && a.alternative ? { ...a, name: a.alternative, icon: a.alternativeIcon ?? a.icon, own: { name: a.name, icon: a.icon } } : a
+
 let data
-/** { groups: [{ name, apps: [{ slug, name, alternative, blurb, accent, icon, opens, release, head }] }] } */
+/** { groups: [{ name, apps: [{ slug, name, alternative, blurb, accent, icon, alternativeIcon, own?, opens, release, head }] }] } */
 export const loadApps = () =>
   (data ??= fetch('/shell/apps.json')
     .then((r) => (r.ok ? r.json() : { groups: [] }))
+    .then((d) => ({ groups: d.groups.map((g) => ({ ...g, apps: g.apps.map(named) })) }))
     .catch(() => ({ groups: [] })))
 
 export const flatApps = ({ groups }) => groups.flatMap((g) => g.apps)
@@ -15,13 +30,5 @@ export const currentApp = (pathname = location.pathname) => {
   return m && !['files', 'shell'].includes(m[2]) ? { slug: m[2], channel: m[1] ? 'head' : 'release' } : null
 }
 
-// The dashboard's "Use latest commits" switch (index.html) keeps its choice in localStorage.channel.
-const preferred = () => {
-  try {
-    return localStorage.getItem('channel')
-  } catch {
-    return null
-  }
-}
-/** An app's page in the preferred channel, else the one it has. */
-export const appHref = (app) => ((preferred() === 'head' && app.head) || app.release || app.head).path
+/** An app's page in the channel chosen with "Use latest commits", else the one it has. */
+export const appHref = (app) => ((stored('channel') === 'head' && app.head) || app.release || app.head).path

@@ -22,14 +22,19 @@ const card = (t) => {
   const head = installed(t, 'head') ?? release
   const shown = release ?? head
   const ahead = head.ahead ? `${head.ahead.commits} commit${head.ahead.commits === 1 ? '' : 's'} ahead of ${head.ahead.of}` : ''
+  // Both names and icons: the app's own, and the one it's an alternative to (index.html's "Alternative naming").
+  const altIcon = existsSync(`icons/alternatives/${t.slug}.svg`) && `/icons/alternatives/${t.slug}.svg`
+  const own = t.alternative ? ' class="as-own"' : ''
   return `
       <div class="tool" data-release-href="${shown.path}" data-head-href="${head.path}" style="--accent:${t.accent};--base:${t.base}">
-        <img src="/${t.icon}" alt="" width="64" height="64">
+        <img${own} src="/${t.icon}" alt="" width="64" height="64">${t.alternative && altIcon ? `
+        <img class="as-alt" src="${altIcon}" alt="" width="64" height="64">` : ''}
         <span class="title">
-          <a class="name open" href="${shown.path}">${t.name}</a>
+          <a class="name open" href="${shown.path}"><span${own}>${t.name}</span>${t.alternative ? `<span class="as-alt">${t.alternative}</span>` : ''}</a>
           <span class="source"><a class="repo" href="https://github.com/${t.repo}" aria-label="${repo} on GitHub" title="${t.repo} on GitHub">${GITHUB}</a> <span class="version" data-release="${shown.label}" data-head="${head.label}" data-date="${head.date ?? ''}" data-ahead="${ahead}">${shown.label}</span></span>
         </span>
-        ${t.alternative ? `<span class="alt">${existsSync(`icons/alternatives/${t.slug}.svg`) ? `<img src="/icons/alternatives/${t.slug}.svg" alt="" width="14" height="14">` : ''}Alternative to ${t.alternative}</span>` : ''}
+        ${t.alternative ? `<span class="alt as-own">${altIcon ? `<img src="${altIcon}" alt="" width="14" height="14">` : ''}Alternative to ${t.alternative}</span>
+        <span class="alt as-alt"><img src="/${t.icon}" alt="" width="14" height="14">Using ${t.name}</span>` : ''}
         <span class="blurb">${t.blurb}</span>
       </div>`
 }
@@ -64,6 +69,7 @@ const appsJson = () => ({
         return [{
           slug: t.slug, name: t.name, alternative: t.alternative ?? null, blurb: t.blurb, accent: t.accent, opens: t.opens ?? [], imports: t.imports ?? [],
           icon: `${(release ?? head).path}site-icon${extname(t.icon)}`,
+          alternativeIcon: existsSync(`public${(release ?? head).path}alternative-icon.svg`) ? `${(release ?? head).path}alternative-icon.svg` : null,
           release: channel(release) ?? null, head: channel(head) ?? null,
         }]
       }),

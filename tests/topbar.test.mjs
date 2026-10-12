@@ -51,6 +51,35 @@ test('with "Use latest commits" on, the switcher links to latest-commit builds',
   await context.close()
 })
 
+test('"Alternative naming" shows each card under the name and icon of the app it is an alternative to, and is remembered', async () => {
+  const page = await openPage(browser, `${site.url}/`)
+  const card = page.locator('.tool', { hasText: 'PhotoCraft' })
+  assert.equal(await card.locator('.name').innerText(), 'PhotoCraft')
+  assert.equal(await card.getByText('Alternative to Photoshop').isVisible(), true)
+  await page.getByRole('switch', { name: 'Alternative naming' }).click()
+  assert.equal(await card.locator('.name').innerText(), 'Photoshop')
+  assert.equal(await card.getByText('Using PhotoCraft').isVisible(), true)
+  assert.match(await card.locator('img:visible').first().getAttribute('src'), /alternatives\/photoshop\.svg$/)
+  await page.reload()
+  assert.equal(await page.getByRole('switch', { name: 'Alternative naming' }).isChecked(), true)
+  assert.equal(await page.locator('.tool', { hasText: 'Using PhotoCraft' }).locator('.name').innerText(), 'Photoshop')
+})
+
+test('with "Alternative naming" on, the switcher and the tab use the alternative names and icons', async () => {
+  const context = await browser.newContext()
+  await context.addInitScript(() => localStorage.setItem('naming', 'alternative'))
+  const page = await openPage(browser, `${site.url}${wordPath()}`, { context })
+  const button = page.locator('.pg-switch')
+  await button.waitFor()
+  assert.match(await button.innerText(), /^Word/)
+  assert.match(await button.locator('img').getAttribute('src'), /alternative-icon\.svg$/)
+  assert.equal(await page.title(), 'Word')
+  await button.click()
+  const item = page.getByRole('menuitem').filter({ has: page.getByText('Photoshop', { exact: true }) })
+  assert.match(await item.innerText(), /Using PhotoCraft/)
+  await context.close()
+})
+
 test('the version shows this build’s label', async () => {
   const page = await openPage(browser, `${site.url}${wordPath()}`)
   const word = apps.find((a) => a.slug === 'word')
