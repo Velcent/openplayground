@@ -16,7 +16,7 @@
   "acrobat": "v0.6.0+709e5986",
   "acrobat@head": "head-7163ba3+709e5986",
   "word": "v0.5.0+6b739c12",
-  "word@head": "head-591cbb6+6b739c12",
+  "word@head": "head-b1d0aab+6b739c12",
   "excel": "v0.5.0+15c7c6a7",
   "excel@head": "head-fc45b7f+15c7c6a7",
   "powerpoint": "v0.5.0+a2125189",
@@ -28,7 +28,7 @@
   "bluebeam": "v0.6.0+aae33f5a",
   "bluebeam@head": "head-6777d22+aae33f5a",
   "fusion-360": "v0.1.1+f327a6c5",
-  "fusion-360@head": "head-e6e0a7e+f327a6c5",
+  "fusion-360@head": "head-65a9960+f327a6c5",
   "pro-tools": "v0.5.0+709e5986",
   "pro-tools@head": "head-6cf896e+709e5986",
   "artcraft-store": "b1dbb1d"
