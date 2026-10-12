@@ -62,3 +62,51 @@
 - file: crates/engine/src/cmd/previews.rs
   find: 'let now = std::time::SystemTime::now\(\);(\s*let mut d = Discarded::default\(\);)'
   replace: 'let now = std::time::UNIX_EPOCH;$1'
+
+# Rule 5: dropping a session no longer crashes the browser build.
+# What it's for: Downloads::drop (crates/engine/src/face_download.rs, part of every Session) waited up to 1 s
+#   for running model downloads, timed with std's Instant::now(), which panics in the browser build ("time not
+#   implemented on this platform"). The web app drops a Session whenever opening the stored library fails (it
+#   swaps in an empty one to show the problem), so that failure stopped the app on every load instead.
+# How: the wait is compiled for native builds only; the browser build has no download threads to wait for.
+# Verify: rule 6's storage being unreadable (or any library that fails to open) shows the library-problem
+#   window instead of "stopped after an internal error: time not implemented on this platform".
+# If upstream changes: delete this rule once Downloads::drop no longer reads std's clock on wasm32.
+- file: crates/engine/src/face_download.rs
+  find: 'let started = std::time::Instant::now\(\);\s*while self\.running\(\) && started\.elapsed\(\) < Duration::from_secs\(1\) \{\s*std::thread::sleep\(Duration::from_millis\(10\)\);\s*\}'
+  replace: |-
+    #[cfg(not(target_arch = "wasm32"))]
+            {
+                $&
+            }
+
+# Rule 6: keep LightCraft Classic's browser storage apart from LightCraft's.
+# What it's for: both apps are served from this one site, so they share its browser storage, and the fork kept
+#   LightCraft's names for all of it: the library, thumbnails and active-library pointer at the OPFS root, the
+#   IndexedDB database "lightcraft" and the tab lock "lightcraft-library". Anyone who had used Lightroom
+#   (LightCraft) here got LightCraft's library handed to Classic, which can't open it (rule 5's crash).
+# How: in OPFS the backend works inside a "lightcraft-classic" folder (created on first use) instead of the root;
+#   the IndexedDB fallback and the tab lock get "lightcraft-classic" names. Render workers open storage the same
+#   way, so they follow.
+# Verify: use /lightroom/ first, then open /lightroom-classic/: the sample library opens, and /lightroom/ still
+#   has its own photos afterwards. In DevTools > Application > Storage, OPFS has a lightcraft-classic folder.
+# If upstream changes: re-anchor on Backend::open's OPFS root and on legacy.rs's IDB_NAME / TAB_LOCK.
+- file: apps/web/src/backend.rs
+  find: 'Ok\(root\) => return Ok\(Backend::Opfs\(root\.unchecked_into\(\)\)\),'
+  replace: |-
+    Ok(root) => {
+                        // playground (patches/lightroom-classic.yaml rule 6): our own folder, apart from LightCraft's.
+                        let root: FileSystemDirectoryHandle = root.unchecked_into();
+                        let opts = FileSystemGetDirectoryOptions::new();
+                        opts.set_create(true);
+                        match JsFuture::from(root.get_directory_handle_with_options("lightcraft-classic", &opts)).await {
+                            Ok(dir) => return Ok(Backend::Opfs(dir.unchecked_into())),
+                            Err(e) => log::warn!("OPFS folder unavailable ({}); using IndexedDB", err(e)),
+                        }
+                    }
+- file: apps/web/src/legacy.rs
+  find: 'pub const IDB_NAME: &str = "lightcraft";'
+  replace: 'pub const IDB_NAME: &str = "lightcraft-classic";'
+- file: apps/web/src/legacy.rs
+  find: 'pub const TAB_LOCK: &str = "lightcraft-library";'
+  replace: 'pub const TAB_LOCK: &str = "lightcraft-classic-library";'
