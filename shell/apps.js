@@ -1,7 +1,7 @@
 // The site's apps, from /shell/apps.json (vite.config.js builds it from tools.yaml and the installed builds).
 
 let data
-/** { groups: [{ name, apps: [{ slug, name, blurb, accent, icon, opens, release, head }] }] } */
+/** { groups: [{ name, apps: [{ slug, name, alternative, blurb, accent, icon, opens, release, head }] }] } */
 export const loadApps = () =>
   (data ??= fetch('/shell/apps.json')
     .then((r) => (r.ok ? r.json() : { groups: [] }))

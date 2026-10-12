@@ -82,7 +82,7 @@ export async function mountTopbar() {
           'a',
           { class: 'pg-app', role: 'menuitem', href: appHref(a), 'aria-current': a.slug === here.slug ? 'page' : null },
           h('img', { src: a.icon, alt: '' }),
-          h('span', {}, h('strong', {}, a.name), h('small', {}, a.blurb)),
+          h('span', {}, h('strong', {}, a.name), h('small', {}, a.alternative ? `Alternative to ${a.alternative}` : a.blurb)),
           a.slug === here.slug ? icon('check') : null,
         ),
       ),

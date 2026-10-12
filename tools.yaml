@@ -6,7 +6,9 @@
 #   branch: the branch the head channel builds (optional; default: main)
 #   paths:  only commits changing these paths count as new head versions (optional; default: any)
 #   asset:  regex matching the release asset name (optional; default: "-web-.*\.zip$")
-#   icon:   dashboard icon, also copied in as the tool page's favicon
+#   alternative: the commercial app it's an open-source alternative to, shown as "Alternative to …" (plain
+#           text only: no logos, colors or styling of theirs, nothing suggesting they endorse it)
+#   icon:   dashboard icon: the project's own, also copied in as the tool page's favicon
 #   accent, base: a light and a dark brand color, used for the dashboard hover
 #   theme:  script that makes the app follow the browser's light/dark preference (optional; see themes/)
 #   patches: source patches for the app's own build (optional; see scripts/build.mjs). Every app is built
@@ -19,141 +21,153 @@
 # Run `make fetch` after editing.
 
 groups:
-  - name: Adobe Creative Cloud
+  - name: Creative
     tools:
       - slug: photoshop
-        name: Photoshop
+        name: PhotoCraft
+        alternative: Photoshop
         blurb: Layers, masks, adjustments, brushes and real PSD files.
         opens: [psd, psb, psdt, pcraft, png, jpg, jpeg, webp, gif, bmp, tif, tiff, tga, ico, qoi, exr, hdr, heic, heif, afphoto]
         imports: [dng, cr2, cr3, nef, nrw, arw, pef, orf, rw2, raf, svg, svgz, pbm, pgm, ppm, pam, pfm, abr, grd, aco, ase, afdesign, afpub]
         repo: storytold/photocraft
-        icon: icons/photoshop.svg
+        icon: icons/photocraft.png
         theme: themes/photoshop.js
         patches: patches/photoshop.yaml
         accent: "#31A8FF"
         base: "#001E36"
 
       - slug: illustrator
-        name: Illustrator
+        name: VectorCraft
+        alternative: Illustrator
         blurb: Vector paths, type and artboards.
         opens: [vectorcraft, drawcraft, ai, ait, eps, svg, svgz, emf, wmf, afdesign]
         imports: [pdf, png, jpg, jpeg, gif, webp, tif, tiff, bmp, dxf, txt, gpl, ase]
         repo: storytold/vectorcraft
-        icon: icons/illustrator.svg
+        icon: icons/vectorcraft.png
         theme: themes/illustrator.js
         patches: patches/illustrator.yaml
         accent: "#FF9A00"
         base: "#330000"
 
       - slug: indesign
-        name: InDesign
+        name: DesignCraft
+        alternative: InDesign
         blurb: Page layout and publishing.
         opens: [designcraft, idml]
         imports: [png, jpg, jpeg, gif, webp, tif, tiff, bmp, psd, svg, pdf, ai, txt, docx, rtf, md, xlsx, ase]
         repo: storytold/designcraft
-        icon: icons/indesign.svg
+        icon: icons/designcraft.png
         theme: themes/indesign.js
         patches: patches/indesign.yaml
         accent: "#FF3366"
         base: "#49021F"
 
       - slug: lightroom
-        name: Lightroom
+        name: LightCraft
+        alternative: Lightroom
         blurb: Photo library and raw development.
         opens: [dng, cr2, cr3, nef, nrw, arw, pef, orf, rw2, raf, rwl, raw, iiq, crw, mrw, x3f, kdc, mos, erf]
         imports: [jpg, jpeg, png, tif, tiff, webp, psd, jxl, gif, bmp, heic, avif]
         repo: storytold/lightcraft
-        icon: icons/lightroom.svg
+        icon: icons/lightcraft.png
         patches: patches/lightroom.yaml
         accent: "#31A8FF"
         base: "#001E36"
 
       - slug: lightroom-classic
-        name: Lightroom Classic
+        name: LightCraft Classic
+        alternative: Lightroom Classic
         blurb: Catalog, Develop, Map, Book, Slideshow, Print and Web modules.
         opens: [dng, cr2, cr3, nef, nrw, arw, pef, orf, rw2, raf, rwl, raw, iiq, crw, mrw, x3f, kdc, mos, erf]
         imports: [jpg, jpeg, png, tif, tiff, webp, psd, jxl, gif, bmp, heic, avif]
         repo: emmertex/lightcraft-classic
-        icon: icons/lightroom-classic.svg
+        icon: icons/lightcraft-classic.svg
         patches: patches/lightroom-classic.yaml
         accent: "#31A8FF"
         base: "#001E36"
 
       - slug: premiere
-        name: Premiere Pro
+        name: FilmCraft
+        alternative: Premiere Pro
         blurb: Video editing, color and sound.
         opens: [fcproj, mp4, m4v, mov, mkv, webm, avi, mxf, mts, m2ts, mpg, mpeg, 3gp]
         imports: [wav, aif, aiff, mp3, m4a, aac, flac, ogg, opus, png, jpg, jpeg, gif, webp, tif, tiff, bmp, srt, vtt, scc, edl, fcpxml, otio, aaf, omf]
         repo: storytold/filmcraft
-        icon: icons/premiere.svg
+        icon: icons/filmcraft.png
         theme: themes/premiere.js
         patches: patches/premiere.yaml
         accent: "#9999FF"
         base: "#00005B"
 
       - slug: after-effects
-        name: After Effects
+        name: EffectCraft
+        alternative: After Effects
         blurb: Compositions, keyframes, effects and expressions.
         opens: [ecproj]
         imports: [mp4, mov, m4v, mkv, webm, png, jpg, jpeg, gif, webp, tif, tiff, bmp, exr, wav, aif, aiff, mp3, flac, ogg, opus, svg, pdf, ai, eps, psd, psb, gltf, glb, obj, csv, tsv]
         repo: storytold/effectcraft
-        icon: icons/after-effects.svg
+        icon: icons/effectcraft.png
         theme: themes/after-effects.js
         patches: patches/after-effects.yaml
         accent: "#9999FF"
         base: "#00005B"
 
       - slug: acrobat
-        name: Acrobat Pro
+        name: PdfCraft
+        alternative: Acrobat Pro
         blurb: Read, organize, combine, split and secure PDFs.
         opens: [pdf]
         imports: [png, jpg, jpeg, tif, tiff, gif, bmp, jp2, j2k, jpx, txt]
         repo: storytold/pdfcraft
-        icon: icons/acrobat.svg
+        icon: icons/pdfcraft.png
         theme: themes/acrobat.js
         accent: "#FA0F00"
         base: "#3A0400"
 
-  - name: Microsoft Office
+  - name: Office
     tools:
       - slug: word
-        name: Word
+        name: WordCraft
+        alternative: Word
         blurb: Writing and document design.
         opens: [docx, docm, dotx, dotm, odt, rtf, txt, md, html, htm]
         imports: [png, jpg, jpeg, gif, webp, bmp]
         repo: storytold/wordcraft
-        icon: icons/word.svg
+        icon: icons/wordcraft.svg
         theme: themes/word.js
         patches: patches/word.yaml
         accent: "#41A5EE"
         base: "#0B2557"
 
       - slug: excel
-        name: Excel
+        name: GridCraft
+        alternative: Excel
         blurb: Spreadsheets and data.
         opens: [xlsx, xlsm, xltx, xltm, csv, tsv]
         imports: [txt, json, tab]
         repo: storytold/gridcraft
-        icon: icons/excel.svg
+        icon: icons/gridcraft.svg
         theme: themes/excel.js
         patches: patches/excel.yaml
         accent: "#33C481"
         base: "#062E19"
 
       - slug: powerpoint
-        name: PowerPoint
+        name: DeckCraft
+        alternative: PowerPoint
         blurb: Presentations and slide shows.
         opens: [pptx, potx, ppsx, deckcraft]
         imports: [png, jpg, jpeg, gif, webp, bmp, tif, tiff, wav, mp3, m4a, aac, flac, ogg, opus, aif, aiff, mp4, m4v, mov, webm, txt, md]
         repo: storytold/deckcraft
-        icon: icons/powerpoint.svg
+        icon: icons/deckcraft.png
         theme: themes/powerpoint.js
         patches: patches/powerpoint.yaml
         accent: "#FF8F6B"
         base: "#3D1308"
 
       - slug: outlook
-        name: Outlook
+        name: MailCraft
+        alternative: Outlook
         blurb: Mail, calendar, people and tasks.
         # Its browser build opens a sample mailbox kept in the browser (no mail server), and takes no files.
         opens: []
@@ -162,7 +176,7 @@ groups:
         # Its web zip is mailcraft-<version>-web.zip; its branch is master.
         asset: '-web\.zip$'
         branch: master
-        icon: icons/outlook.svg
+        icon: icons/mailcraft.svg
         patches: patches/outlook.yaml
         accent: "#28A8EA"
         base: "#0A2767"
@@ -170,17 +184,19 @@ groups:
   - name: Other
     tools:
       - slug: autocad
-        name: AutoCAD
+        name: CADCraft
+        alternative: AutoCAD
         blurb: Computer-aided design and drafting.
         opens: []
         imports: []
         repo: storytold/cadcraft
-        icon: icons/autocad.svg
+        icon: icons/cadcraft.png
         accent: "#E85984"
         base: "#3A0716"
 
       - slug: fusion-360
-        name: Fusion 360
+        name: SolidCraft
+        alternative: Fusion 360
         blurb: Parametric 3D modeling with sketches, constraints and solids.
         # Designs, and STEP/IGES/STL/3MF/OBJ (each opens as a new design, or joins one that has features).
         opens: [solvecraft, step, stp, iges, igs, stl, 3mf, obj]
@@ -191,14 +207,15 @@ groups:
         # The web app and what it compiles (dependency changes show up in Cargo.lock; the root Cargo.toml holds
         # the release profile and the vendored truck patches): CI, docs and desktop-only commits don't rebuild it.
         paths: [apps/solvecraft-web, crates, vendor, Cargo.lock, Cargo.toml]
-        icon: icons/fusion-360.svg
+        icon: icons/solidcraft.svg
         theme: themes/fusion-360.js
         patches: patches/fusion-360.yaml
         accent: "#FF7A1F"
         base: "#3A1806"
 
       - slug: pro-tools
-        name: Pro Tools
+        name: SoundCraft
+        alternative: Pro Tools
         blurb: Recording, editing and mixing audio.
         opens: []
         imports: []
@@ -207,6 +224,6 @@ groups:
         # The web app and the crates it compiles (dependency changes show up in Cargo.lock): CI, docs and
         # desktop-only commits don't rebuild it. One GitHub API request per path per check.
         paths: [apps/soundcraft-web, crates, Cargo.lock]
-        icon: icons/pro-tools.svg
+        icon: icons/soundcraft.svg
         accent: "#A673FF"
         base: "#1F0B40"

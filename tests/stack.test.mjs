@@ -65,7 +65,7 @@ test('right-clicking a file offers its apps and actions; Rename edits the name i
   await page.getByRole('button', { name: 'Files' }).click()
   await fan(page).getByRole('menuitem', { name: 'shot.png' }).click({ button: 'right' })
   const menu = page.locator('.pg-menu')
-  await menu.getByRole('menuitem', { name: 'Open in Photoshop' }).waitFor()
+  await menu.getByRole('menuitem', { name: 'Open in PhotoCraft' }).waitFor()
   for (const action of ['Download', 'Rename', 'Delete']) await menu.getByRole('menuitem', { name: action }).waitFor()
   await menu.getByRole('menuitem', { name: 'Rename' }).click()
   const field = page.getByLabel('New name for shot.png')

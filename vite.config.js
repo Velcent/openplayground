@@ -11,6 +11,9 @@ const installed = (t, channel) => {
   } catch {}
 }
 
+// GitHub's mark (Octicons mark-github), linking each card to its repo.
+const GITHUB = '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>'
+
 // A card links to the release, and carries the latest-commit build's link, label and commit date for the
 // channel switch (index.html). A tool missing one channel uses the other for both.
 const card = (t) => {
@@ -24,8 +27,9 @@ const card = (t) => {
         <img src="/${t.icon}" alt="" width="64" height="64">
         <span class="title">
           <a class="name open" href="${shown.path}">${t.name}</a>
-          <span class="source"><a class="repo" href="https://github.com/${t.repo}">${repo}</a> <span class="version" data-release="${shown.label}" data-head="${head.label}" data-date="${head.date ?? ''}" data-ahead="${ahead}">${shown.label}</span></span>
+          <span class="source"><a class="repo" href="https://github.com/${t.repo}" aria-label="${repo} on GitHub" title="${t.repo} on GitHub">${GITHUB}</a> <span class="version" data-release="${shown.label}" data-head="${head.label}" data-date="${head.date ?? ''}" data-ahead="${ahead}">${shown.label}</span></span>
         </span>
+        ${t.alternative ? `<span class="alt">${existsSync(`icons/alternatives/${t.slug}.svg`) ? `<img src="/icons/alternatives/${t.slug}.svg" alt="" width="14" height="14">` : ''}Alternative to ${t.alternative}</span>` : ''}
         <span class="blurb">${t.blurb}</span>
       </div>`
 }
@@ -58,7 +62,7 @@ const appsJson = () => ({
         if (!release && !head) return []
         const channel = (s) => s && { path: s.path, label: s.label, date: s.date ?? null }
         return [{
-          slug: t.slug, name: t.name, blurb: t.blurb, accent: t.accent, opens: t.opens ?? [], imports: t.imports ?? [],
+          slug: t.slug, name: t.name, alternative: t.alternative ?? null, blurb: t.blurb, accent: t.accent, opens: t.opens ?? [], imports: t.imports ?? [],
           icon: `${(release ?? head).path}site-icon${extname(t.icon)}`,
           release: channel(release) ?? null, head: channel(head) ?? null,
         }]
