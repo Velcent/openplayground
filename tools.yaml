@@ -21,7 +21,7 @@
 # Run `make fetch` after editing.
 
 groups:
-  - name: Adobe
+  - name: Adobe Creative Cloud
     tools:
       - slug: photoshop
         name: PhotoCraft
