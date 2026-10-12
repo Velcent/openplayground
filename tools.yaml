@@ -194,6 +194,19 @@ groups:
         accent: "#E85984"
         base: "#3A0716"
 
+      - slug: bluebeam
+        name: MarkupCraft
+        alternative: Bluebeam Revu
+        blurb: PDF markup, measurement and takeoff for drawings.
+        # PDFs (PdfCraft stays the default for them). Markup files (XFDF, FDF) come in through its own Import.
+        opens: [pdf]
+        imports: []
+        repo: engr-software/markupcraft
+        icon: icons/markupcraft.png
+        patches: patches/bluebeam.yaml
+        accent: "#E9772E"
+        base: "#3A1A06"
+
       - slug: fusion-360
         name: SolidCraft
         alternative: Fusion 360
