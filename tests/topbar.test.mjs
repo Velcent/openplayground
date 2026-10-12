@@ -45,7 +45,8 @@ test('with "Use latest commits" on, the switcher links to latest-commit builds',
   const page = await openPage(browser, `${site.url}${wordPath()}`, { context })
   await page.getByRole('button', { name: /Word/ }).click()
   for (const app of apps.filter((a) => a.head)) {
-    assert.equal(await page.getByRole('menuitem', { name: new RegExp(app.name) }).getAttribute('href'), app.head.path)
+    const item = page.getByRole('menuitem').filter({ has: page.getByText(app.name, { exact: true }) })
+    assert.equal(await item.getAttribute('href'), app.head.path)
   }
   await context.close()
 })
@@ -122,7 +123,7 @@ test('an app that reports its own state is warned about only when it has unsaved
   const page = await openPage(browser, `${site.url}${wordPath()}`)
   await page.locator('.pg-bar').waitFor()
   await page.mouse.click(400, 300)
-  await page.keyboard.press('a')
+  await page.keyboard.press('Shift') // input, but no edit: Word's own report stays "nothing unsaved"
   await page.evaluate(() => playgroundFiles.setUnsaved(false)) // the app says: nothing unsaved
   let asked = false
   page.on('dialog', (d) => ((asked = true), d.accept()))

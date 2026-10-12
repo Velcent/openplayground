@@ -1,0 +1,53 @@
+# LightCraft Classic is a fork of LightCraft (patches/lightroom.yaml has the same three fixes for it); its crates
+# are named dac_* and its web app is apps/web.
+
+# Rule 1: keep the page responsive while the app prepares the photos next to the one on screen.
+# What it's for: once a photo is in Loupe or Develop, the app prefetches its filmstrip neighbours
+#   (Renderer::prefetch). Every other render goes to the browser build's render workers, but prefetch always
+#   used the local job pool, which in the browser runs one job per frame on the page's only thread
+#   (Renderer::poll → JobPool::run_inline). Preparing a photo there froze the whole page, top bar included,
+#   for seconds; a large raw file freezes it longer. The decoded source also stayed in the page's own cache,
+#   which the workers never read.
+# How: when the renderer has an offload (the workers), a prefetch is queued and dispatched to a worker exactly
+#   like Renderer::request does; the worker keeps the decoded source and the photo's next render goes back to
+#   it (the workers' affinity). Without workers (desktop, or none started) nothing changes.
+# Verify: open /lightroom-classic/ and step through the sample photos in Loupe: a 20 ms setInterval never
+#   stalls for more than about a second, and the next photo still shows at once.
+# If upstream changes: delete this rule once Renderer::prefetch (crates/ui-egui/src/render.rs) hands its job to
+#   `self.offload` itself (or no longer calls `self.pool.submit`). If only the line moved, re-anchor on the
+#   prefetch's pool submit.
+- file: crates/ui-egui/src/render.rs
+  find: 'self\.pool\.submit\(slot, key, priority, Box::new\(move \|\| \w+::memory::in_background\(\|\| job\.run\(\)\)\)\);'
+  replace: |-
+    if self.offload.is_some() {
+                self.seq += 1;
+                self.queue.retain(|q| q.slot != slot);
+                self.queue.push(Queued { slot, priority, seq: self.seq, job });
+                self.dispatch();
+                return;
+            }
+            $&
+
+# Rule 2: drop the notice the app shows on every launch.
+# What it's for: for 8 s after opening, "LightCraft Classic in the browser is experimental. Your library is kept
+#   in this browser's storage: …" covered the photo, with a box for the ▸ its font can't draw. The warning that
+#   matters stays: the one rule 3 fixes, shown only when the browser hasn't granted persistent storage, so it
+#   may really delete the library.
+# How: the `if backend.is_some() { notice(…) }` in WebApp::new goes.
+# Verify: open /lightroom-classic/: no notice at the bottom of the photo on a browser that grants persistent
+#   storage.
+# If upstream changes: delete this rule once that notice is gone or no longer shown on every launch; if only its
+#   wording changed, re-anchor on the new text.
+- file: apps/web/src/web.rs
+  find: '\n[ \t]*if backend\.is_some\(\) \{\s*notice\([^;]*in the browser is experimental\.[^;]*;\s*\}'
+  replace: ''
+
+# Rule 3: write the menu path in the storage warning with characters the app's font has.
+# What it's for: "use File ▸ Back Up Library… now and then." showed a box for ▸.
+# How: "File > Back Up Library".
+# Verify: in a browser that doesn't grant persistent storage (a fresh headless Chromium profile), the notice at
+#   the bottom of the photo reads "use File > Back Up Library now and then." with no box.
+# If upstream changes: delete this rule once the notice no longer has the ▸, or its font draws it.
+- file: apps/web/src/web.rs
+  find: 'File ▸ Back Up Library… now and then'
+  replace: 'File > Back Up Library now and then'

@@ -112,7 +112,7 @@ const prepare = async (slug, channel, { dir = 'src', patch = true } = {}) => {
   }
   const merged = patch ? applyDiffs(src, t, channel) : []
   if (t.patches && patch) applyPatches(src, t.patches)
-  const web = globSync('apps/*-web/Cargo.toml', { cwd: src }).map((f) => join(src, f, '..'))[0] ?? fail(`${t.repo} has no apps/*-web crate`)
+  const web = globSync(['apps/*-web/Cargo.toml', 'apps/web/Cargo.toml'], { cwd: src }).map((f) => join(src, f, '..'))[0] ?? fail(`${t.repo} has no apps/*-web or apps/web crate`)
   return { t, id: buildId(t, release.tag_name), work, src, web, merged }
 }
 
@@ -138,12 +138,12 @@ const build = async (slug, channel) => {
     writeFileSync(index, readFileSync(index, 'utf8').replace(/data-wasm-opt="[^"]*"/g, 'data-wasm-opt="0"'))
     run('trunk', ['build', '--release', '--dist', dist, '--public-url', './'], { cwd: web, env: { ...process.env, CARGO_TARGET_DIR: join(work, 'target') } })
   } else {
-    // `cargo xtask web` writes the site to <target>/web/dist or, in some releases, <target>/web (and runs
-    // wasm-opt -O2 if it is on PATH: keep it off).
+    // `cargo xtask web` writes the site to <target>/web/dist or, in some releases, <target>/web, or <target>/web-site
+    // (LightCraft Classic), and runs wasm-opt -O2 if it is on PATH: keep it off.
     const target = join(work, 'target')
     run('cargo', ['xtask', 'web'], { cwd: src, env: { ...process.env, CARGO_TARGET_DIR: target, PATH: wasmBindgenPath(src, join(work, 'tools')) } })
-    const site = [join(target, 'web', 'dist'), join(target, 'web')].find((d) => existsSync(join(d, 'index.html')))
-    if (!site) throw new Error('cargo xtask web left no index.html in <target>/web/dist or <target>/web')
+    const site = [join(target, 'web', 'dist'), join(target, 'web'), join(target, 'web-site')].find((d) => existsSync(join(d, 'index.html')))
+    if (!site) throw new Error('cargo xtask web left no index.html in <target>/web/dist, <target>/web or <target>/web-site')
     for (const f of readdirSync(site)) if (!JUNK.test(f)) cpSync(join(site, f), join(dist, f), { recursive: true })
   }
 

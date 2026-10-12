@@ -46,7 +46,8 @@ test('Files fans out the ten most recent files, newest nearest the bar, then Ope
   assert.deepEqual(labels, [...names.slice(2).reverse(), 'Open Files'])
   const word = apps.find((a) => a.slug === 'word')
   assert.equal(await items.first().locator('img').getAttribute('src'), word.icon)
-  // The fan curves out: each item sits lower and further left than the one before.
+  // The fan curves out: each item sits lower and further left than the one before (once it has fanned out).
+  await fan(page).evaluate((el) => Promise.all(el.getAnimations({ subtree: true }).map((a) => a.finished)))
   const boxes = await Promise.all([0, 4, 9].map((i) => items.nth(i).boundingBox()))
   assert.ok(boxes[0].y < boxes[1].y && boxes[1].y < boxes[2].y, 'items go down')
   assert.ok(boxes[0].x + boxes[0].width > boxes[2].x + boxes[2].width, 'and curve to the left')

@@ -14,7 +14,7 @@ Releases are fetched every 15min.
 - Compile shaders in the background to prevent hanging
 - Render viewers on the page's own GPU instead of in background workers
 - Video frames are copied straight to the GPU as YUV & skips late frames so stacked clips play smoother
-- Preload neighboring photos in background workers so Lightroom doesn't freeze
+- Preload neighboring photos in background workers so Lightroom and Lightroom Classic don't freeze
 
 ### Features
 

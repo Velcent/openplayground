@@ -68,6 +68,17 @@ groups:
         accent: "#31A8FF"
         base: "#001E36"
 
+      - slug: lightroom-classic
+        name: Lightroom Classic
+        blurb: Catalog, Develop, Map, Book, Slideshow, Print and Web modules.
+        opens: [dng, cr2, cr3, nef, nrw, arw, pef, orf, rw2, raf, rwl, raw, iiq, crw, mrw, x3f, kdc, mos, erf]
+        imports: [jpg, jpeg, png, tif, tiff, webp, psd, jxl, gif, bmp, heic, avif]
+        repo: emmertex/lightcraft-classic
+        icon: icons/lightroom-classic.svg
+        patches: patches/lightroom-classic.yaml
+        accent: "#31A8FF"
+        base: "#001E36"
+
       - slug: premiere
         name: Premiere Pro
         blurb: Video editing, color and sound.
