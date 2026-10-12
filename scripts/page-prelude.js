@@ -34,8 +34,26 @@ const progressUI = (total, download) => {
   const label = document.createElement('span')
   box.append(bar, label)
   document.body.append(box)
+  // Just below the app's own loading screen (#<app>_loading or #loading), measured by what's shown in it: the
+  // element itself often fills the page, and some hold hidden messages (PhotoCraft's "taking longer than
+  // usual"). Apps whose screen is taller than usual would otherwise overlap it.
+  const place = () => {
+    const screen = document.querySelector('[id$="_loading"], #loading')
+    let bottom = 0
+    for (const node of screen?.childNodes ?? []) {
+      if (node.nodeType === Node.ELEMENT_NODE && node.checkVisibility?.({ visibilityProperty: true }) === false) continue
+      if (node.nodeType === Node.TEXT_NODE && !node.textContent.trim()) continue
+      const range = document.createRange()
+      range.selectNode(node)
+      const r = range.getBoundingClientRect()
+      if (r.height) bottom = Math.max(bottom, r.bottom)
+    }
+    if (bottom) box.style.top = `${Math.round(bottom + 14)}px`
+  }
+  place()
   return {
     progress(bytes) {
+      place()
       if (total) bar.value = bytes
       const pct = total ? ` · ${Math.floor((100 * bytes) / total)}%` : ''
       label.textContent = `Downloading and extracting${pct}${download ? ` of ${mb(download)} MB` : ''}`
