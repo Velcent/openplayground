@@ -1,6 +1,6 @@
 {
   "photoshop": "v0.8.2+93818286",
-  "photoshop@head": "head-d323d87+93818286",
+  "photoshop@head": "head-776b9dd+93818286",
   "illustrator": "v0.10.0+ce2df258",
   "illustrator@head": "head-02a68e1+ce2df258",
   "indesign": "v0.7.1+a3907f34",
@@ -8,7 +8,7 @@
   "lightroom": "v0.7.1+ac92e6e1",
   "lightroom@head": "head-701f78e+ac92e6e1",
   "lightroom-classic": "v0.7.0+9605ffdc",
-  "lightroom-classic@head": "head-544bf8d+9605ffdc",
+  "lightroom-classic@head": "head-c2512a8+9605ffdc",
   "premiere": "v0.7.2+95ccf574",
   "premiere@head": "head-71438c6+95ccf574",
   "after-effects": "v0.9.2+1f7e5596",
