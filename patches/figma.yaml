@@ -1,0 +1,7 @@
+# Seed the browser app's theme from prefers-color-scheme; later in-app picks remain untouched.
+- file: apps/figcraft-web/src/web.rs
+  find: 'let mut session = Session::new\(\);'
+  after: |
+
+    let dark = web_sys::window().and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten()).is_some_and(|m| m.matches());
+    session.prefs.theme = if dark { "dark" } else { "light" }.into();

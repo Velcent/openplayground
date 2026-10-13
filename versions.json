@@ -31,5 +31,6 @@
   "fusion-360@head": "head-913583b+f327a6c5",
   "pro-tools": "v0.6.1+709e5986",
   "pro-tools@head": "head-6cf896e+709e5986",
-  "artcraft-store": "196c61a"
+  "artcraft-store": "196c61a",
+  "figma": "v0.5.1"
 }

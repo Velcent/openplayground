@@ -26,4 +26,4 @@ Releases are fetched every 15min.
 
 ### Trademarks
 
-This site and the apps it serves are not affiliated with, endorsed by or sponsored by Adobe, Microsoft, Autodesk, Avid or Bluebeam. Photoshop, Illustrator, InDesign, Lightroom, Premiere Pro, After Effects and Acrobat are trademarks of Adobe; Word, Excel, PowerPoint and Outlook of Microsoft; AutoCAD and Fusion 360 of Autodesk; Pro Tools of Avid; Bluebeam and Revu of Bluebeam. Their names appear only to say which product each open-source app is an alternative to.
+This site and the apps it serves are not affiliated with, endorsed by or sponsored by Adobe, Microsoft, Autodesk, Avid, Bluebeam or Figma, Inc. Photoshop, Illustrator, InDesign, Lightroom, Premiere Pro, After Effects and Acrobat are trademarks of Adobe; Word, Excel, PowerPoint and Outlook of Microsoft; AutoCAD and Fusion 360 of Autodesk; Pro Tools of Avid; Bluebeam and Revu of Bluebeam; Figma of Figma, Inc. Their names appear only to say which product each open-source app is an alternative to.

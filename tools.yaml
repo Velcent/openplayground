@@ -184,7 +184,7 @@ groups:
         accent: "#28A8EA"
         base: "#0A2767"
 
-  - name: Other
+  - name: CAD
     tools:
       - slug: autocad
         name: CADCraft
@@ -196,19 +196,6 @@ groups:
         icon: icons/cadcraft.png
         accent: "#E85984"
         base: "#3A0716"
-
-      - slug: bluebeam
-        name: MarkupCraft
-        alternative: Bluebeam Revu
-        blurb: PDF markup, measurement and takeoff for drawings.
-        # PDFs (PdfCraft stays the default for them). Markup files (XFDF, FDF) come in through its own Import.
-        opens: [pdf]
-        imports: []
-        repo: engr-software/markupcraft
-        icon: icons/markupcraft.png
-        patches: patches/bluebeam.yaml
-        accent: "#E9772E"
-        base: "#3A1A06"
 
       - slug: fusion-360
         name: SolidCraft
@@ -228,6 +215,35 @@ groups:
         patches: patches/fusion-360.yaml
         accent: "#FF7A1F"
         base: "#3A1806"
+
+  - name: Other
+    tools:
+      - slug: figma
+        name: FigCraft
+        alternative: Figma
+        blurb: Interface design, components and prototypes.
+        # The web build has no file dialogs; dropped files only import after creating a design.
+        opens: []
+        imports: []
+        repo: storytold/figcraft
+        icon: icons/figcraft.png
+        theme: themes/figma.js
+        patches: patches/figma.yaml
+        accent: "#02DA96"
+        base: "#062E22"
+
+      - slug: bluebeam
+        name: MarkupCraft
+        alternative: Bluebeam Revu
+        blurb: PDF markup, measurement and takeoff for drawings.
+        # PDFs (PdfCraft stays the default for them). Markup files (XFDF, FDF) come in through its own Import.
+        opens: [pdf]
+        imports: []
+        repo: engr-software/markupcraft
+        icon: icons/markupcraft.png
+        patches: patches/bluebeam.yaml
+        accent: "#E9772E"
+        base: "#3A1A06"
 
       - slug: pro-tools
         name: SoundCraft

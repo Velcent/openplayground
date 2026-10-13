@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "overused-font",
+        "value": "geist",
+        "files": [
+          "index.html"
+        ],
+        "createdAt": "2026-10-13T07:28:48.521Z",
+        "reason": "Agent: preserving the incumbent Geist and Geist Mono typography tokens, established in commit e25d054; this task extends the existing dashboard rather than redesigning it."
+      }
+    ]
+  }
+}
