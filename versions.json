@@ -8,7 +8,7 @@
   "lightroom": "v0.7.1+ac92e6e1",
   "lightroom@head": "head-b3d392b+ac92e6e1",
   "lightroom-classic": "v0.7.2+9605ffdc",
-  "lightroom-classic@head": "head-1e30555+9605ffdc",
+  "lightroom-classic@head": "head-449ddd1+9605ffdc",
   "premiere": "v0.7.2+95ccf574",
   "premiere@head": "head-cee1feb+95ccf574",
   "after-effects": "v0.9.2+1f7e5596",
@@ -26,12 +26,12 @@
   "autocad": "v0.6.2+709e5986",
   "autocad@head": "head-033ee15+709e5986",
   "fusion-360": "v0.1.1+f327a6c5",
-  "fusion-360@head": "head-24cff44+f327a6c5",
+  "fusion-360@head": "head-8be0f64+f327a6c5",
   "figma": "v0.5.1+2767df4a",
   "figma@head": "head-e56856f+2767df4a",
   "bluebeam": "v0.6.1+aae33f5a",
   "bluebeam@head": "head-837fdc8+aae33f5a",
   "pro-tools": "v0.6.1+709e5986",
-  "pro-tools@head": "head-afa850d+709e5986",
+  "pro-tools@head": "head-a96cf50+709e5986",
   "artcraft-store": "196c61a"
 }
