@@ -1,6 +1,6 @@
 {
   "photoshop": "v0.8.2+93818286",
-  "photoshop@head": "head-5f8733c+93818286",
+  "photoshop@head": "head-be7a1f8+93818286",
   "illustrator": "v0.10.0+ce2df258",
   "illustrator@head": "head-0d0ea35+ce2df258",
   "indesign": "v0.7.1+a3907f34",
@@ -30,7 +30,7 @@
   "figma": "v0.5.1+2767df4a",
   "figma@head": "head-e56856f+2767df4a",
   "bluebeam": "v0.6.1+aae33f5a",
-  "bluebeam@head": "head-0ca108e+aae33f5a",
+  "bluebeam@head": "head-d3d78e6+aae33f5a",
   "pro-tools": "v0.6.1+709e5986",
   "pro-tools@head": "head-c0cb993+709e5986",
   "artcraft-store": "4764a52"
