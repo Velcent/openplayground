@@ -175,7 +175,8 @@ async function install(t, channel, name) {
     tag = asset.name.slice(t.slug.length + 1, asset.name.lastIndexOf('-'))
     if (channel === 'head') {
       const commit = tag.replace(/^head-/, '')
-      date = (await github(`repos/${t.repo}/commits/${commit}`)).commit.committer.date
+      // (no date when that commit isn't in the repo: a build kept from the repo the tool used to come from)
+      date = (await github(`repos/${t.repo}/commits/${commit}`).catch(() => null))?.commit.committer.date
       label = `${t.branch ?? 'main'}@${commit}`
     } else label = tag
     console.log(`${name}: ${release.tag_name} isn't built yet, keeping ${tag}`)
