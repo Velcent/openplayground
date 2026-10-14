@@ -78,9 +78,28 @@ const appsJson = () => ({
     .filter((g) => g.apps.length),
 })
 
+// Own-name URLs follow the same available-channel fallback as the dashboard.
+export const appRedirects = (apps) => {
+  const canonical = new Set(apps.map((app) => app.slug))
+  const redirects = {}
+  for (const app of apps) {
+    const alias = app.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+    if (!alias || canonical.has(alias)) continue
+    for (const [prefix, build] of [['', app.release ?? app.head], ['/head', app.head ?? app.release]]) {
+      if (!build) continue
+      redirects[`${prefix}/${alias}`] = build.path
+      redirects[`${prefix}/${alias}/`] = build.path
+    }
+  }
+  return redirects
+}
+const aliases = () => appRedirects(appsJson().groups.flatMap((group) => group.apps))
+
 // Vite doesn't serve index.html for public/ folders: /slug -> /slug/ -> /slug/index.html, like a static host would.
 const toolIndex = (req, res, next) => {
   const [path, query = ''] = req.url.split(/(?=\?)/)
+  const destination = aliases()[path]
+  if (destination) return res.writeHead(302, { location: `${destination}${query}` }).end()
   if (path === '/' || !existsSync(`public${path.replace(/\/?$/, '/index.html')}`)) return next()
   if (!path.endsWith('/')) return res.writeHead(301, { location: `${path}/${query}` }).end()
   req.url = `${path}index.html${query}`
@@ -126,6 +145,7 @@ export default defineConfig({
       closeBundle() {
         cpSync('shell', 'dist/shell', { recursive: true })
         writeFileSync('dist/shell/apps.json', JSON.stringify(appsJson()))
+        writeFileSync('dist/_redirects', Object.entries(aliases()).map(([from, to]) => `${from} ${to} 302`).join('\n') + '\n')
       },
     },
   ],
