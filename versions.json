@@ -1,6 +1,6 @@
 {
   "photoshop": "v0.9.0+800604c2",
-  "photoshop@head": "head-3ebc42a+800604c2",
+  "photoshop@head": "head-8d840ea+800604c2",
   "illustrator": "v0.11.0+346ddf66",
   "illustrator@head": "head-0a33cff+346ddf66",
   "indesign": "v0.8.0+7ebb57eb",
@@ -27,7 +27,7 @@
   "autocad@head": "head-fc4e983+c8ac89ea",
   "fusion-360": "v0.1.1+09f8cb20",
   "fusion-360@head": "head-1a456d2+09f8cb20",
-  "substance-painter@head": "head-acc7522+c8ac89ea",
+  "substance-painter@head": "head-0caf7f6+c8ac89ea",
   "pro-tools": "v0.7.0+c8ac89ea",
   "pro-tools@head": "head-3a28a65+c8ac89ea",
   "fl-studio-mobile": "v0.1.3+1c665929",
