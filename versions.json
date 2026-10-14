@@ -27,10 +27,12 @@
   "autocad@head": "head-fc4e983+228c6e63",
   "fusion-360": "v0.1.1+337ac999",
   "fusion-360@head": "head-8ea1fd6+337ac999",
+  "substance-painter@head": "head-25b89c9+30e85e54",
+  "pro-tools": "v0.7.0+228c6e63",
+  "pro-tools@head": "head-3a28a65+228c6e63",
+  "fl-studio-mobile": "v0.1.1",
   "figma": "v0.6.0+c52a25d4",
   "figma@head": "head-833f0d2+c52a25d4",
   "bluebeam@head": "head-6777d22+97b454b9",
-  "pro-tools": "v0.7.0+228c6e63",
-  "pro-tools@head": "head-3a28a65+228c6e63",
   "artcraft-store": "4764a52"
 }
