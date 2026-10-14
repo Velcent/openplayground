@@ -145,14 +145,21 @@ for (const t of tools) {
 
 async function install(t, channel, name) {
   const dir = installDir(t, channel)
-  const current = await version(t, channel)
+  // Our builds of this tool on this channel, newest first.
+  const builds = channelAssets(built, t, channel)
+  const current = await version(t, channel).catch((e) => {
+    // Its repo is gone (deleted, renamed or made private): keep serving our newest build rather than nothing.
+    if (!/GitHub API 404/.test(e.message) || !builds[0]) throw e
+    const tag = builds[0].name.slice(t.slug.length + 1, builds[0].name.lastIndexOf('-'))
+    console.warn(`${name}: ${t.repo} is unavailable (${e.message.split(':')[0]}); keeping ${builds[0].name}`)
+    return { release: { tag_name: tag, label: channel === 'head' ? `${t.branch ?? 'main'}@${tag.replace(/^head-/, '')}` : tag }, asset: null, gone: true }
+  })
   if (!current) {
     rmSync(dir, { recursive: true, force: true }) // a channel the tool no longer has
     return console.log(`${name}: no ${channel} version`)
   }
-  const { release, asset: upstream } = current
-  // Our builds of this tool on this channel, newest first, and the newest of this version.
-  const builds = channelAssets(built, t, channel)
+  const { release, asset: upstream, gone } = current
+  // The newest of our builds of this version.
   const ours = builds.find((a) => a.name.startsWith(`${t.slug}-${release.tag_name}-`))
   // A build made here with build.mjs (out/<slug>-<tag>-<hash>.zip) wins, to try builds before CI publishes them.
   const localZip = existsSync('out') && readdirSync('out').filter((f) => f.startsWith(`${t.slug}-${release.tag_name}-`) && f.endsWith('.zip')).sort((a, b) => statSync(join('out', a)).mtimeMs - statSync(join('out', b)).mtimeMs).at(-1)
@@ -176,7 +183,7 @@ async function install(t, channel, name) {
 
   // How far a head build is past the tool's newest release, for the dashboard's tooltip.
   let ahead
-  const latest = channel === 'head' && (await version(t, 'release'))
+  const latest = channel === 'head' && !gone && (await version(t, 'release'))
   if (latest) {
     const compare = await github(`repos/${t.repo}/compare/${latest.release.tag_name}...${tag.replace(/^head-/, '')}`)
     ahead = { commits: compare.ahead_by, of: latest.release.tag_name }

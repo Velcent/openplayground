@@ -173,7 +173,8 @@ if (command === 'plan') {
   const include = []
   for (const t of tools) {
     for (const channel of CHANNELS) {
-      const version = await resolveVersion(t, channel)
+      // One tool whose repo can't be read (gone, renamed, private) mustn't stop the others' builds.
+      const version = await resolveVersion(t, channel).catch((e) => console.error(`::warning::${t.slug} (${channel}): ${e.message}`))
       const id = version && buildId(t, version.release.tag_name)
       if (id && !has(`${id}.zip`) && !has(`${id}.failed`, DAY)) include.push({ slug: t.slug, channel })
     }
