@@ -4,7 +4,7 @@
   "illustrator": "v0.10.0+3e3f4d35",
   "illustrator@head": "head-0a33cff+3e3f4d35",
   "indesign": "v0.7.1+18e80ec1",
-  "indesign@head": "head-43a46c0+18e80ec1",
+  "indesign@head": "head-11a51d5+18e80ec1",
   "lightroom": "v0.7.1+6b5bce28",
   "lightroom@head": "head-a4b53b2+6b5bce28",
   "lightroom-classic": "v0.8.1+e03385f3",
@@ -14,9 +14,9 @@
   "after-effects": "v0.9.2+c4fc190a",
   "after-effects@head": "head-549e9d8+c4fc190a",
   "acrobat": "v0.7.1+228c6e63",
-  "acrobat@head": "head-c1a41cc+228c6e63",
+  "acrobat@head": "head-9931329+228c6e63",
   "word": "v0.6.1+77b8fae7",
-  "word@head": "head-04f6f53+77b8fae7",
+  "word@head": "head-fc41918+77b8fae7",
   "excel": "v0.6.1+6f2e19e3",
   "excel@head": "head-84acf62+6f2e19e3",
   "powerpoint": "v0.6.1+bcc8b630",
@@ -32,6 +32,6 @@
   "bluebeam": "v0.6.1+aae33f5a",
   "bluebeam@head": "head-c066b02+aae33f5a",
   "pro-tools": "v0.6.1+228c6e63",
-  "pro-tools@head": "head-c0cb993+228c6e63",
+  "pro-tools@head": "head-01fd2d0+228c6e63",
   "artcraft-store": "4764a52"
 }
