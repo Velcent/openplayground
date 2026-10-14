@@ -27,13 +27,15 @@
 #   Vulkan/Metal and the browser's WebGL2 path, doesn't enforce the rule, so upstream never sees it.)
 # How: WGSL's own switch for that check, a `diagnostic(off, derivative_uniformity);` directive at the top of
 #   the shader source (naga accepts it too, so `?webgl` keeps working). The derivatives are only used for the
-#   curvature colours, where a non-uniform result at most speckles a pixel.
+#   curvature colours, where a non-uniform result at most speckles a pixel. The source is the SHADER string in
+#   gpu.rs up to v0.1.1, and assets/shaders/viewport.wgsl (include_str!'d into SHADER) after it: the rule takes
+#   whichever the version has.
 # Verify: open the page in Chrome (WebGPU), New Design, S → "Box" → OK: the box shows in the viewport, and the
 #   console has no "Invalid ShaderModule \"sc_viewport\"" warnings. Then the same with ?webgl.
 # If upstream changes: put the directive first in whatever WGSL source the viewport's shader module is built
 #   from; delete this rule if upstream adds it or moves the derivatives out of the branch.
-- file: crates/ui-egui/src/**/*.rs
-  find: 'const SHADER: &str = r#"\n'
+- file: [crates/ui-egui/src/**/*.rs, assets/shaders/viewport.wgsl]
+  find: 'const SHADER: &str = r#"\n|^(?=\s*struct U \{)'
   after: "diagnostic(off, derivative_uniformity);\n"
 
 # A design that arrives by a drop (Files' "Open in Fusion 360" and ?open= hand it over as one) keeps its edits.
