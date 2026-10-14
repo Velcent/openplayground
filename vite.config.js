@@ -27,7 +27,7 @@ const card = (t) => {
   const own = t.alternative ? ' class="as-own"' : ''
   return `
       <div class="tool" data-release-href="${shown.path}" data-head-href="${head.path}" style="--accent:${t.accent};--base:${t.base}">
-        <img${own} src="/${t.icon}" alt="" width="64" height="64">${t.alternative && altIcon ? `
+        <img${t.alternative && altIcon ? own : ''} src="/${t.icon}" alt="" width="64" height="64">${t.alternative && altIcon ? `
         <img class="as-alt" src="${altIcon}" alt="" width="64" height="64">` : ''}
         <span class="title">
           <a class="name open" href="${shown.path}"><span${own}>${t.name}</span>${t.alternative ? `<span class="as-alt">${t.alternative}</span>` : ''}</a>

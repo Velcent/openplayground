@@ -37,3 +37,16 @@ test('the dashboard and the Files page use the ArtCraft icon as their favicon', 
     assert.match(html, /<link rel="icon"[^>]*href="\/shell\/artcraft-icon\.svg"/, path)
   }
 })
+
+test('alternative naming keeps an app icon when no commercial icon is supplied', async () => {
+  const page = await browser.newPage()
+  try {
+    await page.goto(site.url)
+    const cards = page.locator('.tool').filter({ hasNot: page.locator(':scope > img.as-alt') })
+    assert.ok(await cards.count() > 0, 'an installed app without a commercial icon is needed')
+    await page.evaluate(() => document.documentElement.dataset.naming = 'alternative')
+    for (const card of await cards.all()) {
+      assert.equal(await card.locator(':scope > img:visible').count(), 1, await card.locator('.name').innerText())
+    }
+  } finally { await page.close() }
+})

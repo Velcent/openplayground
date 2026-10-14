@@ -1,0 +1,10 @@
+# Trunk alone does not copy Honeydew's bundled sounds; its upstream release script does.
+# Unpack the tracked archive parts into the staging directory on both source-build channels.
+- file: Trunk.toml
+  find: '^(?=.)'
+  before: |
+    [[hooks]]
+    stage = "post_build"
+    command = "sh"
+    command_arguments = ["-ec", 'mkdir -p target; cat honeydew-sounds.zip.[0-9][0-9][0-9] > target/honeydew-sounds.zip; unzip -q target/honeydew-sounds.zip -d "$TRUNK_STAGING_DIR"']
+

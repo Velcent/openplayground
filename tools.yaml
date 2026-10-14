@@ -184,7 +184,7 @@ groups:
         accent: "#28A8EA"
         base: "#0A2767"
 
-  - name: CAD
+  - name: 3D
     tools:
       - slug: autocad
         name: CADCraft
@@ -216,6 +216,46 @@ groups:
         accent: "#FF7A1F"
         base: "#3A1806"
 
+      - slug: substance-painter
+        name: SubCraft
+        alternative: Substance Painter
+        blurb: Paint 3D models with layered materials, masks and textures.
+        opens: []
+        imports: []
+        repo: Aalzard/subcraft
+        icon: icons/subcraft.png
+        accent: "#FF7A1A"
+        base: "#3A1A06"
+
+  - name: Music
+    tools:
+      - slug: pro-tools
+        name: SoundCraft
+        alternative: Avid Pro Tools
+        blurb: Recording, editing and mixing audio.
+        opens: []
+        imports: []
+        repo: storytold/soundcraft
+        branch: main
+        # The web app and the crates it compiles (dependency changes show up in Cargo.lock): CI, docs and
+        # desktop-only commits don't rebuild it. One GitHub API request per path per check.
+        paths: [apps/soundcraft-web, crates, Cargo.lock]
+        icon: icons/soundcraft.svg
+        accent: "#A673FF"
+        base: "#1F0B40"
+
+      - slug: fl-studio-mobile
+        name: Honeydew
+        alternative: FL Studio Mobile
+        blurb: Compose, sequence and mix music with built-in instruments.
+        opens: []
+        imports: []
+        repo: daijro/honeydew
+        icon: icons/honeydew.svg
+        patches: patches/fl-studio-mobile.yaml
+        accent: "#CDE397"
+        base: "#263513"
+
   - name: Other
     tools:
       - slug: figma
@@ -246,18 +286,3 @@ groups:
         patches: patches/bluebeam.yaml
         accent: "#E9772E"
         base: "#3A1A06"
-
-      - slug: pro-tools
-        name: SoundCraft
-        alternative: Pro Tools
-        blurb: Recording, editing and mixing audio.
-        opens: []
-        imports: []
-        repo: storytold/soundcraft
-        branch: main
-        # The web app and the crates it compiles (dependency changes show up in Cargo.lock): CI, docs and
-        # desktop-only commits don't rebuild it. One GitHub API request per path per check.
-        paths: [apps/soundcraft-web, crates, Cargo.lock]
-        icon: icons/soundcraft.svg
-        accent: "#A673FF"
-        base: "#1F0B40"

@@ -91,6 +91,10 @@ const fail = (message) => {
   throw new Error(message)
 }
 
+export const webDir = (src) =>
+  globSync(['apps/*-web/Cargo.toml', 'apps/web/Cargo.toml'], { cwd: src }).map((f) => join(src, f, '..'))[0]
+    ?? (existsSync(join(src, 'Cargo.toml')) ? src : fail(`${src} has no Cargo.toml for a web build`))
+
 // A fresh checkout of the tool's version on a channel in <work>/<dir>, with its patches applied (unless patch is false).
 const prepare = async (slug, channel, { dir = 'src', patch = true } = {}) => {
   const t = toolFor(slug)
@@ -112,7 +116,7 @@ const prepare = async (slug, channel, { dir = 'src', patch = true } = {}) => {
   }
   const merged = patch ? applyDiffs(src, t, channel) : []
   if (t.patches && patch) applyPatches(src, t.patches)
-  const web = globSync(['apps/*-web/Cargo.toml', 'apps/web/Cargo.toml'], { cwd: src }).map((f) => join(src, f, '..'))[0] ?? fail(`${t.repo} has no apps/*-web or apps/web crate`)
+  const web = webDir(src)
   return { t, id: buildId(t, release.tag_name), work, src, web, merged }
 }
 
@@ -137,6 +141,8 @@ const build = async (slug, channel) => {
     const index = join(web, 'index.html')
     writeFileSync(index, readFileSync(index, 'utf8').replace(/data-wasm-opt="[^"]*"/g, 'data-wasm-opt="0"'))
     run('trunk', ['build', '--release', '--dist', dist, '--public-url', './'], { cwd: web, env: { ...process.env, CARGO_TARGET_DIR: join(work, 'target') } })
+  } else if (existsSync(join(src, 'scripts/build-web.sh'))) {
+    run('bash', ['scripts/build-web.sh', dist], { cwd: src, env: { ...process.env, CARGO_TARGET_DIR: join(work, 'target'), PATH: wasmBindgenPath(src, join(work, 'tools')) } })
   } else {
     // `cargo xtask web` writes the site to <target>/web/dist or, in some releases, <target>/web, or <target>/web-site
     // (LightCraft Classic), and runs wasm-opt -O2 if it is on PATH: keep it off.
@@ -201,7 +207,7 @@ if (command === 'plan') {
   await build(slug, channel)
 } else if (command === 'tidy' && slug) {
   tidyDiffs(toolFor(slug))
-} else {
+} else if (process.argv[1] === import.meta.filename) {
   console.error('usage: node scripts/build.mjs plan | tidy <slug> | build|check|source|facts|prune <slug> release|head')
   process.exit(2)
 }
