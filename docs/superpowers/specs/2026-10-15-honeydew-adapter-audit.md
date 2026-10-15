@@ -96,3 +96,16 @@ the entire sound library into every session.
 Do not add broad model serialization derives or replace UI functions with large string patches merely
 to get an initial demo. New upstream model fields should fail an explicit adapter coverage check,
 not silently disappear from shared documents.
+
+## Implemented model and checkpoint layer
+
+The isolated patch `patches/fl-studio-mobile/peer-document.diff` now provides musical projection,
+conflict-checked merging and inverse merging, plus bounded canonical FLM checkpoints. Clip ordering
+follows start positions after identity-based merging. Similar-header tracks remain one conflict
+unit because lanes have no stable identities; ambiguous personal view matches reset instead of
+being copied to the wrong track.
+
+`document-delta.js` sends changed byte spans with before/after SHA-256 hashes and exact inverse data.
+These reconstruct proposed checkpoints for the model merge. They do not authorize edits or apply
+them to a running app. The mutation/Undo hooks, authored revision protocol, dependencies and presence
+listed above remain the next work. No browser live-editing capability is enabled.

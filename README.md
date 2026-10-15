@@ -34,6 +34,10 @@ The collaboration branch adds private browser-to-browser file sessions. This is 
 app-specific live editing adapters are still in development. Production stays disabled with
 `SESSIONS_ENABLED: "false"` in `wrangler.jsonc`.
 
+The Honeydew patch currently contains a tested document merge and checkpoint codec. Its browser
+hooks, authored history and live presence are not connected yet; the toolbar still offers file
+sharing only.
+
 For local development, run `npm run build`, then start these in separate terminals:
 
 ```sh
