@@ -1,6 +1,6 @@
 {
   "photoshop": "v0.9.0+800604c2",
-  "photoshop@head": "head-fd28da5+800604c2",
+  "photoshop@head": "head-17c85e4+800604c2",
   "illustrator": "v0.11.0+346ddf66",
   "illustrator@head": "head-0946bc5+346ddf66",
   "indesign": "v0.8.0+7ebb57eb",
@@ -16,7 +16,7 @@
   "acrobat": "v0.8.0+c8ac89ea",
   "acrobat@head": "head-d3a91c5+c8ac89ea",
   "word": "v0.7.0+3bb1da56",
-  "word@head": "head-e5d9b3e+3bb1da56",
+  "word@head": "head-fbbf9c0+3bb1da56",
   "excel": "v0.7.0+e302144f",
   "excel@head": "head-e6b6b34+e302144f",
   "powerpoint": "v0.7.0+68e22905",
@@ -33,7 +33,7 @@
   "fl-studio-mobile": "v0.1.6+83961e8e",
   "fl-studio-mobile@head": "head-942e6fb+83961e8e",
   "figma": "v0.6.0+3ddef871",
-  "figma@head": "head-3a1aeb7+3ddef871",
+  "figma@head": "head-8482c3e+3ddef871",
   "bluebeam@head": "head-6777d22+1cfad7a4",
   "artcraft-store": "4764a52"
 }
