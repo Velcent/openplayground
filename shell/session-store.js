@@ -105,6 +105,14 @@ export class SessionStore {
     for (let i = 0; i < entry.hashes.length; i++) parts.push(await this.chunk(asset, i))
     return new File(parts, entry.name)
   }
+  async connection(value) {
+    if (value !== undefined) await write(await this.root(), 'connection.json', JSON.stringify(value))
+    return readJSON(await this.root(), 'connection.json')
+  }
+  async finish(asset) {
+    if ((await this.missing(asset)).length) throw new Error('File is still syncing')
+    await write(await this.directory(asset), 'complete.json', 'true')
+  }
   async remove() {
     const sessions = await (await navigator.storage.getDirectory()).getDirectoryHandle('playground-sessions')
     await sessions.removeEntry(this.room, { recursive: true })
