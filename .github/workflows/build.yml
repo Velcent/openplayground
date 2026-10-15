@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: [tools.yaml, patches/**, scripts/build.mjs, scripts/diffs.mjs, scripts/releases.mjs, .github/workflows/build.yml]
+    paths: [tools.yaml, patches/**, scripts/build.mjs, scripts/diffs.mjs, scripts/releases.mjs, scripts/prune-failures.mjs, .github/workflows/build.yml]
 
 concurrency:
   group: build
@@ -238,6 +238,24 @@ jobs:
             fi
           fi
           exit 1
+
+  # Success clears a channel's failures above; repeated failures also need bounded history.
+  cleanup:
+    needs: [plan, build]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+      - run: npm ci
+      - name: Prune superseded failure markers
+        run: node scripts/prune-failures.mjs | xargs -r -n1 gh release delete-asset builds -y
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
 
   # Install whatever got built now, rather than at fetch.yml's next scheduled run. A push-triggered run
   # with failures also starts a run where Claude can repair them.

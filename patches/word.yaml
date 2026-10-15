@@ -310,20 +310,17 @@
     }
 
 # Rule 8/9: exporting or printing doesn't mark a stored document saved.
-# What it's for: upstream's download branch sets `dirty = false` after any download, including PDF/ODT export
-#   and Print (rule 2 lets those through). With a stored document open that cleared the unsaved state, so
+# What it's for: upstream's download branch marks lossless exports (including ODT) saved, but those are
+#   copies of the stored document in Playground (rule 2 lets them through). That cleared the unsaved state, so
 #   AutoSave skipped the edits, the leave warning (rule A) stayed silent and the title lost its dot.
-# How: with save_as_async set (the shell is present) the download branch leaves `dirty` alone. Without the
-#   shell the line is unchanged, so upstream behavior stays.
-# Verify: open a stored document, type, File → Export → PDF: the title keeps its dot, and Ctrl+S (or
+# How: guard the save condition, before any async completion tracking. With save_as_async set (the shell
+#   is present) the download branch leaves `dirty` alone. Without the shell, upstream behavior stays.
+# Verify: open a stored document, type, File → Export → ODT: the title keeps its dot, and Ctrl+S (or
 #   AutoSave) still writes the edit to the stored file.
 # If upstream changes: anchor on whatever clears dirty after a download; delete once exports no longer do.
 - file: crates/ui-egui/src/lib.rs
-  find: 'self\.session\.dirty = false;(?=\s*(?:\}\s*)?return Ok\(json!\(\{"downloaded")'
-  replace: |-
-    if self.services.save_as_async.is_none() {
-                    self.session.dirty = false;
-                }
+  find: '(if (?:marked_saved|matches!\(id, "file\.save" \| "file\.saveAs"\) && keeps_everything\(&name\))) \{'
+  replace: '$1 && self.services.save_as_async.is_none() {'
 
 # Rule 9/9: opening the document that's already open keeps its unsaved edits.
 # What it's for: Ctrl+O and picking the open stored file, Files > "Open in Word", or its Recent entry ran
