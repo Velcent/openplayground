@@ -1,3 +1,6 @@
+import { sessionRequest } from './session-room.js'
+export { SessionRoom } from './session-room.js'
+
 // The site's Worker. Requests are served from the static assets (dist/); this script only runs for paths
 // that aren't files, and every 15 minutes (wrangler.jsonc `triggers`), when it starts the GitHub
 // workflows that pick up new releases. GitHub's own schedule for them can lag or not fire at all.
@@ -6,7 +9,7 @@
 const WORKFLOWS = ['build.yml', 'store.yml', 'fetch.yml']
 
 export default {
-  fetch: (request, env) => env.ASSETS.fetch(request),
+  fetch: (request, env) => new URL(request.url).pathname.startsWith('/api/session/') ? sessionRequest(request, env) : env.ASSETS.fetch(request),
 
   async scheduled(event, env) {
     if (!env.GITHUB_TOKEN) return console.error('GITHUB_TOKEN secret is not set: not starting the workflows')
