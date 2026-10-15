@@ -75,10 +75,9 @@ export const stat = async (path) => {
   }
 }
 
-export const read = async (path) => {
-  const file = await (await (await folder(parentOf(path))).getFileHandle(baseName(path))).getFile()
-  return new Uint8Array(await file.arrayBuffer())
-}
+/** A File snapshot permits bounded reads when sharing large media. */
+export const file = async (path) => (await (await folder(parentOf(path))).getFileHandle(baseName(path))).getFile()
+export const read = async (path) => new Uint8Array(await (await file(path)).arrayBuffer())
 
 // Apps write synchronously and move on (their write hooks can't wait), so writes queue per path and land
 // in order; pendingWrites() lets the page warn before it is closed with writes still in flight.
