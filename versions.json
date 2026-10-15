@@ -14,7 +14,7 @@
   "after-effects": "v0.10.0+9f8d6116",
   "after-effects@head": "head-0311bdc+9f8d6116",
   "acrobat": "v0.8.0+bde1e050",
-  "acrobat@head": "head-13e3154+bde1e050",
+  "acrobat@head": "head-99941da+bde1e050",
   "word": "v0.7.0+aa0363df",
   "word@head": "head-86adfd3+aa0363df",
   "excel": "v0.7.0+12101ba3",
@@ -34,6 +34,6 @@
   "fl-studio-mobile": "v0.1.6+e9bad523",
   "fl-studio-mobile@head": "head-942e6fb+e9bad523",
   "figma": "v0.6.0+665eea0e",
-  "figma@head": "head-eb741a3+665eea0e",
+  "figma@head": "head-7459cc7+665eea0e",
   "artcraft-store": "4764a52"
 }
