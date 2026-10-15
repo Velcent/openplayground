@@ -15,6 +15,7 @@ export const h = (tag, props = {}, ...children) => {
 
 const FOLDER = '<path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4l2 2h9A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"/>'
 const ICONS = {
+  people: '<circle cx="9" cy="7" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3M17 4a3 3 0 0 1 0 6M21 21v-3a6 6 0 0 0-4-5.65"/>',
   folder: FOLDER,
   files: FOLDER,
   file: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/>',

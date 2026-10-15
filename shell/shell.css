@@ -256,3 +256,37 @@ body > canvas:first-of-type, body > canvas#lemon-canvas {
 .pg-page-head h1 { margin: 12px 0 0; font-size: clamp(32px, 5vw, 52px); font-weight: 600; letter-spacing: -0.04em; line-height: 1.05; }
 .pg-files-main { max-width: 1120px; margin: 0 auto 32px; padding: 0 16px; }
 .pg-files-main .pg-explorer { height: min(72vh, 760px); border: 1px solid var(--pg-line); border-radius: 14px; background: var(--pg-panel); }
+
+/* File sharing uses the existing shell dialog and toolbar. */
+.pg-share { position: relative; }
+.pg-share-progress { position: absolute; bottom: 1px; left: 8px; width: calc(100% - 16px); height: 3px; accent-color: var(--pg-accent); }
+.pg-share-dialog:has(.pg-choice) { height: fit-content; width: min(620px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); }
+.pg-sharing { overflow: auto; position: relative; }
+.pg-sharing label { display: flex; align-items: center; gap: 10px; }
+.pg-sharing label > input:not([type=checkbox]) { flex: 1; }
+.pg-sharing p { margin: 0; }
+.pg-share-heading, .pg-share-person, .pg-share-file { display: flex; align-items: center; gap: 10px; }
+.pg-share-heading { justify-content: space-between; }
+.pg-share-body { display: grid; gap: 12px; }
+.pg-share-pick { max-height: 160px; overflow: auto; }
+.pg-share-pick label { padding: 6px 0; }
+.pg-share-pick span, .pg-share-file > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.pg-share-pick small, .pg-share-person small, .pg-share-file small, .pg-sharing .pg-hint { color: var(--pg-muted); }
+.pg-share-invite { display: flex; flex-wrap: wrap; gap: 8px; }
+.pg-share-invite input { flex: 1; width: 100px; }
+.pg-share-person { padding: 8px 0; border-bottom: 1px solid var(--pg-line); }
+.pg-share-person > span:not(.pg-person-dot) { flex: 1; min-width: 0; }
+.pg-share-person strong, .pg-share-person small { display: block; overflow-wrap: anywhere; }
+.pg-person-dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 9px; }
+.pg-share-file { flex-wrap: wrap; padding: 8px 0; }
+.pg-share-error:not(:empty) { padding: 10px; border: 1px solid var(--pg-danger); border-radius: 8px; }
+@media (max-width: 480px) {
+  .pg-sharing { padding: 14px; }
+  .pg-share-file .pg-actions { width: 100%; }
+  .pg-share-person { flex-wrap: wrap; }
+  .pg-share-person > span:not(.pg-person-dot) { flex-basis: calc(100% - 24px); }
+  .pg-share .pg-icon { display: none; }
+}
+.pg-share-dialog[open] { display: block; }
+.pg-share-dialog .pg-sharing { max-height: calc(100dvh - 24px); box-sizing: border-box; }
+.pg-share-dialog [hidden] { display: none !important; }

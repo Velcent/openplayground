@@ -23,6 +23,20 @@ export async function describe(file, id = crypto.randomUUID()) {
 }
 
 export class SessionStore {
+  static async list(app) {
+    const result = []
+    let root
+    try { root = await (await navigator.storage.getDirectory()).getDirectoryHandle('playground-sessions') }
+    catch(e) { if (e.name === 'NotFoundError') return result; throw e }
+    for await (const [id, dir] of root.entries()) {
+      if (dir.kind !== 'directory' || !UUID.test(id)) continue
+      const config = await readJSON(dir, 'connection.json')
+      if (config?.app !== app) continue
+      const files = await new SessionStore(id).manifest()
+      result.push({ id, name: files[0]?.name || 'Empty session' })
+    }
+    return result
+  }
   constructor(room) {
     if (!UUID.test(room)) throw new Error('Invalid session ID')
     this.room = room

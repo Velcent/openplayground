@@ -11,12 +11,26 @@ async function request(room, action, data, token) {
 }
 
 export class PeerSession extends EventTarget {
+  static async restore(room) {
+    const config = await new SessionStore(room).connection()
+    if (!config || config.room !== room) throw new Error('Local session unavailable')
+    const session = new PeerSession(config)
+    session.files = await session.store.manifest()
+    session.stopped = true; session.status = 'left'
+    for (const f of new Map(session.files.map(f=>[f.asset,f])).values()) {
+      const missing = await session.store.missing(f.asset)
+      session.progress.total += f.size
+      session.progress.received += f.size - missing.reduce((n,i)=>n+Math.min(CHUNK_SIZE,f.size-i*CHUNK_SIZE),0)
+      if (!missing.length) { await session.store.finish(f.asset); session.available.add(f.asset) }
+    }
+    return session
+  }
   static async create({ app, name, files = [] }) {
     const config = { room: crypto.randomUUID(), app, secret: randomToken(), owner: randomToken(), editor: randomToken(), viewer: randomToken(), name: cleanName(name), accepted: true }
     const member = await request(config.room, 'create', { app, owner: await tokenHash(config.owner), editor: await tokenHash(config.editor), viewer: await tokenHash(config.viewer) })
     const session = new PeerSession({ ...config, ...member })
     await session.share(files)
-    await session.connect()
+    try { await session.connect() } catch(e) { session.leave(); throw e }
     return session
   }
   static async join(invite, { name } = {}) {
@@ -28,7 +42,7 @@ export class PeerSession extends EventTarget {
     if (member.app !== info.app) throw new Error('This invitation is for another app')
     const session = new PeerSession({ ...member, room: info.room, secret: info.secret, name: cleanName(name || member.name) })
     session.files = await session.store.manifest()
-    await session.connect()
+    try { await session.connect() } catch(e) { session.leave(); throw e }
     return session
   }
   constructor(config) {

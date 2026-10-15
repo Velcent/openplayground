@@ -1,6 +1,7 @@
 // The bar above every app: back to the dashboard, switch apps, this build's version, Files and fullscreen.
 import { appHref, currentApp, loadApps } from './apps.js'
 import { toggleStack } from './stack.js'
+import { mountShare } from './share.js'
 import { h, icon, isolate } from './ui.js'
 
 const relative = new Intl.RelativeTimeFormat('en', { numeric: 'auto' })
@@ -70,6 +71,7 @@ export async function mountTopbar() {
   const { groups } = await loadApps()
   const app = groups.flatMap((g) => g.apps).find((a) => here && a[here.channel]?.path === here.path)
   if (!app) return
+  mountShare(bar, app, here).catch(() => {})
   const build = app[here.channel]
   // "Alternative naming": the tab goes by the alternative's name and icon too.
   if (app.own) {

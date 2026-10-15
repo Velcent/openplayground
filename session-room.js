@@ -19,6 +19,7 @@ async function body(request) {
 }
 
 export async function sessionRequest(request, env) {
+  if (request.method === 'GET' && new URL(request.url).pathname === '/api/session/config') return json({ enabled: env.SESSIONS_ENABLED === 'true' })
   if (env.SESSIONS_ENABLED !== 'true') return error('File sharing is not enabled yet', 503)
   const url = new URL(request.url)
   if (request.headers.get('origin') !== url.origin) return error('Origin not allowed', 403)
