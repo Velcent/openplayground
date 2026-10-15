@@ -288,18 +288,3 @@ groups:
         patches: patches/figma.yaml
         accent: "#02DA96"
         base: "#062E22"
-
-      - slug: bluebeam
-        name: MarkupCraft
-        alternative: Bluebeam Revu
-        blurb: PDF markup, measurement and takeoff for drawings.
-        # PDFs (PdfCraft stays the default for them). Markup files (XFDF, FDF) come in through its own Import.
-        opens: [pdf]
-        imports: []
-        # engr-software/markupcraft, the original, is gone (since 2026-10-14); this re-upload of its 0.6.0 has no
-        # releases, so only the head channel (its newest commit) is built.
-        repo: generalchad/markupcraft
-        icon: icons/markupcraft.png
-        patches: patches/bluebeam.yaml
-        accent: "#E9772E"
-        base: "#3A1A06"

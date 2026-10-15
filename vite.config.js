@@ -1,8 +1,20 @@
-import { cpSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { extname, join } from 'node:path'
 import { defineConfig } from 'vite'
 import { parse } from 'yaml'
 import { alternativeIcon, appSlug, installDir } from './scripts/releases.mjs'
+
+// A restored download cache can still contain apps removed from tools.yaml.
+export function pruneRetiredBuilds(root = 'public') {
+  const names = new Set(parse(readFileSync('tools.yaml', 'utf8')).groups.flatMap((g) => g.tools).map(appSlug))
+  for (const base of [root, join(root, 'head')]) {
+    if (!existsSync(base)) continue
+    for (const entry of readdirSync(base, { withFileTypes: true })) {
+      const dir = join(base, entry.name)
+      if (entry.isDirectory() && !names.has(entry.name) && existsSync(join(dir, '.release'))) rmSync(dir, { recursive: true })
+    }
+  }
+}
 
 // What `make fetch` installed of a tool on a channel (its .release stamp), and where it's served.
 const installed = (t, channel) => {
@@ -144,6 +156,7 @@ export default defineConfig({
   plugins: [
     {
       name: 'tools',
+      configResolved: () => pruneRetiredBuilds(),
       transformIndexHtml: { order: 'pre', handler: (html) => html.replace('<!-- groups -->', renderGroups()) },
       configureServer: (server) => {
         server.middlewares.use(shell)
