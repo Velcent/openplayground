@@ -1,5 +1,5 @@
-// The site's Worker: Cloudflare serves the Vite build as static assets (folders like /photoshop/ get their
-// index.html, and /photoshop redirects to /photoshop/), and worker.js starts the update workflows every
+// The site's Worker: Cloudflare serves the Vite build as static assets (folders like /photocraft/ get their
+// index.html, and /photocraft redirects to /photocraft/), and worker.js starts the update workflows every
 // 15 minutes.
 {
   "$schema": "node_modules/wrangler/config-schema.json",

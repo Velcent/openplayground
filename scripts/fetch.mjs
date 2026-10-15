@@ -1,14 +1,14 @@
 // Downloads each tool's web builds (see tools.yaml) on both channels (releases.mjs): its newest release into
-// public/<slug>/, our build (scripts/build.mjs) when there is one, else the upstream release; and its newest
-// commit into public/head/<slug>/, our build of it, else our newest earlier one. Each app's community plug-ins
+// public/<app-name>/, our build (scripts/build.mjs) when there is one, else the upstream release; and its newest
+// commit into public/head/<app-name>/, our build of it, else our newest earlier one. Each app's community plug-ins
 // (store.yml) go into its plugins/ folder on both channels.
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { basename, extname, join } from 'node:path'
 import { gzipSync } from 'node:zlib'
-import { CHANNELS, JUNK, builtAssets, channelAssets, github, installDir, resolveVersion, tools } from './releases.mjs'
+import { CHANNELS, JUNK, alternativeIcon, builtAssets, channelAssets, github, installDir, resolveVersion, tools } from './releases.mjs'
 
 const MAX_FILE = 25 * 1024 * 1024 // the host's per-file limit
 const prelude = readFileSync('scripts/page-prelude.js', 'utf8')
@@ -22,7 +22,8 @@ const patch = (t, dir) => {
   const icon = `site-icon${extname(t.icon)}`
   cpSync(t.icon, join(dir, icon))
   // The icon of the app it's an alternative to, for the shell's "Alternative naming" (shell/apps.js).
-  if (existsSync(`icons/alternatives/${t.slug}.svg`)) cpSync(`icons/alternatives/${t.slug}.svg`, join(dir, 'alternative-icon.svg'))
+  const altIcon = alternativeIcon(t)
+  if (altIcon) cpSync(altIcon, join(dir, `alternative-icon${extname(altIcon)}`))
   // Unzipped size of each .wasm, for the progress bar: a gzip file ends with it (mod 2^32).
   const wasm = {}
   for (const f of readdirSync(dir, { recursive: true })) {
@@ -145,6 +146,9 @@ for (const t of tools) {
 
 async function install(t, channel, name) {
   const dir = installDir(t, channel)
+  const oldDir = channel === 'head' ? `public/head/${t.slug}` : `public/${t.slug}`
+  // Reuse cached builds when their public URL changes, without changing release asset IDs.
+  if (oldDir !== dir && existsSync(oldDir) && !existsSync(dir)) renameSync(oldDir, dir)
   // Our builds of this tool on this channel, newest first.
   const builds = channelAssets(built, t, channel)
   const current = await version(t, channel).catch((e) => {

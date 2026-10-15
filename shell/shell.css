@@ -60,7 +60,7 @@
 }
 
 /* App pages: the app's canvas (always the first canvas in <body>) sits below the bar. */
-body > canvas:first-of-type {
+body > canvas:first-of-type, body > canvas#lemon-canvas {
   position: fixed !important;
   inset: var(--pg-bar) 0 0 0 !important;
   width: 100% !important;

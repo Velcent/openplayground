@@ -1,4 +1,5 @@
-# Dashboard groups, each with its tools. Each tool is served at /<slug>/ and listed in this order. A group's
+# Dashboard groups, each with its tools. Each tool is served at its hyphenated name; slug stays its build ID
+# and redirects to that name. Listed in this order. A group's
 # `alternative:` is its heading under the dashboard's "Alternative naming".
 #
 #   repo:   GitHub repo to download the web build from
@@ -15,6 +16,8 @@
 #   patches: source patches for the app's own build (optional; see scripts/build.mjs). Every app is built
 #           from source with a speed-first wasm-opt -O3; when its build is missing or failed, the site
 #           serves the upstream release (with the theme script) instead.
+#   build: false uses upstream releases only (already optimized by the app's own CI)
+#   isolated: true sends the cross-origin isolation headers required by shared-memory WASM
 #   opens:  file types (extensions) the app is the natural home for: Files shows its icon on them and opens them
 #           in it by default (no browser-side Open yet: [])
 #   imports: other types its browser build takes in (imports, places, inserts): offered in Files' right-click menu
@@ -243,6 +246,20 @@ groups:
         icon: icons/soundcraft.svg
         accent: "#A673FF"
         base: "#1F0B40"
+
+      - slug: fl-studio
+        name: Lemon Studio
+        alternative: FL Studio
+        blurb: Compose and arrange music with a piano roll, mixer and built-in instruments.
+        opens: []
+        imports: []
+        repo: daijro/Lemon-Studio-web
+        asset: '^lemon-studio-web\.zip$'
+        build: false
+        isolated: true
+        icon: icons/lemon-studio.png
+        accent: "#F8D84A"
+        base: "#36300C"
 
       - slug: fl-studio-mobile
         name: Honeydew

@@ -27,3 +27,8 @@ test('no release with a web build: no release channel', async () => {
   serve([release('v0.1.0', '2026-01-01', { prerelease: true, asset: 'app-linux.tar.gz' })])
   assert.equal(await resolveVersion(tool, 'release'), null)
 })
+
+test('upstream-built apps have no separate head build', async () => {
+  globalThis.fetch = async () => { throw new Error('head must not query GitHub') }
+  assert.equal(await resolveVersion({ ...tool, build: false }, 'head'), null)
+})

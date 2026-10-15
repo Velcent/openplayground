@@ -35,10 +35,10 @@ export const loadApps = () =>
 
 export const flatApps = ({ groups }) => groups.flatMap((g) => g.apps)
 
-/** The app page this is ('/word/' or '/head/word/'): { slug, channel }, or null on other pages. */
+/** The app page this is ('/wordcraft/' or '/head/wordcraft/'): { path, channel }, or null on other pages. */
 export const currentApp = (pathname = location.pathname) => {
   const m = pathname.match(/^\/(?:(head)\/)?([^/]+)\//)
-  return m && !['files', 'shell'].includes(m[2]) ? { slug: m[2], channel: m[1] ? 'head' : 'release' } : null
+  return m && !['files', 'shell'].includes(m[2]) ? { path: m[0], channel: m[1] ? 'head' : 'release' } : null
 }
 
 /** An app's page in the channel chosen with "Use latest commits", else the one it has. */

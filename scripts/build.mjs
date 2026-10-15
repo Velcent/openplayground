@@ -177,7 +177,7 @@ if (command === 'plan') {
   const assets = await builtAssets()
   const has = (name, maxAge = Infinity) => assets.some((a) => a.name === name && age(a) < maxAge)
   const include = []
-  for (const t of tools) {
+  for (const t of tools.filter((t) => t.build !== false)) {
     for (const channel of CHANNELS) {
       // One tool whose repo can't be read (gone, renamed, private) mustn't stop the others' builds.
       const version = await resolveVersion(t, channel).catch((e) => console.error(`::warning::${t.slug} (${channel}): ${e.message}`))

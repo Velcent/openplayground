@@ -7,7 +7,7 @@ node_modules: package.json
 	npm install
 	@touch node_modules
 
-# Download/refresh each tool in tools.yaml into public/<slug>/
+# Download/refresh each tool in tools.yaml into public/<app-name>/
 fetch: node_modules
 	node scripts/fetch.mjs
 

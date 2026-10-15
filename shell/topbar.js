@@ -68,7 +68,7 @@ export async function mountTopbar() {
   document.body.prepend(bar, tab)
 
   const { groups } = await loadApps()
-  const app = groups.flatMap((g) => g.apps).find((a) => a.slug === here?.slug)
+  const app = groups.flatMap((g) => g.apps).find((a) => here && a[here.channel]?.path === here.path)
   if (!app) return
   const build = app[here.channel]
   // "Alternative naming": the tab goes by the alternative's name and icon too.
@@ -85,10 +85,10 @@ export async function mountTopbar() {
       g.apps.map((a) =>
         h(
           'a',
-          { class: 'pg-app', role: 'menuitem', href: appHref(a), 'aria-current': a.slug === here.slug ? 'page' : null },
+          { class: 'pg-app', role: 'menuitem', href: appHref(a), 'aria-current': a.slug === app.slug ? 'page' : null },
           h('img', { src: a.icon, alt: '' }),
           h('span', {}, h('strong', {}, a.name), h('small', {}, a.own ? `Using ${a.own.name}` : a.alternative ? `Alternative to ${a.alternative}` : a.blurb)),
-          a.slug === here.slug ? icon('check') : null,
+          a.slug === app.slug ? icon('check') : null,
         ),
       ),
     ]),

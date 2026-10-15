@@ -156,7 +156,8 @@ function onOpen(callback) {
 /** The Files button: the explorer as a popup. "Open in <app>" opens files of this app here, others there. */
 /** Open a stored file in `app`: here if it's this page's app, else on that app's page (?open=). */
 export function openInApp(path, app) {
-  if (app.slug !== currentApp()?.slug) return (location.href = `${appHref(app)}?open=${encodeURIComponent(toAppPath(path))}`)
+  const here = currentApp()
+  if (!here || app[here.channel]?.path !== here.path) return (location.href = `${appHref(app)}?open=${encodeURIComponent(toAppPath(path))}`)
   openHere(path).catch((e) => toast(`Couldn’t open ${baseName(path)}: ${e.message}`))
 }
 

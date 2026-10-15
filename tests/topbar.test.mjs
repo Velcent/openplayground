@@ -154,12 +154,23 @@ test('without the app list, the bar still has Files and Fullscreen', async () =>
   await context.close()
 })
 
+// Keep the shell's leave-warning checks independent of Word's frame-by-frame unsaved reports.
+const warningPage = async () => {
+  const context = await browser.newContext()
+  const url = `${site.url}${wordPath()}`
+  await context.route(url, (route) => route.fulfill({
+    contentType: 'text/html',
+    body: '<link rel="stylesheet" href="/shell/shell.css"><canvas></canvas><script type="module" src="/shell/app.js"></script>',
+  }))
+  return openPage(browser, url, { context })
+}
+
 test('leaving after working in the app asks first', async () => {
-  const page = await openPage(browser, `${site.url}${wordPath()}`)
+  const page = await warningPage()
   await page.locator('.pg-bar').waitFor()
   await page.mouse.click(400, 300)
   await page.keyboard.press('a')
-  const dialog = new Promise((resolve) => page.once('dialog', resolve))
+  const dialog = page.waitForEvent('dialog', { timeout: 5000 })
   await page.close({ runBeforeUnload: true })
   const shown = await dialog
   assert.equal(shown.type(), 'beforeunload')
@@ -167,10 +178,10 @@ test('leaving after working in the app asks first', async () => {
 })
 
 test('an app that reports its own state is warned about only when it has unsaved changes', async () => {
-  const page = await openPage(browser, `${site.url}${wordPath()}`)
+  const page = await warningPage()
   await page.locator('.pg-bar').waitFor()
   await page.mouse.click(400, 300)
-  await page.keyboard.press('Shift') // input, but no edit: Word's own report stays "nothing unsaved"
+  await page.keyboard.press('Shift') // input, but no edit
   await page.evaluate(() => playgroundFiles.setUnsaved(false)) // the app says: nothing unsaved
   let asked = false
   page.on('dialog', (d) => ((asked = true), d.accept()))
@@ -178,11 +189,11 @@ test('an app that reports its own state is warned about only when it has unsaved
   await new Promise((r) => setTimeout(r, 500))
   assert.equal(asked, false, 'warned although the app reported no unsaved changes')
 
-  const second = await openPage(browser, `${site.url}${wordPath()}`)
+  const second = await warningPage()
   await second.locator('.pg-bar').waitFor()
   await second.mouse.click(400, 300) // gives the page the user activation a beforeunload prompt needs
   await second.evaluate(() => playgroundFiles.setUnsaved(true))
-  const dialog = new Promise((resolve) => second.once('dialog', resolve))
+  const dialog = second.waitForEvent('dialog', { timeout: 5000 })
   await second.close({ runBeforeUnload: true })
   const shown = await dialog
   assert.equal(shown.type(), 'beforeunload')

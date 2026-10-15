@@ -2,10 +2,11 @@ import { cpSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:
 import { extname, join } from 'node:path'
 import { defineConfig } from 'vite'
 import { parse } from 'yaml'
+import { alternativeIcon, appSlug, installDir } from './scripts/releases.mjs'
 
 // What `make fetch` installed of a tool on a channel (its .release stamp), and where it's served.
 const installed = (t, channel) => {
-  const path = channel === 'head' ? `/head/${t.slug}/` : `/${t.slug}/`
+  const path = `${installDir(t, channel).slice('public'.length)}/`
   try {
     return { path, ...JSON.parse(readFileSync(`public${path}.release`, 'utf8')) }
   } catch {}
@@ -16,14 +17,14 @@ const GITHUB = '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="tru
 
 // A card links to the release, and carries the latest-commit build's link, label and commit date for the
 // channel switch (index.html). A tool missing one channel uses the other for both.
-const card = (t) => {
+export const card = (t) => {
   const repo = t.repo.split('/')[1]
   const release = installed(t, 'release')
   const head = installed(t, 'head') ?? release
   const shown = release ?? head
   const ahead = head.ahead ? `${head.ahead.commits} commit${head.ahead.commits === 1 ? '' : 's'} ahead of ${head.ahead.of}` : ''
   // Both names and icons: the app's own, and the one it's an alternative to (index.html's "Alternative naming").
-  const altIcon = existsSync(`icons/alternatives/${t.slug}.svg`) && `/icons/alternatives/${t.slug}.svg`
+  const altIcon = alternativeIcon(t) && `/${alternativeIcon(t)}`
   const own = t.alternative ? ' class="as-own"' : ''
   return `
       <div class="tool" data-release-href="${shown.path}" data-head-href="${head.path}" style="--accent:${t.accent};--base:${t.base}">
@@ -70,7 +71,7 @@ const appsJson = () => ({
         return [{
           slug: t.slug, name: t.name, alternative: t.alternative ?? null, blurb: t.blurb, accent: t.accent, opens: t.opens ?? [], imports: t.imports ?? [],
           icon: `${(release ?? head).path}site-icon${extname(t.icon)}`,
-          alternativeIcon: existsSync(`public${(release ?? head).path}alternative-icon.svg`) ? `${(release ?? head).path}alternative-icon.svg` : null,
+          alternativeIcon: alternativeIcon(t) ? `${(release ?? head).path}alternative-icon${extname(alternativeIcon(t))}` : null,
           release: channel(release) ?? null, head: channel(head) ?? null,
         }]
       }),
@@ -78,28 +79,40 @@ const appsJson = () => ({
     .filter((g) => g.apps.length),
 })
 
-// Own-name URLs follow the same available-channel fallback as the dashboard.
+// Old product names and unavailable channels follow the dashboard's available build.
 export const appRedirects = (apps) => {
-  const canonical = new Set(apps.map((app) => app.slug))
+  const canonical = new Set(apps.map(appSlug))
   const redirects = {}
   for (const app of apps) {
-    const alias = app.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
-    if (!alias || canonical.has(alias)) continue
-    for (const [prefix, build] of [['', app.release ?? app.head], ['/head', app.head ?? app.release]]) {
-      if (!build) continue
-      redirects[`${prefix}/${alias}`] = build.path
-      redirects[`${prefix}/${alias}/`] = build.path
+    const own = appSlug(app)
+    for (const alias of new Set([app.slug, own])) {
+      if (alias !== own && canonical.has(alias)) continue
+      for (const [prefix, build] of [['', app.release ?? app.head], ['/head', app.head ?? app.release]]) {
+        const from = `${prefix}/${alias}`
+        if (!build || `${from}/` === build.path) continue
+        redirects[from] = redirects[`${from}/`] = build.path
+        redirects[`${from}/*`] = `${build.path}:splat`
+      }
     }
   }
-  return redirects
+  // Cloudflare counts every rule after the first wildcard toward its 100 dynamic-rule limit.
+  return Object.fromEntries(Object.entries(redirects).sort(([a], [b]) => Number(a.endsWith('/*')) - Number(b.endsWith('/*'))))
 }
 const aliases = () => appRedirects(appsJson().groups.flatMap((group) => group.apps))
+const isolatedPaths = () => parse(readFileSync('tools.yaml', 'utf8')).groups.flatMap((g) => g.tools)
+  .filter((t) => t.isolated).flatMap((t) => ['release', 'head'].flatMap((c) => installed(t, c)?.path ?? []))
+const isolationHeaders = { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp' }
 
 // Vite doesn't serve index.html for public/ folders: /slug -> /slug/ -> /slug/index.html, like a static host would.
 const toolIndex = (req, res, next) => {
   const [path, query = ''] = req.url.split(/(?=\?)/)
-  const destination = aliases()[path]
+  const redirects = aliases()
+  const wildcard = Object.keys(redirects).find((from) => from.endsWith('/*') && path.startsWith(from.slice(0, -1)))
+  const destination = redirects[path] ?? (wildcard && redirects[wildcard].replace(':splat', path.slice(wildcard.length - 1)))
   if (destination) return res.writeHead(302, { location: `${destination}${query}` }).end()
+  if (isolatedPaths().some((prefix) => path.startsWith(prefix))) {
+    for (const [name, value] of Object.entries(isolationHeaders)) res.setHeader(name, value)
+  }
   if (path === '/' || !existsSync(`public${path.replace(/\/?$/, '/index.html')}`)) return next()
   if (!path.endsWith('/')) return res.writeHead(301, { location: `${path}/${query}` }).end()
   req.url = `${path}index.html${query}`
@@ -145,6 +158,7 @@ export default defineConfig({
       closeBundle() {
         cpSync('shell', 'dist/shell', { recursive: true })
         writeFileSync('dist/shell/apps.json', JSON.stringify(appsJson()))
+        writeFileSync('dist/_headers', isolatedPaths().map((path) => `${path}*\n${Object.entries(isolationHeaders).map(([name, value]) => `  ${name}: ${value}`).join('\n')}`).join('\n') + '\n')
         writeFileSync('dist/_redirects', Object.entries(aliases()).map(([from, to]) => `${from} ${to} 302`).join('\n') + '\n')
       },
     },

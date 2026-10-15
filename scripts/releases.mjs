@@ -1,5 +1,5 @@
 // tools.yaml and GitHub release lookups shared by fetch.mjs and build.mjs.
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { parse } from 'yaml'
 
 export const tools = parse(readFileSync('tools.yaml', 'utf8')).groups.flatMap((g) => g.tools)
@@ -23,7 +23,9 @@ export const github = async (path) => {
 // Every tool comes in two channels: `release`, its newest upstream release, and `head`, the newest commit on
 // its branch. Head builds are named <slug>-head-<commit>-<hash>.zip and installed under public/head/.
 export const CHANNELS = ['release', 'head']
-export const installDir = (t, channel) => (channel === 'head' ? `public/head/${t.slug}` : `public/${t.slug}`)
+export const appSlug = (t) => (t.name ?? t.slug).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+export const installDir = (t, channel) => `public/${channel === 'head' ? 'head/' : ''}${appSlug(t)}`
+export const alternativeIcon = (t) => ['svg', 'png'].map((ext) => `icons/alternatives/${t.slug}.${ext}`).find(existsSync)
 
 // The version of a tool on a channel, as { release, asset }, or null when the channel has none (a repo
 // without web releases has no release channel).
@@ -33,6 +35,7 @@ export const installDir = (t, channel) => (channel === 'head' ? `public/head/${t
 //         can make its build.
 export const resolveVersion = async (t, channel) => {
   if (channel === 'head') {
+    if (t.build === false) return null
     const branch = t.branch ?? 'main'
     const newest = await Promise.all(
       (t.paths ?? ['']).map((p) => github(`repos/${t.repo}/commits?sha=${branch}&per_page=1${p ? `&path=${encodeURIComponent(p)}` : ''}`)),
