@@ -13,18 +13,18 @@
 #   prefetches, and stepping to the next photo still shows it at once.
 # If upstream changes: delete this rule once Renderer::prefetch (crates/ui-egui/src/render.rs) hands its job to
 #   `self.offload` itself (or no longer calls `self.pool.submit`). If only the line moved, re-anchor on the
-#   prefetch's pool submit.
+#   prefetch's pool submit. Match its call site, preserving either upstream job-result representation.
 - file: crates/ui-egui/src/render.rs
-  find: 'self\.pool\.submit\(slot, key, priority, Box::new\(move \|\| lightcraft_engine::memory::in_background\(\|\| job\.run\(\)\)\)\);'
+  find: '(pub fn prefetch\b[\s\S]*?)(self\.pool\.submit\()'
   replace: |-
-    if self.offload.is_some() {
+    $1if self.offload.is_some() {
                 self.seq += 1;
                 self.queue.retain(|q| q.slot != slot);
                 self.queue.push(Queued { slot, priority, seq: self.seq, job });
                 self.dispatch();
                 return;
             }
-            $&
+            $2
 
 # Rule 2: drop the notice LightCraft shows on every launch.
 # What it's for: for 8 s after opening, "LightCraft in the browser is experimental. Your library is kept in this

@@ -89,15 +89,17 @@
 #   `browser:` path's bytes go to playgroundFiles.write; other paths still error.
 # How: WEB_WRITE is a fn pointer the bridge (rule 6) sets; the engine crate needs no new dependency.
 # Verify: rule 2's flow stores the deck; a silent Save changes it.
+# Match the old wasm error stub or the newer shared I/O wrapper; keep its fallback and native writes intact.
 # If upstream changes: put the hook wherever the wasm build's "write bytes to a path" lives.
 - file: crates/engine/src/cmd/file.rs
-  find: '(#\[cfg\(target_arch = "wasm32"\)\]\s*fn write_file\((\w+): &str, (\w+): &\[u8\]\) -> Result<\(\)> \{)'
+  find: '((?:#\[cfg\(target_arch = "wasm32"\)\]\s*)?fn write_file\((\w+): &str, (\w+): &\[u8\]\) -> Result<\(\)> \{)(?=\s*(?:Err\(EngineError::Other|crate::io::write_file\())'
   replace: |-
     /// playground (patches/powerpoint.yaml): where `browser:` paths are written in the browser build. The web
     /// crate's bridge sets it to openplayground's `playgroundFiles.write`; unset, writing errors as upstream.
     pub static WEB_WRITE: std::sync::OnceLock<fn(&str, &[u8]) -> std::result::Result<(), String>> = std::sync::OnceLock::new();
 
     $1
+        #[cfg(target_arch = "wasm32")]
         if let Some(write) = WEB_WRITE.get()
             && $2.starts_with("browser:")
         {
@@ -121,15 +123,30 @@
                         playground::install(&mut app.services, playground_tx, cc.egui_ctx.clone());
                         
 
+# Keep upstream's open callback and inbox delivery, including request IDs and cancellation on newer builds.
+# Only the picker changes; both channels keep their own target-slide and pending-request handling.
+- file: apps/*-web/src/web.rs
+  find: 'let dialog = match purpose \{'
+  before: "let types = playground::file_types(purpose);\n            "
+- file: apps/*-web/src/web.rs
+  find: 'dialog\.pick_file\(\)\.await'
+  replace: 'playground::pick_file(dialog, types).await'
+- file: apps/*-web/src/web.rs
+  find: 'let bytes = file\.read\(\)\.await;'
+  replace: 'let (name, bytes) = file;'
+- file: apps/*-web/src/web.rs
+  find: 'file\.file_name\(\)'
+  replace: 'name'
+
 # Rule 6/6: the bridge between the app's web services and `playgroundFiles`.
 # What it's for: everything above; this is the only code that talks to the page.
-# How: install() replaces open_async (rfd) with the explorer for every purpose (open, picture, audio, video),
+# How: pick_file() uses the explorer for every purpose (open, picture, audio, video); install()
 #   fills save_as_async (rule 1) and WEB_WRITE (rule 4), and registers onOpen (?open= and Files' "Open in
 #   PowerPoint"). Save As answers go out as `file.saveAs {path}` through the control channel (rule 5).
 #   Without playgroundFiles it changes nothing.
 # Verify: the browser-storage flows above.
 # If upstream changes: this is self-contained; keep it at the end of the web crate's main file and adjust
-#   the names it uses (Services fields, ControlRequest, Inbox, the *_EXTS lists).
+#   the names it uses (Services fields, ControlRequest, the *_EXTS lists).
 - file: apps/*-web/src/web.rs
   find: '$(?![\s\S])'
   before: |
@@ -139,7 +156,7 @@
     mod playground {
         use std::sync::mpsc::Sender;
 
-        use deckcraft_ui_egui::{ControlRequest, Inbox, Services};
+        use deckcraft_ui_egui::{ControlRequest, Services, SlideApp};
         use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
 
         /// Route the app's file services through browser storage. Without the shell (a page not served by
@@ -149,23 +166,12 @@
                 log::warn!("playground: no playgroundFiles on this page; keeping downloads");
                 return;
             }
-            let Some(inbox) = services.inbox.clone() else { return };
             let _ = deckcraft_engine::cmd::file::WEB_WRITE.set(write);
-            let (i, c) = (inbox.clone(), ctx.clone());
-            services.open_async = Some(Box::new(move |purpose: &str| {
-                let types = match purpose {
-                    "picture" => super::PICTURE_EXTS,
-                    "audio" => super::AUDIO_EXTS,
-                    "video" => super::VIDEO_EXTS,
-                    _ => super::PRESENTATION_EXTS,
-                };
-                open(types, i.clone(), c.clone());
-            }));
             let c = ctx.clone();
             services.save_as_async = Some(Box::new(move |name: &str, bytes: Vec<u8>| {
                 save_as(name, &["deckcraft", "pptx"], &bytes, control.clone(), c.clone(), "file.saveAs");
             }));
-            on_open(inbox, ctx);
+            on_open(ctx);
         }
 
         fn api() -> Option<JsValue> {
@@ -215,23 +221,39 @@
                 .ok_or_else(|| format!("{path}: browser storage isn't available"))
         }
 
-        /// A file from the shell ({path, name, bytes}) into the inbox: under its `browser:` path when it has
-        /// one, so the deck keeps it (rule 3), else under its name.
-        fn deliver(file: &JsValue, inbox: &Inbox) {
+        /// Preserve browser-storage paths so Save writes back to the same document.
+        fn file_data(file: &JsValue) -> (String, Vec<u8>) {
             let name = field(file, "path").as_string().or_else(|| field(file, "name").as_string()).unwrap_or_else(|| "Presentation".into());
-            let bytes = js_sys::Uint8Array::new(&field(file, "bytes")).to_vec();
-            inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
+            (name, js_sys::Uint8Array::new(&field(file, "bytes")).to_vec())
         }
 
-        fn open(types: &[&str], inbox: Inbox, ctx: egui::Context) {
-            let promise = call("open", &[object(&[("types", list(types))])]);
-            wasm_bindgen_futures::spawn_local(async move {
-                let Some(files) = settle(promise).await else { return };
-                for file in js_sys::Array::from(&files).iter() {
-                    deliver(&file, &inbox);
-                }
-                ctx.request_repaint();
-            });
+        pub fn file_types(purpose: &str) -> &'static [&'static str] {
+            match purpose {
+                "picture" => super::PICTURE_EXTS,
+                "audio" => super::AUDIO_EXTS,
+                "video" => super::VIDEO_EXTS,
+                _ => super::PRESENTATION_EXTS,
+            }
+        }
+
+        /// Leave delivery and cancellation to upstream, which owns the request's target slide.
+        pub async fn pick_file(dialog: rfd::AsyncFileDialog, types: &[&str]) -> Option<(String, Vec<u8>)> {
+            if api().is_none() {
+                let file = dialog.pick_file().await?;
+                return Some((file.file_name(), file.read().await));
+            }
+            let files = settle(call("open", &[object(&[("types", list(types))])])).await?;
+            let file = js_sys::Array::from(&files).get(0);
+            (!file.is_undefined()).then(|| file_data(&file))
+        }
+
+        thread_local! { static OPEN: std::cell::RefCell<Vec<(String, Vec<u8>)>> = const { std::cell::RefCell::new(Vec::new()) }; }
+
+        /// Files supplied by the shell already have their bytes; apply them on the app's next frame.
+        pub fn receive(app: &mut SlideApp) {
+            for (name, bytes) in OPEN.with(|queue| queue.take()) {
+                app.open_or_insert_bytes(&name, &bytes);
+            }
         }
 
         /// Ask Keep / Download. Keep → the app saves to the chosen `browser:` path itself (`command {path}` on
@@ -249,9 +271,9 @@
         }
 
         /// Files the shell hands this app: ?open=browser:/… at startup, and "Open in PowerPoint" from Files.
-        fn on_open(inbox: Inbox, ctx: egui::Context) {
+        fn on_open(ctx: egui::Context) {
             let callback = Closure::<dyn FnMut(JsValue)>::new(move |file: JsValue| {
-                deliver(&file, &inbox);
+                OPEN.with(|queue| queue.borrow_mut().push(file_data(&file)));
                 ctx.request_repaint();
             });
             call("onOpen", &[callback.as_ref().clone()]);
@@ -278,5 +300,6 @@
 - file: apps/*-web/src/web.rs
   find: 'self\.app\.logic\(ctx\);'
   replace: |-
-    $&
+    playground::receive(&mut self.app);
+            $&
             playground::report_unsaved(self.app.session.documents().iter().any(|d| d.is_dirty()));
