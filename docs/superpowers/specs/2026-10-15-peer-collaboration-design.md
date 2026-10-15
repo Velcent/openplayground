@@ -163,7 +163,7 @@ use document/world coordinates so personal scrolling and zoom remain independent
 | Apps, using the user's familiar names | Shared content and presence |
 | --- | --- |
 | Photoshop, Illustrator, InDesign, Lightroom, Lightroom Classic | Active document/image/drawing, layers, edit history and document cursor. Selected layer and panels stay local. |
-| Acrobat, Word, Excel, PowerPoint, Revu | Editable document content plus colored textbox/object/cell selections and text carets where supported by the document model. |
+| Acrobat, Word, Excel, PowerPoint | Editable document content plus colored textbox/object/cell selections and text carets where supported by the document model. |
 | Premiere, After Effects, Pro Tools, FL Studio/Lemon Studio, FL Studio Mobile/Honeydew | Timeline, tracks/clips/notes, media, positions, tempo, automation, effects/instrument state and dependencies; remote selected clips and document cursors. Layout and playback transport stay local. |
 | Figma | Scene objects, remote cursors and selected items. |
 | AutoCAD, Fusion 360, Substance Painter | Model, objects/layers, drawings and required materials/textures. |

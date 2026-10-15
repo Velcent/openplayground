@@ -50,7 +50,7 @@ export class PeerSession extends EventTarget {
     this.config = config
     this.id = config.id; this.room = config.room; this.role = config.role; this.name = config.name
     this.store = new SessionStore(config.room)
-    this.peers = new Map(); this.files = []; this.status = 'connecting'; this.progress = { received: 0, total: 0 }
+    this.peers = new Map(); this.members = []; this.files = []; this.fileQueue = Promise.resolve(); this.status = 'connecting'; this.progress = { received: 0, total: 0 }
     this.accepted = !!config.accepted
     this.seq = 0; this.epoch = 0; this.generation = null; this.signalQueue = Promise.resolve(); this.downloads = []
     this.stopped = false; this.requested = null; this.ice = null; this.error = null; this.available = new Set()
@@ -87,7 +87,7 @@ export class PeerSession extends EventTarget {
     return this.ice.iceServers
   }
   async connect() {
-    this.stopped = false
+    this.stopped = false; this.error = null; clearTimeout(this.reconnectTimer)
     this.key ??= await signalKey(this.config.secret)
     await this.remember()
     return new Promise((resolve, reject) => {
@@ -106,6 +106,8 @@ export class PeerSession extends EventTarget {
             const me = message.peers.find((p) => p.id === this.id)
             if (!me || message.app !== this.config.app) throw new Error('Session identity or app mismatch')
             this.epoch = message.epoch; this.generation = me.generation; this.role = me.role; this.locked = message.locked
+            this.members = message.members ?? []
+            if (this.config.names) for (const id of Object.keys(this.config.names)) if (!this.members.some(m => m.id === id)) delete this.config.names[id]
             if (!settled) {
               this.seq = 0
               this.status = this.accepted ? 'syncing' : 'awaiting acceptance'
@@ -131,8 +133,10 @@ export class PeerSession extends EventTarget {
         clearTimeout(timer); clearInterval(this.heartbeat)
         for (const id of [...this.peers.keys()]) this.drop(id)
         if (this.stopped) return
-        if (event.code === 4003) {
-          this.status = 'removed'; this.error = 'Access was removed or expired. Your local copies are still available.'; this.stopped = true
+        if (event.code === 4003 || event.code === 4004) {
+          this.status = event.code === 4004 ? 'displaced' : 'removed'
+          this.error = event.code === 4004 ? 'This session opened in another tab. Your local copies are still available.' : 'Access was removed or expired. Your local copies are still available.'
+          this.stopped = true
           if (!settled) reject(new Error(this.error))
         } else {
           this.status = 'reconnecting'
@@ -255,14 +259,32 @@ export class PeerSession extends EventTarget {
     peer.sends = peer.sends.then(() => this.raw(peer, data))
     return peer.sends
   }
-  async announce(peer) {
-    if (this.role !== 'viewer') {
-      const value = JSON.stringify(this.files)
-      await this.send(peer, { type: 'manifest', length: value.length })
-      for (let i = 0; i < value.length; i += 8000) await this.send(peer, { type: 'manifest-part', text: value.slice(i, i + 8000) })
-      await this.send(peer, { type: 'manifest-end' })
-    }
-    await this.report(peer)
+  announce(peer) {
+    peer.announcing = (peer.announcing ?? Promise.resolve()).then(async () => {
+      if (this.role !== 'viewer') {
+        const value = JSON.stringify(this.files)
+        await this.send(peer, { type: 'manifest', length: value.length })
+        for (let i = 0; i < value.length; i += 8000) await this.send(peer, { type: 'manifest-part', text: value.slice(i, i + 8000) })
+        await this.send(peer, { type: 'manifest-end' })
+      }
+      await this.report(peer)
+    })
+    return peer.announcing
+  }
+  mergeFiles(files, persist = this.accepted) {
+    const merged = this.fileQueue.then(async () => {
+      const entries = new Map(this.files.map(f => [f.id, f]))
+      for (const f of await validateManifest(files)) {
+        const old = entries.get(f.id)
+        if (old && (old.asset !== f.asset || old.name !== f.name)) throw new Error('Conflicting file version')
+        entries.set(f.id, f)
+      }
+      const next = await validateManifest([...entries.values()])
+      this.files = persist ? await this.store.saveManifest(next) : next
+      if (this.accepted && !this.stopped) { this.scanDownloads = true; this.status = 'syncing' }
+    })
+    this.fileQueue = merged.catch(() => {})
+    return merged
   }
   async message(peer, data) {
     if (this.peers.get(peer.id) !== peer) return
@@ -283,7 +305,11 @@ export class PeerSession extends EventTarget {
     }
     if (typeof data !== 'string' || data.length > 32768) throw new Error('Invalid control message')
     const value = JSON.parse(data)
-    if (value.type === 'hello') { peer.name = cleanName(value.name); this.changed() }
+    if (value.type === 'hello') {
+      peer.name = cleanName(value.name)
+      if (this.config.owner) { (this.config.names ??= {})[peer.id] = peer.name; await this.remember() }
+      this.changed()
+    }
     else if (value.type === 'manifest') {
       if (peer.role === 'viewer' || !Number.isSafeInteger(value.length) || value.length < 2 || value.length > MAX_MANIFEST || peer.manifest !== undefined) throw new Error('Unauthorized file list')
       peer.manifest = ''; peer.manifestSize = value.length
@@ -292,19 +318,13 @@ export class PeerSession extends EventTarget {
       peer.manifest += value.text
     } else if (value.type === 'manifest-end') {
       if (peer.role === 'viewer' || peer.manifest?.length !== peer.manifestSize) throw new Error('Incomplete file list')
-      const incoming = await validateManifest(JSON.parse(peer.manifest)); delete peer.manifest
-      const merged = new Map(this.files.map((f) => [f.id, f]))
-      for (const f of incoming) {
-        const old = merged.get(f.id)
-        if (old && (old.asset !== f.asset || old.name !== f.name)) throw new Error('Conflicting file version')
-        merged.set(f.id, f)
-      }
-      this.files = await validateManifest([...merged.values()])
-      if (this.accepted) { await this.store.saveManifest(this.files); await this.prepareDownloads() }
+      const incoming = JSON.parse(peer.manifest); delete peer.manifest
+      await this.mergeFiles(incoming)
+      if (this.accepted) await this.prepareDownloads()
       this.changed()
     } else if (value.type === 'inventory') {
       if (!Array.isArray(value.assets) || value.assets.length > 256 || !value.assets.every((a) => typeof a === 'string' && /^[a-f0-9]{64}$/.test(a))) throw new Error('Invalid inventory')
-      peer.inventory = new Set(value.assets); await this.pump()
+      peer.inventory = new Set(value.assets); peer.inventoryKnown = true; await this.pump()
     } else if (value.type === 'want') {
       if (peer.sending || !Number.isInteger(value.index)) throw new Error('Invalid asset request')
       const data = await this.store.chunk(value.asset, value.index)
@@ -331,7 +351,7 @@ export class PeerSession extends EventTarget {
     if (this.role === 'viewer') throw new Error('Viewers cannot share or replace files')
     for (const file of files) {
       const entry = await describe(file)
-      this.files = await this.store.saveManifest([entry])
+      await this.mergeFiles([entry], true)
       for (let i = 0; i < entry.hashes.length; i++) await this.store.putChunk(entry.asset, i, new Uint8Array(await file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE).arrayBuffer()))
     }
     this.accepted = true
@@ -340,7 +360,7 @@ export class PeerSession extends EventTarget {
     await this.remember()
   }
   async receive() {
-    await this.store.saveManifest(this.files)
+    await this.mergeFiles([], true)
     this.accepted = true; this.config.accepted = true
     await this.remember(); await this.prepareDownloads()
   }
@@ -376,10 +396,17 @@ export class PeerSession extends EventTarget {
         }
       }
       const job = this.downloads.find((d) => d.at < d.indices.length)
-      this.status = job ? 'syncing' : 'ready'
+      const source = job && [...this.peers.values()].find(p => p.channel?.readyState === 'open' && p.inventory.has(job.asset))
+      const pending = [...this.peers.values()].some(p => !['closed','failed'].includes(p.pc.connectionState) && p.channel?.readyState !== 'closed' && !p.inventoryKnown)
+      this.status = job || this.scanDownloads ? 'syncing' : 'ready'
+      const disconnected = this.peers.size && [...this.peers.values()].every(p => ['closed', 'failed'].includes(p.pc.connectionState) || p.channel?.readyState === 'closed')
+      if (disconnected || (job && !source && !pending)) {
+        this.status = 'failed'
+        this.error = 'No connected participant can send these files. Reconnect to retry; verified data is saved.'
+      }
       for (const peer of this.peers.values()) if (peer.channel?.readyState === 'open') await this.report(peer)
       if (job) {
-        const peer = [...this.peers.values()].find((p) => p.channel?.readyState === 'open' && p.inventory.has(job.asset))
+        const peer = source
         if (peer) {
           this.requested = { peer: peer.id, asset: job.asset, index: job.indices[job.at] }
           clearTimeout(this.chunkTimer)

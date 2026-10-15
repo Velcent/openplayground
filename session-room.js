@@ -47,8 +47,11 @@ export class SessionRoom extends DurableObject {
       const member = a.id && room.members[a.id]
       return member && a.epoch === room.epoch ? [{ id: a.id, role: member.role, generation: a.generation }] : []
     })
-    const data = JSON.stringify({ type: 'roster', app: room.app, epoch: room.epoch, locked: room.locked, peers })
-    for (const ws of this.sockets()) if (ws.deserializeAttachment().id) ws.send(data)
+    const data = { type: 'roster', app: room.app, epoch: room.epoch, locked: room.locked, peers }
+    for (const ws of this.sockets()) {
+      const member = room.members[ws.deserializeAttachment().id]
+      if (member) ws.send(JSON.stringify({ ...data, ...(member.role === 'owner' ? { members: Object.entries(room.members).map(([id, m]) => ({ id, role: m.role })) } : {}) }))
+    }
   }
   async fetch(request) {
     const action = new URL(request.url).pathname.split('/').pop()
@@ -138,7 +141,7 @@ export class SessionRoom extends DurableObject {
         const hash = await tokenHash(message.token)
         const room = this.load(), member = room?.members[message.id]
         if (!member || member.hash !== hash) return ws.close(4003, 'Invalid membership')
-        for (const old of this.sockets()) if (old !== ws && old.deserializeAttachment().id === message.id) old.close(4001, 'Reconnected elsewhere')
+        for (const old of this.sockets()) if (old !== ws && old.deserializeAttachment().id === message.id) old.close(4004, 'Reconnected elsewhere')
         a = { id: message.id, generation: crypto.randomUUID(), epoch: room.epoch, count: 0, window: Date.now(), seq: 0 }
         ws.serializeAttachment(a)
         this.roster()

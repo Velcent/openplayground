@@ -53,7 +53,15 @@ from a Cloudflare Realtime TURN key, and verify an actual relay transfer. The ex
 login does not have Calls/TURN API permissions. These credentials have not been provisioned, and relay
 connectivity has not yet been verified. Local tests currently exercise direct connections.
 
+With those credentials in the ignored `.dev.vars` file, run the same three-browser transfer through
+TURN. The test forces relay transport and checks the selected ICE candidates as well as the file bytes:
+
+```sh
+SESSION_RELAY=1 node --env-file=.dev.vars --test tests/session.e2e.test.mjs
+```
+
 No files, filenames, project history or decryption secrets are written to the room service. It retains
 only admission metadata and forwards encrypted signaling. A room is limited to eight admitted members;
-the owner can remove a member to free a place. Removing someone invalidates old invitation links but
-cannot erase files they already received.
+the owner can remove online or offline members to free a place. Removing someone invalidates old
+invitation links but cannot erase files they already received. Opening the same session in a second
+tab stops the first tab's connection; both keep their local copies.

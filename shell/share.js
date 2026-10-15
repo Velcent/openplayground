@@ -90,9 +90,10 @@ export async function mountShare(bar, app, here) {
             warning.textContent=session.error || session.relayWarning || (session.peers.size ? '' : 'Waiting for another participant. A person with a local copy must be online to send files.')
             addLabel.hidden=session.role==='viewer' || session.stopped
             receive.hidden=session.accepted; receive.disabled=!session.files.length
-            reconnect.hidden=!['failed','reconnecting','left'].includes(session.status)
+            reconnect.hidden=!['failed','reconnecting','left','displaced'].includes(session.status)
             if (lock) {lock.textContent=session.locked?'Unlock invitations':'Lock invitations';link.value=session.invite(body.querySelector('select').value)}
-            const peers=[{id:session.id,name:`${session.name} (you)`,role:session.role,progress:{...session.progress,status:session.status}},...session.peers.values()]
+            const offline=session.members.filter(p=>p.id!==session.id&&!session.peers.has(p.id)).map(p=>({...p,name:session.config.names?.[p.id]||`Participant ${p.id.slice(0,8)}`,progress:{status:'offline'}}))
+            const peers=[{id:session.id,name:`${session.name} (you)`,role:session.role,progress:{...session.progress,status:session.status}},...session.peers.values(),...offline]
             for (const peer of peers) {
               let row=rows.get(peer.id)
               if (!row) {
@@ -102,7 +103,7 @@ export async function mountShare(bar, app, here) {
                   const access=h('select',{class:'pg-input'},h('option',{value:'editor'},'editor'),h('option',{value:'viewer'},'viewer'))
                   access.onchange=()=>attempt(()=>session.admin({member:peer.id,role:access.value}));row.access=access
                   row.append(access,button('Remove',()=>attempt(async()=>{
-                    if (await confirmIn(view,`Remove ${peer.name}? Old invitation links will stop working. Their downloaded files cannot be erased.`,'Remove',{danger:true})) await session.admin({remove:peer.id})
+                    if (await confirmIn(view,`Remove ${row.label.textContent}? Old invitation links will stop working. Their downloaded files cannot be erased.`,'Remove',{danger:true})) await session.admin({remove:peer.id})
                   })))
                 }
                 rows.set(peer.id,row);members.append(row)
