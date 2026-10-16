@@ -1,0 +1,369 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index b8eb765..4cb592c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3702,6 +3702,7 @@ dependencies = [
+ name = "soundcraft-model"
+ version = "0.7.0"
+ dependencies = [
++ "js-sys",
+  "proptest",
+  "serde",
+  "serde_json",
+@@ -3709,6 +3710,7 @@ dependencies = [
+  "soundcraft-midi",
+  "soundcraft-time",
+  "thiserror 2.0.21",
++ "wasm-bindgen",
+ ]
+ 
+ [[package]]
+diff --git a/apps/soundcraft-web/src/web.rs b/apps/soundcraft-web/src/web.rs
+index 3682fab..b877e63 100644
+--- a/apps/soundcraft-web/src/web.rs
++++ b/apps/soundcraft-web/src/web.rs
+@@ -31,11 +31,15 @@ pub fn start() {
+         {
+             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
+         }
+-        let result = eframe::WebRunner::new()
++        let runner = eframe::WebRunner::new();
++        let repaint = Rc::new(std::cell::OnceCell::<egui::Context>::new());
++        let created = repaint.clone();
++        let result = runner
+             .start(
+                 canvas,
+                 options,
+                 Box::new(move |cc| {
++                    let _ = created.set(cc.egui_ctx.clone());
+                     if let Some(rs) = &cc.wgpu_render_state {
+                         log::info!("soundcraft-web: wgpu backend {:?}", rs.adapter.get_info().backend);
+                     }
+@@ -46,6 +50,21 @@ pub fn start() {
+                 }),
+             )
+             .await;
++        if result.is_ok() {
++            // Live editing in a Playground session.
++            let attached = soundcraft_model::playground_live::web::attach::<SoundApp>(
++                concat!("pro-tools:1:", env!("CARGO_PKG_VERSION")),
++                move |with| runner.app_mut::<WebShell>().map(|mut shell| with(&mut shell.app)).is_some(),
++                move || {
++                    if let Some(ctx) = repaint.get() {
++                        ctx.request_repaint();
++                    }
++                },
++            );
++            if let Err(e) = attached {
++                log::error!("live editing: {e:?}");
++            }
++        }
+         if let Some(el) = document.get_element_by_id(LOADING_ID) {
+             match result {
+                 Ok(()) => el.remove(),
+@@ -222,6 +241,11 @@ impl eframe::App for WebShell {
+ 
+     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+         self.app.ui(ui);
++        soundcraft_model::playground_live::frame(&mut self.app);
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
+     }
+ }
+ 
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 6cc1c90..96bc8c3 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -238,6 +238,11 @@ impl Engine {
+     pub fn redo_label(&self) -> Option<&str> {
+         self.redo.last().map(|h| h.label.as_str())
+     }
++    /// Forget Undo and Redo (a live editing session ended: its steps hold other people's edits).
++    pub fn clear_history(&mut self) {
++        self.undo.clear();
++        self.redo.clear();
++    }
+     pub fn undo_history(&self) -> Vec<String> {
+         self.undo.iter().map(|h| h.label.clone()).collect()
+     }
+diff --git a/crates/model/Cargo.toml b/crates/model/Cargo.toml
+index c948d93..47a381b 100644
+--- a/crates/model/Cargo.toml
++++ b/crates/model/Cargo.toml
+@@ -15,8 +15,16 @@ serde.workspace = true
+ serde_json.workspace = true
+ thiserror.workspace = true
+ 
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++js-sys = "0.3"
++wasm-bindgen = "0.2"
++
+ [dev-dependencies]
+ proptest.workspace = true
+ 
++[features]
++# Playground live editing's adapter (`playground_live`) in native test builds of the crates that use it.
++live = []
++
+ [lints]
+ workspace = true
+diff --git a/crates/model/src/lib.rs b/crates/model/src/lib.rs
+index 61596b7..01ed4da 100644
+--- a/crates/model/src/lib.rs
++++ b/crates/model/src/lib.rs
+@@ -11,6 +11,9 @@ mod clip;
+ mod ids;
+ mod markers;
+ mod mixer;
++// Live editing in a Playground session (web only).
++#[cfg(any(target_arch = "wasm32", test, feature = "live"))]
++pub mod playground_live;
+ mod session;
+ mod source;
+ mod track;
+diff --git a/crates/model/src/session.rs b/crates/model/src/session.rs
+index 449d82d..b42d332 100644
+--- a/crates/model/src/session.rs
++++ b/crates/model/src/session.rs
+@@ -374,6 +374,9 @@ impl Session {
+     pub fn alloc(&mut self) -> u64 {
+         let id = self.next_id.max(1);
+         self.next_id = id.saturating_add(1);
++        // Live editing (web): an id no one else editing at the same time picks.
++        #[cfg(target_arch = "wasm32")]
++        let id = crate::playground_live::fresh_id(&mut { id });
+         id
+     }
+ 
+diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
+index 66158bb..269fb4a 100644
+--- a/crates/ui-egui/Cargo.toml
++++ b/crates/ui-egui/Cargo.toml
+@@ -29,6 +29,7 @@ image.workspace = true
+ 
+ [dev-dependencies]
+ egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
++soundcraft-model = { workspace = true, features = ["live"] }
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index ddd5427..264db8a 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -13,6 +13,9 @@ pub mod edit_window;
+ pub mod extra_windows;
+ pub mod fonts;
+ pub mod icons;
++// Live editing in a Playground session (web only).
++#[cfg(any(target_arch = "wasm32", test))]
++mod live;
+ pub mod menus;
+ pub mod midi_editor;
+ pub mod mix_window;
+@@ -412,6 +415,10 @@ impl SoundApp {
+ 
+     /// Run a command; errors go to the status line. Returns the result.
+     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
++        #[cfg(any(target_arch = "wasm32", test))]
++        if matches!(id, "edit.undo" | "edit.redo") && soundcraft_model::playground_live::undo(id == "edit.redo") {
++            return Ok(Value::Null);
++        }
+         if matches!(id, "session.new" | "session.open" | "session.close" | "session.revert") && bounce::refuses_session_switch(self) {
+             return Err(self.ui.status.clone());
+         }
+diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
+new file mode 100644
+index 0000000..f7eafe9
+--- /dev/null
++++ b/crates/ui-egui/src/live.rs
+@@ -0,0 +1,186 @@
++//! Live editing in a Playground session (web only). The shared document is the session without anyone's views: no
++//! Edit-window state (`edit`: selection, playhead, zoom, tools, modes, view flags), and per track no height, lane view,
++//! folder state, pin, record arm or input monitor. Audio stays in each browser's pool.
++
++use crate::SoundApp;
++use serde_json::Value;
++use soundcraft_model::playground_live::Live;
++use soundcraft_model::{Session, Track};
++
++/// Copies what each person keeps of a track for themselves.
++fn keep_views(t: &mut Track, from: &Track) {
++    t.height = from.height;
++    t.view.clone_from(&from.view);
++    t.folder_open = from.folder_open;
++    t.pinned = from.pinned;
++    t.mixer.record_arm = from.mixer.record_arm;
++    t.mixer.input_monitor = from.mixer.input_monitor;
++}
++
++/// A new track's views: what the shared document gives every track.
++fn fresh(t: &Track) -> Track {
++    Track::new(t.id, "", t.kind, t.format, t.color)
++}
++
++/// Whole numbers without `.0`, as JavaScript writes them: the document reads the same after a round trip through the
++/// shell's JSON.
++fn whole_numbers(v: &mut Value) {
++    match v {
++        Value::Number(n) if n.is_f64() => {
++            if let Some(f) = n.as_f64().filter(|f| f.fract() == 0.0 && f.abs() < 9e15) {
++                *v = (f as i64).into();
++            }
++        }
++        Value::Array(items) => items.iter_mut().for_each(whole_numbers),
++        Value::Object(map) => map.values_mut().for_each(whole_numbers),
++        _ => {}
++    }
++}
++
++impl Live for SoundApp {
++    const COUNTERS: &'static [&'static str] = &["next_id"];
++
++    fn live_document(&self) -> Value {
++        let mut s = self.engine.session().clone();
++        for t in &mut s.tracks {
++            keep_views(t, &fresh(t));
++        }
++        s.sources.iter_mut().for_each(|s| s.unsaved = false);
++        let mut doc = serde_json::to_value(&s).unwrap_or_default();
++        if let Some(doc) = doc.as_object_mut() {
++            doc.remove("edit");
++        }
++        // Playlists keyed by their index, so clips merge one by one.
++        for t in doc["tracks"].as_array_mut().into_iter().flatten() {
++            for (i, p) in t["playlists"].as_array_mut().into_iter().flatten().enumerate() {
++                p["id"] = i.into();
++            }
++        }
++        whole_numbers(&mut doc);
++        doc
++    }
++
++    fn live_adopt(&mut self, mut document: Value) -> Result<(), String> {
++        let current = self.engine.session();
++        let edit = serde_json::to_value(&current.edit).map_err(|e| e.to_string())?;
++        document.as_object_mut().ok_or("Not a session")?.insert("edit".into(), edit);
++        let mut s: Session = serde_json::from_value(document).map_err(|e| format!("Invalid session: {e}"))?;
++        // Repairs what a merge can break (clip order, a removed active playlist); the id counter stays as shared.
++        let next_id = s.next_id;
++        s.sanitize();
++        s.next_id = next_id;
++        for t in &mut s.tracks {
++            let new = fresh(t);
++            keep_views(t, current.track(t.id).unwrap_or(&new));
++        }
++        for src in &mut s.sources {
++            src.unsaved = current.source(src.id).is_some_and(|c| c.unsaved);
++        }
++        s.pool = current.pool.clone();
++        s.folder = current.folder.clone();
++        *self.engine.session_mut() = s;
++        Ok(())
++    }
++
++    fn live_quiet(&self) -> bool {
++        let input = self.docking_context.as_ref().is_some_and(|ctx| ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input());
++        !input
++            && self.gesture.is_none()
++            && self.dialogs.open.is_none()
++            && self.bounce.is_none()
++            && !self.engine.transport.recording
++            && self.touched.is_empty()
++    }
++
++    fn live_generation(&self) -> Option<u64> {
++        Some(self.engine.revision)
++    }
++
++    fn live_disconnected(&mut self) {
++        self.engine.clear_history();
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::{Gesture, Services};
++    use serde_json::json;
++    use soundcraft_engine::Engine;
++    use soundcraft_model::playground_live::{self as live, canonical};
++    use soundcraft_model::{ChannelFormat, TrackHeight, TrackKind};
++
++    fn two_tracks() -> SoundApp {
++        let mut engine = Engine::default();
++        let s = engine.session_mut();
++        s.add_track(TrackKind::Audio, ChannelFormat::Mono, Some("Kick"));
++        s.add_track(TrackKind::Audio, ChannelFormat::Mono, Some("Snare"));
++        engine.mark_clean();
++        SoundApp::new(engine, None, Services::default())
++    }
++
++    fn mute(app: &mut SoundApp, track: usize) {
++        let id = app.engine.session().tracks[track].id;
++        app.run("mix.mute", json!({"tracks": [id]})).unwrap();
++    }
++
++    #[test]
++    fn the_shared_document_leaves_out_views() {
++        let mut app = two_tracks();
++        let before = canonical(&app.live_document());
++        let s = app.engine.session_mut();
++        s.edit.zoom.samples_per_px = 7.0;
++        s.edit.selection.start = 480;
++        let t = &mut s.tracks[0];
++        (t.height, t.view, t.pinned, t.mixer.record_arm) = (TrackHeight::Large, "volume".into(), true, true);
++        assert_eq!(canonical(&app.live_document()), before, "views are not shared");
++        mute(&mut app, 0);
++        let doc = app.live_document();
++        assert!(doc.get("edit").is_none());
++        assert_eq!(doc["tracks"][0]["mixer"]["mute"], true);
++        assert_eq!(doc["tracks"][0]["playlists"][0]["id"], 0);
++        assert!(!String::from_utf8(canonical(&doc)).unwrap().contains(".0,"), "whole numbers as JavaScript writes them");
++    }
++
++    #[test]
++    fn adopting_keeps_views_and_is_no_undo_step() {
++        let mut app = two_tracks();
++        let mut other = two_tracks();
++        mute(&mut other, 1);
++        other.engine.session_mut().add_track(TrackKind::Midi, ChannelFormat::Mono, Some("Keys"));
++        let s = app.engine.session_mut();
++        s.edit.selection.start = 480;
++        s.tracks[1].height = TrackHeight::Large;
++        app.live_adopt(other.live_document()).unwrap();
++        let s = app.engine.session();
++        assert!(s.tracks[1].mixer.mute && s.tracks[1].height == TrackHeight::Large && s.edit.selection.start == 480);
++        assert_eq!(s.tracks[2].view, "notes", "a new track gets its own default views");
++        assert!(!app.engine.can_undo());
++        assert_eq!(canonical(&app.live_document()), canonical(&other.live_document()));
++    }
++
++    #[test]
++    fn a_remote_change_waits_for_the_gesture_and_undo_goes_to_the_session() {
++        let mut app = two_tracks();
++        let mut other = two_tracks();
++        live::connect();
++        let base = canonical(&app.live_document());
++        mute(&mut other, 0);
++        let done = std::rc::Rc::new(std::cell::Cell::new(false));
++        let to = done.clone();
++        live::queue(Some(base), canonical(&other.live_document()), Box::new(move |r| to.set(r.is_ok())));
++        app.gesture = Some(Gesture::Scrub { last: 0 });
++        live::frame(&mut app);
++        assert!(!done.get() && !app.engine.session().tracks[0].mixer.mute, "a gesture holds remote changes");
++        app.gesture = None;
++        live::frame(&mut app);
++        assert!(done.get() && app.engine.session().tracks[0].mixer.mute);
++        mute(&mut app, 1);
++        app.run("edit.undo", json!({})).unwrap();
++        assert!(app.engine.session().tracks[1].mixer.mute, "Undo is the session's while connected");
++        assert_eq!(live::activity().1, [false]);
++        live::disconnect();
++        app.live_disconnected();
++        assert!(!app.engine.can_undo());
++    }
++}

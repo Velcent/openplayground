@@ -241,6 +241,8 @@ groups:
         opens: []
         imports: []
         repo: storytold/soundcraft
+        patches: patches/pro-tools.yaml
+        live: crates/model/src
         branch: main
         # The web app and the crates it compiles (dependency changes show up in Cargo.lock): CI, docs and
         # desktop-only commits don't rebuild it. One GitHub API request per path per check.

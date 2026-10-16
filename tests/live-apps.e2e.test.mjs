@@ -25,7 +25,8 @@ async function open(app) {
   await app.ready?.(page)
   return page
 }
-const json = (page) => page.evaluate(() => new TextDecoder().decode(playgroundLiveAdapter.checkpoint()))
+// Normalized, so a document's text compares equal to its own JSON.stringify(JSON.parse(...)) (e.g. 104.0 and 104).
+const json = (page) => page.evaluate(() => JSON.stringify(JSON.parse(new TextDecoder().decode(playgroundLiveAdapter.checkpoint()))))
 const status = (page) => page.evaluate(() => session.live?.status)
 const follow = (page) => page.evaluate(async () => { await (await import('/shell/live.js')).follow(session) })
 // Every page has the same document, different from `before` when given.
