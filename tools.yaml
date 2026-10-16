@@ -93,6 +93,7 @@ groups:
         repo: emmertex/lightcraft-classic
         icon: icons/lightcraft-classic.svg
         patches: patches/lightroom-classic.yaml
+        live: apps/web/src
         accent: "#31A8FF"
         base: "#001E36"
 
