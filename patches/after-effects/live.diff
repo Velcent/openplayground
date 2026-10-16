@@ -166,25 +166,27 @@ index 105a075..9576947 100644
  pub mod native_menu;
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..97344a8
+index 0000000..18f7358
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,473 @@
 +//! Live editing in a Playground session (web only). The shared document is the project open when the session started
 +//! (`Project`), minus what is this person's: the id counter, each comp's Resolution, Draft 3D and Hide Shy Layers
 +//! switches (viewer and Timeline toggles), which footage is missing in this browser, and the Render Queue (its jobs,
 +//! outputs and status). Selection, current times, open comps, panels and tools already live outside the project.
 +//! Property nodes carry their uid as `id`, so the property tree merges node by node, as layers (by `id`) and items
 +//! (keyed by id) do. A remote change is only installed: what an edit brings about elsewhere (a shared Global Light,
-+//! Essential Properties, analyses to redo) comes from its author's own edit. Imported media stay in the browser that
-+//! imported them. Opening another project leaves the session's document as it was, still merging remote changes.
++//! Essential Properties, analyses to redo) comes from its author's own edit. The footage files the shared project names
++//! (by path, in the page's file table) reach everyone through the session ([`media`]). Opening another project leaves
++//! the session's document as it was, still merging remote changes.
 +
 +use std::cell::{Cell, RefCell};
++use std::collections::BTreeSet;
 +use std::sync::Arc;
 +
-+use effectcraft_engine::LIVE_PROJECT;
 +use effectcraft_engine::playground_live::{self, Live};
-+use effectcraft_project::{ItemKind, LayerSource, Project};
++use effectcraft_engine::{LIVE_PROJECT, Services};
++use effectcraft_project::{Footage, ItemKind, LayerSource, Project};
 +use serde_json::Value;
 +
 +use crate::EffectcraftApp;
@@ -211,6 +213,39 @@ index 0000000..97344a8
 +    if open(app) && playground_live::connected() {
 +        SHARED.set(Some(app.session.project.clone()));
 +    }
++}
++
++/// The shared project: the open one, or the one the session kept once another was opened.
++fn shared_project(app: &EffectcraftApp) -> Arc<Project> {
++    match SHARED.with_borrow(|p| p.clone()) {
++        Some(p) if !open(app) => p,
++        _ => app.session.project.clone(),
++    }
++}
++
++/// A footage item's files: the file, and an image sequence's frames.
++fn files(f: &Footage) -> impl Iterator<Item = &String> {
++    std::iter::once(&f.path).chain(&f.sequence)
++}
++
++/// The media files a project names: its footage items' and proxies' files that live in the page's file table (`/…`),
++/// not saved projects. The document names them by path, so that is their id: two different files imported under one
++/// name each stay with the person who has them, and nothing here is overwritten.
++fn media(p: &Project) -> BTreeSet<String> {
++    p.items
++        .values()
++        .flat_map(|i| [if let ItemKind::Footage(f) = &i.kind { Some(f) } else { None }, i.proxy.as_ref().map(|x| &x.footage)])
++        .flatten()
++        .flat_map(files)
++        .filter(|p| p.starts_with('/') && !p.to_ascii_lowercase().ends_with(".ecproj"))
++        .cloned()
++        .collect()
++}
++
++/// Which of `paths` this browser has, from listings of their folders (`Services::exists` asks a disk the web lacks).
++fn present(services: &dyn Services, paths: &BTreeSet<String>) -> BTreeSet<String> {
++    let dirs: BTreeSet<&str> = paths.iter().map(|p| p.rsplit_once('/').map_or("", |(d, _)| d)).collect();
++    dirs.into_iter().flat_map(|d| services.list_dir(d)).filter(|p| paths.contains(p)).collect()
 +}
 +
 +/// Whether the project open here is the shared one (always, when not connected).
@@ -326,9 +361,54 @@ index 0000000..97344a8
 +
 +impl Live for EffectcraftApp {
 +    fn live_document(&self) -> Value {
-+        match SHARED.with_borrow(|p| p.clone()) {
-+            Some(p) if !open(self) => shared(&p),
-+            _ => shared(&self.session.project),
++        shared(&shared_project(self))
++    }
++
++    fn live_assets(&self) -> Vec<(String, String, bool)> {
++        let paths = media(&shared_project(self));
++        let have = present(&*self.session.services, &paths);
++        paths.into_iter().map(|p| (p.clone(), p.rsplit('/').next().unwrap_or_default().to_string(), have.contains(&p))).collect()
++    }
++
++    fn live_assets_of(document: &Value) -> Vec<String> {
++        project_of(document).map(|p| media(&p).into_iter().collect()).unwrap_or_default()
++    }
++
++    fn live_read_asset(&self, id: &str) -> Option<Vec<u8>> {
++        self.session.services.read_file(id).ok()
++    }
++
++    /// Stores the file as an import does (in the page's file table, which persists it) and hands it to the media pool,
++    /// which forgets what it decoded without it; a file this browser has already stays. Footage that now has all its
++    /// files is no longer Missing here, and the rendered frames go: neither an undo step nor a change to the document.
++    fn live_write_asset(&mut self, id: &str, _name: &str, bytes: Vec<u8>) {
++        let s = &mut self.session;
++        if !present(&*s.services, &BTreeSet::from([id.to_string()])).is_empty() || s.services.store_file(id, &bytes).is_err() {
++            return;
++        }
++        if let Some(importer) = &s.importer {
++            importer.register(id, &bytes);
++        }
++        let here = present(&*s.services, &media(&s.project));
++        let found: Vec<_> = (s.project.items.values())
++            .filter(|i| matches!(&i.kind, ItemKind::Footage(f) if f.missing && files(f).all(|p| here.contains(p))))
++            .map(|i| i.id)
++            .collect();
++        let dirty = s.is_dirty();
++        if !found.is_empty() {
++            let p = Arc::make_mut(&mut s.project);
++            for id in found {
++                if let Some(ItemKind::Footage(f)) = p.item_mut(id).map(|i| &mut i.kind) {
++                    f.missing = false;
++                }
++            }
++        }
++        s.layer_cache.clear();
++        s.events.push(effectcraft_engine::Event::PurgeCaches);
++        // Thumbnails render again; the project isn't modified.
++        s.bump();
++        if !dirty {
++            s.mark_saved();
 +        }
 +    }
 +
@@ -524,5 +604,42 @@ index 0000000..97344a8
 +        playground_live::disconnect();
 +        a.live_disconnected();
 +        assert!(IDS.get().is_none() && LIVE_PROJECT.get().is_none());
++    }
++
++    /// A file table in memory, as on the web.
++    #[derive(Default)]
++    struct Table(std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>);
++    impl Services for Table {
++        fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
++            self.0.lock().unwrap().get(path).cloned().ok_or_else(|| std::io::ErrorKind::NotFound.into())
++        }
++        fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
++            self.0.lock().unwrap().insert(path.into(), data.into());
++            Ok(())
++        }
++        fn list_dir(&self, dir: &str) -> Vec<String> {
++            self.0.lock().unwrap().keys().filter(|p| p.rsplit_once('/').is_some_and(|(d, _)| d == dir)).cloned().collect()
++        }
++    }
++
++    #[test]
++    fn footage_files_are_listed_and_installed_without_changing_the_document() {
++        let mut a = demo();
++        let table = Arc::new(Table::default());
++        a.session.services = table.clone();
++        table.write_file("/mine.png", b"local").unwrap();
++        let footage = Footage { path: "/clip.png".into(), missing: true, width: 8, height: 8, has_video: true, ..Default::default() };
++        Arc::make_mut(&mut a.session.project).add_item("clip", Default::default(), None, ItemKind::Footage(footage));
++        a.session.mark_saved();
++        assert_eq!(a.live_assets(), [("/clip.png".to_string(), "clip.png".to_string(), false)], "only what the project names");
++        assert_eq!(EffectcraftApp::live_assets_of(&a.live_document()), ["/clip.png"]);
++        let (doc, steps) = (canonical(&a.live_document()), a.session.history.undo.len());
++        a.live_write_asset("/clip.png", "clip.png", b"pixels".to_vec());
++        a.live_write_asset("/clip.png", "clip.png", b"other".to_vec());
++        assert_eq!(a.live_read_asset("/clip.png").as_deref(), Some(&b"pixels"[..]), "stored once, never overwritten");
++        assert_eq!(a.live_assets()[0].2, true);
++        assert!(a.session.project.items.values().all(|i| !matches!(&i.kind, ItemKind::Footage(f) if f.missing)), "no longer Missing");
++        assert_eq!((canonical(&a.live_document()), a.session.history.undo.len(), a.session.is_dirty()), (doc, steps, false));
++        assert!(a.session.drain_events().contains(&effectcraft_engine::Event::PurgeCaches));
 +    }
 +}
