@@ -1,0 +1,456 @@
+diff --git a/apps/solidcraft-web/Cargo.toml b/apps/solidcraft-web/Cargo.toml
+index 4c615fb..fa1544e 100644
+--- a/apps/solidcraft-web/Cargo.toml
++++ b/apps/solidcraft-web/Cargo.toml
+@@ -19,6 +19,9 @@ solidcraft-ui-egui = { workspace = true }
+ egui = { workspace = true }
+ log = { workspace = true }
+ 
++[dev-dependencies]
++serde_json = { workspace = true }
++
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+ eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
+ wasm-bindgen = "0.2"
+diff --git a/apps/solidcraft-web/src/live.rs b/apps/solidcraft-web/src/live.rs
+new file mode 100644
+index 0000000..87f713c
+--- /dev/null
++++ b/apps/solidcraft-web/src/live.rs
+@@ -0,0 +1,298 @@
++//! Live editing in a Playground session (`playground_live` drives it). The shared document is the open design's
++//! parametric feature tree (`Session::doc`); every peer evaluates the bodies from it. This person's own state stays out:
++//! the camera, selection and tools (outside the document anyway), what is hidden, each sketch's Sketch Palette options
++//! and the timeline position Edit Sketch rolled to. New features, components and occurrences get ids unique across the
++//! peers (`fresh_id`), and each peer keeps its own `next_id`.
++
++use std::cell::{Cell, OnceCell};
++use std::collections::{BTreeMap, BTreeSet};
++use std::sync::Arc;
++
++use serde_json::{Map, Value};
++use solidcraft_engine::doc::{Document, FeatureKind};
++use solidcraft_ui_egui::SolveApp;
++
++use crate::playground_live::{self, Live};
++
++thread_local! {
++    /// This frame's pointer is down or text is being typed (`live_quiet` has no context to ask).
++    static INPUT_BUSY: Cell<bool> = const { Cell::new(false) };
++    /// The design tab the session follows: the active one when it started.
++    static TAB: Cell<Option<usize>> = const { Cell::new(None) };
++    /// Another design tab is active: its Undo is its own.
++    static OTHER_TAB: Cell<bool> = const { Cell::new(false) };
++    static CTX: OnceCell<egui::Context> = const { OnceCell::new() };
++}
++
++/// The end of each frame.
++pub fn frame(app: &mut SolveApp, ctx: &egui::Context) {
++    CTX.with(|c| {
++        c.get_or_init(|| ctx.clone());
++    });
++    INPUT_BUSY.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
++    OTHER_TAB.set(TAB.get().is_some_and(|tab| tab != app.docs.active));
++    playground_live::frame(app);
++}
++
++/// Undo and Redo of the session's design go to the session.
++#[cfg(target_arch = "wasm32")]
++fn undo(redo: bool) -> bool {
++    !OTHER_TAB.get() && playground_live::undo(redo)
++}
++
++/// Offers live editing to the Playground shell once the app runs; `app` finds the design in the runner's app.
++#[cfg(target_arch = "wasm32")]
++pub fn attach<S: eframe::App + 'static>(runner: &eframe::WebRunner, app: fn(&mut S) -> &mut SolveApp) {
++    let _ = solidcraft_engine::doc::ID_ALLOCATOR.set(playground_live::fresh_id);
++    let _ = solidcraft_ui_egui::LIVE_UNDO.set(undo);
++    let runner = runner.clone();
++    let with_app = move |f: &mut dyn FnMut(&mut SolveApp)| runner.app_mut::<S>().map(|mut s| f(app(&mut s))).is_some();
++    let repaint = || CTX.with(|c| c.get().map_or((), egui::Context::request_repaint));
++    let format = concat!("fusion-360:1:", env!("CARGO_PKG_VERSION"));
++    if let Err(e) = playground_live::web::attach::<SolveApp>(format, with_app, repaint) {
++        log::warn!("live editing: {e:?}");
++    }
++}
++
++impl Live for SolveApp {
++    fn live_document(&self) -> Value {
++        let mut v = serde_json::to_value(&*self.session.doc).unwrap_or_default();
++        let Some(o) = v.as_object_mut() else { return v };
++        // Each peer has its own next id (`fresh_id` keeps the ids apart); what is hidden is this person's.
++        o.remove("next_id");
++        o.remove("visibility");
++        // Edit Sketch rolls the timeline for the person editing only.
++        match self.pre_sketch_marker {
++            Some(Some(m)) => drop(o.insert("marker".into(), m.into())),
++            Some(None) => drop(o.remove("marker")),
++            None => {}
++        }
++        // Parameters merge one by one, by name.
++        for p in items(&mut v, "params") {
++            if let Some(name) = p.get("name").cloned() {
++                p["id"] = name;
++            }
++        }
++        for f in items(&mut v, "features") {
++            if let Some(s) = f.get_mut("sketch").and_then(Value::as_object_mut) {
++                s.remove("view");
++            }
++        }
++        v
++    }
++
++    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
++        let mut doc = design(document)?;
++        let local = &self.session.doc;
++        doc.next_id = doc.next_id.max(local.next_id);
++        for f in &mut doc.features {
++            if let FeatureKind::Sketch { sketch, .. } = &mut f.kind {
++                sketch.view = local.sketch(f.id).map(|s| s.view.clone()).unwrap_or_default();
++            }
++        }
++        if let Some(marker) = &mut self.pre_sketch_marker {
++            *marker = std::mem::replace(&mut doc.marker, local.marker);
++        }
++        if TAB.get().is_none() {
++            TAB.set(Some(self.docs.active));
++        }
++        self.session.doc = Arc::new(doc);
++        self.session.refresh();
++        Ok(())
++    }
++
++    fn live_quiet(&self) -> bool {
++        !INPUT_BUSY.get()
++            && self.dialog.is_none()
++            && self.params.is_none()
++            && self.applying.is_none()
++            && self.tool.as_ref().is_none_or(|t| t.pts.is_empty() && t.picks.is_empty())
++            && self.viewport.point_drag.is_none()
++            && !self.file_load.busy()
++            && !self.file_picker_busy()
++            && !self.session.model.is_stale()
++            && TAB.get().is_none_or(|tab| tab == self.docs.active)
++    }
++
++    fn live_generation(&self) -> Option<u64> {
++        use std::hash::{Hash, Hasher};
++        let mut h = std::hash::DefaultHasher::new();
++        (self.session.revision, Arc::as_ptr(&self.session.doc) as usize, self.pre_sketch_marker).hash(&mut h);
++        Some(h.finish())
++    }
++
++    fn live_disconnected(&mut self) {
++        TAB.set(None);
++        self.session.undo.clear();
++        self.session.redo.clear();
++    }
++
++    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
++        let (mut base, mut current, mut edited) = (base.clone(), current.clone(), edited.clone());
++        take_counters(&mut base);
++        // Sketch ids count up per prefix: the larger of each side's, so concurrent drawing and Undo reuse none.
++        let mut counters = take_counters(&mut current);
++        for (id, theirs) in take_counters(&mut edited) {
++            let mine = counters.entry(id).or_default();
++            for (prefix, n) in theirs {
++                if n.as_u64() > mine.get(&prefix).and_then(Value::as_u64) {
++                    mine.insert(prefix, n);
++                }
++            }
++        }
++        let mut merged = playground_live::merge(&base, &current, &edited, Self::COUNTERS)?;
++        for f in items(&mut merged, "features") {
++            let id = f.get("id").and_then(Value::as_u64).unwrap_or_default();
++            if let Some(s) = f.get_mut("sketch").and_then(Value::as_object_mut) {
++                s.insert("counters".into(), Value::Object(counters.remove(&id).unwrap_or_default()));
++            }
++        }
++        // Both sides adding a Box (Box1, d1…) merge as two features with one name.
++        let before: BTreeSet<_> = named_twice(&current).union(&named_twice(&edited)).cloned().collect();
++        if let Some(name) = named_twice(&merged).difference(&before).next() {
++            return Err(format!("Conflict: two {name}"));
++        }
++        design(merged.clone())?;
++        Ok(merged)
++    }
++}
++
++fn items<'a>(v: &'a mut Value, key: &'static str) -> impl Iterator<Item = &'a mut Value> {
++    v.get_mut(key).and_then(Value::as_array_mut).into_iter().flatten()
++}
++
++fn take_counters(doc: &mut Value) -> BTreeMap<u64, Map<String, Value>> {
++    let mut out = BTreeMap::new();
++    for f in items(doc, "features") {
++        let id = f.get("id").and_then(Value::as_u64).unwrap_or_default();
++        if let Some(Value::Object(n)) = f.get_mut("sketch").and_then(Value::as_object_mut).and_then(|s| s.remove("counters")) {
++            out.insert(id, n);
++        }
++    }
++    out
++}
++
++/// Feature names and parameter names (user parameters and feature inputs) given twice.
++fn named_twice(doc: &Value) -> BTreeSet<String> {
++    let list = |v: &Value, key: &str| v.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
++    let features = list(doc, "features");
++    let names = features.iter().filter_map(|f| f.get("name")?.as_str()).map(|n| format!("features named {n}"));
++    let inputs = features.iter().flat_map(|f| list(f, "param_names"));
++    let params = list(doc, "params").into_iter().filter_map(|p| p.get("name").cloned()).chain(inputs);
++    let params: Vec<_> = params.filter_map(|n| n.as_str().filter(|n| !n.is_empty()).map(|n| format!("parameters named {n}"))).collect();
++    let mut seen = BTreeSet::new();
++    names.chain(params).filter(|n| !seen.insert(n.clone())).collect()
++}
++
++/// The shared document as a design, checked and upgraded as a design file is.
++fn design(mut document: Value) -> Result<Document, String> {
++    for p in items(&mut document, "params") {
++        if let Some(p) = p.as_object_mut() {
++            p.remove("id");
++        }
++    }
++    Document::from_json(&document.to_string()).map_err(|e| e.to_string())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::playground_live::{canonical, checkpoint, connect, queue};
++    use serde_json::json;
++    use solidcraft_engine::Session;
++    use solidcraft_ui_egui::Services;
++
++    fn app() -> SolveApp {
++        let mut app = SolveApp::new(Session::default(), Services::default());
++        app.run("sketch.create", json!({"plane": "XY"})).unwrap();
++        app.run("sketch.line", json!({"points": [[0, 0], [10, 0]]})).unwrap();
++        app.finish_sketch();
++        app
++    }
++
++    fn shared(app: &SolveApp) -> Vec<u8> {
++        canonical(&app.live_document())
++    }
++
++    #[test]
++    fn the_shared_design_leaves_out_views_and_adopting_one_keeps_them_without_an_undo_step() {
++        let mut a = app();
++        let before = shared(&a);
++        let doc = a.live_document();
++        assert!(doc.get("next_id").is_none() && doc["features"][0]["sketch"].get("view").is_none());
++        // Views: the camera and a sketch's display options; below, Edit Sketch's rolled timeline.
++        a.cam.target.x += 5.0;
++        let sketch = a.session.doc.features[0].id;
++        a.session.doc_mut().sketch_mut(sketch).unwrap().view.hide_grid = true;
++        assert_eq!(shared(&a), before);
++        a.run("solid.box", json!({"length": "10", "width": "10", "height": "10"})).unwrap();
++        a.edit_sketch(sketch);
++        assert_ne!(a.session.doc.marker, None, "Edit Sketch rolled the timeline");
++        let with_box = shared(&a);
++        assert_eq!(serde_json::from_slice::<Value>(&with_box).unwrap()["marker"], Value::Null, "the roll is this person's");
++        a.finish_sketch();
++        assert_eq!(shared(&a), with_box);
++        assert_ne!(with_box, before);
++
++        // Someone else's design: a cylinder added; adopting it keeps a's views and is no undo step.
++        let mut b = app();
++        b.live_adopt(serde_json::from_slice(&with_box).unwrap()).unwrap();
++        b.run("solid.cylinder", json!({"radius": "5", "height": "10"})).unwrap();
++        let undo = a.session.undo.len();
++        a.live_adopt(b.live_document()).unwrap();
++        assert_eq!(a.session.undo.len(), undo);
++        assert!(a.session.doc.sketch(sketch).unwrap().view.hide_grid);
++        assert_eq!(a.session.doc.features.len(), 3);
++        assert!(a.session.doc.next_id > a.session.doc.features.iter().map(|f| f.id).max().unwrap());
++        assert_eq!(shared(&a), shared(&b));
++    }
++
++    #[test]
++    fn concurrent_boxes_conflict_on_their_names_and_sketch_counters_take_the_larger() {
++        let a = app();
++        let base = a.live_document();
++        let with = |cmd: &str, p: Value| {
++            let mut x = app();
++            x.live_adopt(base.clone()).unwrap();
++            x.run(cmd, p).unwrap();
++            x.live_document()
++        };
++        let one = with("solid.box", json!({"length": "10", "width": "10", "height": "10"}));
++        let mut two = with("solid.box", json!({"length": "20", "width": "20", "height": "20"}));
++        // Peer-unique ids, as `fresh_id` gives them while connected.
++        two["features"][1]["id"] = json!(1u64 << 52 | 99);
++        let error = SolveApp::live_merge(&base, &one, &two).unwrap_err();
++        assert!(error.contains("two features named Box1"), "{error}");
++        // Each side drew a line in the sketch: counters take the larger.
++        let line = |n: u64| {
++            let mut d = base.clone();
++            d["features"][0]["sketch"]["counters"]["l"] = json!(n);
++            d
++        };
++        let merged = SolveApp::live_merge(&line(1), &line(3), &line(2)).unwrap();
++        assert_eq!(merged["features"][0]["sketch"]["counters"]["l"], 3);
++    }
++
++    #[test]
++    fn a_remote_change_waits_while_a_dialog_is_open() {
++        let mut a = app();
++        let mut b = app();
++        b.live_adopt(a.live_document()).unwrap();
++        connect();
++        let ctx = egui::Context::default();
++        frame(&mut a, &ctx);
++        let base = shared(&a);
++        b.run("solid.box", json!({"length": "10", "width": "10", "height": "10"})).unwrap();
++        let done = std::rc::Rc::new(Cell::new(false));
++        let to = done.clone();
++        queue(Some(base), shared(&b), Box::new(move |r| to.set(r.is_ok())));
++        a.start("solid.sphere");
++        assert!(a.dialog.is_some());
++        frame(&mut a, &ctx);
++        assert!(!done.get() && checkpoint(&a).is_err(), "a busy app waits");
++        a.dialog = None;
++        frame(&mut a, &ctx);
++        assert!(done.get());
++        assert_eq!(shared(&a), shared(&b));
++    }
++}
+diff --git a/apps/solidcraft-web/src/main.rs b/apps/solidcraft-web/src/main.rs
+index 555fe38..6f7b71c 100644
+--- a/apps/solidcraft-web/src/main.rs
++++ b/apps/solidcraft-web/src/main.rs
+@@ -10,6 +10,11 @@
+ mod files;
+ #[cfg(target_arch = "wasm32")]
+ mod install;
++// Live editing in a Playground session.
++#[cfg(any(target_arch = "wasm32", test))]
++mod live;
++#[cfg(any(target_arch = "wasm32", test))]
++mod playground_live;
+ #[cfg(any(target_arch = "wasm32", test))]
+ mod space_mouse;
+ 
+@@ -402,6 +407,10 @@ mod web {
+             self.file_panel(&ctx);
+             self.recovery_prompt(&ctx);
+             self.watch_text_for_font(&ctx);
++            crate::live::frame(&mut self.app, &ctx);
++        }
++        fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++            Some(self)
+         }
+         fn save(&mut self, storage: &mut dyn eframe::Storage) {
+             // Persist the user's own language, not a session-only English fallback.
+@@ -468,7 +477,8 @@ mod web {
+             {
+                 create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
+             }
+-            let result = eframe::WebRunner::new()
++            let runner = eframe::WebRunner::new();
++            let result = runner
+                 .start(
+                     canvas,
+                     options,
+@@ -528,6 +538,7 @@ mod web {
+                     }),
+                 )
+                 .await;
++            crate::live::attach(&runner, |shell: &mut Shell| &mut shell.app);
+             if let Some(el) = document.get_element_by_id(LOADING_ID) {
+                 match result {
+                     Ok(()) => el.remove(),
+diff --git a/crates/doc/src/assembly.rs b/crates/doc/src/assembly.rs
+index aeda6e2..1d3ed66 100644
+--- a/crates/doc/src/assembly.rs
++++ b/crates/doc/src/assembly.rs
+@@ -366,8 +366,7 @@ impl Document {
+         if self.occurrences.len() >= 100_000 {
+             return Err(DocError::Invalid("too many occurrences".into()));
+         }
+-        let id = self.next_id.max(1);
+-        self.next_id = id.checked_add(1).ok_or_else(|| DocError::Invalid("too many items in the design".into()))?;
++        let id = self.new_id()?;
+         let cname = self.components.iter().find(|c| c.id == component).map(|c| c.name.clone()).unwrap_or_default();
+         let k = self.occurrences.iter().filter(|o| o.component == component).count() + 1;
+         self.occurrences.push(crate::Occurrence { id, component, parent, name: format!("{cname}:{k}"), transform, grounded: false });
+diff --git a/crates/doc/src/document.rs b/crates/doc/src/document.rs
+index 0463746..450f51e 100644
+--- a/crates/doc/src/document.rs
++++ b/crates/doc/src/document.rs
+@@ -12,6 +12,10 @@ pub const MAX_PARAMS: usize = 10_000;
+ /// Largest feature id a replayed feature may keep (`Document::insert_feature`): exact in JSON
+ /// numbers, and far from overflowing the next id.
+ pub const MAX_FEATURE_ID: u64 = 1 << 52;
++/// The host's allocator for new feature, component and occurrence ids, if any: given the next id, the id to use (the
++/// web app's live editing makes them unique across the people editing).
++#[cfg(target_arch = "wasm32")]
++pub static ID_ALLOCATOR: std::sync::OnceLock<fn(&mut u64) -> u64> = std::sync::OnceLock::new();
+ 
+ /// A named parameter. User parameters are created by the user; model parameters (`d1`, `d2`…)
+ /// are created by dimensions and features.
+@@ -2496,6 +2500,17 @@ impl Document {
+         if body.transferred { None } else { self.body_offsets.get(&body.name) }
+     }
+ 
++    /// A new feature, component or occurrence id.
++    pub(crate) fn new_id(&mut self) -> Result<u64> {
++        let id = self.next_id.max(1);
++        self.next_id = id.checked_add(1).ok_or_else(|| DocError::Invalid("too many items in the design".into()))?;
++        #[cfg(target_arch = "wasm32")]
++        if let Some(fresh) = ID_ALLOCATOR.get() {
++            return Ok(fresh(&mut { id }));
++        }
++        Ok(id)
++    }
++
+     /// Add a component under `parent` and return its id.
+     pub fn add_component(&mut self, name: Option<&str>, parent: u64) -> Result<u64> {
+         if parent != 0 && !self.components.iter().any(|c| c.id == parent) {
+@@ -2504,8 +2519,7 @@ impl Document {
+         if self.components.len() >= 10_000 {
+             return Err(DocError::Invalid("too many components".into()));
+         }
+-        let id = self.next_id.max(1);
+-        self.next_id = id.checked_add(1).ok_or_else(|| DocError::Invalid("too many items in the design".into()))?;
++        let id = self.new_id()?;
+         let name = match name.map(str::trim) {
+             Some(n) if !n.is_empty() => n.to_string(),
+             _ => {
+@@ -2616,8 +2630,7 @@ impl Document {
+         } else {
+             0
+         };
+-        let id = self.next_id.max(1);
+-        self.next_id = id.checked_add(1).ok_or_else(|| DocError::Invalid("too many items in the design".into()))?;
++        let id = self.new_id()?;
+         let name = match name {
+             Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+             _ => self.unique_name(kind.base_name()),
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index e90c6e1..419fd7f 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -240,6 +240,10 @@ impl Default for UiState {
+     }
+ }
+ 
++/// Undo and Redo while the web app edits live in a Playground session: true when the session took them.
++#[cfg(target_arch = "wasm32")]
++pub static LIVE_UNDO: std::sync::OnceLock<fn(bool) -> bool> = std::sync::OnceLock::new();
++
+ /// Host services injected by the app so this crate stays portable.
+ #[derive(Default)]
+ pub struct Services {
+@@ -597,6 +601,10 @@ impl SolveApp {
+ 
+     /// Run a command programmatically (JSON parameters, no dialogs).
+     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
++        #[cfg(target_arch = "wasm32")]
++        if matches!(id, "edit.undo" | "edit.redo") && LIVE_UNDO.get().is_some_and(|undo| undo(id == "edit.redo")) {
++            return Ok(Value::Null);
++        }
+         if self.file_load.busy() || self.file_picker.is_some() {
+             return Err("a file operation is in progress".into());
+         }

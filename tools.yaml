@@ -222,6 +222,7 @@ groups:
         icon: icons/solidcraft.svg
         theme: themes/fusion-360.js
         patches: patches/fusion-360.yaml
+        live: apps/solidcraft-web/src
         accent: "#FF7A1F"
         base: "#3A1806"
 
