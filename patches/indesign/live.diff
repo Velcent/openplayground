@@ -1,43 +1,18 @@
-diff --git a/Cargo.lock b/Cargo.lock
-index 6b735c5..73da26b 100644
---- a/Cargo.lock
-+++ b/Cargo.lock
-@@ -1207,6 +1207,7 @@ dependencies = [
-  "js-sys",
-  "log",
-  "rfd",
-+ "serde",
-  "serde_json",
-  "wasm-bindgen",
-  "wasm-bindgen-futures",
-diff --git a/apps/designcraft-web/Cargo.toml b/apps/designcraft-web/Cargo.toml
-index 1667e69..179fc7d 100644
---- a/apps/designcraft-web/Cargo.toml
-+++ b/apps/designcraft-web/Cargo.toml
-@@ -21,6 +21,7 @@ form_urlencoded = "1.2"
- designcraft-ui-egui = { workspace = true }
- egui = { workspace = true }
- log = { workspace = true }
-+serde = { workspace = true }
- serde_json = { workspace = true }
- 
- [target.'cfg(target_arch = "wasm32")'.dependencies]
 diff --git a/apps/designcraft-web/src/live.rs b/apps/designcraft-web/src/live.rs
 new file mode 100644
-index 0000000..b8bc554
+index 0000000..477f64a
 --- /dev/null
 +++ b/apps/designcraft-web/src/live.rs
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,336 @@
 +//! Playground live editing (`playground_live`): the shared document is one open document's model as JSON with its
 +//! embedded files' bytes, without this person's views (selection, zoom, spread rotation on screen, a Data Merge
-+//! preview). Native undo history stays local; while connected Undo and Redo go to the session.
++//! preview). Native undo history stays local; while connected, Undo and Redo of the shared document go to the session.
 +
 +use crate::playground_live::{self, Live};
 +use designcraft_engine::DocState;
 +use designcraft_engine::cmd::{base64_decode, base64_encode};
 +use designcraft_engine::doc::{Document, Selection};
 +use designcraft_ui_egui::DesignApp;
-+use serde::Deserialize as _;
 +use serde_json::Value;
 +use std::cell::{Cell, RefCell};
 +use std::collections::BTreeMap;
@@ -46,15 +21,18 @@ index 0000000..b8bc554
 +pub const FORMAT: &str = concat!("indesign:1:", env!("CARGO_PKG_VERSION"));
 +
 +thread_local! {
-+    /// The shared document's `uid`: the document active when the session first read it.
++    /// The shared document's `uid`: the document active when the session first read it, for the whole session.
 +    static SHARED: Cell<Option<u64>> = const { Cell::new(None) };
-+    static POINTER_DOWN: Cell<bool> = const { Cell::new(false) };
++    /// The shared model as last seen, with a counter of its changes: still reported once its tab is closed.
++    static SEEN: RefCell<Option<(Arc<Document>, u64)>> = const { RefCell::new(None) };
++    /// The pointer is down or a text field has the keyboard.
++    static BUSY: Cell<bool> = const { Cell::new(false) };
 +    static CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
 +}
 +
 +/// The end of a frame.
 +pub fn frame(app: &mut DesignApp, ctx: &egui::Context) {
-+    POINTER_DOWN.set(ctx.input(|i| i.pointer.any_down()));
++    BUSY.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
 +    CTX.with_borrow_mut(|c| _ = c.get_or_insert_with(|| ctx.clone()));
 +    playground_live::frame(app);
 +}
@@ -63,17 +41,47 @@ index 0000000..b8bc554
 +    CTX.with_borrow(|c| c.iter().for_each(egui::Context::request_repaint));
 +}
 +
-+/// The shared document's index; when it was closed (or none was chosen yet), the active one becomes it.
++/// Undo or Redo of the `active` document goes to the session when that is the shared one.
++pub fn undo(active: Option<u64>, redo: bool) -> bool {
++    active.is_some() && active == SHARED.get() && playground_live::undo(redo)
++}
++
++/// [`Document::alloc`]'s ids: unique among peers while connected, with `next_id` raised past each so it stays above
++/// every id (`Document::check`).
++pub fn fresh_id(next: &mut u64) -> u64 {
++    let id = playground_live::fresh_id(&mut next.clone());
++    *next = (*next).max(id);
++    id
++}
++
++/// The shared document's index while its tab is open, binding the active one when none is bound yet.
 +fn shared(app: &DesignApp) -> Option<usize> {
 +    let docs = app.session.documents();
-+    let i = SHARED.get().and_then(|uid| docs.iter().position(|d| d.uid == uid)).or(app.session.active_index())?;
-+    SHARED.set(docs.get(i).map(|d| d.uid));
-+    Some(i)
++    let Some(uid) = SHARED.get() else {
++        let i = app.session.active_index()?;
++        SHARED.set(docs.get(i).map(|d| d.uid));
++        return Some(i);
++    };
++    docs.iter().position(|d| d.uid == uid)
 +}
 +
 +/// The document itself: during a Data Merge preview the template waits in the stash.
 +fn model(st: &DocState) -> &Arc<Document> {
 +    st.preview_stash.as_ref().unwrap_or(&st.doc)
++}
++
++/// The shared model (the last one seen once its tab is closed) and its change count: a selection or an equal copy
++/// is no change.
++fn seen(app: &DesignApp) -> Option<(Arc<Document>, u64)> {
++    let now = shared(app).map(|i| model(&app.session.documents()[i]).clone());
++    SEEN.with_borrow_mut(|seen| {
++        match (now, seen.as_mut()) {
++            (Some(doc), Some((last, _))) if Arc::ptr_eq(last, &doc) || *last == doc => *last = doc,
++            (Some(doc), last) => *seen = Some((doc, last.map_or(0, |l| l.1 + 1))),
++            (None, _) => {}
++        }
++        seen.clone()
++    })
 +}
 +
 +fn project(doc: &Document) -> Value {
@@ -174,7 +182,7 @@ index 0000000..b8bc554
 +    const COUNTERS: &'static [&'static str] = &["nextId"];
 +
 +    fn live_document(&self) -> Value {
-+        shared(self).map_or(Value::Null, |i| project(model(&self.session.documents()[i])))
++        seen(self).map_or(Value::Null, |(doc, _)| project(&doc))
 +    }
 +
 +    fn live_adopt(&mut self, mut document: Value) -> Result<(), String> {
@@ -193,18 +201,18 @@ index 0000000..b8bc554
 +            .collect();
 +        let mut doc: Document = serde_json::from_value(document).map_err(invalid)?;
 +        doc.check().map_err(invalid)?;
++        let old = seen(self).map(|(old, _)| old);
++        fill(&mut doc, &files, old.as_deref());
++        // Nothing open to share yet, or its tab was closed: it opens again.
 +        let Some(i) = shared(self) else {
-+            fill(&mut doc, &files, None);
 +            let i = self.session.add_document(DocState::new(doc, None));
 +            SHARED.set(self.session.documents().get(i).map(|d| d.uid));
 +            self.after_engine();
 +            return Ok(());
 +        };
-+        let old = model(&self.session.documents()[i]).clone();
-+        fill(&mut doc, &files, Some(&old));
 +        let st = &mut self.session.documents_mut()[i];
 +        (st.preview_stash, st.preview_record) = (None, None);
-+        prune(&mut st.selection, &doc, Some(&old));
++        prune(&mut st.selection, &doc, old.as_deref());
 +        st.doc = Arc::new(doc);
 +        st.revision += 1;
 +        if st.doc.layer(st.active_layer).is_none() {
@@ -215,19 +223,16 @@ index 0000000..b8bc554
 +    }
 +
 +    fn live_quiet(&self) -> bool {
-+        !POINTER_DOWN.get() && !self.session.tool_busy() && self.session.documents().iter().all(|d| d.interaction.is_none())
++        !BUSY.get() && !self.session.tool_busy() && self.session.documents().iter().all(|d| d.interaction.is_none())
 +    }
 +
 +    fn live_generation(&self) -> Option<u64> {
-+        use std::hash::{Hash as _, Hasher as _};
-+        let st = &self.session.documents()[shared(self)?];
-+        let mut h = std::collections::hash_map::DefaultHasher::new();
-+        (st.uid, st.revision, Arc::as_ptr(model(st))).hash(&mut h);
-+        Some(h.finish())
++        seen(self).map(|(_, changes)| changes)
 +    }
 +
 +    fn live_disconnected(&mut self) {
 +        let docs = self.session.documents_mut();
++        SEEN.take();
 +        if let Some(st) = SHARED.take().and_then(|uid| docs.iter_mut().find(|d| d.uid == uid)) {
 +            st.history.undo.clear();
 +            st.history.redo.clear();
@@ -238,7 +243,7 @@ index 0000000..b8bc554
 +    /// other).
 +    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
 +        let merged = playground_live::merge(base, current, edited, Self::COUNTERS)?;
-+        Document::deserialize(&merged).map_err(invalid)?.check().map_err(|e| format!("Conflict: {e}"))?;
++        serde_json::from_value::<Document>(merged.clone()).map_err(invalid)?.check().map_err(|e| format!("Conflict: {e}"))?;
 +        Ok(merged)
 +    }
 +}
@@ -259,10 +264,10 @@ index 0000000..b8bc554
 +
 +    #[test]
 +    fn shares_the_document_without_views_adopts_it_without_an_undo_step_and_waits_for_a_gesture() -> Result<(), String> {
-+        let _ = designcraft_engine::doc::FRESH_ID.set(playground_live::fresh_id);
 +        let mut a = sample()?;
 +        playground_live::connect();
 +        let start = canonical(&a.live_document());
++        let bound = SHARED.get();
 +        // Views: a selection, a rotated spread and a Data Merge preview's filled copy stay out.
 +        let ids: Vec<u64> = a.session.doc().map_err(|e| e.to_string())?.doc.spreads[0].items.iter().map(|i| i.id.0).collect();
 +        a.run("selection.set", json!({"ids": [ids[0]]}))?;
@@ -284,6 +289,9 @@ index 0000000..b8bc554
 +        b.run("selection.set", json!({"ids": [ids[1]]}))?;
 +        b.run("transform.move", json!({"dx": 10, "dy": 0}))?;
 +        let edited = canonical(&b.live_document());
++        // One page, one app: the binding goes back to A's document.
++        SHARED.set(bound);
++        SEEN.take();
 +        let undo_steps = a.session.doc().map_err(|e| e.to_string())?.history.undo.len();
 +        let done = std::rc::Rc::new(Cell::new(false));
 +        let to = done.clone();
@@ -299,10 +307,35 @@ index 0000000..b8bc554
 +        assert_eq!((st.history.undo.len(), st.selection.items.clone()), (undo_steps, vec![designcraft_engine::doc::ItemId(ids[0])]));
 +        assert_eq!(st.doc.spreads[0].pages[0].view_rotation, 1, "the spread stays rotated here");
 +
-+        // New objects get ids unique to this peer, and the document stays valid.
-+        let id = a.session.edit(|d, _| Ok(d.alloc())).map_err(|e| e.to_string())?;
-+        let doc = &a.session.doc().map_err(|e| e.to_string())?.doc;
-+        assert!(id >> 52 == 1 && doc.next_id >= id && doc.check().is_ok());
++        // New objects get ids unique to this peer, and the counter stays above them.
++        let mut next = a.session.doc().map_err(|e| e.to_string())?.doc.next_id + 1;
++        let id = fresh_id(&mut next);
++        assert!(id >> 52 == 1 && next == id);
++        playground_live::disconnect();
++        Ok(())
++    }
++
++    #[test]
++    fn another_documents_undo_stays_native_and_a_closed_shared_document_is_still_shared_and_reopens() -> Result<(), String> {
++        let mut app = sample()?;
++        playground_live::connect();
++        let shared = canonical(&app.live_document());
++        let uid = app.session.active().map(|d| d.uid);
++        app.run("file.new", json!({}))?;
++        assert!(!undo(app.session.active().map(|d| d.uid), false), "a private document's Undo stays its own");
++        assert!(undo(uid, false));
++
++        // Closing the shared document's tab shares no other document; the next remote change opens it again.
++        let i = app.session.documents().iter().position(|d| Some(d.uid) == uid).ok_or("no shared document")?;
++        app.session.close_document(i);
++        assert_eq!(canonical(&app.live_document()), shared);
++        let mut edited: Value = serde_json::from_slice(&shared).map_err(|e| e.to_string())?;
++        edited["title"] = json!("Renamed");
++        playground_live::queue(Some(shared), canonical(&edited), Box::new(|r| assert_eq!(r.map(drop), Ok(()))));
++        playground_live::frame(&mut app);
++        let reopened = app.session.active().ok_or("no document")?;
++        assert_eq!((app.session.documents().len(), reopened.doc.title.as_str()), (2, "Renamed"));
++        assert!(undo(Some(reopened.uid), false));
 +        playground_live::disconnect();
 +        Ok(())
 +    }
@@ -326,7 +359,7 @@ index 1b28064..bb4bae7 100644
  fn main() {
      web::start();
 diff --git a/apps/designcraft-web/src/web.rs b/apps/designcraft-web/src/web.rs
-index c532b5d..aca4982 100644
+index c532b5d..c6175a9 100644
 --- a/apps/designcraft-web/src/web.rs
 +++ b/apps/designcraft-web/src/web.rs
 @@ -82,6 +82,13 @@ pub fn start() {
@@ -334,7 +367,7 @@ index c532b5d..aca4982 100644
          match result {
              Ok(()) => {
 +                // Playground live editing (inert until its shell connects).
-+                let _ = designcraft_engine::doc::FRESH_ID.set(crate::playground_live::fresh_id);
++                let _ = designcraft_engine::doc::FRESH_ID.set(crate::live::fresh_id);
 +                let live = runner.clone();
 +                let with_app = move |f: &mut dyn FnMut(&mut DesignApp)| live.app_mut::<WebShell>().map(|mut shell| f(&mut shell.app)).is_some();
 +                if let Err(e) = crate::playground_live::web::attach::<DesignApp>(crate::live::FORMAT, with_app, crate::live::repaint) {
@@ -359,33 +392,34 @@ index c532b5d..aca4982 100644
              }
          })),
          inbox: Some(inbox),
-+        undo: Some(Box::new(crate::playground_live::undo)),
++        undo: Some(Box::new(crate::live::undo)),
          ..Default::default()
      }
  }
 diff --git a/crates/doc/src/lib.rs b/crates/doc/src/lib.rs
-index c0fdc8f..a682706 100644
+index c0fdc8f..3bf51d0 100644
 --- a/crates/doc/src/lib.rs
 +++ b/crates/doc/src/lib.rs
-@@ -633,11 +633,17 @@ pub struct Bookmark {
+@@ -633,10 +633,19 @@ pub struct Bookmark {
      pub children: Vec<Bookmark>,
  }
  
-+/// Set by the web app for live editing: makes the ids [`Document::alloc`] counts unique among the people editing at once.
++/// Set by the web app for live editing: hands out the ids [`Document::alloc`] counts, unique among the people editing at
++/// once (it raises `next_id` past each).
++#[cfg(target_arch = "wasm32")]
 +pub static FRESH_ID: std::sync::OnceLock<fn(&mut u64) -> u64> = std::sync::OnceLock::new();
 +
  impl Document {
      /// Allocate a fresh id.
      pub fn alloc(&mut self) -> u64 {
          self.next_id += 1;
--        self.next_id
-+        let Some(fresh) = FRESH_ID.get() else { return self.next_id };
-+        let id = fresh(&mut self.next_id.clone());
-+        self.next_id = self.next_id.max(id);
-+        id
++        #[cfg(target_arch = "wasm32")]
++        if let Some(fresh) = FRESH_ID.get() {
++            return fresh(&mut self.next_id);
++        }
+         self.next_id
      }
  
-     pub fn page_count(&self) -> usize {
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
 index 745e456..6780fff 100644
 --- a/crates/engine/src/lib.rs
@@ -401,23 +435,28 @@ index 745e456..6780fff 100644
          self.active
      }
 diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index 59c7ebb..7f8ae9e 100644
+index 59c7ebb..78d907d 100644
 --- a/crates/ui-egui/src/lib.rs
 +++ b/crates/ui-egui/src/lib.rs
-@@ -79,6 +79,8 @@ pub struct Services {
+@@ -79,6 +79,10 @@ pub struct Services {
      /// The system clipboard's text, for Paste chosen from a menu (egui only delivers it with the
      /// paste keys, which a native menu bar takes first).
      pub clipboard_text: Option<ClipboardFn>,
-+    /// Takes Undo (false) or Redo (true) instead of the document's history when it returns true (live editing).
-+    pub undo: Option<Box<dyn Fn(bool) -> bool>>,
++    /// Takes Undo (false) or Redo (true) of the active document (its uid) instead of its history when it returns true
++    /// (live editing).
++    #[cfg(target_arch = "wasm32")]
++    pub undo: Option<Box<dyn Fn(Option<u64>, bool) -> bool>>,
  }
  
  #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-@@ -667,6 +669,9 @@ impl DesignApp {
+@@ -667,6 +671,12 @@ impl DesignApp {
  
      /// THE entry point for every action (menus, shortcuts, palette, panels, control channel).
      pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
-+        if matches!(id, "edit.undo" | "edit.redo") && self.services.undo.as_ref().is_some_and(|undo| undo(id == "edit.redo")) {
++        #[cfg(target_arch = "wasm32")]
++        if matches!(id, "edit.undo" | "edit.redo")
++            && self.services.undo.as_ref().is_some_and(|undo| undo(self.session.active().map(|d| d.uid), id == "edit.redo"))
++        {
 +            return Ok(Value::Null);
 +        }
          if let Some(r) = menus::run_ui(self, id, &params) {
