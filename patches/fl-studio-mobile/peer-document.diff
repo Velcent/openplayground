@@ -1,9 +1,9 @@
 diff --git a/src/collaboration.rs b/src/collaboration.rs
 new file mode 100644
-index 0000000..19962fa
+index 0000000..9395271
 --- /dev/null
 +++ b/src/collaboration.rs
-@@ -0,0 +1,850 @@
+@@ -0,0 +1,892 @@
 +//! Musical document changes for the optional browser collaboration adapter.
 +
 +use crate::song::*;
@@ -300,8 +300,20 @@ index 0000000..19962fa
 +    }
 +    let mut out = c.clone();
 +    fields!(Channel, b, c, e, out, path;
-+        name, kind, id, zipped, hue, params, bus_id, output_bus, drum_kit, file; rack, lanes);
-+    out.rack = choose(&b.rack, &c.rack, &e.rack, &format!("{path}.rack"))?;
++        name, kind, id, zipped, hue, params, bus_id, output_bus, file; rack, lanes, drum_kit);
++    // Allocators stay raised after an Undo: compare without them, then keep the highest below.
++    let rack = |ch: &Channel| Rack {
++        last_instance_id: 0,
++        ..ch.rack.clone()
++    };
++    out.rack = choose(&rack(b), &rack(c), &rack(e), &format!("{path}.rack"))?;
++    let kit = |ch: &Channel| {
++        ch.drum_kit.clone().map(|mut kit| {
++            kit.file.last_slot_id = 0;
++            kit
++        })
++    };
++    out.drum_kit = choose(&kit(b), &kit(c), &kit(e), &format!("{path}.drum_kit"))?;
 +    out.rack.last_instance_id = b
 +        .rack
 +        .last_instance_id
@@ -329,7 +341,12 @@ index 0000000..19962fa
 +            .any(|other| lane_key(l) == lane_key(other))
 +    });
 +    if !same_shape(c) || !same_shape(e) || ambiguous {
-+        out.lanes = choose(&b.lanes, &c.lanes, &e.lanes, &format!("{path}.tracks"))?;
++        let lanes = |ch: &Channel| {
++            let mut lanes = ch.lanes.clone();
++            lanes.iter_mut().for_each(|lane| lane.last_clip_id = 0);
++            lanes
++        };
++        out.lanes = choose(&lanes(b), &lanes(c), &lanes(e), &format!("{path}.tracks"))?;
 +        // Lanes have no stable ID, so preserve the highest observed counter across a structure change.
 +        let last = [&b.lanes, &c.lanes, &e.lanes]
 +            .into_iter()
@@ -757,6 +774,31 @@ index 0000000..19962fa
 +                .lanes
 +                .iter()
 +                .all(|l| l.clips[0].file.zoom == ClipFileState::default().zoom)
++        );
++    }
++
++    #[test]
++    fn undone_additions_do_not_block_older_undo() {
++        let mut s0 = song();
++        s0.add_channel(ChannelKind::Drums);
++        let mut s1 = s0.clone();
++        s1.channels[1].rack.modules[0].params[0] = 0.2;
++        s1.channels[2].drum_kit.as_mut().unwrap().slots[0].name = "Kick 2".into();
++        let mut s2 = s1.clone();
++        s2.channels[1].rack.add(32);
++        s2.channels[1].lanes.push(Lane::new(LaneKind::Notes));
++        let kit = s2.channels[2].drum_kit.as_mut().unwrap();
++        kit.insert_slot(0, SamplerSlot::default());
++        let undone = merge(&s2, &s2, &s1).unwrap();
++        let older = merge(&s1, &undone, &s0).expect("the undone additions cancel out");
++        assert_eq!(older.channels[1].rack.modules, s0.channels[1].rack.modules);
++        assert_eq!(
++            older.channels[2].drum_kit.as_ref().unwrap().slots,
++            s0.channels[2].drum_kit.as_ref().unwrap().slots
++        );
++        assert_eq!(
++            older.channels[1].rack.last_instance_id,
++            s2.channels[1].rack.last_instance_id
 +        );
 +    }
 +

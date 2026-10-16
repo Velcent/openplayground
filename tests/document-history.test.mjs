@@ -1,9 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { delta } from '../shell/document-delta.js'
+import { DocumentHistory } from '../shell/document-history.js'
 
-const module = await import('../shell/document-history.js').catch(() => ({}))
-const { DocumentHistory } = module
 const document = crypto.randomUUID(), format = 'honeydew:1:test-build'
 const alice = crypto.randomUUID(), bob = crypto.randomUUID(), viewer = crypto.randomUUID()
 const bytes = (...values) => Uint8Array.from(values)
@@ -17,7 +16,6 @@ function merge(base, current, edited) {
   })
 }
 async function setup(overrides = {}) {
-  assert.ok(DocumentHistory, 'DocumentHistory must implement authored commits')
   return DocumentHistory.create({ document, format, bytes: bytes(0, 0, 0), merge,
     commit: async () => {}, allowed: id => id === alice || id === bob, ...overrides })
 }
@@ -127,7 +125,7 @@ test('untrusted identities, formats, revisions and read-only senders cannot subm
   assert.deepEqual(state(j), [0, 0, 0])
 })
 
-test('queued work checks current permission after waiting', async () => {
+test('queued work checks current permission after waiting, and a pending check fails closed', async () => {
   let release, blocked = false, allow = true
   const j = await setup({ allowed: () => allow, commit: async () => {
     if (blocked) await new Promise(resolve => { release = resolve })
@@ -141,6 +139,8 @@ test('queued work checks current permission after waiting', async () => {
   await first
   await assert.rejects(second, /permission/)
   assert.deepEqual(state(j), [1, 0, 0])
+  const pending = await setup({ allowed: async () => false })
+  await assert.rejects(pending.submit(alice, await edit(0, [0, 0, 0], [1, 0, 0])), /permission/)
 })
 
 test('caller mutations cannot change queued proposals, receipts or stored history', async () => {

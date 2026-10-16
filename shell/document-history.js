@@ -31,6 +31,8 @@ async function fingerprint({ base, kind, target, edit }) {
   return digest(await new Blob(edit ? [head, edit.remove, edit.insert] : [head]).arrayBuffer())
 }
 
+// ponytail: each submit copies and commits the whole record and runs up to one merge per retained revision; fine for
+// typical songs, a ceiling near the 128 MiB document and 256 MiB history limits. Commit deltas incrementally if that shows.
 // Orders authored changes for one shared document. Merges are checked against every retained revision after a
 // proposal's base, so changing a value and changing it back still fences stale work. Undo and Redo revert the
 // author's own latest operation and are checked against other authors' later changes only.
@@ -101,7 +103,7 @@ export class DocumentHistory {
 
   async #apply(author, p) {
     // Identity and role come from the authenticated caller at processing time, never from the proposal.
-    if (typeof author !== 'string' || !UUID.test(author) || !this.#allowed(author)) throw new Error('Sender lacks editing permission')
+    if (typeof author !== 'string' || !UUID.test(author) || await this.#allowed(author) !== true) throw new Error('Sender lacks editing permission')
     const request = await fingerprint(p)
     const old = this.#entries.find(entry => entry.id === p.id)
     if (old) {
