@@ -60,10 +60,10 @@ index f784ac0..15797df 100644
 +uuid.workspace = true
 +flate2 = "1"
 diff --git a/crates/ui/src/app.rs b/crates/ui/src/app.rs
-index 9ca775f..7629c8b 100644
+index 9ca775f..e63b211 100644
 --- a/crates/ui/src/app.rs
 +++ b/crates/ui/src/app.rs
-@@ -110,6 +110,18 @@ pub fn default_layout() -> DockState<Tab> {
+@@ -110,6 +110,19 @@ pub fn default_layout() -> DockState<Tab> {
  
  const DOCK_KEY: &str = "subcraft_dock_v4";
  
@@ -71,18 +71,19 @@ index 9ca775f..7629c8b 100644
 +#[cfg(any(target_arch = "wasm32", test))]
 +pub(crate) mod live;
 +
-+/// A Playground live session holds Undo and Redo (web only): they stay available and History jumps are off.
++/// A Playground live session holds Undo and Redo (web only): they stay available, History jumps are off, and New and
++/// Open wait until the session ends.
 +pub(crate) fn live_session() -> bool {
-+    #[cfg(target_arch = "wasm32")]
++    #[cfg(any(target_arch = "wasm32", test))]
 +    return live::connected();
-+    #[cfg(not(target_arch = "wasm32"))]
++    #[cfg(not(any(target_arch = "wasm32", test)))]
 +    false
 +}
 +
  #[cfg(test)]
  mod launch_tests {
      use super::*;
-@@ -347,6 +359,10 @@ impl SubcraftApp {
+@@ -347,6 +360,10 @@ impl SubcraftApp {
                  }
              }
          }
@@ -93,7 +94,7 @@ index 9ca775f..7629c8b 100644
          match action {
              Action::ResetCamera => self.state.camera = OrbitCamera::framing(&self.state.session.scene().mesh.bounds),
              Action::BrushTool => self.state.tool = Tool::Brush,
-@@ -390,7 +406,7 @@ impl SubcraftApp {
+@@ -390,7 +407,7 @@ impl SubcraftApp {
              }
              ui.add_space(6.0);
              let h = self.state.session.history();
@@ -102,7 +103,7 @@ index 9ca775f..7629c8b 100644
              if ui.add_enabled_ui(can_redo, |ui| icon_button(ui, icons::REDO, "Redo (Ctrl+Y)")).inner.clicked() {
                  self.perform(Action::Redo, now);
              }
-@@ -509,7 +525,7 @@ impl SubcraftApp {
+@@ -509,7 +526,7 @@ impl SubcraftApp {
                  let h = self.state.session.history();
                  let undo = h.undo_label().map(|l| format!("Undo {l}")).unwrap_or("Undo".into());
                  let redo = h.redo_label().map(|l| format!("Redo {l}")).unwrap_or("Redo".into());
@@ -111,7 +112,17 @@ index 9ca775f..7629c8b 100644
                  if ui.add_enabled(can_undo, egui::Button::new(format!("{}   {undo}", icons::UNDO)).shortcut_text("Ctrl+Z")).clicked() {
                      self.perform(Action::Undo, now);
                  }
-@@ -870,6 +886,8 @@ impl eframe::App for SubcraftApp {
+@@ -591,6 +608,9 @@ impl SubcraftApp {
+ 
+     /// Run `action` now, or after the unsaved-changes prompt.
+     fn request(&mut self, action: Pending, now: f64) {
++        if action != Pending::Close && live_session() {
++            return self.state.set_status("Leave the live session to open or start another project", now);
++        }
+         if self.state.pen.is_editing() || self.state.pen.is_pending() || self.state.asset_preview.is_applying() {
+             if let Err(e) = self.state.pen.release(&self.state.session) { self.state.set_status(e.to_string(), now); }
+             if self.state.pen.is_pending() || self.state.asset_preview.is_applying() {
+@@ -870,6 +890,8 @@ impl eframe::App for SubcraftApp {
              }
              dialogs::run_pending(&mut self.state, action, &ctx, now);
          }
@@ -120,7 +131,7 @@ index 9ca775f..7629c8b 100644
          let title = dialogs::title(&self.state);
          if title != self.state.last_title {
              ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
-@@ -892,6 +910,11 @@ impl eframe::App for SubcraftApp {
+@@ -892,6 +914,11 @@ impl eframe::App for SubcraftApp {
          if let Ok(j) = serde_json::to_string(&self.state.welcome.recent) { storage.set_string(crate::welcome::RECENTS_KEY, j); }
      }
  
@@ -134,10 +145,10 @@ index 9ca775f..7629c8b 100644
          self.state.recovery.autosaver.finish_clean();
 diff --git a/crates/ui/src/app/live.rs b/crates/ui/src/app/live.rs
 new file mode 100644
-index 0000000..0c79153
+index 0000000..448ffe9
 --- /dev/null
 +++ b/crates/ui/src/app/live.rs
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,302 @@
 +//! Live editing in a Playground session (`shell/live.js` drives it through [`web`]); nothing here runs until the shell
 +//! connects. The shared project is [`checkpoint`]'s canonical binary checkpoint: the layer trees and settings, the
 +//! painted tiles, the images they use and the mesh, without anyone's views (camera, selection, tool, brush, open
@@ -308,13 +319,17 @@ index 0000000..0c79153
 +    /// Merges a remote change into the project (or adopts a whole one, giving back the checkpoint it replaced), with no
 +    /// undo step of its own.
 +    fn live_apply(&mut self, base: Option<&[u8]>, edited: &[u8]) -> Result<Option<Vec<u8>>, String> {
-+        let local = self.live_encode()?;
-+        let current = checkpoint::parse(&local)?;
++        // A whole project installs even when this one cannot be shared (too large): it then gives nothing back.
++        let local = self.live_encode();
++        let current = local.as_deref().ok().map(checkpoint::parse).transpose()?;
 +        let edited = checkpoint::parse(edited)?;
-+        let target = match base {
-+            Some(base) => checkpoint::merge(&checkpoint::parse(base)?, &current, &edited)?,
-+            None => {
-+                checkpoint::check_whole(&edited, &current)?;
++        let target = match (base, &current) {
++            (Some(base), Some(current)) => checkpoint::merge(&checkpoint::parse(base)?, current, &edited)?,
++            (Some(_), None) => return Err(local.err().unwrap_or_default()),
++            (None, _) => {
++                checkpoint::check_whole(&edited, current.as_ref())?;
++                // Joined: the welcome hub's New and Open would only be refused now.
++                self.state.welcome.open = false;
 +                edited
 +            }
 +        };
@@ -332,7 +347,7 @@ index 0000000..0c79153
 +                checkpoint::known_mesh(&self.state.session.scene().mesh, &bytes);
 +            }
 +        }
-+        Ok(base.is_none().then_some(local))
++        Ok(local.ok().filter(|_| base.is_none()))
 +    }
 +
 +    /// The session ended: native Undo starts over from the project as the session left it.
@@ -438,10 +453,10 @@ index 0000000..0c79153
 +mod tests;
 diff --git a/crates/ui/src/app/live/checkpoint.rs b/crates/ui/src/app/live/checkpoint.rs
 new file mode 100644
-index 0000000..ddcfe1d
+index 0000000..d8f0853
 --- /dev/null
 +++ b/crates/ui/src/app/live/checkpoint.rs
-@@ -0,0 +1,886 @@
+@@ -0,0 +1,931 @@
 +//! The shared project as one canonical binary checkpoint (the same project gives the same bytes on every peer), and
 +//! its strict three-way merge.
 +//!
@@ -811,7 +826,7 @@ index 0000000..ddcfe1d
 +}
 +
 +fn mesh_from(blob: &[u8]) -> Result<Mesh, Error> {
-+    subcraft_mesh::serialize::decode(&inflate(blob, 1 << 30)?).map_err(invalid)
++    subcraft_mesh::serialize::decode(&inflate(blob, 2 * MAX_BYTES)?).map_err(invalid)
 +}
 +
 +/// Deflated tiles and mesh by allocation, so a checkpoint compresses only what changed since the last one. A weak
@@ -1141,21 +1156,21 @@ index 0000000..ddcfe1d
 +    build(cp, &|_| true, &mut |_, _, i| Ok(TiledImage::new(i.size, i.size, i.comps as usize, i.fill.map(f32::from_bits))))
 +}
 +
-+/// Whether every peer can install `cp`: its structure, and whatever differs from `current` (already installed)
-+/// decodes. Gives the images the document uses.
-+fn check(cp: &Checkpoint, current: &Checkpoint) -> Result<HashSet<Uuid>, Error> {
++/// Whether every peer can install `cp`: its structure, and whatever differs from `current` (already installed; none:
++/// everything) decodes. Gives the images the document uses.
++fn check(cp: &Checkpoint, current: Option<&Checkpoint>) -> Result<HashSet<Uuid>, Error> {
 +    let doc = skeleton(cp)?;
-+    if cp.mesh != current.mesh {
++    if current.is_none_or(|c| cp.mesh != c.mesh) {
 +        mesh_from(&cp.mesh)?;
 +    }
 +    for (id, r) in &cp.resources {
-+        if current.resources.get(id) != Some(r) {
++        if current.and_then(|c| c.resources.get(id)) != Some(r) {
 +            subcraft_image::io::decode_bitmap(&r.bytes, Some(&r.name)).map_err(invalid)?;
 +        }
 +    }
 +    for (layer, images) in &cp.layers {
 +        for (slot, image) in images {
-+            let known = current.layers.get(layer).and_then(|i| i.get(slot)).filter(|k| k.comps == image.comps);
++            let known = current.and_then(|c| c.layers.get(layer)?.get(slot)).filter(|k| k.comps == image.comps);
 +            for (t, blob) in &image.tiles {
 +                if known.and_then(|k| k.tiles.get(t)) != Some(blob) {
 +                    tile_from(blob, image.comps)?;
@@ -1173,7 +1188,7 @@ index 0000000..ddcfe1d
 +}
 +
 +/// A whole checkpoint `edited` replacing `current`: checked like a merge's result.
-+pub(crate) fn check_whole(edited: &Checkpoint, current: &Checkpoint) -> Result<(), Error> {
++pub(crate) fn check_whole(edited: &Checkpoint, current: Option<&Checkpoint>) -> Result<(), Error> {
 +    let used = check(edited, current)?;
 +    if edited.resources.keys().any(|id| !used.contains(id)) {
 +        return Err(invalid("an unused image"));
@@ -1212,10 +1227,55 @@ index 0000000..ddcfe1d
 +    Ok(out)
 +}
 +
++/// Lists of per-channel settings (a layer's blends, a fill's channels, a pen's values) keyed by their channel, so
++/// the JSON merge takes each channel from whoever changed it.
++fn by_channel(mut json: Value) -> Value {
++    fn walk(v: &mut Value) {
++        match v {
++            Value::Array(items) => {
++                if !items.is_empty() && items.iter().all(|i| i.get("channel").is_some_and(Value::is_string) && i.get("id").is_none()) {
++                    for i in items.iter_mut() {
++                        let channel = i["channel"].clone();
++                        i["id"] = channel;
++                    }
++                }
++                items.iter_mut().for_each(walk);
++            }
++            Value::Object(fields) => fields.values_mut().for_each(walk),
++            _ => {}
++        }
++    }
++    walk(&mut json);
++    json
++}
++
++/// Undoes [`by_channel`], each list in the model's channel order.
++fn in_channel_order(mut json: Value) -> Value {
++    fn walk(v: &mut Value) {
++        match v {
++            Value::Array(items) => {
++                if !items.is_empty() && items.iter().all(|i| i.get("channel").is_some_and(|c| Some(c) == i.get("id"))) {
++                    for i in items.iter_mut() {
++                        i.as_object_mut().expect("has fields").remove("id");
++                    }
++                    let order = |i: &Value| serde_json::from_value::<ChannelKind>(i["channel"].clone()).map_or(u8::MAX, channel_index);
++                    items.sort_by_key(order);
++                }
++                items.iter_mut().for_each(walk);
++            }
++            Value::Object(fields) => fields.values_mut().for_each(walk),
++            _ => {}
++        }
++    }
++    walk(&mut json);
++    json
++}
++
 +/// Strict three-way merge, then [`check`]: the layer trees and settings per field (layers, effects and anchors by
 +/// id), rasters tile by tile, the mesh as one value and the images as a union.
 +pub(crate) fn merge<'a>(b: &Checkpoint<'a>, c: &Checkpoint<'a>, e: &Checkpoint<'a>) -> Result<Checkpoint<'a>, Error> {
-+    let json = crate::playground_live::merge(&b.json, &c.json, &e.json, &[])?;
++    let [b_json, c_json, e_json] = [&b.json, &c.json, &e.json].map(|j| by_channel(j.clone()));
++    let json = in_channel_order(crate::playground_live::merge(&b_json, &c_json, &e_json, &[])?);
 +    let mesh = if e.mesh == b.mesh {
 +        c.mesh.clone()
 +    } else if c.mesh == b.mesh {
@@ -1242,7 +1302,7 @@ index 0000000..ddcfe1d
 +        })
 +    })?;
 +    let mut merged = Checkpoint { json, mesh, resources, layers };
-+    let used = check(&merged, c)?;
++    let used = check(&merged, Some(c))?;
 +    merged.resources.retain(|id, _| used.contains(id));
 +    Ok(merged)
 +}
@@ -1330,10 +1390,10 @@ index 0000000..ddcfe1d
 +}
 diff --git a/crates/ui/src/app/live/tests.rs b/crates/ui/src/app/live/tests.rs
 new file mode 100644
-index 0000000..5f0d690
+index 0000000..a5321c7
 --- /dev/null
 +++ b/crates/ui/src/app/live/tests.rs
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,278 @@
 +use std::collections::HashSet;
 +use std::sync::Arc;
 +
@@ -1383,7 +1443,7 @@ index 0000000..5f0d690
 +/// `checkpoint` installed into `s` with no base, as a joining peer does.
 +fn adopt(s: &mut Session, checkpoint: &[u8]) {
 +    let cp = parse(checkpoint).unwrap();
-+    checkpoint::check_whole(&cp, &parse(&bytes(s)).unwrap()).unwrap();
++    checkpoint::check_whole(&cp, Some(&parse(&bytes(s)).unwrap())).unwrap();
 +    let i = install(&cp, s.history().current(), s.resources(), &s.scene().mesh).unwrap();
 +    assert!(i.mesh.is_none());
 +    s.adopt(i.doc, i.resources, false);
@@ -1494,6 +1554,18 @@ index 0000000..5f0d690
 +        s.execute(Command::Rename { layer, name: "Same".into() }).unwrap();
 +    }
 +    assert!(merge_bytes(&base, &bytes(&d), &bytes(&e)).unwrap_err().contains("Conflict"));
++    // Per-channel settings merge by channel: two people's opacities on one layer.
++    let (mut d, mut e) = (cube(), cube());
++    adopt(&mut d, &base);
++    adopt(&mut e, &base);
++    for (s, channel) in [(&mut d, ChannelKind::BaseColor), (&mut e, ChannelKind::Roughness)] {
++        s.execute(Command::SetBlendOpacity { layer, channel, opacity: 0.25 }).unwrap();
++    }
++    let merged = merge_bytes(&base, &bytes(&d), &bytes(&e)).unwrap();
++    let both = parse(&merged).unwrap();
++    let i = install(&both, d.history().current(), d.resources(), &d.scene().mesh).unwrap();
++    let blend = &i.doc.texture_sets[0].layers[0].blend;
++    assert_eq!((blend[&ChannelKind::BaseColor].opacity, blend[&ChannelKind::Roughness].opacity), (0.25, 0.25));
 +
 +    // Not this build's form, or not a checkpoint: refused before anyone records it.
 +    let mut extra: serde_json::Value = serde_json::from_slice(json_of(&cb)).unwrap();
@@ -1549,6 +1621,21 @@ index 0000000..5f0d690
 +    let changes = LIVE.with_borrow(|l| l.changes);
 +    owner.live_frame(&ctx);
 +    assert_eq!(LIVE.with_borrow(|l| l.changes), changes, "no change: nothing to report");
++
++    // While connected, New and Open wait for the session's end.
++    let mesh = Arc::as_ptr(&owner.state.session.scene().mesh);
++    owner.request(crate::dialogs::Pending::NewSample, 0.0);
++    assert!(owner.pending_now.is_none() && owner.state.confirm.is_none());
++    assert_eq!(Arc::as_ptr(&owner.state.session.scene().mesh), mesh);
++
++    // A project too large to share still takes a whole shared one (giving nothing back), so a peer never wedges.
++    let shared = bytes(&peer);
++    image_fill(&mut owner.state.session, image(Some(vec![0; checkpoint::MAX_BYTES])));
++    owner.state.welcome.open = true;
++    assert!(owner.live_apply(Some(&shared), &shared).unwrap_err().contains("too large"));
++    assert_eq!(owner.live_apply(None, &shared), Ok(None));
++    assert_eq!(owner.live_encode().unwrap(), shared);
++    assert!(!owner.state.welcome.open, "joined: the welcome hub closes");
 +
 +    disconnect();
 +    owner.live_disconnected();
