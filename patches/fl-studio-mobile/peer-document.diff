@@ -1,9 +1,9 @@
 diff --git a/src/collaboration.rs b/src/collaboration.rs
 new file mode 100644
-index 0000000..0fde7e4
+index 0000000..19962fa
 --- /dev/null
 +++ b/src/collaboration.rs
-@@ -0,0 +1,851 @@
+@@ -0,0 +1,850 @@
 +//! Musical document changes for the optional browser collaboration adapter.
 +
 +use crate::song::*;
@@ -167,7 +167,7 @@ index 0000000..0fde7e4
 +) -> Result<T, Conflict> {
 +    if edited == base {
 +        Ok(current.clone())
-+    } else if current == base || current == edited {
++    } else if current == base {
 +        Ok(edited.clone())
 +    } else {
 +        Err(Conflict(path.into()))
@@ -567,10 +567,9 @@ index 0000000..0fde7e4
 +        assert_eq!(both.file.playlist_view, bob.file.playlist_view);
 +        let undone = merge(&alice, &both, &base).unwrap();
 +        assert_eq!(undone, bob);
-+        assert_eq!(
-+            merge(&base, &both, &alice).unwrap(),
-+            both,
-+            "reapplying an edit is idempotent"
++        assert!(
++            merge(&base, &both, &alice).is_err(),
++            "equal values do not prove authorship; only the journal can deduplicate an operation"
 +        );
 +    }
 +
