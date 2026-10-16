@@ -28,6 +28,13 @@ pub trait Live {
     fn live_disconnected(&mut self) {}
     /// Object keys whose numbers are allocators: merged by maximum, so concurrent additions do not conflict on them.
     const COUNTERS: &'static [&'static str] = &[];
+    /// The three-way merge of shared documents: [`merge`] with [`Self::COUNTERS`] unless the model needs its own (text).
+    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error>
+    where
+        Self: Sized,
+    {
+        merge(base, current, edited, Self::COUNTERS)
+    }
 }
 
 /// A conflict or an invalid document.
@@ -403,7 +410,7 @@ fn adopt<A: Live>(
     let edited = parse(edited)?;
     let current = app.live_document();
     let (document, replaced) = match base {
-        Some(base) => (merge(&parse(base)?, &current, &edited, A::COUNTERS)?, None),
+        Some(base) => (A::live_merge(&parse(base)?, &current, &edited)?, None),
         None => (edited, Some(canonical(&current))),
     };
     app.live_adopt(document)?;
@@ -465,13 +472,13 @@ pub mod web {
                      current: Uint8Array,
                      edited: Uint8Array|
          -> Result<Uint8Array, JsValue> {
-            let merged = super::merge_bytes(
-                &base.to_vec(),
-                &current.to_vec(),
-                &edited.to_vec(),
-                A::COUNTERS,
-            );
-            Ok(merged.map_err(|e| JsValue::from_str(&e))?.as_slice().into())
+            let parse = |bytes: Uint8Array| super::parse(&bytes.to_vec());
+            let merged = (|| A::live_merge(&parse(base)?, &parse(current)?, &parse(edited)?))();
+            Ok(
+                super::canonical(&merged.map_err(|e| JsValue::from_str(&e))?)
+                    .as_slice()
+                    .into(),
+            )
         };
         set(
             "merge",

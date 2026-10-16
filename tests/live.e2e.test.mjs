@@ -70,7 +70,7 @@ test('Honeydew browsers edit one song live, keep views local, undo personally an
   await c.evaluate(async (invite) => { window.session = await PeerSession.join(invite, { name: 'Carol' }) }, invite.viewer)
   await follow(c)
   assert.equal(await same([a, b, c], 'the late viewer to catch up'), undone)
-  assert.equal(await status(c), 'read-only')
+  await until(async () => await status(c) === 'read-only', 10000, 'the viewer to be read-only')
   await tempoUp(c)
   await c.waitForTimeout(1500)
   assert.equal(await same([a, b, c], 'the viewer\'s edit to revert'), undone)

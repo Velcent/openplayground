@@ -71,7 +71,7 @@ for (const slug of specs) {
     await c.evaluate(async (invite) => { window.session = await PeerSession.join(invite, { name: 'Carol' }) }, invite.viewer)
     await follow(c)
     await same([a, b, c], 'the late viewer to catch up')
-    assert.equal(await status(c), 'read-only')
+    await until(async () => await status(c) === 'read-only', 10000, 'the viewer to be read-only')
     for (const page of [a, b, c]) await page.evaluate(() => session.leave())
   })
 }
