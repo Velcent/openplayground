@@ -1,0 +1,836 @@
+diff --git a/apps/wordcraft-web/src/live.rs b/apps/wordcraft-web/src/live.rs
+new file mode 100644
+index 0000000..8d94520
+--- /dev/null
++++ b/apps/wordcraft-web/src/live.rs
+@@ -0,0 +1,329 @@
++//! Playground live editing (`playground_live`): the shared document is the open document's model as JSON (as the
++//! app's own JSON format writes it, with pictures and kept parts as base64) without what is personal or stamped on
++//! save: the zoom saved with it, the save times, author and count, and field-code toggles. Text merges character by
++//! character (`text_merge`). Native undo history stays local; while connected Undo and Redo go to the session.
++
++use std::cell::{Cell, RefCell};
++use std::collections::BTreeMap;
++use std::sync::Arc;
++
++use serde_json::{Map, Value};
++use wordcraft_doc::{Block, Blocks, Document, Pos, StoryRef};
++use wordcraft_engine::cmd::insert::{base64_decode, base64_encode};
++use wordcraft_ui_egui::WordApp;
++
++use crate::playground_live::{self, Error, Live};
++use crate::text_merge;
++
++pub const FORMAT: &str = concat!("word:1:", env!("CARGO_PKG_VERSION"));
++
++thread_local! {
++    /// The shared document's `document_id`: the document open when the session first read it (not the Start screen's
++    /// placeholder), or the one the Start screen opened for it.
++    static SHARED: Cell<Option<u64>> = const { Cell::new(None) };
++    /// The shared document as last seen, still reported and merged into once another document replaced it here.
++    static LAST: RefCell<Option<Document>> = const { RefCell::new(None) };
++    /// A pointer is down, or a text field other than the page has the keyboard.
++    static UI_BUSY: Cell<bool> = const { Cell::new(false) };
++    static CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
++}
++
++/// The end of a frame.
++pub fn frame(app: &mut WordApp, ctx: &egui::Context) {
++    UI_BUSY.set(ctx.input(|i| i.pointer.any_down()) || (ctx.memory(|m| m.focused().is_some()) && !app.canvas.focused));
++    CTX.with_borrow_mut(|c| _ = c.get_or_insert_with(|| ctx.clone()));
++    playground_live::frame(app);
++}
++
++pub fn repaint() {
++    CTX.with_borrow(|c| c.iter().for_each(egui::Context::request_repaint));
++}
++
++/// `wordcraft_engine::LIVE_UNDO`: Undo and Redo of the shared document go to the session while connected.
++pub fn undo(document: u64, redo: bool) -> bool {
++    SHARED.get() == Some(document) && playground_live::undo(redo)
++}
++
++/// Whether the open document is the shared one; the first document open becomes it.
++fn bound(app: &WordApp) -> bool {
++    let id = app.session.document_id();
++    match SHARED.get() {
++        Some(shared) => shared == id,
++        None if app.has_document() => {
++            SHARED.set(Some(id));
++            true
++        }
++        None => false,
++    }
++}
++
++fn project(doc: &Document) -> Value {
++    let mut d = doc.clone();
++    let (media, passthrough) = (std::mem::take(&mut d.media), std::mem::take(&mut d.passthrough));
++    d.settings.zoom = None;
++    (d.core.created, d.core.modified, d.core.last_modified_by, d.core.revision) = Default::default();
++    let mut v = serde_json::to_value(&d).unwrap_or_default();
++    without_field_codes(&mut v);
++    // ponytail: files are encoded again on every changed frame; cache the text by Arc if big pictures make typing lag.
++    for (key, files) in [("media", media), ("passthrough", passthrough)] {
++        if !files.is_empty() {
++            v[key] = files.iter().map(|(name, bytes)| (name.clone(), Value::from(base64_encode(bytes)))).collect::<Map<_, _>>().into();
++        }
++    }
++    v
++}
++
++/// Shift+F9's per-field code view is this person's.
++fn without_field_codes(v: &mut Value) {
++    match v {
++        Value::Object(m) => {
++            if m.get("type").and_then(Value::as_str) == Some("field") {
++                m.remove("code");
++            }
++            m.values_mut().for_each(without_field_codes);
++        }
++        Value::Array(items) => items.iter_mut().for_each(without_field_codes),
++        _ => {}
++    }
++}
++
++fn from_shared(mut document: Value) -> Result<Document, Error> {
++    let invalid = |e: &dyn std::fmt::Display| format!("Invalid shared document: {e}");
++    let files = |v: Option<Value>| -> Result<BTreeMap<String, Arc<Vec<u8>>>, Error> {
++        match v {
++            None => Ok(BTreeMap::new()),
++            Some(Value::Object(m)) => m
++                .into_iter()
++                .map(|(name, v)| Ok((name, Arc::new(v.as_str().and_then(base64_decode).ok_or_else(|| invalid(&"bad file bytes"))?))))
++                .collect(),
++            Some(_) => Err(invalid(&"bad files")),
++        }
++    };
++    let map = document.as_object_mut().ok_or_else(|| invalid(&"not an object"))?;
++    let (media, passthrough) = (map.remove("media"), map.remove("passthrough"));
++    let mut doc: Document = serde_json::from_value(document).map_err(|e| invalid(&e))?;
++    (doc.media, doc.passthrough) = (files(media)?, files(passthrough)?);
++    Ok(doc)
++}
++
++/// Keeps `old`'s blocks (and so their layout) where `new` has them unchanged: for each old block, its new index.
++fn reuse(new: &mut Blocks, old: &Blocks) -> Vec<Option<usize>> {
++    let pairs = text_merge::matches(old, new, |a, b| a == b);
++    for (i, j) in pairs.iter().enumerate() {
++        if let (Some(j), Some(block)) = (*j, old.get(i)) {
++            new[j] = block.clone();
++        }
++    }
++    pairs
++}
++
++/// `pos` after its story's blocks went from `old` to `new` (`pairs` from [`reuse`]).
++fn map_pos(pos: &mut Pos, pairs: &[Option<usize>], old: &Blocks, new: &Blocks) {
++    let Some(i) = pos.path.0.first().map(|&i| i as usize) else { return };
++    let j = match pairs.get(i) {
++        Some(Some(j)) => *j,
++        // Its block changed too: the block after the last unchanged one before it, at the same place in the text.
++        _ => {
++            let j = pairs.get(..i).unwrap_or(pairs).iter().rev().find_map(|p| *p).map_or(0, |j| j + 1);
++            if let ([_], Some(Block::Para(a)), Some(Block::Para(b))) = (pos.path.0.as_slice(), old.get(i).map(|b| &**b), new.get(j).map(|b| &**b)) {
++                pos.off = offset(&a.text, &b.text, pos.off);
++            }
++            j
++        }
++    };
++    pos.path.0[0] = j as u32;
++}
++
++/// `off` in `old` moved into `new`: kept in their common start, kept from the end in their common end.
++fn offset(old: &str, new: &str, off: usize) -> usize {
++    let pre: usize = old.chars().zip(new.chars()).take_while(|(a, b)| a == b).map(|(a, _)| a.len_utf8()).sum();
++    if off <= pre {
++        return off;
++    }
++    let suf: usize = old[pre..].chars().rev().zip(new[pre..].chars().rev()).take_while(|(a, b)| a == b).map(|(a, _)| a.len_utf8()).sum();
++    let after = old.len().saturating_sub(off);
++    if after <= suf { new.len() - after } else { pre }
++}
++
++impl Live for WordApp {
++    fn live_document(&self) -> Value {
++        if bound(self) {
++            LAST.set(Some(self.session.doc.clone()));
++        } else if SHARED.get().is_some() {
++            return LAST.with_borrow(|last| project(last.as_ref().unwrap_or(&self.session.doc)));
++        }
++        project(&self.session.doc)
++    }
++
++    fn live_adopt(&mut self, document: Value) -> Result<(), Error> {
++        let mut doc = from_shared(document)?;
++        if !self.has_document() {
++            // The Start screen: the shared document opens.
++            self.session.set_document(doc);
++            self.ui.backstage = false;
++            SHARED.set(Some(self.session.document_id()));
++            LAST.set(Some(self.session.doc.clone()));
++            return Ok(());
++        }
++        if !bound(self) {
++            LAST.set(Some(doc));
++            return Ok(());
++        }
++        let s = &mut self.session;
++        doc.settings.zoom = s.doc.settings.zoom;
++        let core = &s.doc.core;
++        (doc.core.created, doc.core.modified, doc.core.last_modified_by, doc.core.revision) =
++            (core.created.clone(), core.modified.clone(), core.last_modified_by.clone(), core.revision);
++        doc.ensure_nonempty();
++        if doc == s.doc {
++            return Ok(());
++        }
++        // Unchanged blocks and files keep their Arcs (and their layout); the selection moves with the text.
++        let body = reuse(&mut doc.body, &s.doc.body);
++        let mut parts = BTreeMap::new();
++        for (id, part) in doc.parts.iter_mut() {
++            if let Some(was) = s.doc.parts.get(id) {
++                parts.insert(*id, reuse(&mut part.blocks, &was.blocks));
++            }
++        }
++        for (new, old) in [(&mut doc.media, &s.doc.media), (&mut doc.passthrough, &s.doc.passthrough)] {
++            for (name, bytes) in new.iter_mut() {
++                if let Some(was) = old.get(name).filter(|was| ***was == **bytes) {
++                    *bytes = was.clone();
++                }
++            }
++        }
++        for pos in [&mut s.sel.anchor, &mut s.sel.focus] {
++            let story = match pos.story {
++                StoryRef::Body => Some((&body, &s.doc.body, &doc.body)),
++                StoryRef::Part(id) => parts.get(&id).zip(s.doc.parts.get(&id)).zip(doc.parts.get(&id)).map(|((p, o), n)| (p, &o.blocks, &n.blocks)),
++            };
++            if let Some((pairs, old, new)) = story {
++                map_pos(pos, pairs, old, new);
++            }
++        }
++        s.doc = doc;
++        s.also_selected.clear();
++        s.column = None;
++        s.touch();
++        s.clamp_selection();
++        Ok(())
++    }
++
++    fn live_quiet(&self) -> bool {
++        !UI_BUSY.get() && self.canvas.ime_preedit.is_empty()
++    }
++
++    fn live_generation(&self) -> Option<u64> {
++        // Elsewhere only a remote change, adopted already, changes the shared document.
++        Some(if bound(self) { self.session.rev() ^ self.session.document_id().rotate_left(40) } else { u64::MAX })
++    }
++
++    fn live_disconnected(&mut self) {
++        LAST.set(None);
++        if SHARED.take() == Some(self.session.document_id()) {
++            self.session.reset_history();
++        }
++    }
++
++    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
++        let merged = text_merge::merge(base, current, edited)?;
++        from_shared(merged.clone())?;
++        Ok(merged)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use playground_live::canonical;
++    use serde_json::json;
++    use wordcraft_engine::Session;
++    use wordcraft_ui_egui::Services;
++
++    fn app(text: &[&str]) -> WordApp {
++        let mut doc = Document::new();
++        doc.body = text.iter().map(|t| wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text(t, Default::default()))).collect();
++        WordApp::new(Session::new(doc), Services::default())
++    }
++    fn caret(app: &mut WordApp, block: usize, off: usize) {
++        app.session.sel = wordcraft_engine::Selection::caret(Pos::body(block, off));
++    }
++    fn typed(app: &mut WordApp, block: usize, off: usize, text: &str) {
++        caret(app, block, off);
++        app.session.run("text.insert", &json!({"text": text})).unwrap();
++    }
++
++    #[test]
++    fn shares_the_document_without_views_merges_text_in_without_an_undo_step_and_waits_for_a_gesture() {
++        let mut a = app(&["Hello world", "Second", "Third"]);
++        let _ = wordcraft_engine::LIVE_UNDO.set(undo);
++        playground_live::connect();
++        let start = canonical(&a.live_document());
++        // Views, save stamps and field-code toggles are not shared.
++        caret(&mut a, 2, 3);
++        a.session.view.zoom = 2.0;
++        a.session.stamp_save();
++        assert_eq!(canonical(&a.live_document()), start, "views are not shared");
++
++        // B (another page: the adapter's state is per thread) joins from the Start screen and adopts it whole, types in
++        // the first paragraph and adds one before the last.
++        let joined = start.clone();
++        let edited = std::thread::spawn(move || {
++            let mut b = app(&[""]);
++            b.ui.start_screen = true;
++            b.start_screen();
++            assert!(!b.has_document());
++            b.live_adopt(serde_json::from_slice(&joined).unwrap()).unwrap();
++            assert!(b.has_document() && !b.ui.backstage);
++            assert_eq!(canonical(&b.live_document()), joined);
++            typed(&mut b, 0, 0, "Oh, ");
++            typed(&mut b, 2, 0, "New");
++            b.session.run("text.newParagraph", &json!({})).unwrap();
++            canonical(&b.live_document())
++        })
++        .join()
++        .unwrap();
++        // A, typing in the same first paragraph further on, merges B's edits at a quiet frame, keeping its own, its
++        // caret, its undo history and unchanged blocks.
++        typed(&mut a, 0, 11, "!");
++        caret(&mut a, 2, 3);
++        let (undo_steps, second) = (a.session.undo_depth(), a.session.doc.body[1].clone());
++        let done = std::rc::Rc::new(Cell::new(false));
++        let to = done.clone();
++        playground_live::queue(Some(start.clone()), edited, Box::new(move |r| to.set(r.is_ok())));
++        UI_BUSY.set(true);
++        playground_live::frame(&mut a);
++        assert!(!done.get(), "a gesture under way holds remote changes");
++        UI_BUSY.set(false);
++        playground_live::frame(&mut a);
++        assert!(done.get());
++        let text: Vec<&str> = a.session.doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.text.as_str()).collect();
++        assert_eq!(text[0], "Oh, Hello world!");
++        assert_eq!(text.last(), Some(&"Third"));
++        assert_eq!(a.session.undo_depth(), undo_steps, "no undo step");
++        assert!(Arc::ptr_eq(&a.session.doc.body[1], &second), "an unchanged paragraph keeps its Arc");
++        let last = a.session.doc.body.len() - 1;
++        assert_eq!((a.session.sel.focus.path.0.as_slice(), a.session.sel.focus.off), (&[last as u32][..], 3), "the caret stays in Third");
++        assert_eq!(a.session.view.zoom, 2.0);
++
++        // Undo goes to the session; the shared document ends at another document.
++        a.session.run("edit.undo", &json!({})).unwrap();
++        assert_eq!(playground_live::activity().1, [false]);
++        let shared = canonical(&a.live_document());
++        a.session.set_document(Document::new());
++        assert_eq!(canonical(&a.live_document()), shared, "the shared document stays reported");
++        a.session.run("text.insert", &json!({"text": "x"})).unwrap();
++        a.session.run("edit.undo", &json!({})).unwrap();
++        assert_eq!(a.session.doc.plain_text(StoryRef::Body).trim(), "", "another document's Undo is native");
++        playground_live::disconnect();
++    }
++
++    #[test]
++    fn a_merge_that_would_not_open_is_refused() {
++        let base = json!({"body": [{"kind": "para", "text": "a", "runs": [{"len": 1}]}]});
++        let bad = json!({"body": [{"kind": "para", "text": "a", "runs": "?"}]});
++        assert!(WordApp::live_merge(&base, &base, &bad).is_err());
++        assert!(WordApp::live_merge(&base, &base, &Value::Null).is_err());
++    }
++}
+diff --git a/apps/wordcraft-web/src/main.rs b/apps/wordcraft-web/src/main.rs
+index 2f4283d..9f074ff 100644
+--- a/apps/wordcraft-web/src/main.rs
++++ b/apps/wordcraft-web/src/main.rs
+@@ -12,6 +12,15 @@
+ #[cfg(target_arch = "wasm32")]
+ mod web;
+ 
++#[cfg(any(target_arch = "wasm32", test))]
++#[cfg_attr(test, allow(dead_code))]
++mod live;
++#[cfg(any(target_arch = "wasm32", test))]
++#[allow(dead_code)]
++mod playground_live;
++#[cfg(any(target_arch = "wasm32", test))]
++mod text_merge;
++
+ #[cfg(target_arch = "wasm32")]
+ fn main() {
+     web::start();
+diff --git a/apps/wordcraft-web/src/text_merge.rs b/apps/wordcraft-web/src/text_merge.rs
+new file mode 100644
+index 0000000..a58eafa
+--- /dev/null
++++ b/apps/wordcraft-web/src/text_merge.rs
+@@ -0,0 +1,402 @@
++//! Playground live editing: the three-way merge of WordCraft's shared document (JSON). Stories (the body, parts, note
++//! separators, table cells) are lists of blocks without ids and a paragraph is one string with byte-length runs and
++//! positional inline objects, so they merge as text does (diff3, as git merges lines): blocks that neither side
++//! changed match by content; where both sides changed the same stretch of blocks, its paragraphs become characters
++//! (each with its run's formatting and, for U+FFFC, its inline object; a paragraph end carries the paragraph's own
++//! properties) that merge the same way and then become paragraphs again. Overlapping changes conflict. Table rows and
++//! cells merge by position while both sides keep the table's shape; everything else merges as JSON by key
++//! ([`playground_live::merge`]).
++
++use std::borrow::Cow;
++
++use serde_json::{Map, Value};
++
++use crate::playground_live::{self, Error};
++
++/// The object replacement character: an inline object's place in a paragraph's text.
++const OBJ: char = '\u{FFFC}';
++/// Edit distance [`matches`] works out exactly; past it the stretch counts as all changed (more conflicts, never a
++/// wrong merge).
++// ponytail: O(D²) memory for the trace (about 8 MB at the cap); a linear-space Myers if bigger edits must merge.
++const MAX_EDITS: isize = 1000;
++
++pub fn merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
++    value(base, current, edited, "")
++}
++
++fn conflict(at: &str) -> Error {
++    format!("Conflict at {}", if at.is_empty() { "/" } else { at })
++}
++
++fn value(b: &Value, c: &Value, e: &Value, key: &str) -> Result<Value, Error> {
++    if e == b {
++        return Ok(c.clone());
++    }
++    if c == b {
++        return Ok(e.clone());
++    }
++    match (b, c, e) {
++        (Value::Object(bo), Value::Object(co), Value::Object(eo)) => {
++            let keys: std::collections::BTreeSet<&String> = bo.keys().chain(co.keys()).chain(eo.keys()).collect();
++            let mut out = Map::new();
++            for k in keys {
++                let (bv, cv, ev) = (bo.get(k), co.get(k), eo.get(k));
++                let merged = if ev == bv {
++                    cv.cloned()
++                } else if cv == bv {
++                    ev.cloned()
++                } else if let (Some(bv), Some(cv), Some(ev)) = (bv, cv, ev) {
++                    Some(value(bv, cv, ev, k)?)
++                } else {
++                    return Err(conflict(k));
++                };
++                if let Some(v) = merged {
++                    out.insert(k.clone(), v);
++                }
++            }
++            Ok(Value::Object(out))
++        }
++        (Value::Array(bs), Value::Array(cs), Value::Array(es)) if [bs, cs, es].iter().all(|a| a.iter().all(is_block)) => {
++            blocks(bs, cs, es).map(Value::Array)
++        }
++        // A table's rows and a row's cells, while both sides keep their number: by position, unless a side moved one
++        // (a sort), which conflicts.
++        (Value::Array(bs), Value::Array(cs), Value::Array(es)) if matches!(key, "rows" | "cells") && bs.len() == cs.len() && bs.len() == es.len() => {
++            let moved = |x: &Value, at: &Value| x != at && bs.contains(x);
++            bs.iter()
++                .zip(cs.iter().zip(es))
++                .map(|(b, (c, e))| if moved(c, b) || moved(e, b) { Err(conflict(key)) } else { value(b, c, e, "") })
++                .collect::<Result<Vec<_>, _>>()
++                .map(Value::Array)
++        }
++        _ => playground_live::merge(b, c, e, &[]).map_err(|err| if key.is_empty() { err } else { format!("{err} in {key}") }),
++    }
++}
++
++fn is_block(v: &Value) -> bool {
++    match v.get("kind").and_then(Value::as_str) {
++        Some("para") => v.get("text").is_some_and(Value::is_string) && v.get("runs").is_some_and(Value::is_array),
++        Some("table") => v.get("rows").is_some_and(Value::is_array),
++        _ => false,
++    }
++}
++
++fn blocks(b: &[Value], c: &[Value], e: &[Value]) -> Result<Vec<Value>, Error> {
++    diff3(
++        b,
++        c,
++        e,
++        |x, y| x == y,
++        |b, _, _| Ok(b.clone()),
++        |b, c, e| {
++            // Both sides changed these blocks: merge them character by character.
++            let (b, c, e) = (atoms(b)?, atoms(c)?, atoms(e)?);
++            let merged = diff3(&b, &c, &e, Atom::same, Atom::merge, |_, _, _| Err(conflict("text")))?;
++            paragraphs(merged)
++        },
++    )
++}
++
++/// A story's content in reading order: characters, paragraph ends and tables.
++#[derive(Clone, Debug, PartialEq)]
++enum Atom<'a> {
++    /// A character with its run's `props` (`{}` for none) and, for U+FFFC, its inline object.
++    Char(char, Cow<'a, Value>, Option<Cow<'a, Value>>),
++    /// A paragraph's end: the paragraph without its text, runs and objects.
++    End(Cow<'a, Value>),
++    Table(Cow<'a, Value>),
++}
++
++impl<'a> Atom<'a> {
++    /// The same character, paragraph end or table, whatever its formatting or contents.
++    fn same(x: &Self, y: &Self) -> bool {
++        match (x, y) {
++            (Atom::Char(a, ..), Atom::Char(b, ..)) => a == b,
++            (Atom::End(_), Atom::End(_)) | (Atom::Table(_), Atom::Table(_)) => true,
++            _ => false,
++        }
++    }
++
++    /// One that neither side removed: formatting, objects and paragraph or table properties merge.
++    fn merge(b: &Self, c: &Self, e: &Self) -> Result<Self, Error> {
++        fn three<'a>(b: &Cow<'a, Value>, c: &Cow<'a, Value>, e: &Cow<'a, Value>, key: &str) -> Result<Cow<'a, Value>, Error> {
++            Ok(if e == b {
++                c.clone()
++            } else if c == b {
++                e.clone()
++            } else {
++                Cow::Owned(value(b, c, e, key)?)
++            })
++        }
++        Ok(match (b, c, e) {
++            (Atom::Char(ch, bp, bo), Atom::Char(_, cp, co), Atom::Char(_, ep, eo)) => {
++                let object = match (bo, co, eo) {
++                    (Some(b), Some(c), Some(e)) => Some(three(b, c, e, "objects")?),
++                    _ => None,
++                };
++                Atom::Char(*ch, three(bp, cp, ep, "props")?, object)
++            }
++            (Atom::End(b), Atom::End(c), Atom::End(e)) => Atom::End(three(b, c, e, "paragraph")?),
++            (Atom::Table(b), Atom::Table(c), Atom::Table(e)) => Atom::Table(three(b, c, e, "table")?),
++            _ => return Err(conflict("text")),
++        })
++    }
++}
++
++fn atoms(blocks: &[Value]) -> Result<Vec<Atom<'_>>, Error> {
++    let mut out = Vec::new();
++    for block in blocks {
++        if block.get("kind").and_then(Value::as_str) != Some("para") {
++            out.push(Atom::Table(Cow::Borrowed(block)));
++            continue;
++        }
++        let text = block.get("text").and_then(Value::as_str).unwrap_or_default();
++        let runs = block.get("runs").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
++        let len = |run: &Value| run.get("len").and_then(Value::as_u64).unwrap_or(0) as usize;
++        let mut objects = block.get("objects").and_then(Value::as_array).into_iter().flatten();
++        let (mut run, mut end) = (0, runs.first().map_or(0, len));
++        for (at, ch) in text.char_indices() {
++            while at >= end && run + 1 < runs.len() {
++                run += 1;
++                end += runs.get(run).map_or(0, len);
++            }
++            let props = runs.get(run).and_then(|r| r.get("props")).map_or_else(|| Cow::Owned(Value::Object(Map::new())), Cow::Borrowed);
++            let object = if ch == OBJ { Some(Cow::Borrowed(objects.next().ok_or("Invalid paragraph: an inline object is missing")?)) } else { None };
++            out.push(Atom::Char(ch, props, object));
++        }
++        let rest = block.as_object().into_iter().flatten().filter(|(k, _)| !matches!(k.as_str(), "text" | "runs" | "objects"));
++        out.push(Atom::End(Cow::Owned(Value::Object(rest.map(|(k, v)| (k.clone(), v.clone())).collect()))));
++    }
++    Ok(out)
++}
++
++/// Paragraphs (runs as the app normalizes them: adjacent equal formatting joined) and tables again.
++fn paragraphs(atoms: Vec<Atom>) -> Result<Vec<Value>, Error> {
++    let mut out = Vec::new();
++    let (mut text, mut runs, mut objects) = (String::new(), Vec::<(usize, Value)>::new(), Vec::new());
++    for atom in atoms {
++        match atom {
++            Atom::Char(ch, props, object) => {
++                match runs.last_mut() {
++                    Some((len, p)) if *p == *props => *len += ch.len_utf8(),
++                    _ => runs.push((ch.len_utf8(), props.into_owned())),
++                }
++                text.push(ch);
++                objects.extend(object.map(Cow::into_owned));
++            }
++            Atom::End(rest) => {
++                let mut p = match rest.into_owned() {
++                    Value::Object(p) => p,
++                    _ => Map::new(),
++                };
++                p.insert("text".into(), std::mem::take(&mut text).into());
++                let runs = runs.drain(..).map(|(len, props)| {
++                    let mut run = Map::from_iter([("len".to_string(), Value::from(len))]);
++                    if props.as_object().is_none_or(|p| !p.is_empty()) {
++                        run.insert("props".into(), props);
++                    }
++                    Value::Object(run)
++                });
++                p.insert("runs".into(), runs.collect());
++                if !objects.is_empty() {
++                    p.insert("objects".into(), std::mem::take(&mut objects).into());
++                }
++                out.push(Value::Object(p));
++            }
++            // Text left without its paragraph end (one side joined paragraphs where the other put a table).
++            Atom::Table(_) if !text.is_empty() => return Err(conflict("text")),
++            Atom::Table(table) => out.push(table.into_owned()),
++        }
++    }
++    if !text.is_empty() {
++        return Err(conflict("text"));
++    }
++    Ok(out)
++}
++
++/// diff3: the stretches where `b`, `c` and `e` agree (items `same` in all three, merged by `stable`) and between them
++/// the changed ones, taken from the side that changed them, or from `both` when both did.
++fn diff3<T: Clone + PartialEq>(
++    b: &[T],
++    c: &[T],
++    e: &[T],
++    same: impl Fn(&T, &T) -> bool + Copy,
++    mut stable: impl FnMut(&T, &T, &T) -> Result<T, Error>,
++    mut both: impl FnMut(&[T], &[T], &[T]) -> Result<Vec<T>, Error>,
++) -> Result<Vec<T>, Error> {
++    let (mc, me) = (matches(b, c, same), matches(b, e, same));
++    let (mut i, mut j, mut k) = (0, 0, 0);
++    let mut out = Vec::new();
++    loop {
++        while i < b.len() && mc[i] == Some(j) && me[i] == Some(k) {
++            out.push(stable(&b[i], &c[j], &e[k])?);
++            (i, j, k) = (i + 1, j + 1, k + 1);
++        }
++        let next = (i..b.len()).find_map(|x| Some((x, mc[x]?, me[x]?))).unwrap_or((b.len(), c.len(), e.len()));
++        if next == (i, j, k) {
++            return Ok(out);
++        }
++        let (bb, cc, ee) = (&b[i..next.0], &c[j..next.1], &e[k..next.2]);
++        if cc == bb {
++            out.extend_from_slice(ee);
++        } else if ee == bb {
++            out.extend_from_slice(cc);
++        } else {
++            out.extend(both(bb, cc, ee)?);
++        }
++        (i, j, k) = next;
++    }
++}
++
++/// For each item of `a`, the item of `b` it is paired with in a longest common subsequence (Myers' O(ND) diff after
++/// the common start and end).
++pub fn matches<T>(a: &[T], b: &[T], same: impl Fn(&T, &T) -> bool) -> Vec<Option<usize>> {
++    let mut out = vec![None; a.len()];
++    let pre = a.iter().zip(b).take_while(|(x, y)| same(x, y)).count();
++    let suf = a[pre..].iter().rev().zip(b[pre..].iter().rev()).take_while(|(x, y)| same(x, y)).count();
++    for (i, o) in out.iter_mut().enumerate().take(pre) {
++        *o = Some(i);
++    }
++    for s in 1..=suf {
++        out[a.len() - s] = Some(b.len() - s);
++    }
++    let (a, b) = (&a[pre..a.len() - suf], &b[pre..b.len() - suf]);
++    let (n, m) = (a.len() as isize, b.len() as isize);
++    if n == 0 || m == 0 {
++        return out;
++    }
++    let off = n + m + 1;
++    let mut v = vec![0isize; 2 * off as usize + 1];
++    let mut trace = Vec::new();
++    'search: for d in 0..=n + m {
++        if d > MAX_EDITS {
++            return out;
++        }
++        // The furthest x on diagonals -d-1..=d+1 before this step, for the way back.
++        trace.push(v[(off - d - 1) as usize..=(off + d + 1) as usize].to_vec());
++        for k in (-d..=d).step_by(2) {
++            let at = |k: isize| v[(off + k) as usize];
++            let mut x = if k == -d || (k != d && at(k - 1) < at(k + 1)) { at(k + 1) } else { at(k - 1) + 1 };
++            let mut y = x - k;
++            while x < n && y < m && same(&a[x as usize], &b[y as usize]) {
++                (x, y) = (x + 1, y + 1);
++            }
++            v[(off + k) as usize] = x;
++            if x >= n && y >= m {
++                break 'search;
++            }
++        }
++    }
++    let (mut x, mut y) = (n, m);
++    for (d, t) in trace.iter().enumerate().rev() {
++        let d = d as isize;
++        let at = |k: isize| t[(k + d + 1) as usize];
++        let k = x - y;
++        let prev = if k == -d || (k != d && at(k - 1) < at(k + 1)) { k + 1 } else { k - 1 };
++        let (px, py) = (at(prev), at(prev) - prev);
++        while x > px && y > py {
++            (x, y) = (x - 1, y - 1);
++            out[pre + x as usize] = Some(pre + y as usize);
++        }
++        (x, y) = (px, py);
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    /// A paragraph from (text, bold) pieces.
++    fn para(pieces: &[(&str, bool)]) -> Value {
++        let text: String = pieces.iter().map(|(t, _)| *t).collect();
++        let runs: Vec<Value> =
++            pieces.iter().map(|(t, bold)| if *bold { json!({"len": t.len(), "props": {"bold": true}}) } else { json!({"len": t.len()}) }).collect();
++        json!({"kind": "para", "text": text, "runs": runs})
++    }
++    fn plain(text: &str) -> Value {
++        para(&[(text, false)])
++    }
++    fn doc(body: Vec<Value>) -> Value {
++        json!({"body": body, "settings": {"trackChanges": false}})
++    }
++
++    #[test]
++    fn edits_in_different_paragraphs_and_places_merge_and_overlapping_ones_conflict() {
++        let base = doc(vec![plain("One two three"), plain("Four"), plain("Five")]);
++        // Different paragraphs, and one side adds a paragraph.
++        let c = doc(vec![plain("One two three!"), plain("Four"), plain("Five")]);
++        let e = doc(vec![plain("One two three"), plain("Four"), plain("New"), plain("Five 5")]);
++        assert_eq!(merge(&base, &c, &e).unwrap(), doc(vec![plain("One two three!"), plain("Four"), plain("New"), plain("Five 5")]));
++        // The same paragraph, different places; one side also splits it (Enter) after "two".
++        let c = doc(vec![plain("Uno two three"), plain("Four"), plain("Five")]);
++        let e = doc(vec![plain("One two"), plain(" three, four"), plain("Four"), plain("Five")]);
++        assert_eq!(merge(&base, &c, &e).unwrap(), doc(vec![plain("Uno two"), plain(" three, four"), plain("Four"), plain("Five")]));
++        // Next to each other: a conflict.
++        let e = doc(vec![plain("One"), plain(" two three"), plain("Four"), plain("Five")]);
++        assert!(merge(&base, &c, &e).is_err());
++        // The same place: a conflict, even when both typed the same.
++        let c = doc(vec![plain("One two! three"), plain("Four"), plain("Five")]);
++        let e = doc(vec![plain("One two? three"), plain("Four"), plain("Five")]);
++        assert!(merge(&base, &c, &e).unwrap_err().contains("Conflict"));
++        assert!(merge(&base, &c, &c).is_err());
++        // Other parts of the document merge by key.
++        let mut c = base.clone();
++        c["settings"]["trackChanges"] = json!(true);
++        let e = doc(vec![plain("One two three"), plain("Four"), plain("Five!")]);
++        let mut both = e.clone();
++        both["settings"]["trackChanges"] = json!(true);
++        assert_eq!(merge(&base, &c, &e).unwrap(), both);
++    }
++
++    #[test]
++    fn formatting_and_inline_objects_follow_their_characters() {
++        let pic = |w: u32| json!({"type": "image", "media": "image1.png", "w": w, "h": 10});
++        let mut base = plain("ab\u{FFFC}cd efg");
++        base["objects"] = json!([pic(10)]);
++        base["props"] = json!({"style": "Normal"});
++        // One side bolds "efg" and resizes the picture; the other types before the picture and restyles the paragraph.
++        let mut c = para(&[("ab\u{FFFC}cd ", false), ("efg", true)]);
++        c["objects"] = json!([pic(20)]);
++        c["props"] = json!({"style": "Normal"});
++        let mut e = plain("aXb\u{FFFC}cd efg");
++        e["objects"] = json!([pic(10)]);
++        e["props"] = json!({"style": "Heading1"});
++        let mut want = para(&[("aXb\u{FFFC}cd ", false), ("efg", true)]);
++        want["objects"] = json!([pic(20)]);
++        want["props"] = json!({"style": "Heading1"});
++        assert_eq!(merge(&doc(vec![base.clone()]), &doc(vec![c]), &doc(vec![e])).unwrap(), doc(vec![want]));
++        // Bold and italic on the same letter merge; bold on both sides conflicts.
++        let styled = |props: Value| json!({"kind": "para", "text": "ab", "runs": [{"len": 1, "props": props}, {"len": 1}]});
++        let b = doc(vec![plain("ab")]);
++        let merged = merge(&b, &doc(vec![styled(json!({"bold": true}))]), &doc(vec![styled(json!({"italic": true}))])).unwrap();
++        assert_eq!(merged, doc(vec![styled(json!({"bold": true, "italic": true}))]));
++        let bold = doc(vec![styled(json!({"bold": true}))]);
++        assert!(merge(&b, &bold, &bold).is_err());
++    }
++
++    #[test]
++    fn tables_merge_by_cell_while_their_shape_holds_and_a_sort_conflicts() {
++        let cell = |t: &str| json!({"blocks": [plain(t)]});
++        let table = |rows: &[[&str; 2]]| json!({"kind": "table", "rows": rows.iter().map(|r| json!({"cells": [cell(r[0]), cell(r[1])]})).collect::<Vec<_>>()});
++        let base = doc(vec![table(&[["a", "b"], ["c", "d"]]), plain("after")]);
++        let c = doc(vec![table(&[["a1", "b"], ["c", "d"]]), plain("after")]);
++        let e = doc(vec![table(&[["a", "b"], ["c", "d2"]]), plain("after")]);
++        assert_eq!(merge(&base, &c, &e).unwrap(), doc(vec![table(&[["a1", "b"], ["c", "d2"]]), plain("after")]));
++        let sorted = doc(vec![table(&[["c", "d"], ["a", "b"]]), plain("after")]);
++        assert!(merge(&base, &sorted, &e).is_err());
++    }
++
++    #[test]
++    fn matches_pairs_a_longest_common_subsequence() {
++        let pairs = |a: &str, b: &str| {
++            let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
++            matches(&a, &b, |x, y| x == y)
++        };
++        assert_eq!(pairs("abcabba", "cbabac").iter().flatten().count(), 4);
++        assert_eq!(pairs("xay", "xby"), [Some(0), None, Some(2)]);
++        assert_eq!(pairs("", "abc"), []);
++        assert_eq!(pairs("abc", "zabcz"), [Some(1), Some(2), Some(3)]);
++    }
++}
+diff --git a/apps/wordcraft-web/src/web.rs b/apps/wordcraft-web/src/web.rs
+index 0e40099..683b454 100644
+--- a/apps/wordcraft-web/src/web.rs
++++ b/apps/wordcraft-web/src/web.rs
+@@ -38,7 +38,8 @@ pub fn start() {
+         {
+             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
+         }
+-        let result = eframe::WebRunner::new()
++        let runner = eframe::WebRunner::new();
++        let result = runner
+             .start(
+                 canvas,
+                 options,
+@@ -73,6 +74,14 @@ pub fn start() {
+                 }),
+             )
+             .await;
++        if result.is_ok() {
++            // Playground live editing (inert until its shell connects).
++            let _ = wordcraft_engine::LIVE_UNDO.set(crate::live::undo);
++            let with_app = move |f: &mut dyn FnMut(&mut WordApp)| runner.app_mut::<WebShell>().map(|mut shell| f(&mut shell.app)).is_some();
++            if let Err(e) = crate::playground_live::web::attach::<WordApp>(crate::live::FORMAT, with_app, crate::live::repaint) {
++                log::error!("live editing unavailable: {e:?}");
++            }
++        }
+         if let Some(el) = document.get_element_by_id(LOADING_ID) {
+             match result {
+                 Ok(()) => el.remove(),
+@@ -124,6 +133,11 @@ impl eframe::App for WebShell {
+ 
+     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+         self.app.ui(ui);
++        crate::live::frame(&mut self.app, ui.ctx());
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
+     }
+ }
+ 
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 0158a60..0ac8fca 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -31,6 +31,10 @@ pub use session::{
+     CellRange, ColumnBlock, EditSnapshot, FindState, MathEdit, Prefs, Selection, Session, UNDO_LIST_MAX, ViewState, blank_document, set_system_locale,
+ };
+ pub use wordcraft_doc as doc;
++
++/// Set by the web app for live editing: takes Undo (false) or Redo (true) of document `id` from the native history
++/// when it returns true.
++pub static LIVE_UNDO: std::sync::OnceLock<fn(u64, bool) -> bool> = std::sync::OnceLock::new();
+ pub use wordcraft_geom::Region;
+ pub use wordcraft_layout as layout;
+ pub use wordcraft_proof as proof;
+diff --git a/crates/engine/src/session.rs b/crates/engine/src/session.rs
+index 4f16aea..ed7c1b6 100644
+--- a/crates/engine/src/session.rs
++++ b/crates/engine/src/session.rs
+@@ -1165,6 +1165,12 @@ impl Session {
+     /// control channel). Mutating commands are undoable; a failed command leaves the document as
+     /// it was; a panic inside a command becomes an error.
+     pub fn run(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
++        if let Some(undo) = crate::LIVE_UNDO.get()
++            && matches!(id, "edit.undo" | "edit.undoTo" | "edit.redo")
++            && (0..params.get("count").and_then(Value::as_u64).unwrap_or(1).max(1)).all(|_| undo(self.document_id, id == "edit.redo"))
++        {
++            return Ok(Value::Null);
++        }
+         let join = std::mem::take(&mut self.join_next);
+         let reg = self.registry.clone();
+         let Some(spec) = reg.get(id) else { return Err(CmdError::Unknown(id.to_string())) };

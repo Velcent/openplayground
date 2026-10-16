@@ -150,6 +150,7 @@ groups:
         icon: icons/wordcraft.svg
         theme: themes/word.js
         patches: patches/word.yaml
+        live: apps/wordcraft-web/src
         accent: "#41A5EE"
         base: "#0B2557"
 
