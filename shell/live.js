@@ -4,13 +4,17 @@
 // proposal at a time and has the app merge each accepted change into its live document. Rejected or conflicting
 // local work is kept as a draft, never overwritten silently. Without the owner, editing pauses.
 //
-// The app supplies an adapter (Honeydew: src/app/live.rs): format, checkpoint(), merge(base, current, edited),
-// apply(base | null, edited) → Promise, connect({ changed, undo }) and disconnect().
+// The app supplies an adapter (Honeydew: src/app/live.rs; others: patches/live/playground_live.rs): format;
+// checkpoint(), which throws 'busy' while a gesture is under way; merge(base, current, edited); apply(base, edited) and
+// apply(null, document), promises settled at the next quiet frame, the second resolving to the document it replaced;
+// connect({ changed, undo }) and disconnect().
 import { DocumentHistory, stacks } from './document-history.js'
 import { applyDelta, delta } from './document-delta.js'
 
 const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i])
-const RETAINED = 100
+const busy = (e) => e === 'busy' || e?.message === 'busy'
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const RETAINED = 100, MAX_WANTED = 8
 
 // The app's adapter: set before the shell loads (globalThis.playgroundLiveAdapter) or offered through attach.
 let adapter = globalThis.playgroundLiveAdapter ?? null
@@ -20,7 +24,12 @@ export const liveAdapter = () => adapter
 // Live editing for a session once this page's app offers an adapter; apps without one only share files.
 export function follow(session) {
   if (!followed.has(session)) followed.set(session, (adapter ? Promise.resolve(adapter) : new Promise((resolve) => waiting.add(resolve)))
-    .then(async (found) => session.unfollowed ? null : (session.live = await LiveDocument.start({ session, adapter: found }))))
+    .then(async (found) => {
+      if (session.unfollowed) return null
+      const live = await LiveDocument.start({ session, adapter: found })
+      if (session.unfollowed) { live.stop(); return null }
+      return session.live = live
+    }))
   return followed.get(session)
 }
 export function unfollow(session) {
@@ -31,15 +40,18 @@ export function unfollow(session) {
 export class LiveDocument extends EventTarget {
   static async start({ session, adapter, store = session.store }) {
     const live = new LiveDocument(session, adapter, store)
-    if (session.config.owner) await live.coordinate()
+    // Connected first: the owner's coordinate() may need the app to apply a stored document.
     adapter.connect({ changed: () => queueMicrotask(() => live.kick()), undo: (redo) => queueMicrotask(() => live.undo(redo)) })
+    if (session.config.owner) await live.coordinate()
     for (const [type, handler] of Object.entries(live.handlers)) session.addEventListener(type, handler)
     for (const peer of session.peers.values()) if (peer.document?.readyState === 'open') live.opened(peer)
+    // A snapshot the owner sent before this document listened is gone: ask again.
+    live.resync()
     return live
   }
   constructor(session, adapter, store) {
     super()
-    Object.assign(this, { session, adapter, store, acked: null, entries: [], inflight: null, wanted: [], error: null })
+    Object.assign(this, { session, adapter, store, acked: null, entries: [], inflight: null, wanted: [], error: null, unsaved: [] })
     this.work = this.coordinating = Promise.resolve()
     this.handlers = {
       document: (e) => this.receive(e.peer, e.value),
@@ -49,13 +61,15 @@ export class LiveDocument extends EventTarget {
   }
   get editable() { return this.session.role !== 'viewer' }
   get status() {
+    if (this.incompatible) return 'incompatible'
     if (!this.acked) return 'catching up'
-    if (!this.history && !this.coordinator()) return 'paused'
+    if (this.session.stopped || (!this.history && !this.coordinator())) return 'paused'
     return this.editable ? 'live' : 'read-only'
   }
   changed() { this.dispatchEvent(new Event('change')) }
   report(error) { this.error = error?.message ?? String(error); this.changed() }
   stop() {
+    this.stopped = true
     for (const [type, handler] of Object.entries(this.handlers)) this.session.removeEventListener(type, handler)
     this.adapter.disconnect()
   }
@@ -63,28 +77,38 @@ export class LiveDocument extends EventTarget {
     return [...this.session.peers.values()].find((p) => p.role === 'owner' && p.document?.readyState === 'open')
   }
 
-  // Coordinator: the journal decides; one proposal is handled at a time so entries go out in revision order.
+  // Coordinator. Proposals go to the journal as they arrive (its own bounds apply); their replies and broadcasts
+  // follow in submission order, which is revision order.
   async coordinate() {
     const options = {
       merge: (base, current, edited) => this.adapter.merge(base, current, edited),
       commit: (record) => this.store.document(record),
       allowed: (id) => id === this.session.id ? this.editable : ['owner', 'editor'].includes(this.session.peers.get(id)?.role),
     }
-    const record = await this.store.document()
-    if (record?.format === this.adapter.format) this.history = DocumentHistory.restore(record, options)
-    else {
-      if (record) await this.store.draft(record.bytes)
-      this.history = await DocumentHistory.create({ document: crypto.randomUUID(), format: this.adapter.format, bytes: this.adapter.checkpoint(), ...options })
+    const record = await this.store.document().catch(() => null)
+    try {
+      if (record?.format !== this.adapter.format) throw new Error('another build')
+      this.history = DocumentHistory.restore(record, options)
+    } catch {
+      // Another build's or an unreadable journal: its document carries over when this build can open it.
+      if (record?.bytes) await this.adapter.apply(null, record.bytes).catch(() => this.store.draft(record.bytes))
+      this.history = await DocumentHistory.create({ document: crypto.randomUUID(), format: this.adapter.format, bytes: await this.quietCheckpoint(), ...options })
     }
     const snapshot = this.history.snapshot()
     this.broadcasted = snapshot.revision
     this.work = this.work.then(() => this.adopt(snapshot)).catch((e) => this.report(e))
   }
+  async quietCheckpoint() {
+    for (;;) {
+      try { return this.adapter.checkpoint() } catch (e) { if (!busy(e)) throw e }
+      await sleep(50)
+    }
+  }
   coordinateProposal(author, proposal, reply) {
+    const result = this.history.submit(author, proposal).then((entry) => ({ entry }), (error) => ({ error }))
     this.coordinating = this.coordinating.then(async () => {
-      let entry
-      try { entry = await this.history.submit(author, proposal) }
-      catch (e) { return reply({ type: 'reject', id: proposal?.id, error: e.message }) }
+      const { entry, error } = await result
+      if (error) return reply({ type: 'reject', id: proposal?.id, error: error.message })
       // A replayed ID returns its original entry: only its sender can have missed it.
       if (entry.revision <= this.broadcasted) return reply({ type: 'entry', entry })
       this.broadcasted = entry.revision
@@ -92,19 +116,37 @@ export class LiveDocument extends EventTarget {
       this.receive(null, { type: 'entry', entry })
     })
   }
+  // At most one snapshot per peer in flight, and a second one at least a second later: a peer cannot make the owner
+  // copy the whole document at will.
+  snapshot(peer) {
+    if (peer.snapshotting) { peer.snapshotAgain = true; return }
+    peer.snapshotting = true
+    this.session.sendDocument(peer, { type: 'snapshot', record: this.history.snapshot() }).catch(() => {}).then(() => sleep(1000)).then(() => {
+      peer.snapshotting = false
+      if (peer.snapshotAgain && this.session.peers.get(peer.id) === peer && !this.stopped) { peer.snapshotAgain = false; this.snapshot(peer) }
+    })
+  }
   opened(peer) {
-    if (this.history) this.session.sendDocument(peer, { type: 'snapshot', record: this.history.snapshot() }).catch(() => {})
+    if (this.history) this.snapshot(peer)
+    else if (peer.role === 'owner') this.resyncing = false
     this.changed()
   }
   closed(peer) {
     if (peer.role === 'owner') this.changed()
   }
+  resync() {
+    const owner = !this.history && !this.resyncing && this.coordinator()
+    if (!owner) return
+    this.resyncing = true
+    this.session.sendDocument(owner, { type: 'resync' }).catch(() => { this.resyncing = false })
+  }
 
   // Client. `peer` is null for the coordinator in this browser.
   receive(peer, value) {
+    if (this.stopped) return
     if (this.history && peer) {
       if (value?.type === 'propose') this.coordinateProposal(peer.id, value.proposal, (reply) => this.session.sendDocument(peer, reply).catch(() => {}))
-      else if (value?.type === 'resync') this.opened(peer)
+      else if (value?.type === 'resync') this.snapshot(peer)
       return
     }
     if (peer && peer.role !== 'owner') return
@@ -112,45 +154,58 @@ export class LiveDocument extends EventTarget {
   }
   async process(value) {
     if (value?.type === 'snapshot') return this.adopt(value.record)
-    if (!this.acked) return
-    if (value?.type === 'entry') await this.entry(value.entry)
-    else if (value?.type === 'reject' && value.id === this.inflight?.proposal.id) {
-      const { proposal } = this.inflight
+    if (!this.acked || this.incompatible) return
+    if (value?.type === 'entry') {
+      // An entry that does not apply to our acknowledged document means we diverged: start again from a snapshot.
+      try { await this.entry(value.entry) } catch (e) { this.resync(); throw e }
+    } else if (value?.type === 'reject' && value.id === this.inflight?.proposal.id) {
+      const { proposal, inLive } = this.inflight
       this.inflight = null
-      if (proposal.kind === 'edit') await this.restore()
+      // Only an edit still in the live document is undone here; a conflict already kept it as a draft.
+      if (proposal.kind === 'edit' && inLive) await this.restore(this.acked.bytes)
       this.report(new Error(`${proposal.kind === 'edit' ? 'Edit kept as a draft' : 'Cannot ' + proposal.kind}: ${value.error}`))
     }
     this.kick()
   }
-  // A new document, or the first one: keeps differing local work as a draft. A reconnect replays missed entries.
+  // A new document, or the first one: differing local work becomes a draft. A reconnect replays missed entries.
   async adopt(record) {
+    this.resyncing = false
+    if (record.format !== this.adapter.format) {
+      this.incompatible = true
+      return this.report(new Error(`This session's document is from ${record.format}; this page runs ${this.adapter.format}. Your work here is unchanged.`))
+    }
+    this.incompatible = false
     const known = this.acked?.document === record.document && record.revision >= this.acked.revision
       && record.revision - record.entries.length <= this.acked.revision
+      && (record.revision > this.acked.revision || same(record.bytes, this.acked.bytes))
+    let replayed = false
     if (known) {
-      for (const entry of record.entries) await this.entry(entry)
+      try {
+        for (const entry of record.entries) await this.entry(entry)
+        replayed = true
+      } catch {}
+    }
+    if (replayed) {
       // Its ID makes a resent proposal apply at most once.
       if (this.inflight) this.send(this.inflight.proposal, this.inflight.inLive)
     } else {
+      this.inflight = null
+      await this.restore(record.bytes)
       this.acked = { document: record.document, revision: record.revision, bytes: record.bytes }
-      this.entries = record.entries.slice(-RETAINED); this.inflight = null
-      await this.restore()
+      this.entries = record.entries.slice(-RETAINED)
     }
     this.error = null; this.changed(); this.kick()
   }
+  // The live document takes the entry before the acknowledged one does: a failure leaves both as they were.
   async entry(entry) {
     if (entry.revision <= this.acked.revision) return
-    if (entry.revision !== this.acked.revision + 1) {
-      // A gap: everything after it waits for a fresh snapshot.
-      const owner = this.coordinator()
-      if (owner) await this.session.sendDocument(owner, { type: 'resync' })
-      return
-    }
+    if (entry.revision !== this.acked.revision + 1) return this.resync()
     const before = this.acked.bytes, after = await applyDelta(before, entry.change)
-    this.acked = { ...this.acked, revision: entry.revision, bytes: after }
-    this.entries = [...this.entries, entry].slice(-RETAINED)
     const own = entry.id === this.inflight?.proposal.id
     // An acknowledged edit is already in the live document, unless a conflict replaced it meanwhile.
     if (!own || !this.inflight.inLive) await this.merge(before, after)
+    this.acked = { ...this.acked, revision: entry.revision, bytes: after }
+    this.entries = [...this.entries, entry].slice(-RETAINED)
     if (own) this.inflight = null
     this.changed()
   }
@@ -158,25 +213,35 @@ export class LiveDocument extends EventTarget {
     try { await this.adapter.apply(before, after) }
     catch (e) {
       this.report(new Error(`Local changes kept as a draft: ${e?.message ?? e}`))
-      await this.restore()
+      await this.restore(after)
     }
   }
-  // The live document becomes the acknowledged one; its differing local work goes to a draft first.
-  async restore() {
-    const local = this.adapter.checkpoint()
-    if (same(local, this.acked.bytes)) return
-    await this.store.draft(local)
+  // The live document becomes `document`; what it replaced is kept as a draft when it differs.
+  async restore(document) {
+    const replaced = await this.adapter.apply(null, document)
     if (this.inflight) this.inflight.inLive = false
-    await this.adapter.apply(null, this.acked.bytes)
+    if (!(replaced instanceof Uint8Array) || same(replaced, document)) return
+    try { await this.store.draft(replaced) }
+    catch (e) {
+      // ponytail: held in memory only; offer it for download once there is a drafts UI.
+      this.unsaved.push(replaced)
+      this.report(new Error(`Your replaced work could not be saved as a draft (${e?.message ?? e}). Keep this page open.`))
+    }
   }
-  undo(redo) { this.wanted.push(redo); this.kick() }
-  kick() { this.work = this.work.then(() => this.step()).catch((e) => this.report(e)) }
-  // Sends unsent local work, else the next Undo or Redo, once nothing is in flight.
+  undo(redo) {
+    if (this.status === 'live' && this.wanted.length < MAX_WANTED) this.wanted.push(redo)
+    this.kick()
+  }
+  kick() { if (!this.stopped) this.work = this.work.then(() => this.step()).catch((e) => this.report(e)) }
+  // Sends unsent local work, else the next Undo or Redo, once nothing is in flight. A busy app reports again when
+  // its gesture ends.
   async step() {
-    if (!this.acked || this.inflight || this.status === 'paused') return
-    const local = this.adapter.checkpoint()
+    if (this.status !== 'live' && this.status !== 'read-only') return
+    if (this.inflight) return
+    let local
+    try { local = this.adapter.checkpoint() } catch (e) { if (busy(e)) return; throw e }
     if (!same(local, this.acked.bytes)) {
-      if (!this.editable) return this.adapter.apply(null, this.acked.bytes)
+      if (!this.editable) return this.restore(this.acked.bytes)
       return this.send({ ...this.request('edit'), edit: await delta(this.acked.bytes, local) }, true)
     }
     if (!this.wanted.length) return

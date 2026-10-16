@@ -96,7 +96,7 @@ export function unpack(bytes) {
     if (keys.includes('__proto__')) throw invalid()
     if (keys.length === 1 && keys[0] === '$bytes') {
       if (!Number.isSafeInteger(node.$bytes) || node.$bytes < 0 || node.$bytes > bytes.length - at) throw invalid()
-      return bytes.slice(at, at += node.$bytes)
+      return bytes.subarray(at, at += node.$bytes)
     }
     for (const key of keys) node[key] = revive(node[key])
     return node

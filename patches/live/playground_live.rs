@@ -76,12 +76,28 @@ pub fn parse(bytes: &[u8]) -> Result<Value, Error> {
 /// changed is a conflict, even to the same thing (equal values do not prove who made them; the session's operation IDs
 /// deduplicate). Objects merge by key. Arrays whose items are all objects with a unique scalar `id` merge by id, with
 /// additions kept next to their neighbors; other arrays are single values. `counters` keys take the maximum.
-pub fn merge(base: &Value, current: &Value, edited: &Value, counters: &[&str]) -> Result<Value, Error> {
-    merge_at(Some(base), Some(current), Some(edited), counters, "")?.ok_or_else(|| "Conflict: document removed".into())
+pub fn merge(
+    base: &Value,
+    current: &Value,
+    edited: &Value,
+    counters: &[&str],
+) -> Result<Value, Error> {
+    merge_at(Some(base), Some(current), Some(edited), counters, "")?
+        .ok_or_else(|| "Conflict: document removed".into())
 }
 
-pub fn merge_bytes(base: &[u8], current: &[u8], edited: &[u8], counters: &[&str]) -> Result<Vec<u8>, Error> {
-    Ok(canonical(&merge(&parse(base)?, &parse(current)?, &parse(edited)?, counters)?))
+pub fn merge_bytes(
+    base: &[u8],
+    current: &[u8],
+    edited: &[u8],
+    counters: &[&str],
+) -> Result<Vec<u8>, Error> {
+    Ok(canonical(&merge(
+        &parse(base)?,
+        &parse(current)?,
+        &parse(edited)?,
+        counters,
+    )?))
 }
 
 fn conflict(path: &str) -> Error {
@@ -105,18 +121,29 @@ fn merge_at(
     match (b, c, e) {
         (Some(Value::Object(b)), Some(Value::Object(c)), Some(Value::Object(e))) => {
             let mut out = serde_json::Map::new();
-            let keys: std::collections::BTreeSet<_> = b.keys().chain(c.keys()).chain(e.keys()).collect();
+            let keys: std::collections::BTreeSet<_> =
+                b.keys().chain(c.keys()).chain(e.keys()).collect();
             for k in keys {
-                if let Some(v) = merge_at(b.get(k), c.get(k), e.get(k), counters, &format!("{path}/{k}"))? {
+                if let Some(v) = merge_at(
+                    b.get(k),
+                    c.get(k),
+                    e.get(k),
+                    counters,
+                    &format!("{path}/{k}"),
+                )? {
                     out.insert(k.clone(), v);
                 }
             }
             Ok(Some(Value::Object(out)))
         }
-        (Some(Value::Array(b)), Some(Value::Array(c)), Some(Value::Array(e))) if keyed(&[b, c, e]) => {
+        (Some(Value::Array(b)), Some(Value::Array(c)), Some(Value::Array(e)))
+            if keyed(&[b, c, e]) =>
+        {
             keyed_merge(b, c, e, counters, path).map(|v| Some(Value::Array(v)))
         }
-        (Some(Value::Number(_)), Some(Value::Number(_)), Some(Value::Number(_))) if counters.contains(&key) => {
+        (Some(Value::Number(_)), Some(Value::Number(_)), Some(Value::Number(_)))
+            if counters.contains(&key) =>
+        {
             let n = |v: Option<&Value>| v.and_then(Value::as_f64).unwrap_or(f64::MIN);
             Ok(if n(c) >= n(e) { c.cloned() } else { e.cloned() })
         }
@@ -135,7 +162,9 @@ fn id(item: &Value) -> Option<String> {
 fn keyed(arrays: &[&Vec<Value>]) -> bool {
     arrays.iter().all(|items| {
         let mut seen = std::collections::HashSet::new();
-        items.iter().all(|item| id(item).is_some_and(|id| seen.insert(id)))
+        items
+            .iter()
+            .all(|item| id(item).is_some_and(|id| seen.insert(id)))
     }) && arrays.iter().any(|items| !items.is_empty())
 }
 
@@ -147,7 +176,10 @@ fn keyed_merge(
     path: &str,
 ) -> Result<Vec<Value>, Error> {
     let index = |items: &[Value]| -> BTreeMap<String, Value> {
-        items.iter().map(|item| (id(item).unwrap_or_default(), item.clone())).collect()
+        items
+            .iter()
+            .map(|item| (id(item).unwrap_or_default(), item.clone()))
+            .collect()
     };
     let order = |items: &[Value]| -> Vec<String> { items.iter().filter_map(id).collect() };
     let (bm, cm, em) = (index(b), index(c), index(e));
@@ -163,7 +195,15 @@ fn keyed_merge(
     }
     // The survivors every side has keep the order the one side that reordered them gave.
     let common = |items: &[Value]| -> Vec<String> {
-        order(items).into_iter().filter(|k| merged.contains_key(k) && bm.contains_key(k) && cm.contains_key(k) && em.contains_key(k)).collect()
+        order(items)
+            .into_iter()
+            .filter(|k| {
+                merged.contains_key(k)
+                    && bm.contains_key(k)
+                    && cm.contains_key(k)
+                    && em.contains_key(k)
+            })
+            .collect()
     };
     let (bo, co, eo) = (common(b), common(c), common(e));
     let mut out = if co == bo {
@@ -178,7 +218,10 @@ fn keyed_merge(
         let mut after: Option<String> = None;
         for key in order(side) {
             if merged.contains_key(&key) && !out.contains(&key) {
-                let at = after.as_ref().and_then(|a| out.iter().position(|k| k == a)).map_or(0, |i| i + 1);
+                let at = after
+                    .as_ref()
+                    .and_then(|a| out.iter().position(|k| k == a))
+                    .map_or(0, |i| i + 1);
                 out.insert(at, key.clone());
             }
             if out.contains(&key) {
@@ -193,12 +236,19 @@ fn keyed_merge(
 struct Remote {
     base: Option<Vec<u8>>,
     edited: Vec<u8>,
-    done: Box<dyn FnOnce(Result<(), Error>)>,
+    done: Done,
 }
+
+/// Settles a remote change: a whole adopted document gives back the one it replaced, for the shell's draft.
+pub type Done = Box<dyn FnOnce(Result<Option<Vec<u8>>, Error>)>;
 
 #[derive(Default)]
 struct Session {
     connected: bool,
+    /// The last frame was not quiet: a checkpoint now would catch a gesture half done.
+    busy: bool,
+    /// Ids handed out while connected.
+    ids: u64,
     /// The generation and the canonical document last reported.
     generation: Option<u64>,
     reported: Option<Vec<u8>>,
@@ -238,13 +288,55 @@ pub fn disconnect() {
     }
 }
 
-pub fn queue(base: Option<Vec<u8>>, edited: Vec<u8>, done: Box<dyn FnOnce(Result<(), Error>)>) {
-    SESSION.with_borrow_mut(|s| {
+pub fn queue(base: Option<Vec<u8>>, edited: Vec<u8>, done: Done) {
+    let done = SESSION.with_borrow_mut(|s| {
+        if !s.connected {
+            return Some(done);
+        }
         s.remote.push_back(Remote { base, edited, done });
         if let Some(repaint) = &s.repaint {
             repaint();
         }
+        None
     });
+    if let Some(done) = done {
+        done(Err("Live editing is not connected".into()));
+    }
+}
+
+/// The canonical shared document, unless the last frame was busy: then the next quiet frame reports it again.
+pub fn checkpoint<A: Live>(app: &A) -> Result<Vec<u8>, Error> {
+    let busy = SESSION.with_borrow_mut(|s| {
+        if s.busy {
+            (s.generation, s.reported) = (None, None);
+        }
+        s.busy
+    });
+    if busy {
+        return Err("busy".into());
+    }
+    Ok(canonical(&app.live_document()))
+}
+
+/// A new object id from the app's counter `next`, which goes up as before. While connected the id is also unique
+/// across peers (random high bits), so two people adding objects at once do not pick the same one. For apps whose ids
+/// are opaque 64-bit numbers; ids that index arrays or show to people need the app's own scheme.
+pub fn fresh_id(next: &mut u64) -> u64 {
+    let id = *next;
+    *next += 1;
+    let connected = SESSION.with_borrow_mut(|s| {
+        s.ids += 1;
+        s.connected
+    });
+    if !connected {
+        return id;
+    }
+    #[cfg(target_arch = "wasm32")]
+    let random = (js_sys::Math::random() * (1u64 << 20) as f64) as u64;
+    #[cfg(not(target_arch = "wasm32"))]
+    let random = SESSION.with_borrow(|s| s.ids).wrapping_mul(0x9E37_79B9) & 0xF_FFFF;
+    // Below 2^53, so the shell and JSON keep them exact.
+    (1 << 52) | (random << 32) | (id & 0xFFFF_FFFF)
 }
 
 /// Passes Undo or Redo to the session while connected: whether it did. Call it first in the app's Undo and Redo.
@@ -269,7 +361,11 @@ pub fn activity() -> (u64, Vec<bool>) {
 
 /// The end of each frame: applies the remote changes waiting and reports a changed shared document, once quiet.
 pub fn frame<A: Live>(app: &mut A) {
-    if !SESSION.with_borrow(|s| s.connected) || !app.live_quiet() {
+    let quiet = app.live_quiet();
+    if !SESSION.with_borrow_mut(|s| {
+        s.busy = !quiet;
+        s.connected && quiet
+    }) {
         return;
     }
     let waiting = SESSION.with_borrow_mut(|s| std::mem::take(&mut s.remote));
@@ -299,23 +395,30 @@ pub fn frame<A: Live>(app: &mut A) {
     let _ = changed;
 }
 
-fn adopt<A: Live>(app: &mut A, base: Option<&[u8]>, edited: &[u8]) -> Result<(), Error> {
+fn adopt<A: Live>(
+    app: &mut A,
+    base: Option<&[u8]>,
+    edited: &[u8],
+) -> Result<Option<Vec<u8>>, Error> {
     let edited = parse(edited)?;
-    let document = match base {
-        Some(base) => merge(&parse(base)?, &app.live_document(), &edited, A::COUNTERS)?,
-        None => edited,
+    let current = app.live_document();
+    let (document, replaced) = match base {
+        Some(base) => (merge(&parse(base)?, &current, &edited, A::COUNTERS)?, None),
+        None => (edited, Some(canonical(&current))),
     };
-    app.live_adopt(document)
+    app.live_adopt(document)?;
+    Ok(replaced)
 }
 
-/// The adapter object the Playground shell drives (`shell/live.js`): `format`, `checkpoint()`, `merge(base, current,
-/// edited)`, `apply(base | null, edited)` (a promise, settled at the next quiet frame), `connect({ changed, undo })` and
+/// The adapter object the Playground shell drives (`shell/live.js`): `format`, `checkpoint()` (throws `busy` while a
+/// gesture is under way), `merge(base, current, edited)`, `apply(base | null, edited)` (a promise, settled at the next
+/// quiet frame; a whole adopted document resolves to the one it replaced), `connect({ changed, undo })` and
 /// `disconnect()`. The hooks are called from inside a frame: the shell defers its calls back.
 #[cfg(target_arch = "wasm32")]
 pub mod web {
     use super::{Live, SESSION};
     use js_sys::{Function, Object, Promise, Reflect, Uint8Array};
-    use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
+    use wasm_bindgen::{closure::Closure, JsCast as _, JsValue};
 
     pub(super) struct Hooks {
         pub(super) changed: Function,
@@ -323,7 +426,9 @@ pub mod web {
     }
 
     pub(super) fn call(pick: impl FnOnce(&Hooks) -> &Function, arg: &JsValue) {
-        if let Some(hook) = SESSION.with_borrow(|s| s.hooks.as_ref().map(|hooks| pick(hooks).clone())) {
+        if let Some(hook) =
+            SESSION.with_borrow(|s| s.hooks.as_ref().map(|hooks| pick(hooks).clone()))
+        {
             let _ = hook.call1(&JsValue::NULL, arg);
         }
     }
@@ -339,47 +444,89 @@ pub mod web {
         let with_app = std::rc::Rc::new(with_app);
         SESSION.with_borrow_mut(|s| s.repaint = Some(Box::new(repaint)));
         let adapter = Object::new();
-        let set = |name: &str, value: JsValue| Reflect::set(&adapter, &name.into(), &value).map(drop);
+        let set =
+            |name: &str, value: JsValue| Reflect::set(&adapter, &name.into(), &value).map(drop);
         set("format", format.into())?;
         let app = with_app.clone();
         let checkpoint = move || -> Result<Uint8Array, JsValue> {
             let mut bytes = None;
-            app(&mut |app: &mut A| bytes = Some(super::canonical(&app.live_document())));
-            Ok(bytes.ok_or("The app is not running")?.as_slice().into())
+            app(&mut |app: &mut A| bytes = Some(super::checkpoint(app)));
+            Ok(bytes
+                .ok_or("The app is not running")?
+                .map_err(|e| JsValue::from_str(&e))?
+                .as_slice()
+                .into())
         };
-        set("checkpoint", Closure::<dyn Fn() -> _>::new(checkpoint).into_js_value())?;
-        let merge = |base: Uint8Array, current: Uint8Array, edited: Uint8Array| -> Result<Uint8Array, JsValue> {
-            let merged = super::merge_bytes(&base.to_vec(), &current.to_vec(), &edited.to_vec(), A::COUNTERS);
+        set(
+            "checkpoint",
+            Closure::<dyn Fn() -> _>::new(checkpoint).into_js_value(),
+        )?;
+        let merge = |base: Uint8Array,
+                     current: Uint8Array,
+                     edited: Uint8Array|
+         -> Result<Uint8Array, JsValue> {
+            let merged = super::merge_bytes(
+                &base.to_vec(),
+                &current.to_vec(),
+                &edited.to_vec(),
+                A::COUNTERS,
+            );
             Ok(merged.map_err(|e| JsValue::from_str(&e))?.as_slice().into())
         };
-        set("merge", Closure::<dyn Fn(_, _, _) -> _>::new(merge).into_js_value())?;
+        set(
+            "merge",
+            Closure::<dyn Fn(_, _, _) -> _>::new(merge).into_js_value(),
+        )?;
         let apply = |base: JsValue, edited: Uint8Array| -> Promise {
-            let mut job = Some((base.dyn_ref::<Uint8Array>().map(Uint8Array::to_vec), edited.to_vec()));
+            let mut job = Some((
+                base.dyn_ref::<Uint8Array>().map(Uint8Array::to_vec),
+                edited.to_vec(),
+            ));
             Promise::new(&mut |resolve, reject| {
-                let Some((base, edited)) = job.take() else { return };
-                super::queue(base, edited, Box::new(move |result| {
-                    let _ = match result {
-                        Ok(()) => resolve.call0(&JsValue::NULL),
-                        Err(e) => reject.call1(&JsValue::NULL, &JsValue::from_str(&e)),
-                    };
-                }));
+                let Some((base, edited)) = job.take() else {
+                    return;
+                };
+                super::queue(
+                    base,
+                    edited,
+                    Box::new(move |result| {
+                        let _ = match result {
+                            Ok(None) => resolve.call0(&JsValue::NULL),
+                            Ok(Some(replaced)) => resolve
+                                .call1(&JsValue::NULL, &Uint8Array::from(replaced.as_slice())),
+                            Err(e) => reject.call1(&JsValue::NULL, &JsValue::from_str(&e)),
+                        };
+                    }),
+                );
             })
         };
-        set("apply", Closure::<dyn Fn(_, _) -> _>::new(apply).into_js_value())?;
+        set(
+            "apply",
+            Closure::<dyn Fn(_, _) -> _>::new(apply).into_js_value(),
+        )?;
         let connect = |hooks: JsValue| -> Result<(), JsValue> {
             let get = |name: &str| Reflect::get(&hooks, &name.into())?.dyn_into::<Function>();
-            let hooks = Hooks { changed: get("changed")?, undo: get("undo")? };
+            let hooks = Hooks {
+                changed: get("changed")?,
+                undo: get("undo")?,
+            };
             SESSION.with_borrow_mut(|s| s.hooks = Some(hooks));
             super::connect();
             Ok(())
         };
-        set("connect", Closure::<dyn Fn(_) -> _>::new(connect).into_js_value())?;
+        set(
+            "connect",
+            Closure::<dyn Fn(_) -> _>::new(connect).into_js_value(),
+        )?;
         let app = with_app.clone();
         let disconnect = move || {
             super::disconnect();
             app(&mut |app: &mut A| app.live_disconnected());
         };
-        set("disconnect", Closure::<dyn Fn()>::new(disconnect).into_js_value())?;
+        set(
+            "disconnect",
+            Closure::<dyn Fn()>::new(disconnect).into_js_value(),
+        )?;
         let global = js_sys::global();
         Reflect::set(&global, &"playgroundLiveAdapter".into(), &adapter)?;
         let attach = Reflect::get(&global, &"playgroundLive".into())
@@ -407,10 +554,20 @@ mod tests {
         let b = json!({"title": "a", "size": 1, "view": {"zoom": 1}});
         let c = json!({"title": "b", "size": 1, "view": {"zoom": 1}});
         let e = json!({"title": "a", "size": 2, "view": {"zoom": 1}});
-        assert_eq!(m(b.clone(), c.clone(), e).unwrap(), json!({"title": "b", "size": 2, "view": {"zoom": 1}}));
-        assert!(m(b.clone(), c.clone(), c.clone()).unwrap_err().contains("/title"));
+        assert_eq!(
+            m(b.clone(), c.clone(), e).unwrap(),
+            json!({"title": "b", "size": 2, "view": {"zoom": 1}})
+        );
+        assert!(m(b.clone(), c.clone(), c.clone())
+            .unwrap_err()
+            .contains("/title"));
         let removed = json!({"size": 1, "view": {"zoom": 1}});
-        assert!(m(b.clone(), removed, json!({"title": "c", "size": 1, "view": {"zoom": 1}})).is_err());
+        assert!(m(
+            b.clone(),
+            removed,
+            json!({"title": "c", "size": 1, "view": {"zoom": 1}})
+        )
+        .is_err());
     }
 
     #[test]
@@ -422,7 +579,15 @@ mod tests {
         let e = json!({"items": [item(3, "c"), item(2, "B"), item(5, "new e")], "next_id": 6});
         let out = m(b.clone(), c, e).unwrap();
         assert_eq!(out["next_id"], 6);
-        assert_eq!(out["items"], json!([item(3, "c"), item(2, "B"), item(5, "new e"), item(4, "new c")]));
+        assert_eq!(
+            out["items"],
+            json!([
+                item(3, "c"),
+                item(2, "B"),
+                item(5, "new e"),
+                item(4, "new c")
+            ])
+        );
         // 1 was edited on one side and removed on the other.
         let edited_one = json!({"items": [item(1, "A"), item(2, "b"), item(3, "c")], "next_id": 4});
         let removed_one = json!({"items": [item(2, "b"), item(3, "c")], "next_id": 4});
@@ -467,18 +632,30 @@ mod tests {
 
     #[test]
     fn remote_changes_wait_for_quiet_keep_views_and_only_shared_changes_report() {
-        let mut app = Doc { doc: json!({"shared": {"a": 1, "b": 1}, "view": 1}), busy: true };
+        let mut app = Doc {
+            doc: json!({"shared": {"a": 1, "b": 1}, "view": 1}),
+            busy: true,
+        };
         connect();
         let base = canonical(&app.live_document());
         let done = std::rc::Rc::new(std::cell::RefCell::new(None));
         let to = done.clone();
-        queue(Some(base), canonical(&json!({"a": 2, "b": 1})), Box::new(move |r| *to.borrow_mut() = Some(r)));
+        queue(
+            Some(base),
+            canonical(&json!({"a": 2, "b": 1})),
+            Box::new(move |r| *to.borrow_mut() = Some(r)),
+        );
         app.doc["shared"]["b"] = json!(3);
         frame(&mut app);
         assert!(done.borrow().is_none(), "a busy app waits");
+        assert_eq!(
+            checkpoint(&app),
+            Err("busy".into()),
+            "no half-done gesture is read"
+        );
         app.busy = false;
         frame(&mut app);
-        assert_eq!(*done.borrow(), Some(Ok(())));
+        assert_eq!(*done.borrow(), Some(Ok(None)));
         assert_eq!(app.doc, json!({"shared": {"a": 2, "b": 3}, "view": 1}));
         let (changes, _) = activity();
         app.doc["view"] = json!(2);
@@ -486,7 +663,14 @@ mod tests {
         assert_eq!(activity().0, changes, "views are not shared");
         assert!(undo(true));
         assert_eq!(activity().1, [true]);
+        let mut next = 7;
+        let (a, b) = (fresh_id(&mut next), fresh_id(&mut next));
+        assert!(
+            a != b && a >> 52 == 1 && next == 9,
+            "connected ids are peer-unique and the counter still counts"
+        );
         disconnect();
         assert!(!undo(false));
+        assert_eq!(fresh_id(&mut next), 9);
     }
 }

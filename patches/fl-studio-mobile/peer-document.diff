@@ -43,10 +43,10 @@ index 7e7cd63..78417d6 100644
      mod preview;
 diff --git a/src/app/live.rs b/src/app/live.rs
 new file mode 100644
-index 0000000..c921484
+index 0000000..6af4877
 --- /dev/null
 +++ b/src/app/live.rs
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,353 @@
 +//! Live editing in a Playground session. The shell's adapter ([`web`]) drives it; nothing here runs until the shell
 +//! connects. A remote change merges into the live song at the end of a quiet frame, keeping this person's views and
 +//! unsent work, and is no step of the native undo history. While connected, Undo and Redo go to the session, which
@@ -60,12 +60,17 @@ index 0000000..c921484
 +struct Remote {
 +    base: Option<Vec<u8>>,
 +    edited: Vec<u8>,
-+    done: Box<dyn FnOnce(Result<(), Conflict>)>,
++    done: Done,
 +}
++
++/// Settles a remote change: a whole adopted song gives back the shared song it replaced, for the shell's draft.
++pub(crate) type Done = Box<dyn FnOnce(Result<Option<Vec<u8>>, Conflict>)>;
 +
 +#[derive(Default)]
 +struct Live {
 +    connected: bool,
++    /// The last frame was not quiet: a checkpoint now would catch a gesture half done.
++    busy: bool,
 +    /// The song as last compared, and its shared projection as last reported.
 +    seen: Option<Song>,
 +    shared: Option<Song>,
@@ -106,18 +111,21 @@ index 0000000..c921484
 +    }
 +}
 +
-+pub(crate) fn queue(
-+    base: Option<Vec<u8>>,
-+    edited: Vec<u8>,
-+    done: Box<dyn FnOnce(Result<(), Conflict>)>,
-+) {
-+    LIVE.with_borrow_mut(|live| {
++pub(crate) fn queue(base: Option<Vec<u8>>, edited: Vec<u8>, done: Done) {
++    let done = LIVE.with_borrow_mut(|live| {
++        if !live.connected {
++            return Some(done);
++        }
 +        live.remote.push_back(Remote { base, edited, done });
 +        #[cfg(target_arch = "wasm32")]
 +        if let Some(ctx) = &live.ctx {
 +            ctx.request_repaint();
 +        }
++        None
 +    });
++    if let Some(done) = done {
++        done(Err(Conflict("Live editing is not connected".into())));
++    }
 +}
 +
 +/// Passes Undo or Redo to the session while connected: whether it did.
@@ -147,6 +155,20 @@ index 0000000..c921484
 +}
 +
 +impl HoneydewApp {
++    /// The canonical shared song, unless the last frame was busy: then the next quiet frame reports it again.
++    pub(crate) fn live_checkpoint(&self) -> Result<Vec<u8>, Conflict> {
++        let busy = LIVE.with_borrow_mut(|live| {
++            if live.busy {
++                (live.seen, live.shared) = (None, None);
++            }
++            live.busy
++        });
++        if busy {
++            return Err(Conflict("busy".into()));
++        }
++        checkpoint::encode(&self.song)
++    }
++
 +    /// Nothing under way that a remote change would cut short or a proposal would catch half done: no pointer down
 +    /// (a drag, a held control), no param or sample-row gesture, no channel params outside the history, no recording.
 +    fn live_quiet(&self, ctx: &egui::Context) -> bool {
@@ -163,6 +185,7 @@ index 0000000..c921484
 +        let waiting = LIVE.with_borrow_mut(|live| {
 +            #[cfg(target_arch = "wasm32")]
 +            live.ctx.get_or_insert_with(|| ctx.clone());
++            live.busy = !quiet;
 +            if live.connected && quiet {
 +                std::mem::take(&mut live.remote)
 +            } else {
@@ -202,8 +225,12 @@ index 0000000..c921484
 +        tick: u64,
 +        base: Option<&[u8]>,
 +        edited: &[u8],
-+    ) -> Result<(), Conflict> {
++    ) -> Result<Option<Vec<u8>>, Conflict> {
 +        let edited = checkpoint::decode(edited)?;
++        let replaced = base
++            .is_none()
++            .then(|| checkpoint::encode(&self.song).ok())
++            .flatten();
 +        let mut song = match base {
 +            Some(base) => merge(&checkpoint::decode(base)?, &self.song, &edited)?,
 +            None => {
@@ -224,16 +251,16 @@ index 0000000..c921484
 +        let last = self.song.channels.len() - 1;
 +        self.selected_channel = self.selected_channel.clamp(last.min(1), last);
 +        self.rebuild_as(tick, Handover::Undo);
-+        Ok(())
++        Ok(replaced)
 +    }
 +}
 +
 +/// The adapter object the Playground shell drives (`shell/live.js`):
 +/// - `format`: the document format and build;
-+/// - `checkpoint()`: the live song's canonical shared bytes;
++/// - `checkpoint()`: the live song's canonical shared bytes; throws `busy` while a gesture is under way;
 +/// - `merge(base, current, edited)`: the pure model merge, for the session's coordinator;
-+/// - `apply(base, edited)`: a promise that merges `edited` relative to `base` (null: adopts it whole) at the end of
-+///   the next quiet frame, or rejects with the conflict;
++/// - `apply(base, edited)`: a promise that merges `edited` relative to `base` (null: adopts it whole, resolving to the
++///   shared song it replaced) at the end of the next quiet frame, or rejects with the conflict;
 +/// - `connect({ changed, undo })`: `changed()` after a quiet frame whose shared song changed, `undo(redo)` instead of
 +///   the native Undo and Redo. Both are called from inside a frame: the shell must defer its calls back;
 +/// - `disconnect()`: native Undo again, from the current song.
@@ -285,10 +312,7 @@ index 0000000..c921484
 +            let app = app
 +                .app_mut::<HoneydewApp>()
 +                .ok_or("Honeydew is not running")?;
-+            Ok(checkpoint::encode(&app.song)
-+                .map_err(error)?
-+                .as_slice()
-+                .into())
++            Ok(app.live_checkpoint().map_err(error)?.as_slice().into())
 +        };
 +        set(
 +            "checkpoint",
@@ -320,7 +344,9 @@ index 0000000..c921484
 +                    edited,
 +                    Box::new(move |result| {
 +                        let _ = match result {
-+                            Ok(()) => resolve.call0(&JsValue::NULL),
++                            Ok(None) => resolve.call0(&JsValue::NULL),
++                            Ok(Some(replaced)) => resolve
++                                .call1(&JsValue::NULL, &Uint8Array::from(replaced.as_slice())),
 +                            Err(conflict) => reject.call1(&JsValue::NULL, &error(conflict)),
 +                        };
 +                    }),
@@ -376,10 +402,10 @@ index 0000000..c921484
 +}
 diff --git a/src/app/tests/peer_live.rs b/src/app/tests/peer_live.rs
 new file mode 100644
-index 0000000..46e1c1c
+index 0000000..2116e76
 --- /dev/null
 +++ b/src/app/tests/peer_live.rs
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,116 @@
 +//! Live editing in a Playground session (`app/live.rs`): a remote change waits for a quiet frame and keeps this
 +//! person's unsent work and views; while connected, Undo and Redo go to the session.
 +
@@ -405,7 +431,7 @@ index 0000000..46e1c1c
 +    (rig, base, Session)
 +}
 +
-+type Done = Rc<RefCell<Option<Result<(), Conflict>>>>;
++type Done = Rc<RefCell<Option<Result<Option<Vec<u8>>, Conflict>>>>;
 +
 +fn queue(base: &[u8], edited: &Song) -> Done {
 +    let done = Done::default();
@@ -428,7 +454,7 @@ index 0000000..46e1c1c
 +    rig.app.main_screen.zoom = 0.7;
 +    let done = queue(&base, &remote);
 +    rig.frame(vec![]);
-+    assert!(matches!(*done.borrow(), Some(Ok(()))));
++    assert!(matches!(*done.borrow(), Some(Ok(None))));
 +    assert_eq!(rig.app.song.tempo_bpm, 99.0);
 +    assert_eq!(rig.app.song.channels[1].name, "Mine");
 +    assert_eq!(rig.app.main_screen.zoom, 0.7);
@@ -445,10 +471,21 @@ index 0000000..46e1c1c
 +    rig.frame(vec![]);
 +    assert!(done.borrow().is_none());
 +    assert_ne!(rig.app.song.tempo_bpm, 99.0);
++    let reported = live::changes();
++    assert_eq!(
++        rig.app.live_checkpoint(),
++        Err(Conflict("busy".into())),
++        "no half-done gesture is read"
++    );
 +    rig.release(OUTSIDE);
 +    rig.frame(vec![]);
-+    assert!(matches!(*done.borrow(), Some(Ok(()))));
++    assert!(matches!(*done.borrow(), Some(Ok(None))));
 +    assert_eq!(rig.app.song.tempo_bpm, 99.0);
++    assert_eq!(
++        live::changes(),
++        reported + 1,
++        "the quiet frame after a busy checkpoint reports again"
++    );
 +}
 +
 +#[test]

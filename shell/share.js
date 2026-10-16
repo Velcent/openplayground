@@ -9,7 +9,7 @@ import { h, icon, modal, toast, download, confirmIn } from './ui.js'
 const button = (label, run, primary = false) => h('button', { type:'button', class:`pg-btn${primary ? ' pg-primary' : ''}`, onclick:run }, label)
 const color = id => `hsl(${parseInt(id.slice(0, 6), 16) % 360} 65% 60%)`
 const total = files => [...new Map(files.map(f => [f.asset, f])).values()].reduce((n,f)=>n+f.size,0)
-const LIVE = { live:'Live editing', 'read-only':'Viewing live edits', paused:'Paused: the owner is offline. Your edits stay here until they return.', 'catching up':'Catching up on edits' }
+const LIVE = { live:'Live editing', 'read-only':'Viewing live edits', paused:'Paused: the owner is offline. Your edits stay here until they return.', 'catching up':'Catching up on edits', incompatible:'Not live: another app version' }
 
 export async function mountShare(bar, app, here) {
   if (app.slug === 'outlook') return
@@ -35,6 +35,8 @@ export async function mountShare(bar, app, here) {
   const use = next => {
     session?.removeEventListener('change',update); session=next; session.addEventListener('change',update); update()
     follow(next).then(live => live?.addEventListener('change', () => next.changed())).catch(e => { next.error = e.message; next.changed() })
+    // Removed, or opened in another tab: this page no longer takes part, so Undo is the app's own again.
+    next.addEventListener('change', () => { if (['removed','displaced'].includes(next.status)) unfollow(next) })
   }
   const end = () => { unfollow(session); session.leave() }
   const clearLink = () => {

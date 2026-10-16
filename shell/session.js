@@ -4,8 +4,9 @@ import { MAX_DOCUMENT } from './document-delta.js'
 
 const cleanName = (name) => String(name || 'Guest').replace(/[\x00-\x1f\x7f]/g, '').slice(0, 40)
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-// A document message: a delta's two spans or a snapshot with its retained history, plus its JSON.
-const MAX_DOCUMENT_MESSAGE = 4 * MAX_DOCUMENT + 4 * 1024 ** 2
+// Document messages by sender: the owner's snapshots (a document and its retained history, see document-history.js),
+// an editor's proposal to the owner (a delta's two spans), anything else small (a resync).
+const MAX_SNAPSHOT = 3 * MAX_DOCUMENT + 8 * 1024 ** 2, MAX_PROPOSAL = 2 * MAX_DOCUMENT + 64 * 1024, MAX_CONTROL = 64 * 1024
 async function request(room, action, data, token) {
   const response = await fetch(`/api/session/${room}/${action}`, { method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(data), cache: 'no-store' })
   const result = await response.json()
@@ -279,7 +280,8 @@ export class PeerSession extends EventTarget {
     const incoming = peer.documentIn
     if (typeof data === 'string') {
       const size = data.length < 64 && JSON.parse(data).size
-      if (incoming || !Number.isSafeInteger(size) || size < 4 || size > MAX_DOCUMENT_MESSAGE) throw new Error('Invalid document message')
+      const limit = peer.role === 'owner' ? MAX_SNAPSHOT : this.config.owner && peer.role === 'editor' ? MAX_PROPOSAL : MAX_CONTROL
+      if (incoming || !Number.isSafeInteger(size) || size < 4 || size > limit) throw new Error('Invalid document message')
       peer.documentIn = { size, frames: [], used: 0 }
       return
     }
@@ -293,7 +295,7 @@ export class PeerSession extends EventTarget {
   }
   sendDocument(peer, value) {
     const blob = pack(value)
-    if (blob.size > MAX_DOCUMENT_MESSAGE) return Promise.reject(new Error('Document message too large'))
+    if (blob.size > MAX_SNAPSHOT) return Promise.reject(new Error('Document message too large'))
     const channel = peer.document
     if (!channel) return Promise.reject(new Error('Peer disconnected'))
     peer.documentSends = peer.documentSends.catch(() => {}).then(async () => {
