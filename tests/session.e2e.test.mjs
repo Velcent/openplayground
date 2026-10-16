@@ -206,3 +206,30 @@ test('a closed transfer channel offers retry and resumes verified data', async (
   assert.equal(await b.evaluate(async()=>new Uint8Array(await(await session.store.file(session.files[0].asset)).arrayBuffer()).every(v=>v===19)),true)
   for(const page of [a,b])await page.evaluate(()=>session.leave())
 })
+
+test('document messages carry nested bytes beside a file transfer, and a stray frame closes only that channel', async () => {
+  const a = await site.page(), b = await site.page()
+  const invite = await a.evaluate(async () => {
+    window.session = await PeerSession.create({ app: '/honeydew/', files: [new File([new Uint8Array(3000000).fill(5)], 'big.wav')] })
+    return session.invite()
+  })
+  await b.evaluate(async (invite) => {
+    window.session = await PeerSession.join(invite); window.got = []
+    session.addEventListener('document', (e) => got.push(e.value))
+    await session.receive()
+  }, invite)
+  await until(() => a.evaluate(() => [...session.peers.values()].some((p) => p.document?.readyState === 'open')), 15000, 'document channel')
+  await a.evaluate(() => {
+    const bytes = Uint8Array.from({ length: 200000 }, (_, i) => i % 253)
+    return session.sendDocument([...session.peers.values()][0], { type: 'snapshot', record: { bytes, entries: [{ change: { remove: new Uint8Array(0), insert: bytes.subarray(5, 9) } }] } })
+  })
+  await until(() => b.evaluate(() => got.length === 1), 10000, 'document message')
+  assert.equal(await b.evaluate(() => {
+    const { record } = got[0]
+    return record.bytes.every((v, i) => v === i % 253) && record.bytes.length + record.entries[0].change.remove.length === 200000 && record.entries[0].change.insert.join()
+  }), '5,6,7,8')
+  await a.evaluate(() => [...session.peers.values()][0].document.send(new ArrayBuffer(10)))
+  await until(() => b.evaluate(() => [...session.peers.values()][0].document.readyState === 'closed'), 10000, 'stray frame closes the document channel')
+  await until(() => b.evaluate(() => session.status === 'ready'), 20000, 'file transfer unaffected')
+  for (const page of [a, b]) await page.evaluate(() => session.leave())
+})

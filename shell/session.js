@@ -1,8 +1,12 @@
 import { CHUNK_SIZE, FRAME_SIZE, MAX_MANIFEST, MAX_SIGNAL, randomToken, tokenHash, signalKey, seal, open, readInvite, inviteURL, validateManifest } from './session-protocol.js'
 import { SessionStore, describe } from './session-store.js'
+import { MAX_DOCUMENT } from './document-delta.js'
 
 const cleanName = (name) => String(name || 'Guest').replace(/[\x00-\x1f\x7f]/g, '').slice(0, 40)
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const text = new TextEncoder(), untext = new TextDecoder()
+// A document message: a delta's two spans or a snapshot with its retained history, plus its JSON.
+const MAX_DOCUMENT_MESSAGE = 4 * MAX_DOCUMENT + 4 * 1024 ** 2
 async function request(room, action, data, token) {
   const response = await fetch(`/api/session/${room}/${action}`, { method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(data), cache: 'no-store' })
   const result = await response.json()
@@ -187,8 +191,11 @@ export class PeerSession extends EventTarget {
       }
       this.changed()
     }
-    pc.ondatachannel = (e) => this.channel(peer, e.channel)
-    if (this.id < peer.id) this.channel(peer, pc.createDataChannel('files', { ordered: true }))
+    pc.ondatachannel = (e) => e.channel.label === 'document' ? this.documentChannel(peer, e.channel) : this.channel(peer, e.channel)
+    if (this.id < peer.id) {
+      this.channel(peer, pc.createDataChannel('files', { ordered: true }))
+      this.documentChannel(peer, pc.createDataChannel('document', { ordered: true }))
+    }
   }
   sendSignal(peer, value) {
     this.signalQueue = this.signalQueue.then(async () => {
@@ -244,14 +251,81 @@ export class PeerSession extends EventTarget {
     }
     channel.onclose = () => { if (this.requested?.peer === peer.id) this.requested = null; this.changed(); this.pump().catch((e) => this.fail(e)) }
   }
-  async raw(peer, data) {
-    if (peer.channel?.readyState !== 'open') throw new Error('Peer disconnected')
+  async raw(peer, data, channel = peer.channel) {
+    if (channel?.readyState !== 'open') throw new Error('Peer disconnected')
     const deadline = Date.now() + 15000
-    while (peer.channel.bufferedAmount > 262144) {
-      if (peer.channel.readyState !== 'open' || Date.now() > deadline) throw new Error('Transfer stalled; reconnect to resume')
+    while (channel.bufferedAmount > 262144) {
+      if (channel.readyState !== 'open' || Date.now() > deadline) throw new Error('Transfer stalled; reconnect to resume')
       await sleep(10)
     }
-    peer.channel.send(data)
+    channel.send(data)
+  }
+  // Live document traffic has its own ordered channel, so bulk file transfers never hold it up. Each message is a
+  // short {size} string, then its JSON and byte fields as binary frames; Uint8Array fields travel as raw bytes.
+  documentChannel(peer, channel) {
+    if (peer.document) { channel.close(); return }
+    peer.document = channel; peer.documentSends = Promise.resolve(); peer.documentIn = null; channel.binaryType = 'arraybuffer'
+    const event = (type, detail) => this.dispatchEvent(Object.assign(new Event(type), detail))
+    channel.onopen = () => event('document-open', { peer })
+    channel.onclose = () => event('document-close', { peer })
+    channel.onmessage = ({ data }) => {
+      if (this.peers.get(peer.id) !== peer) return
+      try {
+        const message = this.documentFrame(peer, data)
+        if (message) event('document', { peer, ...message })
+      } catch (e) { peer.error = e.message; channel.close() }
+    }
+  }
+  documentFrame(peer, data) {
+    const incoming = peer.documentIn
+    if (typeof data === 'string') {
+      const size = data.length < 64 && JSON.parse(data).size
+      if (incoming || !Number.isSafeInteger(size) || size < 4 || size > MAX_DOCUMENT_MESSAGE) throw new Error('Invalid document message')
+      peer.documentIn = { size, frames: [], used: 0 }
+      return
+    }
+    if (!incoming || data.byteLength > FRAME_SIZE || incoming.used + data.byteLength > incoming.size) throw new Error('Unsolicited document data')
+    incoming.frames.push(new Uint8Array(data)); incoming.used += data.byteLength
+    if (incoming.used < incoming.size) return
+    peer.documentIn = null
+    const bytes = new Uint8Array(incoming.size)
+    incoming.frames.reduce((at, frame) => (bytes.set(frame, at), at + frame.length), 0)
+    const length = new DataView(bytes.buffer).getUint32(0)
+    if (length > bytes.length - 4) throw new Error('Invalid document message')
+    let at = 4 + length
+    const revive = (node) => {
+      if (!node || typeof node !== 'object') return node
+      const keys = Object.keys(node)
+      if (keys.includes('__proto__')) throw new Error('Invalid document message')
+      if (keys.length === 1 && keys[0] === '$bytes') {
+        if (!Number.isSafeInteger(node.$bytes) || node.$bytes < 0 || node.$bytes > bytes.length - at) throw new Error('Invalid document message')
+        return bytes.slice(at, at += node.$bytes)
+      }
+      for (const key of keys) node[key] = revive(node[key])
+      return node
+    }
+    const value = revive(JSON.parse(untext.decode(bytes.subarray(4, 4 + length))))
+    if (at !== bytes.length) throw new Error('Invalid document message')
+    return { value }
+  }
+  sendDocument(peer, value) {
+    const parts = []
+    const json = text.encode(JSON.stringify(value, function (key, v) {
+      const raw = this[key]
+      return raw instanceof Uint8Array ? (parts.push(raw), { $bytes: raw.length }) : v
+    }))
+    const head = new Uint8Array(4); new DataView(head.buffer).setUint32(0, json.length)
+    const blob = new Blob([head, json, ...parts])
+    if (blob.size > MAX_DOCUMENT_MESSAGE) return Promise.reject(new Error('Document message too large'))
+    const channel = peer.document
+    if (!channel) return Promise.reject(new Error('Peer disconnected'))
+    peer.documentSends = peer.documentSends.catch(() => {}).then(async () => {
+      try {
+        await this.raw(peer, JSON.stringify({ size: blob.size }), channel)
+        for (let i = 0; i < blob.size; i += FRAME_SIZE) await this.raw(peer, await blob.slice(i, i + FRAME_SIZE).arrayBuffer(), channel)
+      } catch (e) { channel.close(); throw e } // A half-sent message would desynchronize the receiver.
+    })
+    return peer.documentSends
   }
   send(peer, value) {
     const data = JSON.stringify(value)
