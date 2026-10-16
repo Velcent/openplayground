@@ -9,13 +9,15 @@ export const diffDir = (t) => (t.patches && existsSync(t.patches.replace(/\.yaml
 const diffName = (f) => f.replace(new RegExp(`(\\.(${CHANNELS.join('|')}))?\\.diff$`), '')
 const isEmpty = (dir, f) => !readFileSync(join(dir, f), 'utf8').trim()
 
-// Applies the channel's diffs to the git checkout `src`; returns the files of those upstream already has.
-export const applyDiffs = (src, t, channel) => {
+// Applies the channel's diffs to the git checkout `src`; returns the files of those upstream already has. Without
+// `live`, the live-editing diff (live.diff) is left out.
+export const applyDiffs = (src, t, channel, live = true) => {
   const dir = diffDir(t)
   if (!dir) return []
   const files = readdirSync(dir).filter((f) => f.endsWith('.diff'))
   const upstream = []
   for (const name of [...new Set(files.map(diffName))].sort()) {
+    if (!live && name === 'live') continue
     const file = [`${name}.${channel}.diff`, `${name}.diff`].find((f) => files.includes(f))
     if (!file || isEmpty(dir, file)) continue
     const apply = (...args) => spawnSync('git', ['apply', '--recount', ...args, resolve(dir, file)], { cwd: src, encoding: 'utf8' })

@@ -23,6 +23,11 @@
 // newest release has it, `build` lists its files in out/<slug>.merged and build.yml deletes them. An empty
 // diff is skipped too, so an empty <name>.<channel>.diff skips <name>.diff on that channel; `tidy` deletes the
 // ones that do nothing (build.yml runs it on a repair).
+//
+// Live editing in Playground sessions is an extra on top: the shared adapter (patches/live/playground_live.rs, copied
+// into the tools.yaml `live:` folder), patches/<slug>/live.diff and the rules marked `live: true`. When those no
+// longer fit upstream and a repair doesn't help, build.yml builds the version without them (LIVE=0) rather than
+// nothing; the failure stays on record, so it is retried daily and reported after a day.
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { cpSync, existsSync, globSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
@@ -63,8 +68,8 @@ const run = (cmd, args, opts = {}) => {
   execFileSync(cmd, args, { stdio: 'inherit', ...opts })
 }
 
-const applyPatches = (src, file) => {
-  for (const rule of parse(readFileSync(file, 'utf8'))) {
+const applyPatches = (src, file, live = true) => {
+  for (const rule of parse(readFileSync(file, 'utf8')).filter((rule) => live || !rule.live)) {
     const re = new RegExp(rule.find, 'm')
     const hit = globSync(rule.file, { cwd: src }).find((f) => re.test(readFileSync(join(src, f), 'utf8')))
     if (!hit) throw new Error(`${file}: no ${rule.file} matches /${rule.find}/`)
@@ -90,6 +95,9 @@ const wasmBindgenPath = (src, cache) => {
   return `${dir}:${process.env.PATH}`
 }
 
+// Whether the tool has live-editing parts to leave out when they fail.
+const hasLive = (t) => !!t.live || !!diffDir(t) && readdirSync(diffDir(t)).some((f) => /^live(\.\w+)?\.diff$/.test(f))
+  || !!t.patches && existsSync(t.patches) && (parse(readFileSync(t.patches, 'utf8')) ?? []).some((rule) => rule.live)
 const toolFor = (slug) => tools.find((t) => t.slug === slug) ?? fail(`no tool ${slug} in tools.yaml`)
 const fail = (message) => {
   throw new Error(message)
@@ -100,7 +108,7 @@ export const webDir = (src) =>
     ?? (existsSync(join(src, 'Cargo.toml')) ? src : fail(`${src} has no Cargo.toml for a web build`))
 
 // A fresh checkout of the tool's version on a channel in <work>/<dir>, with its patches applied (unless patch is false).
-const prepare = async (slug, channel, { dir = 'src', patch = true } = {}) => {
+const prepare = async (slug, channel, { dir = 'src', patch = true, live = process.env.LIVE !== '0' } = {}) => {
   const t = toolFor(slug)
   const { release } = (await resolveVersion(t, channel)) ?? fail(`${slug} has no ${channel} version`)
   const work = process.env.BUILD_DIR ? resolve(process.env.BUILD_DIR, `${slug}-${channel}`) : mkdtempSync(join(tmpdir(), `build-${slug}-`))
@@ -118,9 +126,9 @@ const prepare = async (slug, channel, { dir = 'src', patch = true } = {}) => {
   } else {
     run('git', ['clone', '--quiet', '--depth', '1', '--branch', release.tag_name, `https://github.com/${t.repo}.git`, src])
   }
-  if (t.live && patch) cpSync(LIVE, join(src, t.live, 'playground_live.rs'))
-  const merged = patch ? applyDiffs(src, t, channel) : []
-  if (t.patches && patch) applyPatches(src, t.patches)
+  if (t.live && patch && live) cpSync(LIVE, join(src, t.live, 'playground_live.rs'))
+  const merged = patch ? applyDiffs(src, t, channel, live) : []
+  if (t.patches && patch) applyPatches(src, t.patches, live)
   const web = webDir(src)
   return { t, id: buildId(t, release.tag_name), work, src, web, merged }
 }
@@ -178,7 +186,8 @@ const age = (asset) => Date.now() - Date.parse(asset.created_at)
 const [command, slug, channel] = process.argv.slice(2)
 if (command === 'plan') {
   // To build: each tool's channels whose build is missing, unless it failed (<id>.failed) in the last day.
-  // Failures are retried daily, and at once when the version or the patches change (a new id).
+  // Failures are retried daily, and at once when the version or the patches change (a new id); so is a build
+  // made without live editing (it has both a zip and a failure on record).
   const assets = await builtAssets()
   const has = (name, maxAge = Infinity) => assets.some((a) => a.name === name && age(a) < maxAge)
   const include = []
@@ -187,7 +196,7 @@ if (command === 'plan') {
       // One tool whose repo can't be read (gone, renamed, private) mustn't stop the others' builds.
       const version = await resolveVersion(t, channel).catch((e) => console.error(`::warning::${t.slug} (${channel}): ${e.message}`))
       const id = version && buildId(t, version.release.tag_name)
-      if (id && !has(`${id}.zip`) && !has(`${id}.failed`, DAY)) include.push({ slug: t.slug, channel })
+      if (id && (!has(`${id}.zip`) || has(`${id}.failed`)) && !has(`${id}.failed`, DAY)) include.push({ slug: t.slug, channel })
     }
   }
   console.log(`include=${JSON.stringify(include)}`)
@@ -200,6 +209,7 @@ if (command === 'plan') {
   console.log(`id=${version ? buildId(t, version.release.tag_name) : ''}`)
   console.log(`failed_today=${failures.some((a) => age(a) < DAY)}`)
   console.log(`failed_before=${failures.some((a) => age(a) > DAY - 3600e3)}`)
+  console.log(`live=${hasLive(t)}`)
 } else if (command === 'prune' && slug && CHANNELS.includes(channel)) {
   // Everything but the channel's newest build: fetch only ever installs that one.
   for (const a of channelAssets(await builtAssets(), toolFor(slug), channel).slice(1)) console.log(a.name)

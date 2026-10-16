@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
@@ -61,4 +61,14 @@ test('tidying keeps an empty channel diff while its <name>.diff is there, and de
   const { t } = setup('', { 'a.diff': change('two', 'TWO'), 'a.head.diff': '', 'b.diff': '', 'b.head.diff': '', 'c.release.diff': '', 'd.release.diff': change('two', 'TWO') })
   tidyDiffs(t)
   assert.deepEqual(readdirSync(t.patches.replace(/\.yaml$/, '')).sort(), ['a.diff', 'a.head.diff', 'd.release.diff'])
+})
+
+test('without live editing, live.diff is left out and the other diffs still apply', () => {
+  const live = 'diff --git a/live.rs b/live.rs\nnew file mode 100644\n--- /dev/null\n+++ b/live.rs\n@@ -0,0 +1 @@\n+live\n'
+  const { src, t, read } = setup('one\ntwo\nthree\n', { 'live.diff': live, 'pr-1.diff': change('two', 'TWO') })
+  applyDiffs(src, t, 'release', false)
+  assert.equal(read(), 'one\nTWO\nthree\n')
+  assert.equal(existsSync(join(src, 'live.rs')), false)
+  applyDiffs(src, t, 'head')
+  assert.equal(existsSync(join(src, 'live.rs')), true)
 })

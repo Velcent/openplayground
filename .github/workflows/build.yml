@@ -151,6 +151,10 @@ jobs:
             nothing to do with the patches (a network error, or upstream code that doesn't build at all), change
             nothing and say so.
 
+            Rules marked `live: true` and patches/${{ matrix.slug }}/live.diff add live editing in Playground sessions
+            (scripts/build.mjs explains it): repair them the same way. live.diff holds only new files; keep every edit
+            to an existing upstream file a one-line rule anchored on a stable signature.
+
       - id: rebuild
         name: Rebuild with the repaired patches
         if: steps.repair.outcome == 'success'
@@ -169,6 +173,15 @@ jobs:
           node scripts/build.mjs build "$SLUG" "$CHANNEL"
           node scripts/build.mjs check "$SLUG" "$([ "$CHANNEL" = head ] && echo release || echo head)"
 
+      # Live editing is an extra (scripts/build.mjs): when its parts no longer fit and the repair didn't help,
+      # ship this version without it rather than nothing. The failure is still recorded below, so the full build
+      # is retried daily and reported after a day.
+      - id: fallback
+        name: Build without live editing
+        if: steps.build.outcome == 'failure' && steps.rebuild.outcome != 'success' && steps.build.outputs.live == 'true'
+        continue-on-error: true
+        run: LIVE=0 node scripts/build.mjs build "$SLUG" "$CHANNEL"
+
       - name: Commit the repaired patches
         if: steps.rebuild.outcome == 'success'
         run: |
@@ -180,16 +193,18 @@ jobs:
           git pull -q --rebase && git push -q
 
       - name: Publish, deleting this channel's older builds
-        if: steps.build.outcome == 'success' || steps.rebuild.outcome == 'success'
+        if: steps.build.outcome == 'success' || steps.rebuild.outcome == 'success' || steps.fallback.outcome == 'success'
         run: |
           gh release upload builds out/*.zip --clobber
-          gh release view builds --json assets -q '.assets[].name' | grep -E "^$SLUG-.*\.failed$" | grep -E "^$SLUG-head-" $([ "$CHANNEL" = head ] || echo -v) \
-            | xargs -r -n1 gh release delete-asset builds -y
           node scripts/build.mjs prune "$SLUG" "$CHANNEL" | xargs -r -n1 gh release delete-asset builds -y
-          # Builds again: close its build-failure issue.
-          for n in $(gh issue list --label build-failure --state open --json number,title -q ".[] | select(.title == \"$TITLE\") | .number"); do
-            gh issue close "$n" --comment "Builds again: $(basename out/*.zip .zip) in [this run]($RUN_URL)."
-          done
+          # Builds again (in full: a build without live editing still counts as failing): clear its failures.
+          if [ "${{ steps.fallback.outcome }}" != success ]; then
+            gh release view builds --json assets -q '.assets[].name' | grep -E "^$SLUG-.*\.failed$" | grep -E "^$SLUG-head-" $([ "$CHANNEL" = head ] || echo -v) \
+              | xargs -r -n1 gh release delete-asset builds -y
+            for n in $(gh issue list --label build-failure --state open --json number,title -q ".[] | select(.title == \"$TITLE\") | .number"); do
+              gh issue close "$n" --comment "Builds again: $(basename out/*.zip .zip) in [this run]($RUN_URL)."
+            done
+          fi
 
       # A diff (patches/<slug>/) the newest release already has, so both channels do: build.mjs listed its files.
       - name: Delete diffs upstream has merged
@@ -211,6 +226,7 @@ jobs:
           REPAIR: ${{ steps.repair.outcome }}
           FAILED_BEFORE: ${{ steps.build.outputs.failed_before }}
           FAILED_TODAY: ${{ steps.build.outputs.failed_today }}
+          FALLBACK: ${{ steps.fallback.outcome }}
         run: |
           if [ -n "$ID" ] && [ "${{ github.event_name }}" != push ]; then
             echo "Build failed; see the Build apps run log." > "$ID.failed"
@@ -225,6 +241,7 @@ jobs:
               esac
               [ "$CHANNEL" = head ] && which="newest commit" || which="newest release"
               [ "$CHANNEL" = head ] && meanwhile="its last good latest-commit build" || meanwhile="the app's upstream release"
+              [ "$FALLBACK" = success ] && meanwhile="this version built without live editing (its live-editing parts are what fail)"
               gh issue create --label build-failure --title "$TITLE" --body "$(printf '%s\n' \
                 "The **$SLUG** build of its $which has failed for over a day. Meanwhile the site serves $meanwhile, so it keeps working." \
                 "" \
