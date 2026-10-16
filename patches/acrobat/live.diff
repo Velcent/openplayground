@@ -26,7 +26,7 @@ index a46a467..86a1c20 100644
              eframe::web_sys::console::error_1(&e);
              if query_param("host").as_deref() == Some("parent")
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 01f162a..acdef3d 100644
+index 01f162a..e45a093 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
 @@ -664,6 +664,11 @@ impl Document {
@@ -41,12 +41,12 @@ index 01f162a..acdef3d 100644
      /// What the opening password allows; `None` when the document is not encrypted.
      pub fn permissions(&self) -> Option<pdfcraft_cos::Permissions> {
          self.editor.as_ref().and_then(|e| e.cos.permissions())
-@@ -3813,6 +3818,35 @@ impl Session {
+@@ -3813,6 +3818,48 @@ impl Session {
          Ok(label)
      }
  
-+    /// Playground live editing: install `cos` as the working graph the way Undo does, with no undo step. On a
-+    /// failed refresh the document stays as it was.
++    /// Playground live editing: install `cos` as the working graph the way Undo does, with no undo step. Undo and
++    /// Redo start again from it (their steps lack the change). On a failed refresh the document stays as it was.
 +    pub fn replace_graph(&mut self, id: DocId, cos: pdfcraft_cos::Document) -> Result<(), EditError> {
 +        let doc = self.doc_mut(id)?;
 +        doc.edit_notices.clear();
@@ -63,6 +63,7 @@ index 01f162a..acdef3d 100644
 +        }
 +        Self::sync_dirty(doc);
 +        doc.generation += 1;
++        self.clear_history(id);
 +        Ok(())
 +    }
 +
@@ -74,15 +75,27 @@ index 01f162a..acdef3d 100644
 +        }
 +    }
 +
++    /// [`Self::mark_saved`] that keeps the working graph (Playground live editing: the shared document must not
++    /// take the save's own changes). The next save appends to `bytes` all the same.
++    pub fn mark_saved_keeping_graph(&mut self, id: DocId, bytes: Arc<Vec<u8>>) -> Result<(), EditError> {
++        let doc = self.doc_mut(id)?;
++        if let Some(editor) = doc.editor.as_mut() {
++            editor.saved = bytes;
++            editor.saved_keys = editor.keys.clone();
++        }
++        doc.dirty = false;
++        Ok(())
++    }
++
      /// Unsaved when the working graph is not the last opened or saved file. Undo back to that
      /// file is clean; undo past a later save is not, because the restored snapshot's own base
      /// is an earlier revision.
 diff --git a/crates/ui-egui/live/live.rs b/crates/ui-egui/live/live.rs
 new file mode 100644
-index 0000000..d27d626
+index 0000000..6cceb12
 --- /dev/null
 +++ b/crates/ui-egui/live/live.rs
-@@ -0,0 +1,703 @@
+@@ -0,0 +1,932 @@
 +//! Playground live editing of one PDF (web only; [`crate::playground_live`] drives it). The shared document is the
 +//! PDF the session started from plus every object that differs from it, as JSON:
 +//! `{"pdf": base64, "objects": {"<number>": base64("N G obj … endobj") or null when deleted}, "trailer"?: base64(the
@@ -92,8 +105,9 @@ index 0000000..d27d626
 +//!
 +//! The merge is per object, then per dictionary key: arrays of references (`/Annots`, `/Kids`, `/Fields`, …) merge as
 +//! sets that keep their order, so two comments on one page both stay; a value both sides changed is a conflict.
-+//! Objects both sides added under one number are told apart by giving the unsent side's new objects fresh numbers.
-+//! Every merged document is written and opened again before anyone installs it.
++//! Objects both sides added under one number are told apart by giving the unsent side's (`current`'s) new objects
++//! fresh numbers. The coordinator checks every document it records the way receivers install it (written, then
++//! inspected); receivers check by installing.
 +
 +#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 +
@@ -129,10 +143,11 @@ index 0000000..d27d626
 +    /// The last base decoded for a merge of another file.
 +    other: Option<Rc<Base>>,
 +    generation: u64,
-+    /// Inside [`playground_live::frame`] between `live_quiet` and `live_generation`, where merges are of this
-+    /// browser's unsent work (`current`) with accepted changes; the coordinator's merges get proposals as `edited`.
-+    // ponytail: relies on frame()'s call order; a template hook saying which side is local would replace it.
-+    local: bool,
++    /// The shared tab became a PDF that is not shared (signed, encrypted): for the rest of the session it reports its
++    /// last shared state, and remote changes leave it alone.
++    paused: bool,
++    /// Inside [`frame`], where merged documents are this browser's to install: installing checks them.
++    in_frame: bool,
 +    notice: Option<String>,
 +    ctx: Option<egui::Context>,
 +}
@@ -187,15 +202,15 @@ index 0000000..d27d626
 +    rewrite: bool,
 +}
 +
-+/// Reads a shared document, strictly: anything [`project`] would not write back byte for byte is refused. `None`:
-+/// no document yet.
-+fn read(doc: &Value) -> Result<Option<Shared<'_>>, Error> {
++/// Reads a shared document, strictly: anything [`project`] would not write back byte for byte is refused, and so is
++/// no document (`{}`, nothing open yet).
++fn read(doc: &Value) -> Result<Shared<'_>, Error> {
 +    let Some(map) = doc.as_object() else { return Err("Invalid shared document: not an object".into()) };
 +    if let Some(why) = map.get("refused") {
 +        return Err(why.as_str().unwrap_or("This PDF can't be edited live").to_owned());
 +    }
 +    if map.is_empty() {
-+        return Ok(None);
++        return Err("Open a PDF to share it live.".into());
 +    }
 +    let invalid = |what: &str| format!("Invalid shared document: {what}");
 +    if map.keys().any(|k| !["pdf", "objects", "trailer", "rewrite"].contains(&k.as_str())) {
@@ -238,7 +253,7 @@ index 0000000..d27d626
 +        Some(Value::Bool(true)) => true,
 +        Some(_) => return Err(invalid("rewrite")),
 +    };
-+    Ok(Some(Shared { pdf, objects, trailer, rewrite }))
++    Ok(Shared { pdf, objects, trailer, rewrite })
 +}
 +
 +/// The shared document of `cos`, a state of `base`'s file (or of a later save of it).
@@ -311,9 +326,8 @@ index 0000000..d27d626
 +    }
 +}
 +
-+/// Checks a merged document the way a receiver will use it, and gives its canonical form: nothing changed refers to
-+/// an object the merge deleted, and the written file opens with the pages its graph has.
-+fn finish(shared: &Shared, base: &Base) -> Result<Value, Error> {
++/// A merged document's canonical form, once nothing changed refers to an object the merge deleted.
++fn merged(shared: &Shared, base: &Base) -> Result<Value, Error> {
 +    for (num, entry) in &shared.objects {
 +        let mut to = Vec::new();
 +        if let Some((_, o)) = entry {
@@ -323,18 +337,20 @@ index 0000000..d27d626
 +            return Err(format!("Conflict: object {} was deleted while object {num} still uses it", gone.num));
 +        }
 +    }
-+    let cos = build(shared, base);
-+    let pages = pdfcraft_model::pages(&cos).len();
-+    let bytes = write_incremental(&cos, &SaveOptions::default()).map_err(|e| format!("Conflict: the merged PDF can't be written: {e}"))?;
-+    pdfcraft_render::check_pages(Arc::new(bytes), None, pages).map_err(|e| format!("Conflict: the merged PDF does not open: {e}"))?;
-+    Ok(project(&cos, base))
++    Ok(project(&build(shared, base), base))
 +}
 +
-+fn checked(shared: Option<Shared>) -> Result<Value, Error> {
-+    match shared {
-+        None => Ok(json!({})),
-+        Some(s) => finish(&s, &*base_for(s.pdf)?),
++/// Whether every peer can install `doc`: it is canonical, and its file writes and inspects as installing does.
++fn validate(doc: &Value) -> Result<(), Error> {
++    let shared = read(doc)?;
++    let base = base_for(shared.pdf)?;
++    let cos = build(&shared, &base);
++    if project(&cos, &base) != *doc {
++        return Err("Invalid shared document: not in its canonical form".into());
 +    }
++    let bytes = write_incremental(&cos, &SaveOptions::default()).map_err(|e| format!("Conflict: the PDF can't be written: {e}"))?;
++    pdfcraft_render::inspect(Arc::new(bytes), None).map_err(|e| format!("Conflict: the PDF does not open: {e}"))?;
++    Ok(())
 +}
 +
 +/// Points references at renumbered objects.
@@ -365,6 +381,8 @@ index 0000000..d27d626
 +    if map.is_empty() {
 +        return Ok(());
 +    }
++    #[cfg(test)]
++    tests::RENUMBERED.set(tests::RENUMBERED.get() + 1);
 +    for (num, entry) in std::mem::take(&mut side.objects) {
 +        let entry = if b.objects.get(&num) == Some(&entry) { entry } else { entry.map(|(g, o)| (g, renumbered(o, &map))) };
 +        side.objects.insert(map.get(&num).copied().unwrap_or(num), entry);
@@ -479,26 +497,21 @@ index 0000000..d27d626
 +    Ok(out)
 +}
 +
-+/// The three-way merge of shared documents. `local`: `current` is this browser's unsent work, whose new objects
-+/// move if both sides added one under the same number (else `edited`'s, a proposal, move).
-+fn merge(base: &Value, current: &Value, edited: &Value, local: bool) -> Result<Value, Error> {
-+    let (b, c, e) = (read(base)?, read(current)?, read(edited)?);
++/// The three-way merge of shared documents: `current` is the side not accepted yet (a proposal on the coordinator,
++/// this browser's unsent work on a receiver), and its new objects move when both sides added one under one number.
++fn merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
++    let (b, mut c, e) = (read(base)?, read(current)?, read(edited)?);
 +    if current == base {
-+        return checked(e);
++        return Ok(edited.clone());
 +    }
 +    if edited == base {
-+        return checked(c);
++        return Ok(current.clone());
 +    }
-+    let (Some(b), Some(mut c), Some(mut e)) = (b, c, e) else { return Err(conflict("the document (two PDFs shared at once)")) };
 +    if b.pdf != c.pdf || b.pdf != e.pdf {
 +        return Err(conflict("the document (it was replaced)"));
 +    }
 +    let base = base_for(b.pdf)?;
-+    if local {
-+        renumber(&b, &e, &mut c, &base)?;
-+    } else {
-+        renumber(&b, &c, &mut e, &base)?;
-+    }
++    renumber(&b, &e, &mut c, &base)?;
 +    let numbers: BTreeSet<u32> = b.objects.keys().chain(c.objects.keys()).chain(e.objects.keys()).copied().collect();
 +    let mut objects = BTreeMap::new();
 +    for num in numbers {
@@ -525,8 +538,8 @@ index 0000000..d27d626
 +    let own = own_entries(base.doc.trailer());
 +    let [tb, tc, te] = [&b.trailer, &c.trailer, &e.trailer].map(|t| t.clone().unwrap_or_else(|| own.clone()));
 +    let trailer = merge_dict(&tb, &tc, &te, "the trailer")?;
-+    let merged = Shared { pdf: b.pdf, objects, trailer: (trailer != own).then_some(trailer), rewrite: c.rewrite || e.rewrite };
-+    finish(&merged, &base)
++    let result = Shared { pdf: b.pdf, objects, trailer: (trailer != own).then_some(trailer), rewrite: c.rewrite || e.rewrite };
++    merged(&result, &base)
 +}
 +
 +/// Why a document is not shared, if it isn't.
@@ -543,15 +556,54 @@ index 0000000..d27d626
 +
 +/// Whether `id` is the shared document (Undo and Redo go to the session).
 +pub(crate) fn shared(id: DocId) -> bool {
-+    STATE.with_borrow(|s| s.pin == Some(id))
++    STATE.with_borrow(|s| s.pin == Some(id) && !s.paused) && playground_live::connected()
++}
++
++/// Commands that act otherwise on the shared document while live: Undo and Redo go to the session (whatever this
++/// browser's own history holds), and Revert, which would take back everyone's edits, is off.
++pub(crate) fn command_enabled(app: &PdfCraftApp, id: &str) -> Option<bool> {
++    if !app.active_ids().is_some_and(|(_, doc)| shared(doc)) {
++        return None;
++    }
++    match id {
++        "edit.undo" | "edit.redo" => Some(true),
++        "file.revert" => Some(false),
++        _ => None,
++    }
 +}
 +
 +/// The end of each frame.
 +pub(crate) fn frame(app: &mut PdfCraftApp) {
-+    STATE.with_borrow_mut(|s| s.ctx.clone_from(&app.ctx));
++    STATE.with_borrow_mut(|s| (s.ctx.clone_from(&app.ctx), s.in_frame = true));
 +    playground_live::frame(app);
++    STATE.with_borrow_mut(|s| s.in_frame = false);
 +    if let Some(notice) = STATE.with_borrow_mut(|s| s.notice.take()) {
 +        app.notify(notice);
++    }
++}
++
++/// Views of `id` after its graph changed from `before`: the reader's place and a selected comment that is still
++/// where it was stay. When the pages changed, everything else that points at a page index starts afresh.
++fn views_changed(app: &mut PdfCraftApp, id: DocId, before: Option<&Document>) {
++    let Some(doc) = app.session.get(id) else { return };
++    let pages = |cos: Option<&Document>| cos.map(|c| pdfcraft_model::pages(c).into_iter().map(|p| (p.obj, p.dict)).collect::<Vec<_>>());
++    let (old, new) = (pages(before), pages(doc.cos()));
++    let annot = |pages: &Option<Vec<(ObjRef, Dict)>>, cos: Option<&Document>, page: usize, index: usize| -> Option<ObjRef> {
++        let (_, dict) = pages.as_ref()?.get(page)?;
++        cos?.resolve(dict.get(b"Annots")?).as_array()?.get(index)?.as_ref()
++    };
++    let same_pages = old.as_ref().map(|o| o.iter().map(|p| p.0).collect::<Vec<_>>()) == new.as_ref().map(|n| n.iter().map(|p| p.0).collect());
++    for view in app.views.iter_mut().filter(|v| v.id == id) {
++        let kept = view
++            .comments
++            .selected
++            .filter(|&(page, index)| annot(&old, before, page, index).is_some_and(|r| annot(&new, doc.cos(), page, index) == Some(r)));
++        if same_pages {
++            view.document_changed(&doc.info);
++        } else {
++            view.document_replaced(&doc.info);
++        }
++        view.comments.selected = kept;
 +    }
 +}
 +
@@ -563,8 +615,7 @@ index 0000000..d27d626
 +            if s.pin.is_none()
 +                && let Some(id) = active
 +            {
-+                s.pin = Some(id);
-+                s.base = None;
++                (s.pin, s.base, s.last, s.paused) = (Some(id), None, None, false);
 +                s.notice = self.session.get(id).and_then(refusal);
 +            }
 +            s.pin
@@ -577,12 +628,24 @@ index 0000000..d27d626
 +        let Some(id) = self.live_pin() else { return json!({}) };
 +        let cos = match self.session.get(id) {
 +            Some(doc) => match refusal(doc) {
++                // Shared before (then signed or protected here): its last shared state stays the one reported for the
++                // rest of the session, and this browser says why.
++                Some(why) if STATE.with_borrow(|s| s.last.is_some()) => {
++                    STATE.with_borrow_mut(|s| {
++                        if !s.paused {
++                            s.paused = true;
++                            s.notice = Some(format!("Live editing is paused for this PDF: your changes to it stay in this browser. {why}"));
++                        }
++                    });
++                    None
++                }
 +                Some(why) => return json!({ "refused": why }),
++                None if STATE.with_borrow(|s| s.paused) => None,
 +                None => doc.cos().cloned(),
 +            },
-+            None => STATE.with_borrow(|s| s.last.clone()),
++            None => None,
 +        };
-+        let Some(cos) = cos else { return json!({}) };
++        let Some(cos) = cos.or_else(|| STATE.with_borrow(|s| s.last.clone())) else { return json!({}) };
 +        let base = match STATE.with_borrow(|s| s.base.clone()) {
 +            Some(base) => base,
 +            None => match base_of(cos.bytes().clone(), None) {
@@ -596,14 +659,14 @@ index 0000000..d27d626
 +    }
 +
 +    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
-+        let Some(shared) = read(&document)? else { return Ok(()) };
++        let shared = read(&document)?;
 +        let base = base_for(shared.pdf)?;
 +        let cos = build(&shared, &base);
 +        let pin = self.live_pin();
-+        let same_file = STATE.with_borrow(|s| s.base.as_ref().is_some_and(|b| b.pdf == base.pdf));
++        let (same_file, paused) = STATE.with_borrow(|s| (s.base.as_ref().is_some_and(|b| b.pdf == base.pdf), s.paused));
 +        let id = match pin {
-+            // Closed: its last state stays the one reported.
-+            Some(id) if self.session.get(id).is_none() => {
++            // Closed or paused: the shared state is kept as the one reported, the tab is left alone.
++            Some(id) if paused || self.session.get(id).is_none() => {
 +                STATE.with_borrow_mut(|s| (s.base, s.last, s.generation) = (Some(base), Some(cos), s.generation.wrapping_add(1)));
 +                return Ok(());
 +            }
@@ -618,21 +681,7 @@ index 0000000..d27d626
 +        let before = self.session.get(id).and_then(|d| d.cos()).cloned();
 +        self.session.replace_graph(id, cos).map_err(|e| e.to_string())?;
 +        STATE.with_borrow_mut(|s| (s.pin, s.base) = (Some(id), Some(base)));
-+        let Some(doc) = self.session.get(id) else { return Ok(()) };
-+        // The selected comment stays selected while its place in the page's /Annots holds it still.
-+        let annot = |cos: Option<&Document>, page: usize, index: usize| -> Option<ObjRef> {
-+            let cos = cos?;
-+            let page = pdfcraft_model::pages(cos).into_iter().nth(page)?;
-+            cos.resolve(page.dict.get(b"Annots")?).as_array()?.get(index)?.as_ref()
-+        };
-+        for view in self.views.iter_mut().filter(|v| v.id == id) {
-+            let kept = view
-+                .comments
-+                .selected
-+                .filter(|&(page, index)| annot(before.as_ref(), page, index).is_some_and(|r| annot(doc.cos(), page, index) == Some(r)));
-+            view.document_changed(&doc.info);
-+            view.comments.selected = kept;
-+        }
++        views_changed(self, id, before.as_ref());
 +        if let Some(ctx) = &self.ctx {
 +            ctx.request_repaint();
 +        }
@@ -656,13 +705,10 @@ index 0000000..d27d626
 +                || v.marquee.is_some()
 +                || v.camera.is_some()
 +        });
-+        let quiet = !input && !gesture && !self.modal_open() && !self.palette_open;
-+        STATE.with_borrow_mut(|s| s.local = quiet && playground_live::connected());
-+        quiet
++        !input && !gesture && !self.modal_open() && !self.palette_open
 +    }
 +
 +    fn live_generation(&self) -> Option<u64> {
-+        STATE.with_borrow_mut(|s| s.local = false);
 +        let id = self.live_pin();
 +        let now = id.and_then(|id| Some(self.session.get(id)?.edit_generation().wrapping_add(id.0 << 40).wrapping_add(1)));
 +        STATE.with_borrow_mut(|s| {
@@ -679,11 +725,12 @@ index 0000000..d27d626
 +    }
 +
 +    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
-+        merge(base, current, edited, STATE.with_borrow(|s| s.local))
++        merge(base, current, edited)
 +    }
 +
++    /// The coordinator checks fully; a receiver's merge is checked by installing it (the same write and inspection).
 +    fn live_check(document: &Value) -> Result<(), Error> {
-+        read(document).map(drop)
++        if STATE.with_borrow(|s| s.in_frame) { read(document).map(drop) } else { validate(document) }
 +    }
 +}
 +
@@ -705,8 +752,13 @@ index 0000000..d27d626
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
-+    use crate::playground_live::{canonical, checkpoint, connect, disconnect, queue};
++    use crate::playground_live::{activity, canonical, checkpoint, connect, disconnect, queue};
 +    use pdfcraft_engine::{Edit, NewAnnotation, NoteIcon, Session, Shape, Style};
++
++    thread_local! {
++        /// Merges that gave new objects fresh numbers.
++        pub(super) static RENUMBERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
++    }
 +
 +    fn note(page: usize, text: &str) -> Edit {
 +        let style = Style { color: [1.0, 0.8, 0.0], opacity: 1.0, width: 1.0, fill: None };
@@ -723,84 +775,303 @@ index 0000000..d27d626
 +        Edit::RotatePages { pages: vec![page], degrees }
 +    }
 +
-+    /// The shared document of `bytes` after `edits` in a browser of its own.
-+    fn edited(bytes: &Arc<Vec<u8>>, base: &Base, edits: Vec<Edit>) -> Value {
++    /// `doc` after `edits` in a browser of its own.
++    fn edited(doc: &Value, edits: Vec<Edit>) -> Value {
++        let (shared, base) = (read(doc).unwrap(), base_for(doc["pdf"].as_str().unwrap()).unwrap());
 +        let mut session = Session::new();
-+        let id = session.open("other.pdf", None, bytes.clone(), None).unwrap();
++        let id = session.open("other.pdf", None, base.doc.bytes().clone(), None).unwrap();
++        session.replace_graph(id, build(&shared, &base)).unwrap();
 +        for edit in edits {
 +            session.apply(id, edit).unwrap();
 +        }
-+        project(session.get(id).unwrap().cos().unwrap(), base)
++        project(session.get(id).unwrap().cos().unwrap(), &base)
++    }
++
++    /// A blank PDF of `pages` pages, as a shared document.
++    fn blank(pages: usize) -> Value {
++        let bytes = Session::new().create_blank(200.0, 200.0, pages).unwrap();
++        project(&Document::open(bytes.clone()).unwrap(), &base_of(bytes, None).unwrap())
++    }
++
++    /// Delivers an accepted change the way the shell does, then runs a frame.
++    fn receive(app: &mut PdfCraftApp, before: &Value, after: &Value) -> Option<Result<Option<Vec<u8>>, Error>> {
++        let done = std::rc::Rc::new(std::cell::RefCell::new(None));
++        let to = done.clone();
++        queue(Some(canonical(before)), canonical(after), Box::new(move |r| *to.borrow_mut() = Some(r)));
++        frame(app);
++        done.take()
++    }
++
++    fn app_with(pages: usize) -> PdfCraftApp {
++        let mut app = PdfCraftApp::new();
++        let bytes = app.session.create_blank(200.0, 200.0, pages).unwrap();
++        app.open_bytes("shared.pdf", None, bytes.to_vec()).unwrap();
++        connect();
++        app
 +    }
 +
 +    #[test]
-+    fn the_shared_pdf_leaves_views_out_and_a_remote_change_waits_keeps_views_and_is_no_undo_step() {
-+        let mut app = PdfCraftApp::new();
-+        let bytes = app.session.create_blank(200.0, 200.0, 2).unwrap();
-+        app.open_bytes("shared.pdf", None, bytes.to_vec()).unwrap();
-+        connect();
++    fn views_stay_local_remote_changes_wait_and_replace_history_while_undo_save_and_revert_act_on_the_session() {
++        let mut app = app_with(2);
 +        let start = app.live_document();
 +        assert_eq!(start["objects"], json!({}), "an unedited PDF is just its file");
-+        let base = base_for(start["pdf"].as_str().unwrap()).unwrap();
 +        (app.views[0].zoom, app.views[0].current) = (3.0, 1);
-+        app.views[0].comments.selected = None;
 +        assert_eq!(app.live_document(), start, "views are not shared");
++        let enabled = |app: &PdfCraftApp, id| app.command_enabled(pdfcraft_engine::commands::command(id).unwrap());
++        assert!(enabled(&app, "edit.undo") && enabled(&app, "edit.redo") && !enabled(&app, "file.revert"), "the session's Undo, not this browser's");
++        app.undo();
++        assert_eq!(activity().1, [false], "Undo goes to the session");
 +
-+        let remote = edited(&bytes, &base, vec![rotate(1, 90)]);
-+        let done = std::rc::Rc::new(std::cell::RefCell::new(None));
-+        let to = done.clone();
-+        queue(Some(canonical(&start)), canonical(&remote), Box::new(move |r| *to.borrow_mut() = Some(r)));
++        assert!(app.apply_edit(rotate(0, 90)));
++        let mine = app.live_document();
++        let id = app.views[0].id;
++        let saved = app.session.save_bytes(id).unwrap();
++        app.session.mark_saved_keeping_graph(id, saved).unwrap();
++        assert_eq!(app.live_document(), mine, "a save does not change the shared document");
++
++        let remote = edited(&mine, vec![rotate(1, 90)]);
 +        app.palette_open = true;
-+        crate::playground_live::frame(&mut app);
-+        assert!(done.borrow().is_none() && checkpoint(&app) == Err("busy".into()), "a busy app waits");
++        assert!(receive(&mut app, &mine, &remote).is_none() && checkpoint(&app) == Err("busy".into()), "a busy app waits");
 +        app.palette_open = false;
-+        crate::playground_live::frame(&mut app);
-+        assert_eq!(*done.borrow(), Some(Ok(None)));
++        frame(&mut app);
 +        assert_eq!(canonical(&app.live_document()), canonical(&remote), "same document, same bytes");
 +        assert_eq!((app.views[0].zoom, app.views[0].current), (3.0, 1), "this person's view stays");
-+        let doc = app.session.get(app.views[0].id).unwrap();
-+        assert!(doc.can_undo().is_none() && pdfcraft_model::pages(doc.cos().unwrap())[1].dict.int(b"Rotate") == Some(90));
++        let doc = app.session.get(id).unwrap();
++        assert!(doc.can_undo().is_none(), "no undo step, and none left from before (the camera slider replays them)");
++        assert_eq!(pdfcraft_model::pages(doc.cos().unwrap())[1].dict.int(b"Rotate"), Some(90));
 +        disconnect();
 +    }
 +
 +    #[test]
-+    fn comments_on_one_page_merge_with_fresh_numbers_alike_everywhere_and_one_key_changed_twice_conflicts() {
-+        let bytes = Session::new().create_blank(200.0, 200.0, 2).unwrap();
-+        let base = base_of(bytes.clone(), None).unwrap();
-+        let b = edited(&bytes, &base, vec![]);
-+        let c = edited(&bytes, &base, vec![rotate(0, 90), note(1, "c")]);
-+        let e = edited(&bytes, &base, vec![note(1, "e"), rotate(1, 90)]);
-+        // The coordinator moves the proposal's new objects; the proposer, merging the accepted change into its
-+        // unsent work, moves its own: both get the same document.
-+        let merged = merge(&b, &c, &e, false).unwrap();
-+        assert_eq!(merged, merge(&b, &e, &c, true).unwrap());
-+        let cos = build(&read(&merged).unwrap().unwrap(), &base);
++    fn a_remote_page_change_resets_page_indices_and_keeps_a_selected_comment() {
++        let mut app = app_with(3);
++        assert!(app.apply_edit(note(0, "mine")));
++        let mine = app.live_document();
++        app.views[0].comments.selected = Some((0, 0));
++        let turned = edited(&mine, vec![rotate(2, 90)]);
++        assert!(matches!(receive(&mut app, &mine, &turned), Some(Ok(None))));
++        assert_eq!(app.views[0].comments.selected, Some((0, 0)), "the same pages: the selection stays");
++
++        app.views[0].pending_redaction = Some((2, vec![[0.0; 8]]));
++        let fewer = edited(&turned, vec![Edit::DeletePages { pages: vec![1] }]);
++        assert!(matches!(receive(&mut app, &turned, &fewer), Some(Ok(None))));
++        assert!(app.views[0].pending_redaction.is_none(), "no stale page index survives a page change");
++        assert_eq!(app.views[0].comments.selected, Some((0, 0)), "its comment is where it was");
++        disconnect();
++    }
++
++    #[test]
++    fn comments_on_one_page_merge_as_two_objects_and_one_key_changed_twice_conflicts() {
++        let b = blank(2);
++        let c = edited(&b, vec![rotate(0, 90), note(1, "c")]);
++        let e = edited(&b, vec![note(1, "e"), rotate(1, 90)]);
++        let merged = merge(&b, &c, &e).unwrap();
++        validate(&merged).unwrap();
++        let (shared, base) = (read(&merged).unwrap(), base_for(b["pdf"].as_str().unwrap()).unwrap());
++        let cos = build(&shared, &base);
 +        let pages = pdfcraft_model::pages(&cos);
 +        let annots = cos.resolve(pages[1].dict.get(b"Annots").unwrap()).as_array().unwrap().clone();
 +        let contents: BTreeSet<String> =
 +            annots.iter().filter_map(|a| cos.resolve(a).as_dict()?.get(b"Contents")?.as_string().map(|s| s.to_text())).collect();
 +        assert_eq!(contents, ["c".to_string(), "e".to_string()].into(), "both comments, as two objects");
 +        assert_eq!([0, 1].map(|p| pages[p].dict.int(b"Rotate")), [Some(90), Some(90)]);
++        assert!(merge(&b, &c, &edited(&b, vec![rotate(0, 180)])).unwrap_err().contains("/Rotate"), "both turned page 1");
++        assert!(merge(&b, &b, &json!({})).is_err() && validate(&json!({})).is_err(), "no document is never shared");
++    }
 +
-+        let again = edited(&bytes, &base, vec![rotate(0, 180)]);
-+        assert!(merge(&b, &c, &again, false).unwrap_err().contains("/Rotate"), "both turned page 1");
++    /// A random edit of `doc`, changing the graph the way PdfCraft's edits do (new objects from the allocator).
++    fn random_edit(doc: &Value, rng: &mut u64, tag: &str) -> Value {
++        let mut next = |n: usize| {
++            (*rng ^= *rng << 13, *rng ^= *rng >> 7, *rng ^= *rng << 17);
++            (*rng % n as u64) as usize
++        };
++        let (shared, base) = (read(doc).unwrap(), base_for(doc["pdf"].as_str().unwrap()).unwrap());
++        let mut cos = build(&shared, &base);
++        let pages = pdfcraft_model::pages(&cos);
++        let page = pages[next(pages.len())].obj;
++        let annots: Vec<ObjRef> = cos
++            .dict(&Object::Ref(page))
++            .and_then(|d| Some(d.get(b"Annots")?.as_array()?.iter().filter_map(Object::as_ref).collect()))
++            .unwrap_or_default();
++        let pick = next(4);
++        if pick == 0 {
++            cos.update_dict(page, |d| d.set(b"Rotate".to_vec(), (d.int(b"Rotate").unwrap_or(0) + 90) % 360)).unwrap();
++        } else if pick == 1 || annots.is_empty() {
++            let note: Dict = [
++                (b"Type".to_vec(), Object::name("Annot")),
++                (b"Subtype".to_vec(), Object::name("Text")),
++                (b"Contents".to_vec(), pdfcraft_cos::PdfString::text(tag).into()),
++                (b"P".to_vec(), page.into()),
++            ]
++            .into_iter()
++            .collect();
++            let r = cos.add(note);
++            cos.update_dict(page, |d| {
++                let mut list = d.get(b"Annots").and_then(Object::as_array).cloned().unwrap_or_default();
++                list.push(r.into());
++                d.set(b"Annots".to_vec(), list);
++            })
++            .unwrap();
++        } else if pick == 2 {
++            let gone = annots[next(annots.len())];
++            cos.update_dict(page, |d| d.set(b"Annots".to_vec(), annots.iter().filter(|r| **r != gone).map(|r| Object::Ref(*r)).collect::<Vec<_>>()))
++                .unwrap();
++            cos.free(gone);
++        } else {
++            cos.update_dict(annots[next(annots.len())], |d| d.set(b"Contents".to_vec(), pdfcraft_cos::PdfString::text(tag))).unwrap();
++        }
++        project(&cos, &base)
++    }
++
++    /// Peers edit at random; the coordinator rebases each proposal over later entries with merge(before, proposal,
++    /// entry) and checks it, receivers rebase unsent work with merge(before, local, entry). A peer whose own entry
++    /// comes back while it made no further edits must hold exactly that entry (otherwise it would propose a phantom
++    /// change), and once everything is sent every peer holds the head. LIVE_SIM_ROUNDS sets the length.
++    #[test]
++    fn peers_rebasing_stepwise_reach_the_coordinators_bytes() {
++        struct Peer {
++            live: Value,
++            acked: usize,
++            /// The proposal in flight: whether the live document holds it unchanged since (no edit, no restore), and
++            /// whether it holds it at all (a conflict restores the accepted document).
++            inflight: Option<(bool, bool)>,
++            inbox: std::collections::VecDeque<usize>,
++        }
++        let rounds: usize = std::env::var("LIVE_SIM_ROUNDS").ok().and_then(|n| n.parse().ok()).unwrap_or(600);
++        let start = blank(2);
++        let mut journal = vec![(start.clone(), usize::MAX)];
++        let mut peers: Vec<Peer> = (0..3).map(|_| Peer { live: start.clone(), acked: 0, inflight: None, inbox: Default::default() }).collect();
++        let mut queue: std::collections::VecDeque<(usize, usize, Value)> = Default::default();
++        let (mut rng, mut seq) = (std::env::var("LIVE_SIM_SEED").ok().and_then(|n| n.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15u64), 0);
++        let (mut accepted, mut rejected, mut divergences) = (0, 0, 0);
++        RENUMBERED.set(0);
++        let mut step = |peers: &mut Vec<Peer>,
++                        queue: &mut std::collections::VecDeque<_>,
++                        journal: &mut Vec<(Value, usize)>,
++                        action: usize,
++                        p: usize,
++                        rng: &mut u64| match action {
++            0 => {
++                seq += 1;
++                let peer = &mut peers[p];
++                peer.live = random_edit(&peer.live, rng, &format!("{p}.{seq}"));
++                if let Some((unchanged, _)) = peer.inflight.as_mut() {
++                    *unchanged = false;
++                }
++            }
++            1 => {
++                let peer = &mut peers[p];
++                if peer.inflight.is_none() && peer.live != journal[peer.acked].0 {
++                    peer.inflight = Some((true, true));
++                    queue.push_back((p, peer.acked, peer.live.clone()));
++                }
++            }
++            2 => {
++                let Some((author, base, proposal)) = queue.pop_front() else { return };
++                let rebased = merge(&journal[base].0, &journal[base].0, &proposal)
++                    .and_then(|first| (base + 1..journal.len()).try_fold(first, |next, i| merge(&journal[i - 1].0, &next, &journal[i].0)));
++                match rebased.and_then(|next| validate(&next).map(|()| next)) {
++                    Ok(next) => {
++                        journal.push((next, author));
++                        peers.iter_mut().for_each(|peer| peer.inbox.push_back(journal.len() - 1));
++                        accepted += 1;
++                    }
++                    Err(_) => {
++                        // The shell's reject: unsent work in the live document goes back to the acknowledged one.
++                        let peer = &mut peers[author];
++                        if peer.inflight.take().is_some_and(|(_, in_live)| in_live) {
++                            peer.live = journal[peer.acked].0.clone();
++                        }
++                        rejected += 1;
++                    }
++                }
++            }
++            _ => {
++                let peer = &mut peers[p];
++                let Some(revision) = peer.inbox.pop_front() else { return };
++                let (after, author) = &journal[revision];
++                let own = (*author == p).then(|| peer.inflight.take()).flatten();
++                if let Some((unchanged, true)) = own {
++                    if unchanged && peer.live != *after {
++                        divergences += 1;
++                    }
++                } else {
++                    // The shell's apply(before, after), whose merge returns `after` when nothing is unsent.
++                    peer.live = merge(&journal[peer.acked].0, &peer.live, after).unwrap_or_else(|_| {
++                        peer.inflight = peer.inflight.map(|_| (false, false));
++                        after.clone()
++                    });
++                }
++                peer.acked = revision;
++            }
++        };
++        for _ in 0..rounds {
++            let pick = |rng: &mut u64, n: usize| {
++                (*rng ^= *rng << 13, *rng ^= *rng >> 7, *rng ^= *rng << 17);
++                (*rng % n as u64) as usize
++            };
++            let (action, p) = ([0, 0, 0, 0, 1, 1, 2, 2, 3, 3][pick(&mut rng, 10)], pick(&mut rng, 3));
++            step(&mut peers, &mut queue, &mut journal, action, p, &mut rng);
++        }
++        // Everything still unsent goes out and comes back.
++        for _ in 0..200 {
++            for p in 0..3 {
++                for action in [1, 2, 3, 3, 3] {
++                    step(&mut peers, &mut queue, &mut journal, action, p, &mut rng);
++                }
++            }
++        }
++        eprintln!("{rounds} rounds: {accepted} accepted, {rejected} conflicts, {} renumbered, {divergences} divergences", RENUMBERED.get());
++        assert_eq!(divergences, 0, "a peer's own entry differs from what it holds");
++        let head = &journal.last().unwrap().0;
++        assert!(peers.iter().all(|peer| peer.live == *head), "every peer holds the head");
++        assert!(accepted > 20 && rejected > 0 && RENUMBERED.get() > 0, "the run exercised merges, conflicts and fresh numbers");
 +    }
 +}
+diff --git a/crates/ui-egui/src/commands.rs b/crates/ui-egui/src/commands.rs
+index c46d93d..79bca53 100644
+--- a/crates/ui-egui/src/commands.rs
++++ b/crates/ui-egui/src/commands.rs
+@@ -84,6 +84,10 @@ impl PdfCraftApp {
+         if self.combine_showing() && matches!(spec.needs, commands::Needs::Undo | commands::Needs::Redo) {
+             return self.combine_can_undo(spec.needs == commands::Needs::Undo);
+         }
++        #[cfg(any(target_arch = "wasm32", test))]
++        if let Some(enabled) = crate::live::command_enabled(self, spec.id) {
++            return enabled;
++        }
+         commands::is_enabled(spec, &self.session, self.active_ids().map(|(_, id)| id))
+             && (spec.id != "edit.copy"
+                 || self.active.and_then(|i| self.views.get(i)).is_some_and(|v| !v.organize && v.selected_text().is_some_and(|t| !t.is_empty())))
 diff --git a/crates/ui-egui/src/editing.rs b/crates/ui-egui/src/editing.rs
-index be1347d..0b5d979 100644
+index be1347d..2f45fa8 100644
 --- a/crates/ui-egui/src/editing.rs
 +++ b/crates/ui-egui/src/editing.rs
 @@ -196,6 +196,10 @@ impl PdfCraftApp {
  
      fn history_step(&mut self, undo: bool) {
          let Some((i, id)) = self.active_ids() else { return };
-+        #[cfg(target_arch = "wasm32")]
++        #[cfg(any(target_arch = "wasm32", test))]
 +        if crate::live::shared(id) && crate::playground_live::undo(!undo) {
 +            return;
 +        }
          let result = if undo { self.session.undo(id) } else { self.session.redo(id) };
          match result {
              Ok(label) => {
+@@ -643,7 +647,12 @@ impl PdfCraftApp {
+             };
+             match delivered {
+                 Ok(()) => {
+-                    let _ = self.session.mark_saved(id, bytes, None);
++                    // A shared live document keeps its graph: the save's own changes are not everyone's.
++                    let _ = if crate::live::shared(id) {
++                        self.session.mark_saved_keeping_graph(id, bytes)
++                    } else {
++                        self.session.mark_saved(id, bytes, None)
++                    };
+                     if let Some(doc) = self.session.get(id)
+                         && let Some(view) = self.views.get_mut(index)
+                     {
 diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
 index d101d81..79515e5 100644
 --- a/crates/ui-egui/src/lib.rs
