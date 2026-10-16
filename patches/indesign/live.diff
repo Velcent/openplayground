@@ -1,6 +1,6 @@
 diff --git a/apps/designcraft-web/src/live.rs b/apps/designcraft-web/src/live.rs
 new file mode 100644
-index 0000000..477f64a
+index 0000000..92ebc1b
 --- /dev/null
 +++ b/apps/designcraft-web/src/live.rs
 @@ -0,0 +1,336 @@
@@ -54,12 +54,14 @@ index 0000000..477f64a
 +    id
 +}
 +
-+/// The shared document's index while its tab is open, binding the active one when none is bound yet.
++/// The shared document's index while its tab is open; the active one until a session binds it.
 +fn shared(app: &DesignApp) -> Option<usize> {
 +    let docs = app.session.documents();
 +    let Some(uid) = SHARED.get() else {
 +        let i = app.session.active_index()?;
-+        SHARED.set(docs.get(i).map(|d| d.uid));
++        if playground_live::connected() {
++            SHARED.set(docs.get(i).map(|d| d.uid));
++        }
 +        return Some(i);
 +    };
 +    docs.iter().position(|d| d.uid == uid)
@@ -239,12 +241,10 @@ index 0000000..477f64a
 +        }
 +    }
 +
-+    /// The JSON merge, refusing a result that is no valid document (a frame threaded on one side, deleted on the
-+    /// other).
-+    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
-+        let merged = playground_live::merge(base, current, edited, Self::COUNTERS)?;
-+        serde_json::from_value::<Document>(merged.clone()).map_err(invalid)?.check().map_err(|e| format!("Conflict: {e}"))?;
-+        Ok(merged)
++    /// A merged document must install: it deserializes and passes the document's own check (no frame threaded on one
++    /// side and deleted on the other).
++    fn live_check(document: &Value) -> Result<(), String> {
++        serde_json::from_value::<Document>(document.clone()).map_err(invalid)?.check().map_err(|e| format!("Conflict: {e}"))
 +    }
 +}
 +

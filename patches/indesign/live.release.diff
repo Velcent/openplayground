@@ -1,0 +1,473 @@
+diff --git a/apps/designcraft-web/src/live.rs b/apps/designcraft-web/src/live.rs
+new file mode 100644
+index 0000000..fea88c4
+--- /dev/null
++++ b/apps/designcraft-web/src/live.rs
+@@ -0,0 +1,334 @@
++//! Playground live editing (`playground_live`): the shared document is one open document's model as JSON with its
++//! embedded files' bytes, without this person's views (selection, zoom, spread rotation on screen, a Data Merge
++//! preview). Native undo history stays local; while connected, Undo and Redo of the shared document go to the session.
++
++use crate::playground_live::{self, Live};
++use designcraft_engine::DocState;
++use designcraft_engine::cmd::{base64_decode, base64_encode};
++use designcraft_engine::doc::{Document, Selection};
++use designcraft_ui_egui::DesignApp;
++use serde_json::Value;
++use std::cell::{Cell, RefCell};
++use std::collections::BTreeMap;
++use std::sync::Arc;
++
++pub const FORMAT: &str = concat!("indesign:1:", env!("CARGO_PKG_VERSION"));
++
++thread_local! {
++    /// The shared document's `uid`: the document active when the session first read it, for the whole session.
++    static SHARED: Cell<Option<u64>> = const { Cell::new(None) };
++    /// The shared model as last seen, with a counter of its changes: still reported once its tab is closed.
++    static SEEN: RefCell<Option<(Arc<Document>, u64)>> = const { RefCell::new(None) };
++    /// The pointer is down or a text field has the keyboard.
++    static BUSY: Cell<bool> = const { Cell::new(false) };
++    static CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
++}
++
++/// The end of a frame.
++pub fn frame(app: &mut DesignApp, ctx: &egui::Context) {
++    BUSY.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
++    CTX.with_borrow_mut(|c| _ = c.get_or_insert_with(|| ctx.clone()));
++    playground_live::frame(app);
++}
++
++pub fn repaint() {
++    CTX.with_borrow(|c| c.iter().for_each(egui::Context::request_repaint));
++}
++
++/// Undo or Redo of the `active` document goes to the session when that is the shared one.
++pub fn undo(active: Option<u64>, redo: bool) -> bool {
++    active.is_some() && active == SHARED.get() && playground_live::undo(redo)
++}
++
++/// [`Document::alloc`]'s ids: unique among peers while connected, with `next_id` raised past each so it stays above
++/// every id (`Document::check`).
++pub fn fresh_id(next: &mut u64) -> u64 {
++    let id = playground_live::fresh_id(&mut next.clone());
++    *next = (*next).max(id);
++    id
++}
++
++/// The shared document's index while its tab is open; the active one until a session binds it.
++fn shared(app: &DesignApp) -> Option<usize> {
++    let docs = app.session.documents();
++    let Some(uid) = SHARED.get() else {
++        let i = app.session.active_index()?;
++        if playground_live::connected() {
++            SHARED.set(docs.get(i).map(|d| d.uid));
++        }
++        return Some(i);
++    };
++    docs.iter().position(|d| d.uid == uid)
++}
++
++/// The document itself: during a Data Merge preview the template waits in the stash.
++fn model(st: &DocState) -> &Arc<Document> {
++    st.preview_stash.as_ref().unwrap_or(&st.doc)
++}
++
++/// The shared model (the last one seen once its tab is closed) and its change count: a selection or an equal copy
++/// is no change.
++fn seen(app: &DesignApp) -> Option<(Arc<Document>, u64)> {
++    let now = shared(app).map(|i| model(&app.session.documents()[i]).clone());
++    SEEN.with_borrow_mut(|seen| {
++        match (now, seen.as_mut()) {
++            (Some(doc), Some((last, _))) if Arc::ptr_eq(last, &doc) || *last == doc => *last = doc,
++            (Some(doc), last) => *seen = Some((doc, last.map_or(0, |l| l.1 + 1))),
++            (None, _) => {}
++        }
++        seen.clone()
++    })
++}
++
++fn project(doc: &Document) -> Value {
++    let mut v = serde_json::to_value(doc).unwrap_or(Value::Null);
++    for list in ["spreads", "parents"] {
++        for spread in v.get_mut(list).and_then(Value::as_array_mut).into_iter().flatten() {
++            for page in spread.get_mut("pages").and_then(Value::as_array_mut).into_iter().flatten() {
++                page.as_object_mut().map(|p| p.remove("viewRotation"));
++            }
++        }
++    }
++    // A local cache key (the composition cache's), bumped by every edit of the story.
++    for story in v.get_mut("stories").and_then(Value::as_object_mut).into_iter().flat_map(|s| s.values_mut()) {
++        story.as_object_mut().map(|s| s.remove("rev"));
++    }
++    if let Some(assets) = v.get_mut("assets").and_then(Value::as_object_mut) {
++        for (id, asset) in &doc.assets {
++            if let Some(a) = assets.get_mut(&id.0.to_string()).and_then(Value::as_object_mut) {
++                a.insert("data".into(), base64_encode(&asset.data).into());
++            }
++        }
++    }
++    v
++}
++
++fn invalid(e: impl std::fmt::Display) -> String {
++    format!("Invalid shared document: {e}")
++}
++
++/// Puts back what the shared document leaves out (file bytes, views, cache keys) and keeps the parts that did not
++/// change, so caches keyed by them stay warm.
++fn fill(doc: &mut Document, files: &BTreeMap<String, String>, old: Option<&Document>) {
++    for (id, asset) in &mut doc.assets {
++        let data = base64_decode(files.get(&id.0.to_string()).map_or("", String::as_str));
++        let o = old.and_then(|o| o.assets.get(id));
++        Arc::make_mut(asset).data = match o {
++            Some(o) if *o.data == data => o.data.clone(),
++            _ => Arc::new(data),
++        };
++        keep(asset, o);
++    }
++    let Some(old) = old else { return };
++    doc.font_scope = old.font_scope;
++    keep(&mut doc.styles, Some(&old.styles));
++    for (id, story) in &mut doc.stories {
++        let Some(o) = old.stories.get(id) else { continue };
++        Arc::make_mut(story).rev = o.rev;
++        if story != o {
++            Arc::make_mut(story).rev = o.rev.wrapping_add(1);
++        }
++        keep(story, Some(o));
++    }
++    // ponytail: linear lookups per spread and item, fine for page counts; index by id if documents grow huge.
++    for spread in doc.spreads.iter_mut().chain(&mut doc.parents) {
++        let Some(o) = old.spreads.iter().chain(&old.parents).find(|o| o.id == spread.id) else { continue };
++        let s = Arc::make_mut(spread);
++        for page in &mut s.pages {
++            page.view_rotation = o.pages.iter().find(|p| p.id == page.id).map_or(0, |p| p.view_rotation);
++        }
++        for item in &mut s.items {
++            keep(item, o.items.iter().find(|i| i.id == item.id));
++        }
++        keep(spread, Some(o));
++    }
++}
++
++fn keep<T: PartialEq>(new: &mut Arc<T>, old: Option<&Arc<T>>) {
++    if let Some(old) = old.filter(|old| *old == new) {
++        *new = old.clone();
++    }
++}
++
++/// Drops what the selection names that is gone, and keeps a caret inside a story that changed.
++fn prune(sel: &mut Selection, doc: &Document, old: Option<&Document>) {
++    let same = |story| matches!((doc.stories.get(&story), old.and_then(|o| o.stories.get(&story))), (Some(a), Some(b)) if Arc::ptr_eq(a, b));
++    sel.items.retain(|i| doc.item(*i).is_some());
++    sel.anchors.retain(|a| doc.item(a.0).is_some());
++    sel.key = sel.key.filter(|k| doc.item(*k).is_some());
++    sel.cells = sel.cells.filter(|c| same(c.story));
++    sel.text = sel.text.and_then(|mut t| {
++        if same(t.story) {
++            return Some(t);
++        }
++        let text = &doc.stories.get(&t.story).filter(|_| t.cell.is_none())?.text;
++        for at in [&mut t.anchor, &mut t.focus] {
++            *at = (*at).min(text.len());
++            while !text.is_char_boundary(*at) {
++                *at -= 1;
++            }
++        }
++        t.frame = t.frame.filter(|f| doc.item(*f).is_some());
++        Some(t)
++    });
++}
++
++impl Live for DesignApp {
++    const COUNTERS: &'static [&'static str] = &["nextId"];
++
++    fn live_document(&self) -> Value {
++        seen(self).map_or(Value::Null, |(doc, _)| project(&doc))
++    }
++
++    fn live_adopt(&mut self, mut document: Value) -> Result<(), String> {
++        if document.is_null() {
++            return Ok(());
++        }
++        let files: BTreeMap<String, String> = document
++            .get_mut("assets")
++            .and_then(Value::as_object_mut)
++            .into_iter()
++            .flat_map(|assets| assets.iter_mut())
++            .filter_map(|(id, a)| match a.as_object_mut()?.remove("data")? {
++                Value::String(data) => Some((id.clone(), data)),
++                _ => None,
++            })
++            .collect();
++        let mut doc: Document = serde_json::from_value(document).map_err(invalid)?;
++        doc.check().map_err(invalid)?;
++        let old = seen(self).map(|(old, _)| old);
++        fill(&mut doc, &files, old.as_deref());
++        // Nothing open to share yet, or its tab was closed: it opens again.
++        let Some(i) = shared(self) else {
++            let i = self.session.add_document(DocState::new(doc, None));
++            SHARED.set(self.session.documents().get(i).map(|d| d.uid));
++            self.after_engine();
++            return Ok(());
++        };
++        let st = &mut self.session.documents_mut()[i];
++        (st.preview_stash, st.preview_record) = (None, None);
++        prune(&mut st.selection, &doc, old.as_deref());
++        st.doc = Arc::new(doc);
++        st.revision += 1;
++        if st.doc.layer(st.active_layer).is_none() {
++            st.active_layer = st.doc.default_layer();
++        }
++        Ok(())
++    }
++
++    fn live_quiet(&self) -> bool {
++        !BUSY.get() && !self.session.tool_busy() && self.session.documents().iter().all(|d| d.interaction.is_none())
++    }
++
++    fn live_generation(&self) -> Option<u64> {
++        seen(self).map(|(_, changes)| changes)
++    }
++
++    fn live_disconnected(&mut self) {
++        let docs = self.session.documents_mut();
++        SEEN.take();
++        if let Some(st) = SHARED.take().and_then(|uid| docs.iter_mut().find(|d| d.uid == uid)) {
++            st.history.undo.clear();
++            st.history.redo.clear();
++        }
++    }
++
++    /// A merged document must install: it deserializes and passes the document's own check (no frame threaded on one
++    /// side and deleted on the other).
++    fn live_check(document: &Value) -> Result<(), String> {
++        serde_json::from_value::<Document>(document.clone()).map_err(invalid)?.check().map_err(|e| format!("Conflict: {e}"))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use designcraft_engine::Session;
++    use designcraft_ui_egui::Services;
++    use playground_live::canonical;
++    use serde_json::json;
++
++    fn sample() -> Result<DesignApp, String> {
++        let mut app = DesignApp::new(Session::new(), Services::default());
++        app.run("file.newSample", json!({}))?;
++        Ok(app)
++    }
++
++    #[test]
++    fn shares_the_document_without_views_adopts_it_without_an_undo_step_and_waits_for_a_gesture() -> Result<(), String> {
++        let mut a = sample()?;
++        playground_live::connect();
++        let start = canonical(&a.live_document());
++        let bound = SHARED.get();
++        // Views: a selection, a rotated spread and a Data Merge preview's filled copy stay out.
++        let ids: Vec<u64> = a.session.doc().map_err(|e| e.to_string())?.doc.spreads[0].items.iter().map(|i| i.id.0).collect();
++        a.run("selection.set", json!({"ids": [ids[0]]}))?;
++        let st = a.session.doc_mut().map_err(|e| e.to_string())?;
++        Arc::make_mut(&mut Arc::make_mut(&mut st.doc).spreads[0]).pages[0].view_rotation = 1;
++        st.preview_stash = Some(st.doc.clone());
++        Arc::make_mut(&mut st.doc).title = "Filled".into();
++        assert_eq!(canonical(&a.live_document()), start, "views are not shared");
++        a.session.stop_data_preview();
++
++        // A joiner with no document open adopts it whole, files included, and shares the same bytes.
++        let mut b = DesignApp::new(Session::new(), Services::default());
++        b.live_adopt(serde_json::from_slice(&start).map_err(|e| e.to_string())?)?;
++        assert_eq!(canonical(&b.live_document()), start);
++        let assets = |app: &DesignApp| app.session.active().map(|d| d.doc.assets.values().map(|a| a.data.len()).collect::<Vec<_>>());
++        assert!(assets(&b).is_some_and(|sizes| !sizes.is_empty() && sizes == assets(&a).unwrap_or_default()));
++
++        // B moves another object; A merges it at a quiet frame, keeping its selection and its own undo history.
++        b.run("selection.set", json!({"ids": [ids[1]]}))?;
++        b.run("transform.move", json!({"dx": 10, "dy": 0}))?;
++        let edited = canonical(&b.live_document());
++        // One page, one app: the binding goes back to A's document.
++        SHARED.set(bound);
++        SEEN.take();
++        let undo_steps = a.session.doc().map_err(|e| e.to_string())?.history.undo.len();
++        let done = std::rc::Rc::new(Cell::new(false));
++        let to = done.clone();
++        playground_live::queue(Some(start.clone()), edited.clone(), Box::new(move |r| to.set(r.is_ok())));
++        a.session.begin_interaction("Drag").map_err(|e| e.to_string())?;
++        playground_live::frame(&mut a);
++        assert!(!done.get(), "a gesture under way holds remote changes");
++        a.session.commit_interaction().map_err(|e| e.to_string())?;
++        playground_live::frame(&mut a);
++        assert!(done.get());
++        assert_eq!(canonical(&a.live_document()), edited);
++        let st = a.session.doc().map_err(|e| e.to_string())?;
++        assert_eq!((st.history.undo.len(), st.selection.items.clone()), (undo_steps, vec![designcraft_engine::doc::ItemId(ids[0])]));
++        assert_eq!(st.doc.spreads[0].pages[0].view_rotation, 1, "the spread stays rotated here");
++
++        // New objects get ids unique to this peer, and the counter stays above them.
++        let mut next = a.session.doc().map_err(|e| e.to_string())?.doc.next_id + 1;
++        let id = fresh_id(&mut next);
++        assert!(id >> 52 == 1 && next == id);
++        playground_live::disconnect();
++        Ok(())
++    }
++
++    #[test]
++    fn another_documents_undo_stays_native_and_a_closed_shared_document_is_still_shared_and_reopens() -> Result<(), String> {
++        let mut app = sample()?;
++        playground_live::connect();
++        let shared = canonical(&app.live_document());
++        let uid = app.session.active().map(|d| d.uid);
++        app.run("file.new", json!({}))?;
++        assert!(!undo(app.session.active().map(|d| d.uid), false), "a private document's Undo stays its own");
++        assert!(undo(uid, false));
++
++        // Closing the shared document's tab shares no other document; the next remote change opens it again.
++        let i = app.session.documents().iter().position(|d| Some(d.uid) == uid).ok_or("no shared document")?;
++        app.session.close_document(i);
++        assert_eq!(canonical(&app.live_document()), shared);
++        let mut edited: Value = serde_json::from_slice(&shared).map_err(|e| e.to_string())?;
++        edited["title"] = json!("Renamed");
++        playground_live::queue(Some(shared), canonical(&edited), Box::new(|r| assert_eq!(r.map(drop), Ok(()))));
++        playground_live::frame(&mut app);
++        let reopened = app.session.active().ok_or("no document")?;
++        assert_eq!((app.session.documents().len(), reopened.doc.title.as_str()), (2, "Renamed"));
++        assert!(undo(Some(reopened.uid), false));
++        playground_live::disconnect();
++        Ok(())
++    }
++}
+diff --git a/apps/designcraft-web/src/main.rs b/apps/designcraft-web/src/main.rs
+index 527baff..02123e2 100644
+--- a/apps/designcraft-web/src/main.rs
++++ b/apps/designcraft-web/src/main.rs
+@@ -22,6 +22,13 @@ mod browser_policy;
+ #[cfg(target_arch = "wasm32")]
+ mod web;
+ 
++#[cfg(any(target_arch = "wasm32", test))]
++#[cfg_attr(test, allow(dead_code))]
++mod live;
++#[cfg(any(target_arch = "wasm32", test))]
++#[cfg_attr(test, allow(dead_code))]
++mod playground_live;
++
+ #[cfg(target_arch = "wasm32")]
+ fn main() {
+     web::start();
+diff --git a/apps/designcraft-web/src/web.rs b/apps/designcraft-web/src/web.rs
+index fe7cca4..4ca2685 100644
+--- a/apps/designcraft-web/src/web.rs
++++ b/apps/designcraft-web/src/web.rs
+@@ -47,7 +47,8 @@ pub fn start() {
+         {
+             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
+         }
+-        let result = eframe::WebRunner::new()
++        let runner = eframe::WebRunner::new();
++        let result = runner
+             .start(
+                 canvas,
+                 options,
+@@ -64,6 +65,14 @@ pub fn start() {
+                 }),
+             )
+             .await;
++        if result.is_ok() {
++            // Playground live editing (inert until its shell connects).
++            let _ = designcraft_engine::doc::FRESH_ID.set(crate::live::fresh_id);
++            let with_app = move |f: &mut dyn FnMut(&mut DesignApp)| runner.app_mut::<WebShell>().map(|mut shell| f(&mut shell.app)).is_some();
++            if let Err(e) = crate::playground_live::web::attach::<DesignApp>(crate::live::FORMAT, with_app, crate::live::repaint) {
++                log::error!("live editing unavailable: {e:?}");
++            }
++        }
+         if let Some(el) = document.get_element_by_id(LOADING_ID) {
+             match result {
+                 Ok(()) => el.remove(),
+@@ -112,6 +121,11 @@ impl eframe::App for WebShell {
+ 
+     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+         self.app.ui(ui);
++        crate::live::frame(&mut self.app, ui.ctx());
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
+     }
+ }
+ 
+@@ -146,6 +160,7 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
+             }
+         })),
+         inbox: Some(inbox),
++        undo: Some(Box::new(crate::live::undo)),
+         ..Default::default()
+     }
+ }
+diff --git a/crates/doc/src/lib.rs b/crates/doc/src/lib.rs
+index c1c55dc..82401ac 100644
+--- a/crates/doc/src/lib.rs
++++ b/crates/doc/src/lib.rs
+@@ -604,10 +604,19 @@ pub struct Bookmark {
+     pub children: Vec<Bookmark>,
+ }
+ 
++/// Set by the web app for live editing: hands out the ids [`Document::alloc`] counts, unique among the people editing at
++/// once (it raises `next_id` past each).
++#[cfg(target_arch = "wasm32")]
++pub static FRESH_ID: std::sync::OnceLock<fn(&mut u64) -> u64> = std::sync::OnceLock::new();
++
+ impl Document {
+     /// Allocate a fresh id.
+     pub fn alloc(&mut self) -> u64 {
+         self.next_id += 1;
++        #[cfg(target_arch = "wasm32")]
++        if let Some(fresh) = FRESH_ID.get() {
++            return fresh(&mut self.next_id);
++        }
+         self.next_id
+     }
+ 
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 900bd88..1cd531c 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -320,6 +320,9 @@ impl Session {
+     pub fn documents(&self) -> &[DocState] {
+         &self.docs
+     }
++    pub fn documents_mut(&mut self) -> &mut [DocState] {
++        &mut self.docs
++    }
+     pub fn active_index(&self) -> Option<usize> {
+         self.active
+     }
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 1db2f59..8412a7a 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -77,6 +77,10 @@ pub struct Services {
+     /// The system clipboard's text, for Paste chosen from a menu (egui only delivers it with the
+     /// paste keys, which a native menu bar takes first).
+     pub clipboard_text: Option<ClipboardFn>,
++    /// Takes Undo (false) or Redo (true) of the active document (its uid) instead of its history when it returns true
++    /// (live editing).
++    #[cfg(target_arch = "wasm32")]
++    pub undo: Option<Box<dyn Fn(Option<u64>, bool) -> bool>>,
+ }
+ 
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+@@ -634,6 +638,12 @@ impl DesignApp {
+ 
+     /// THE entry point for every action (menus, shortcuts, palette, panels, control channel).
+     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
++        #[cfg(target_arch = "wasm32")]
++        if matches!(id, "edit.undo" | "edit.redo")
++            && self.services.undo.as_ref().is_some_and(|undo| undo(self.session.active().map(|d| d.uid), id == "edit.redo"))
++        {
++            return Ok(Value::Null);
++        }
+         if let Some(r) = menus::run_ui(self, id, &params) {
+             return r;
+         }
