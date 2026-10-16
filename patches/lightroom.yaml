@@ -48,3 +48,85 @@
 - file: apps/*-web/src/web.rs
   find: 'File ▸ Back Up Library… now and then'
   replace: 'File > Back Up Library now and then'
+
+# Live editing in Playground sessions (patches/lightroom/live.diff + patches/live/playground_live.rs)
+# What it's for: people in a Playground session edit one LightCraft library together (the catalog: ratings, develop
+#   settings, History, albums…), see each other's pointers and selections, and get each other's imported photos.
+# How: the adapter lives in new files: apps/lightcraft-web/src/live.rs (the shared document, merge, adopt, media,
+#   presence, the session's own library folder), apps/lightcraft-web/src/web/live.rs (the kept runner and the wrapper
+#   that ends each frame with the session's frame hook) and crates/catalog/src/playground.rs (hooks the web build sets;
+#   inert elsewhere). These rules only declare them and call in, each one line at the end of a file or right after a
+#   function's signature.
+# Verify: node scripts/build.mjs check lightroom head|release, then the e2e (tests/live-apps/lightroom.mjs).
+# If upstream changes: when a function named below is renamed, anchor on its new signature; when WebApp, its `app`,
+#   `originals` or `backend` fields are renamed, follow them in web/live.rs.
+#
+# The adapter module (web build; native tests).
+- live: true
+  file: apps/lightcraft-web/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session.\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
+# The web entry: its live module, the runner kept, the app wrapped, and a session's own library folder (an invitation
+# link's ?pg-session=<room>) instead of this browser's library, so joining never touches it.
+- live: true
+  file: apps/lightcraft-web/src/web.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session.\nmod live;\n"
+- live: true
+  file: apps/lightcraft-web/src/web.rs
+  find: 'eframe::WebRunner::new\(\)'
+  replace: 'live::runner()'
+- live: true
+  file: apps/lightcraft-web/src/web.rs
+  find: 'Ok\(Box::new\((?=\s*WebApp::new\b)'
+  replace: 'Ok(live::wrap('
+- live: true
+  file: apps/lightcraft-web/src/web.rs
+  find: 'for\s+name\s+in\s+LIBRARY_FILES\b'
+  before: "if let Some(dir) = crate::live::session_library() { lib_dir = dir; }\n        "
+# The hooks module; the id allocators: while connected, an id nobody else adding something at once picks.
+- live: true
+  file: crates/catalog/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (hooks the web build sets).\npub mod playground;\n"
+- live: true
+  file: crates/catalog/src/lib.rs
+  find: 'pub\s+fn\s+alloc_photo_id\s*\(\s*&mut\s+self\s*\)[^{]*\{'
+  after: "\n        if let Some(id) = crate::playground::fresh(&mut self.next_photo) { return PhotoId(id); }"
+- live: true
+  file: crates/catalog/src/lib.rs
+  find: 'pub\s+fn\s+alloc_album_id\s*\(\s*&mut\s+self\s*\)[^{]*\{'
+  after: "\n        if let Some(id) = crate::playground::fresh(&mut self.next_album) { return AlbumId(id); }"
+- live: true
+  file: crates/catalog/src/lib.rs
+  find: 'pub\s+fn\s+alloc_stack_id\s*\(\s*&mut\s+self\s*\)[^{]*\{'
+  after: "\n        if let Some(id) = crate::playground::fresh(&mut self.next_stack) { return StackId(id); }"
+# Automatic versions: while connected, made by whoever edited the photo (Session::commit notes it), not by everyone
+# who leaves the photo after the edit arrived.
+- live: true
+  file: crates/engine/src/lib.rs
+  find: 'pub\s+fn\s+commit\s*\(\s*&mut\s+self\b[^{]*\{'
+  after: "\n        lightcraft_catalog::playground::committed(&op);"
+- live: true
+  file: crates/engine/src/lib.rs
+  find: 'pub\s+fn\s+auto_version\s*\(\s*&mut\s+self\b[^{]*\{'
+  after: "\n        if lightcraft_catalog::playground::others_edit(id) { return; }"
+# Undo and Redo: while connected they are the session's (this person's own steps), offered whatever the native
+# history holds; LightcraftApp::run, which menus and shortcuts go through, hands them over. The Presets panel's
+# Amount slider re-applies a preset by undoing it natively: not offered while connected.
+- live: true
+  file: crates/engine/src/cmd/mod.rs
+  find: 'pub\s+fn\s+can_undo\s*\([^{]*\{'
+  after: "\n    if lightcraft_catalog::playground::live() { return Ok(()); }"
+- live: true
+  file: crates/engine/src/cmd/mod.rs
+  find: 'pub\s+fn\s+can_redo\s*\([^{]*\{'
+  after: "\n    if lightcraft_catalog::playground::live() { return Ok(()); }"
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\b[^{]*\{'
+  after: "\n        if matches!(id, \"edit.undo\" | \"edit.redo\") && lightcraft_catalog::playground::undo(id == \"edit.redo\") { return Ok(Default::default()); }"
+- live: true
+  file: crates/ui-egui/src/panels/presets.rs
+  find: 'fn\s+is_current\s*\(\s*&self\b[^{]*\{'
+  after: "\n        if lightcraft_catalog::playground::live() { return false; }"

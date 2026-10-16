@@ -1,66 +1,30 @@
-diff --git a/apps/lightcraft-web/src/backup.rs b/apps/lightcraft-web/src/backup.rs
-index 00ec12a4..083818ed 100644
---- a/apps/lightcraft-web/src/backup.rs
-+++ b/apps/lightcraft-web/src/backup.rs
-@@ -47,6 +47,14 @@ pub fn valid_library_dir(name: &str) -> bool {
-         || name.strip_prefix("library-").is_some_and(|s| !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
- }
- 
-+/// The library folder of a Playground session (`?pg-session=<room id>`, a lowercase UUID): its own, so joining a session
-+/// never touches this browser's library. `None` for anything else.
-+pub fn session_library_dir(room: &str) -> Option<String> {
-+    let uuid = room.len() == 36
-+        && room.char_indices().all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { c == '-' } else { matches!(c, '0'..='9' | 'a'..='f') });
-+    uuid.then(|| format!("library-session-{room}"))
-+}
-+
- /// Is `h` a plausible content hash (used as a storage key segment)?
- pub fn valid_hash(h: &str) -> bool {
-     !h.is_empty() && h.len() <= 128 && h.chars().all(|c| c.is_ascii_alphanumeric())
-@@ -328,6 +336,9 @@ mod tests {
-         assert_eq!(original_entry("abc", ".."), "originals/abc/original");
-         assert!(valid_library_dir("library") && valid_library_dir("library-restored-17"));
-         assert!(!valid_library_dir("library-../x") && !valid_library_dir("originals") && !valid_library_dir("library-"));
-+        let room = "0f8e7d6c-5b4a-4321-8fed-cba987654321";
-+        assert!(session_library_dir(room).is_some_and(|d| d == format!("library-session-{room}") && valid_library_dir(&d)));
-+        assert!([&room.to_uppercase(), "../library", "", &room[1..]].iter().all(|r| session_library_dir(r).is_none()));
-     }
- 
-     #[test]
-diff --git a/apps/lightcraft-web/src/lib.rs b/apps/lightcraft-web/src/lib.rs
-index 58966e6e..81b37e63 100644
---- a/apps/lightcraft-web/src/lib.rs
-+++ b/apps/lightcraft-web/src/lib.rs
-@@ -22,6 +22,12 @@ pub mod files;
- pub mod store;
- pub mod wire;
- 
-+#[cfg(any(target_arch = "wasm32", test))]
-+#[cfg_attr(test, allow(dead_code))]
-+mod live;
-+#[cfg(any(target_arch = "wasm32", test))]
-+#[allow(dead_code)]
-+mod playground_live;
- #[cfg(target_arch = "wasm32")]
- mod backend;
- #[cfg(target_arch = "wasm32")]
 diff --git a/apps/lightcraft-web/src/live.rs b/apps/lightcraft-web/src/live.rs
 new file mode 100644
-index 00000000..ccdad929
+index 00000000..9ef8f634
 --- /dev/null
 +++ b/apps/lightcraft-web/src/live.rs
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,472 @@
 +//! Playground live editing (`playground_live`): the shared document is the library's catalog as JSON (every photo's
 +//! develop settings, History, Versions, rating, flag, label and metadata; albums, stacks, the keyword list), without
 +//! this browser's own browsing records (when it browsed Local folders and the photos seen there) and without views
 +//! (selection, filter, sort, panels live outside the catalog). The originals of imported photos travel as session files
 +//! named by their content hash, and land in this browser's storage as if imported here. Native undo history stays
-+//! local; while connected Undo and Redo go to the session.
++//! local; while connected Undo and Redo go to the session. Each person sees the others' selections outlined in the grid
++//! and filmstrip, and their pointers over a photo both have open, in their color with their name.
 +
-+use crate::playground_live::{self, Live};
++#![cfg_attr(test, allow(dead_code))]
++
++// The template, copied next to this file (tools.yaml `live:`).
++#[allow(dead_code)]
++#[path = "playground_live.rs"]
++mod playground_live;
++
 +use crate::store::{self, Originals};
-+use lightcraft_engine::catalog::{Catalog, Source};
++use lightcraft_engine::Session;
++use lightcraft_engine::catalog::{Catalog, PhotoId, Source, playground as hooks};
++use playground_live::{Live, Presence};
 +use lightcraft_ui_egui::LightcraftApp;
++use lightcraft_ui_egui::state::ViewMode;
 +use serde::Deserialize as _;
 +use serde_json::Value;
 +use std::cell::{Cell, RefCell};
@@ -74,6 +38,71 @@ index 00000000..ccdad929
 +    static MEDIA: RefCell<(Originals, HashSet<String>)> = RefCell::default();
 +    /// An original arrived from the session since the last frame.
 +    static ARRIVED: Cell<bool> = const { Cell::new(false) };
++    /// Where this person points on the photo open in the loupe, as fractions of its frame.
++    static POINTER: Cell<Option<[f64; 2]>> = const { Cell::new(None) };
++    /// The others in the session, as the shell last gave them.
++    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
++}
++
++/// The photo this person has open in the loupe (Detail view).
++fn open_photo(app: &LightcraftApp) -> Option<PhotoId> {
++    (app.ui.view == ViewMode::Detail).then_some(app.session.selection.active).flatten()
++}
++
++/// The end of a frame in the browser: notes where this person points on the open photo, draws the others' selections
++/// and pointers over the app, then [`frame`].
++#[cfg(target_arch = "wasm32")]
++pub fn end_frame(app: &mut LightcraftApp, ctx: &egui::Context) {
++    let (down, at) = ctx.input(|i| (i.pointer.any_down(), i.pointer.hover_pos()));
++    let over = |r: egui::Rect| at.filter(|p| r.contains(*p) && app.canvas_rect.is_some_and(|c| c.contains(*p)));
++    let fraction = |p: egui::Pos2, r: egui::Rect| [(p.x - r.left()) / r.width(), (p.y - r.top()) / r.height()].map(|f| (f as f64 * 1e4).round() / 1e4);
++    POINTER.set(open_photo(app).and(app.image_rect).and_then(|r| Some(fraction(over(r)?, r))));
++    OTHERS.with_borrow(|others| show_others(app, ctx, others));
++    frame(app, down);
++}
++
++/// Each other person's selection outlined (grid cells, filmstrip) and pointer (on the photo this person has open too),
++/// in their color with their name. Their states come from other people: what does not resolve is skipped.
++#[cfg(target_arch = "wasm32")]
++fn show_others(app: &LightcraftApp, ctx: &egui::Context, others: &[Presence]) {
++    use egui::{Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, vec2};
++    fn tag(p: &Painter, at: Pos2, name: &str, color: Color32) {
++        let text = p.layout_no_wrap(name.to_owned(), FontId::proportional(11.0), Color32::WHITE);
++        let r = Rect::from_min_size(at, text.size() + vec2(8.0, 4.0));
++        p.rect_filled(r, 3.0, color);
++        p.galley(r.min + vec2(4.0, 2.0), text, Color32::WHITE);
++    }
++    let painter = ctx.layer_painter(egui::LayerId::background());
++    let area = |key: &str| app.widgets.iter().find(|(k, _)| k == key).map(|(_, r)| *r);
++    let (grid, strip) = (area("grid:scroll"), area("filmstrip"));
++    for (i, who) in others.iter().enumerate() {
++        let color = Color32::from_rgb(who.color[0], who.color[1], who.color[2]);
++        let selected: HashSet<u64> = who.state["selection"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
++        for (key, r) in &app.widgets {
++            let clip = match key.split_once(':') {
++                Some(("thumb", id)) if id.parse().is_ok_and(|id| selected.contains(&id)) => grid,
++                Some(("film", id)) if id.parse().is_ok_and(|id| selected.contains(&id)) => strip,
++                _ => continue,
++            };
++            let Some(clip) = clip else { continue };
++            let p = painter.with_clip_rect(clip.intersect(*r));
++            // one inside the other when several people select the same photo
++            let inner = r.shrink(1.0 + 3.0 * i as f32);
++            p.rect_stroke(inner, 0.0, Stroke::new(2.0, color), StrokeKind::Inside);
++            tag(&p, inner.min + vec2(3.0, 3.0), &who.name, color);
++        }
++        let pointer = who.state["pointer"].as_array().map(|xy| xy.iter().filter_map(Value::as_f64).collect::<Vec<_>>());
++        if let (Some(photo), Some(image), Some(canvas), Some(&[x, y])) = (open_photo(app), app.image_rect, app.canvas_rect, pointer.as_deref())
++            && who.state["page"].as_u64() == Some(photo.0)
++            && (0.0..=1.0).contains(&x)
++            && (0.0..=1.0).contains(&y)
++        {
++            let at = image.min + vec2(x as f32 * image.width(), y as f32 * image.height());
++            let p = painter.with_clip_rect(canvas);
++            p.add(Shape::convex_polygon(vec![at, at + vec2(0.0, 16.0), at + vec2(11.0, 11.0)], color, Stroke::new(1.0, Color32::WHITE)));
++            tag(&p, at + vec2(10.0, 14.0), &who.name, color);
++        }
++    }
 +}
 +
 +/// The end of a frame.
@@ -82,10 +111,6 @@ index 00000000..ccdad929
 +    if ARRIVED.take() {
 +        // failed renders are retried once the catalog changes (as after a relink); the document itself stays as it is
 +        app.session.catalog.revision = app.session.catalog.revision.wrapping_add(1);
-+    }
-+    // while live, automatic versions are for the photos this person edited (others' are theirs to keep)
-+    if playground_live::connected() != app.session.own_edits.is_some() {
-+        app.session.own_edits = playground_live::connected().then(Default::default);
 +    }
 +    playground_live::frame(app);
 +}
@@ -105,9 +130,13 @@ index 00000000..ccdad929
 +        None => Vec::new(),
 +    };
 +    MEDIA.set((originals.clone(), stored.into_iter().collect()));
-+    let _ = lightcraft_engine::catalog::FRESH_ID.set(playground_live::fresh_id);
-+    let _ = lightcraft_ui_egui::UNDO.set(playground_live::undo);
-+    let _ = lightcraft_ui_egui::LIVE.set(playground_live::connected);
++    let _ = hooks::FRESH_ID.set(playground_live::fresh_id);
++    let _ = hooks::UNDO.set(playground_live::undo);
++    let _ = hooks::LIVE.set(playground_live::connected);
++    if session_library().is_some() {
++        // a restore would point this browser's own library at the backup
++        with_app(&mut |app| app.services.restore_library = None);
++    }
 +    if let Err(e) = playground_live::web::attach::<LightcraftApp>(FORMAT, with_app, repaint).and_then(|()| media(originals, backend)) {
 +        log::error!("live editing unavailable: {e:?}");
 +    }
@@ -163,6 +192,41 @@ index 00000000..ccdad929
 +    Ok(())
 +}
 +
++/// Installs a catalog with other people's changes in it. No undo step; the selection keeps the photos still there, and
++/// the library saves it whole (no op says what changed).
++fn adopt(session: &mut Session, mut catalog: Catalog) {
++    for p in session.catalog.photos() {
++        if catalog.photo(p.id).is_none_or(|n| (&n.source, &n.content_hash) != (&p.source, &p.content_hash)) {
++            session.media.forget(p.id);
++        }
++    }
++    // caches keyed on the revision see a new one, with nothing remembered of how it got there (the grid works its
++    // photos out again)
++    catalog.revision = session.catalog.revision.wrapping_add(1);
++    session.catalog = catalog;
++    let there = |id: &PhotoId| session.catalog.photo(*id).is_some();
++    session.selection.ids.retain(there);
++    session.selection.active = session.selection.active.filter(there).or_else(|| session.selection.ids.first().copied());
++    // ponytail: a whole snapshot per remote change, O(library); journal the photos that changed if big libraries lag
++    session.compact_soon();
++}
++
++/// The library folder of a Playground session (`?pg-session=<room id>`, a lowercase UUID): its own, so joining a session
++/// never touches this browser's library. `None` for anything else.
++fn session_library_dir(room: &str) -> Option<String> {
++    let uuid = room.len() == 36
++        && room.char_indices().all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { c == '-' } else { matches!(c, '0'..='9' | 'a'..='f') });
++    uuid.then(|| format!("library-session-{room}"))
++}
++
++/// This page's session library folder, when it was opened from a Playground invitation.
++#[cfg(target_arch = "wasm32")]
++pub fn session_library() -> Option<String> {
++    let query = web_sys::window()?.location().search().ok()?;
++    let room = query.trim_start_matches('?').split('&').find_map(|p| p.strip_prefix("pg-session="))?;
++    session_library_dir(room)
++}
++
 +/// A photo record only this browser has: seen while browsing a Local folder, not in the library.
 +fn own(photo: &Value) -> bool {
 +    photo.get("local") == Some(&Value::Bool(true))
@@ -204,7 +268,7 @@ index 00000000..ccdad929
 +                }
 +            }
 +        }
-+        self.session.adopt_catalog(catalog(&document)?);
++        adopt(&mut self.session, catalog(&document)?);
 +        Ok(())
 +    }
 +
@@ -247,6 +311,25 @@ index 00000000..ccdad929
 +        })
 +    }
 +
++    /// `{ page: "library" | the photo open in the loupe, pointer: [x, y] on it (fractions of its frame), selection: the
++    /// first 50 selected photos }`.
++    fn live_presence(&self) -> Value {
++        let catalog = &self.session.catalog;
++        let shared = self.session.selection.ids.iter().filter(|id| catalog.photo(**id).is_some_and(|p| !p.local));
++        let mut state = serde_json::json!({"page": "library", "selection": shared.take(50).map(|id| id.0).collect::<Vec<_>>()});
++        if let Some(photo) = open_photo(self) {
++            state["page"] = photo.0.into();
++            if let Some(at) = POINTER.get() {
++                state["pointer"] = serde_json::json!(at);
++            }
++        }
++        state
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        OTHERS.set(others);
++    }
++
 +    fn live_assets_of(document: &Value) -> Vec<String> {
 +        let photos = document.get("photos").and_then(Value::as_object).into_iter().flat_map(|p| p.values());
 +        let ids: BTreeSet<_> = photos.filter(|p| !own(p)).filter_map(|p| store::hash_of_path(p.get("source")?.get("path")?.as_str()?)).collect();
@@ -257,9 +340,9 @@ index 00000000..ccdad929
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
-+    use lightcraft_engine::Session;
-+    use lightcraft_engine::catalog::{Op, Photo, Source};
++    use lightcraft_engine::catalog::{Op, Photo};
 +    use lightcraft_ui_egui::Services;
++    use std::sync::Arc;
 +    use playground_live::canonical;
 +    use serde_json::json;
 +
@@ -271,7 +354,7 @@ index 00000000..ccdad929
 +
 +    #[test]
 +    fn shares_the_catalog_without_views_adopts_it_without_an_undo_step_and_waits_for_a_gesture() -> Result<(), String> {
-+        let _ = lightcraft_engine::catalog::FRESH_ID.set(playground_live::fresh_id);
++        let _ = hooks::FRESH_ID.set(playground_live::fresh_id);
 +        let (mut a, mut b) = (demo(), demo());
 +        playground_live::connect();
 +        // A browsed a Local folder: its records there are its own, like its views.
@@ -284,7 +367,7 @@ index 00000000..ccdad929
 +        assert_eq!(canonical(&a.live_document()), start, "views are not shared");
 +        let (selected, undo_steps) = (a.session.selection.clone(), a.session.undo.len());
 +        // The Edit menu's Undo and Redo are the session's, whatever the native history holds.
-+        let _ = lightcraft_ui_egui::LIVE.set(playground_live::connected);
++        let _ = hooks::LIVE.set(playground_live::connected);
 +        let enabled = |id: &str| lightcraft_ui_egui::menus::menu_entries(&a).into_iter().any(|e| e.id == id && e.enabled);
 +        assert!(a.session.redo.is_empty() && enabled("edit.undo") && enabled("edit.redo"));
 +        // A merge that no longer holds together (two stacks sharing a photo) is refused, not repaired by every peer.
@@ -321,15 +404,18 @@ index 00000000..ccdad929
 +
 +    #[test]
 +    fn while_live_leaving_a_photo_versions_only_this_persons_edits() -> Result<(), String> {
-+        let (mut a, mut b) = (demo(), demo());
++        let _ = hooks::LIVE.set(playground_live::connected);
++        let mut a = demo();
 +        playground_live::connect();
-+        frame(&mut a, false);
 +        let versions = |app: &LightcraftApp, id| app.session.catalog.photo(id).map_or(0, |p| p.versions.len());
-+        // B edits the photo A is on; A steps away from it: no automatic version of B's edit from A.
++        // Someone else edits the photo A is on (it arrives as a document); A steps away from it: no automatic version
++        // of their edit from A.
 +        let x = a.session.active().ok_or("no active photo")?;
-+        b.run("library.select", json!({"ids": [x.0]}))?;
-+        b.run("develop.set", json!({"values": {"light.exposure": 0.5}}))?;
-+        a.live_adopt(b.live_document())?;
++        let mut theirs = a.session.catalog.clone();
++        let mut settings = (*a.session.develop_of(x).ok_or("no settings")?).clone();
++        settings.light.exposure = 0.5;
++        theirs.apply(Op::SetDevelop { id: x, settings: Arc::new(settings), label: "Exposure".into(), edited: None }).map_err(|e| e.to_string())?;
++        a.live_adopt(serde_json::to_value(&theirs).map_err(|e| e.to_string())?)?;
 +        let before = versions(&a, x);
 +        a.run("library.next", json!({}))?;
 +        assert_eq!(versions(&a, x), before, "someone else's edit is theirs to version");
@@ -340,8 +426,32 @@ index 00000000..ccdad929
 +        a.run("library.next", json!({}))?;
 +        assert_eq!(versions(&a, y), before + 1);
 +        playground_live::disconnect();
-+        frame(&mut a, false);
-+        assert!(a.session.own_edits.is_none(), "not live: every edited photo again");
++        assert!(!hooks::others_edit(x), "not live: every edited photo again");
++        Ok(())
++    }
++
++    #[test]
++    fn a_session_has_its_own_library_folder() {
++        let room = "0f8e7d6c-5b4a-4321-8fed-cba987654321";
++        assert!(session_library_dir(room).is_some_and(|d| d == format!("library-session-{room}") && crate::backup::valid_library_dir(&d)));
++        assert!([&room.to_uppercase(), "../library", "", &room[1..]].iter().all(|r| session_library_dir(r).is_none()));
++    }
++
++    #[test]
++    fn presence_is_the_open_photo_the_pointer_on_it_and_the_shared_selection() -> Result<(), String> {
++        let mut a = demo();
++        let ids: Vec<u64> = a.session.catalog.photos().map(|p| p.id.0).take(2).collect();
++        // a Local folder's photo is this person's own: the others are not shown it
++        let mut seen = Photo::new(a.session.catalog.alloc_photo_id(), Source::Demo { scene: 1 }, "seen.jpg", "JPEG", 9, 9, "2026-01-01T00:00:00");
++        seen.local = true;
++        a.session.catalog.apply(Op::AddPhoto { photo: Box::new(seen.clone()) }).map_err(|e| e.to_string())?;
++        a.run("library.select", json!({"ids": [ids[0], ids[1], seen.id.0]}))?;
++        POINTER.set(Some([0.25, 0.5]));
++        a.ui.view = ViewMode::PhotoGrid;
++        assert_eq!(a.live_presence(), json!({"page": "library", "selection": ids}), "no pointer outside the loupe");
++        a.ui.view = ViewMode::Detail;
++        let open = a.session.selection.active.ok_or("no active photo")?;
++        assert_eq!(a.live_presence(), json!({"page": open.0, "pointer": [0.25, 0.5], "selection": ids}));
 +        Ok(())
 +    }
 +
@@ -366,358 +476,144 @@ index 00000000..ccdad929
 +        Ok(())
 +    }
 +}
-diff --git a/apps/lightcraft-web/src/web.rs b/apps/lightcraft-web/src/web.rs
-index 6a4487d0..345724fc 100644
---- a/apps/lightcraft-web/src/web.rs
-+++ b/apps/lightcraft-web/src/web.rs
-@@ -15,7 +15,7 @@ use wasm_bindgen::JsCast;
- use wasm_bindgen::prelude::*;
- 
- use crate::backend::Backend;
--use crate::backup::{ACTIVE_LIBRARY, DEFAULT_LIBRARY_DIR, valid_library_dir};
-+use crate::backup::{ACTIVE_LIBRARY, DEFAULT_LIBRARY_DIR, session_library_dir, valid_library_dir};
- use crate::bench::Bench;
- use crate::files::{Files, FlushOp, LIBRARY_FILES};
- use crate::safety::{self, notice};
-@@ -71,6 +71,8 @@ struct Options {
-     store: String,
-     workers: Option<usize>,
-     reset: bool,
-+    /// `?pg-session=<room id>` (a Playground invitation): that session's own library folder.
-+    session: Option<String>,
- }
- 
- impl Options {
-@@ -91,6 +93,7 @@ impl Options {
-             store: get("store").filter(|s| s == "idb" || s == "memory").unwrap_or_else(|| "opfs".into()),
-             workers: get("workers").and_then(|v| v.parse().ok()),
-             reset: get("reset").is_some(),
-+            session: get("pg-session").and_then(|room| session_library_dir(&room)),
-         }
-     }
- }
-@@ -297,7 +300,7 @@ async fn boot(opts: Options) -> Boot {
-     };
-     let files = Files::default();
-     let mut index = ThumbIndex::default();
--    let mut lib_dir = DEFAULT_LIBRARY_DIR.to_string();
-+    let mut lib_dir = opts.session.clone().unwrap_or_else(|| DEFAULT_LIBRARY_DIR.to_string());
-     if let Some(b) = &backend {
-         if opts.reset {
-             // everything this site keeps in the browser, photos included: never without asking
-@@ -315,7 +318,9 @@ async fn boot(opts: Options) -> Boot {
-             }
-         }
-         // a restored backup lives in its own folder (see `backup`)
--        if let Ok(Some(d)) = b.read(ACTIVE_LIBRARY).await {
-+        if opts.session.is_none()
-+            && let Ok(Some(d)) = b.read(ACTIVE_LIBRARY).await
-+        {
-             let d = String::from_utf8_lossy(&d).trim().to_string();
-             if valid_library_dir(&d) {
-                 lib_dir = d;
-@@ -440,6 +445,10 @@ impl WebApp {
-             app.ui = ui;
-         }
-         app.ui = app.ui.sanitized();
-+        if opts.session.is_some() {
-+            // a restore would point this browser's own library at the backup
-+            app.services.restore_library = None;
+diff --git a/apps/lightcraft-web/src/web/live.rs b/apps/lightcraft-web/src/web/live.rs
+new file mode 100644
+index 00000000..5c219bb7
+--- /dev/null
++++ b/apps/lightcraft-web/src/web/live.rs
+@@ -0,0 +1,71 @@
++//! Live editing in Playground sessions, the web entry's side (`crate::live` is the adapter): the runner, kept so the
++//! adapter reaches the app between frames, and the app wrapped so each frame ends with the session's frame hook.
++
++use super::WebApp;
++use lightcraft_ui_egui::LightcraftApp;
++use std::cell::RefCell;
++
++thread_local! {
++    static RUNNER: RefCell<Option<eframe::WebRunner>> = const { RefCell::new(None) };
++}
++
++/// `eframe::WebRunner::new()`, kept for the adapter.
++pub(super) fn runner() -> eframe::WebRunner {
++    let runner = eframe::WebRunner::new();
++    RUNNER.set(Some(runner.clone()));
++    runner
++}
++
++/// The app, each frame ending with the session's frame hook; the first offers live editing to the Playground shell.
++pub(super) fn wrap(app: WebApp) -> Box<Shell> {
++    Box::new(Shell { app, attached: false })
++}
++
++pub(super) struct Shell {
++    app: WebApp,
++    attached: bool,
++}
++
++/// Runs `f` on the app between frames (false while a frame runs).
++fn with_app(f: &mut dyn FnMut(&mut LightcraftApp)) -> bool {
++    RUNNER.with_borrow(|r| r.as_ref().and_then(|r| r.app_mut::<Shell>()).map(|mut shell| f(&mut shell.app.app)).is_some())
++}
++
++impl eframe::App for Shell {
++    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
++        eframe::App::logic(&mut self.app, ctx, frame);
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        eframe::App::ui(&mut self.app, ui, frame);
++        crate::live::end_frame(&mut self.app.app, ui.ctx());
++        if !std::mem::replace(&mut self.attached, true) {
++            let media = (self.app.originals.clone(), self.app.backend.clone());
++            wasm_bindgen_futures::spawn_local(crate::live::attach(with_app, super::request_repaint, media));
 +        }
-         app.library_problem = problem;
-         let n = opts.workers.unwrap_or_else(|| {
-             let cores = window().map_or(1, |w| w.navigator().hardware_concurrency() as usize);
-@@ -660,11 +669,16 @@ impl eframe::App for WebApp {
- 
-     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-         self.app.ui(ui);
-+        crate::live::frame(&mut self.app, ui.ctx().input(|i| i.pointer.any_down()));
-         if !self.first_frame_logged && !self.app.widgets.is_empty() {
-             self.first_frame_logged = true;
-             log::info!("lightcraft first UI frame at {:.0} ms after navigation start", perf_now());
-         }
-     }
++    }
++
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
++        eframe::App::raw_input_hook(&mut self.app, ctx, raw);
++    }
++
++    fn save(&mut self, storage: &mut dyn eframe::Storage) {
++        eframe::App::save(&mut self.app, storage);
++    }
++
++    fn auto_save_interval(&self) -> std::time::Duration {
++        eframe::App::auto_save_interval(&self.app)
++    }
++
++    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
++        eframe::App::clear_color(&self.app, visuals)
++    }
++
++    fn persist_egui_memory(&self) -> bool {
++        eframe::App::persist_egui_memory(&self.app)
++    }
 +
 +    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
 +        Some(self)
 +    }
- }
- 
- /// Start the app with the separately fetched Simplified Chinese font (empty in font-free builds).
-@@ -699,6 +713,13 @@ pub fn start(chinese_font: Vec<u8>) {
-         let r = runner.start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(WebApp::new(cc, boot, chinese_font))))).await;
-         match r {
-             Ok(()) => {
-+                let live = runner.clone();
-+                let media = runner.app_mut::<WebApp>().map(|w| (w.originals.clone(), w.backend.clone())).unwrap_or_default();
-+                wasm_bindgen_futures::spawn_local(crate::live::attach(
-+                    move |f| live.app_mut::<WebApp>().map(|mut w| f(&mut w.app)).is_some(),
-+                    || _ = CTX.with(|c| c.borrow().as_ref().map(egui::Context::request_repaint)),
-+                    media,
-+                ));
-                 if let Some(el) = window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("lightcraft_loading")) {
-                     el.remove();
-                 }
-diff --git a/crates/catalog/src/lib.rs b/crates/catalog/src/lib.rs
-index 1776c895..43aa475c 100644
---- a/crates/catalog/src/lib.rs
-+++ b/crates/catalog/src/lib.rs
-@@ -357,6 +357,17 @@ impl PartialEq for Changes {
-     }
- }
- 
-+/// Set by the web build for live editing: while several people edit one library, each new id is one none of the others
-+/// can pick (the counter still goes past it).
-+pub static FRESH_ID: std::sync::OnceLock<fn(&mut u64) -> u64> = std::sync::OnceLock::new();
++}
+diff --git a/crates/catalog/src/playground.rs b/crates/catalog/src/playground.rs
+new file mode 100644
+index 00000000..f222bf42
+--- /dev/null
++++ b/crates/catalog/src/playground.rs
+@@ -0,0 +1,58 @@
++//! Hooks for live editing in Playground sessions, set by the web build (`apps/lightcraft-web/src/live.rs`); without
++//! them everything behaves as before. Each is called from one line at the top of the function it changes.
 +
-+fn next_id(counter: &mut u64) -> u64 {
-+    let id = (*counter).max(1);
-+    let id = FRESH_ID.get().map_or(id, |fresh| fresh(&mut id.clone()));
-+    *counter = (*counter).max(id.saturating_add(1));
-+    id
++use std::cell::RefCell;
++use std::collections::BTreeSet;
++use std::sync::OnceLock;
++
++use crate::{Op, PhotoId};
++
++/// A new id from a counter while several people edit one library: one none of the others can pick.
++pub static FRESH_ID: OnceLock<fn(&mut u64) -> u64> = OnceLock::new();
++/// Whether a live session is connected.
++pub static LIVE: OnceLock<fn() -> bool> = OnceLock::new();
++/// Takes Undo (`false`) or Redo (`true`) over while it returns true.
++pub static UNDO: OnceLock<fn(bool) -> bool> = OnceLock::new();
++
++thread_local! {
++    /// While live: the photos whose develop settings this person committed since their last automatic version.
++    static OWN_EDITS: RefCell<BTreeSet<PhotoId>> = const { RefCell::new(BTreeSet::new()) };
 +}
 +
- impl Catalog {
-     pub fn new() -> Catalog {
-         Catalog { next_photo: 1, next_album: 1, next_stack: 1, ..Default::default() }
-@@ -367,19 +378,13 @@ impl Catalog {
-     // (saturating: a counter a damaged snapshot left at the top hands out its last id again, which
-     // the op that adds it then refuses as taken, rather than overflowing)
-     pub fn alloc_photo_id(&mut self) -> PhotoId {
--        let id = PhotoId(self.next_photo.max(1));
--        self.next_photo = id.0.saturating_add(1);
--        id
-+        PhotoId(next_id(&mut self.next_photo))
-     }
-     pub fn alloc_album_id(&mut self) -> AlbumId {
--        let id = AlbumId(self.next_album.max(1));
--        self.next_album = id.0.saturating_add(1);
--        id
-+        AlbumId(next_id(&mut self.next_album))
-     }
-     pub fn alloc_stack_id(&mut self) -> StackId {
--        let id = StackId(self.next_stack.max(1));
--        self.next_stack = id.0.saturating_add(1);
--        id
-+        StackId(next_id(&mut self.next_stack))
-     }
- 
-     // ---- reads
-diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 8a282ce3..727dbb19 100644
---- a/crates/engine/src/lib.rs
-+++ b/crates/engine/src/lib.rs
-@@ -228,6 +228,9 @@ pub struct Session {
-     /// Photos in the current source with no filter on (cached like `visible`).
-     total: Option<((u64, String), usize)>,
-     pub undo: Vec<UndoEntry>,
-+    /// Live editing: the photos whose develop settings this person committed since their last automatic version.
-+    /// `None` (not live): every edited photo gets one when left. While live, others' edits are theirs to keep.
-+    pub own_edits: Option<std::collections::BTreeSet<PhotoId>>,
-     /// Undo steps committed in this session, ever (the history drops its oldest past 1000, so
-     /// its length can't tell how many steps a command just made; see [`Session::commits`]).
-     commits: u64,
-@@ -423,6 +426,7 @@ impl Session {
-             visible_gen: 0,
-             total: None,
-             undo: Vec::new(),
-+            own_edits: None,
-             commits: 0,
-             redo: Vec::new(),
-             pending_sidecar_repairs: Vec::new(),
-@@ -587,6 +591,16 @@ impl Session {
-     pub fn commit(&mut self, label: &str, op: Op) -> Result<()> {
-         let fwd = op.clone();
-         let inv = self.apply_catalog(op)?;
-+        if let Some(own) = &mut self.own_edits {
-+            let mut ops = vec![&fwd];
-+            while let Some(op) = ops.pop() {
-+                match op {
-+                    Op::SetDevelop { id, .. } => _ = own.insert(*id),
-+                    Op::Batch { ops: inner } => ops.extend(inner),
-+                    _ => {}
-+                }
-+            }
-+        }
-         self.pending_log.push(fwd);
-         self.undo.push(UndoEntry { label: label.to_string(), op: inv, folder: None, retry_inverse: Vec::new(), retry_sidecars: Vec::new() });
-         self.commits = self.commits.wrapping_add(1);
-@@ -663,6 +677,24 @@ impl Session {
-         Ok(())
-     }
- 
-+    /// Live editing: install a catalog with other people's changes in it. No undo step; the selection keeps the photos
-+    /// still there, and the library saves it whole (no op says what changed).
-+    pub fn adopt_catalog(&mut self, mut catalog: Catalog) {
-+        for p in self.catalog.photos() {
-+            if catalog.photo(p.id).is_none_or(|n| (&n.source, &n.content_hash) != (&p.source, &p.content_hash)) {
-+                self.media.forget(p.id);
-+            }
-+        }
-+        // caches keyed on the revision see a new one, with nothing remembered of how it got there
-+        catalog.revision = self.catalog.revision.wrapping_add(1);
-+        self.catalog = catalog;
-+        self.selection.ids.retain(|id| self.catalog.photo(*id).is_some());
-+        self.selection.active = self.selection.active.filter(|id| self.catalog.photo(*id).is_some()).or_else(|| self.selection.ids.first().copied());
-+        self.refresh_view();
-+        // ponytail: a whole snapshot per remote change, O(library); journal the photos that changed if big libraries lag
-+        self.compact_soon();
-+    }
-+
-     /// Leaving photo `id` after editing it: keep its settings as an automatic version (when they
-     /// differ from its latest version; at most [`AUTO_VERSIONS`] auto versions, oldest dropped).
-     /// Saved with the library but not an undo step.
-@@ -671,6 +703,9 @@ impl Session {
-         if !p.is_edited() || p.versions.last().is_some_and(|v| *v.settings == *p.develop) || self.interaction.is_some() {
-             return;
-         }
-+        if self.own_edits.as_mut().is_some_and(|own| !own.remove(&id)) {
-+            return;
-+        }
-         let mut versions = p.versions.clone();
-         let created = (self.clock)();
-         let name = lightcraft_catalog::dates::display_time(&created);
-diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index bb290bd8..68ec4316 100644
---- a/crates/ui-egui/src/lib.rs
-+++ b/crates/ui-egui/src/lib.rs
-@@ -228,6 +228,16 @@ pub type HostAction = Box<dyn FnMut(&mut Session) -> Result<Value, String>>;
- /// last heard and wakes the UI itself when that changes; it is never polled for changes.
- pub type SystemThemeFn = Box<dyn Fn(&egui::Context) -> Option<egui::Theme>>;
- 
-+/// Set by a host that takes Undo and Redo over while it returns true (the web build's live editing); not those run with
-+/// `{"native": true}` (the Presets panel's Amount, which replaces the step it made).
-+pub static UNDO: std::sync::OnceLock<fn(bool) -> bool> = std::sync::OnceLock::new();
-+/// Set by a host with live editing: whether it is connected (then the Edit menu's Undo and Redo are the session's).
-+pub static LIVE: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
-+
-+pub(crate) fn live() -> bool {
++pub fn live() -> bool {
 +    LIVE.get().is_some_and(|connected| connected())
 +}
 +
- /// Platform services injected by the host app (desktop or web).
- #[derive(Default)]
- pub struct Services {
-@@ -599,6 +609,9 @@ impl LightcraftApp {
-     /// [`LightcraftApp::run`], keeping what kind of error a refusal is: for code that decides on it
-     /// (offer a model's download, treat a cancel as one) instead of reading the message.
-     pub fn run_typed(&mut self, id: &str, params: Value) -> Result<Value, CommandError> {
-+        if matches!(id, "edit.undo" | "edit.redo") && params["native"] != true && UNDO.get().is_some_and(|undo| undo(id == "edit.redo")) {
-+            return Ok(Value::Null);
-+        }
-         if let Some(result) = model_setup::intercept(self, id, &params) {
-             return result.map_err(CommandError::from);
-         }
-diff --git a/crates/ui-egui/src/menubar.rs b/crates/ui-egui/src/menubar.rs
-index c5e4e45c..ef9e1802 100644
---- a/crates/ui-egui/src/menubar.rs
-+++ b/crates/ui-egui/src/menubar.rs
-@@ -377,6 +377,7 @@ pub fn checked(app: &LightcraftApp, id: &str) -> Option<bool> {
- fn live_label(app: &LightcraftApp, id: &str, label: &str) -> String {
-     let n = app.session.selection.ids.len();
-     match id {
-+        "edit.undo" | "edit.redo" if crate::live() => label.to_string(),
-         "edit.undo" => {
-             app.session.undo.last().map(|e| crate::i18n::tr_format!("Undo {}", crate::i18n::tr(&e.label))).unwrap_or_else(|| "Undo".into())
-         }
-diff --git a/crates/ui-egui/src/menus.rs b/crates/ui-egui/src/menus.rs
-index 9fcfc8b9..af03a1b5 100644
---- a/crates/ui-egui/src/menus.rs
-+++ b/crates/ui-egui/src/menus.rs
-@@ -2209,7 +2209,7 @@ pub fn menu_entries(app: &LightcraftApp) -> Vec<MenuEntry> {
-                 label: c.label.into(),
-                 menu: c.menu.iter().map(|s| s.to_string()).collect(),
-                 shortcut: crate::shortcuts::shortcut_of(&app.ui.settings.keymap, c.id).map(str::to_string),
--                enabled: c.enabled,
-+                enabled: c.enabled || (matches!(c.id, "edit.undo" | "edit.redo") && crate::live()),
-             });
-         }
-     }
-diff --git a/crates/ui-egui/src/panels/presets.rs b/crates/ui-egui/src/panels/presets.rs
-index ca0243cc..d144ba3e 100644
---- a/crates/ui-egui/src/panels/presets.rs
-+++ b/crates/ui-egui/src/panels/presets.rs
-@@ -27,17 +27,24 @@ struct AppliedPreset {
-     selected: Vec<lightcraft_catalog::PhotoId>,
-     active: Option<lightcraft_catalog::PhotoId>,
-     commits: u64,
-+    /// The photos' settings it left: a change that came from elsewhere (live editing) is no undo step of this session.
-+    develop: Vec<Option<Arc<lightcraft_develop::DevelopSettings>>>,
- }
- 
- impl AppliedPreset {
-     fn new(session: &lightcraft_engine::Session, id: String, amount: f64) -> Self {
--        Self { id, amount, selected: session.selection.ids.clone(), active: session.active(), commits: session.commits() }
-+        let develop = develop_of(session, &session.selection.ids, session.active());
-+        Self { id, amount, selected: session.selection.ids.clone(), active: session.active(), commits: session.commits(), develop }
-     }
- 
-     fn is_current(&self, session: &lightcraft_engine::Session) -> bool {
-         self.selected == session.selection.ids
-             && self.active == session.active()
-             && self.commits == session.commits()
-+            && develop_of(session, &self.selected, self.active).iter().zip(&self.develop).all(|(now, then)| match (now, then) {
-+                (Some(now), Some(then)) => Arc::ptr_eq(now, then) || now == then,
-+                (now, then) => now.is_none() && then.is_none(),
-+            })
-             && session.interaction.is_none()
-             && session.redo.is_empty()
-             && session
-@@ -47,6 +54,14 @@ impl AppliedPreset {
-     }
- }
- 
-+fn develop_of(
-+    session: &lightcraft_engine::Session,
-+    selected: &[lightcraft_catalog::PhotoId],
-+    active: Option<lightcraft_catalog::PhotoId>,
-+) -> Vec<Option<Arc<lightcraft_develop::DevelopSettings>>> {
-+    selected.iter().chain(&active).map(|id| session.develop_of(*id)).collect()
++/// `alloc_*_id`: the id [`FRESH_ID`] gives (the counter still goes past it), or `None` to allocate as usual.
++pub fn fresh(counter: &mut u64) -> Option<u64> {
++    let fresh = FRESH_ID.get()?;
++    let id = fresh(&mut (*counter).max(1));
++    *counter = (*counter).max(id.saturating_add(1));
++    Some(id)
 +}
 +
- pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
-     let t = Tokens::get(ui.ctx());
-     egui::Frame::NONE.fill(t.chrome).stroke(egui::Stroke::new(1.0, t.divider)).show(ui, |ui| {
-@@ -102,13 +117,13 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
-             };
-             let out = slider(ui, &spec, last.amount, true, None);
-             if let Some(v) = out.value
--                && app.run("edit.undo", json!({})).is_ok()
-+                && app.run("edit.undo", json!({"native": true})).is_ok()
-             {
-                 // Only replace the most recent preset; never undo intervening edits.
-                 if app.run("preset.apply", json!({"id": &last.id, "amount": v})).is_ok() {
-                     ui.data_mut(|d| d.insert_temp(amt_id, AppliedPreset::new(&app.session, last.id, v)));
-                 } else {
--                    let _ = app.run("edit.redo", json!({}));
-+                    let _ = app.run("edit.redo", json!({"native": true}));
-                     ui.data_mut(|d| d.remove::<AppliedPreset>(amt_id));
-                 }
-             }
-@@ -413,4 +428,26 @@ mod tests {
-         session.execute("library.select", &json!({"ids": [other.0]})).unwrap();
-         assert!(!state.is_current(&session), "the preset belongs to the earlier selection");
-     }
++/// `edit.undo` / `edit.redo`: whether the session took it.
++pub fn undo(redo: bool) -> bool {
++    UNDO.get().is_some_and(|undo| undo(redo))
++}
 +
-+    #[test]
-+    fn amount_slider_does_not_undo_a_change_from_elsewhere() {
-+        let mut session = lightcraft_engine::Session::with_demo();
-+        let pid = "lc.golden-hour";
-+        session.execute("preset.apply", &json!({"id": pid})).unwrap();
-+        let state = AppliedPreset::new(&session, pid.into(), 100.0);
-+        // live editing installs other people's changes without a commit here
-+        let exposure = |session: &lightcraft_engine::Session, id| {
-+            let mut shared = session.catalog.clone();
-+            let mut d = (*session.develop_of(id).unwrap()).clone();
-+            d.light.exposure = 0.5;
-+            shared.apply(lightcraft_catalog::Op::SetDevelop { id, settings: Arc::new(d), label: "Exposure".into(), edited: None }).unwrap();
-+            shared
-+        };
-+        let active = session.active().unwrap();
-+        let other = session.visible().iter().copied().find(|id| *id != active).unwrap();
-+        session.adopt_catalog(exposure(&session, other));
-+        assert!(state.is_current(&session), "another photo's change leaves the preset's step alone");
-+        session.adopt_catalog(exposure(&session, active));
-+        assert!(!state.is_current(&session), "undoing the preset now would drop someone else's change");
++/// `Session::commit`: notes the photos whose develop settings this person changed.
++pub fn committed(op: &Op) {
++    if !live() {
++        return;
 +    }
- }
++    let mut ops = vec![op];
++    while let Some(op) = ops.pop() {
++        match op {
++            Op::SetDevelop { id, .. } => _ = OWN_EDITS.with_borrow_mut(|own| own.insert(*id)),
++            Op::Batch { ops: inner } => ops.extend(inner),
++            _ => {}
++        }
++    }
++}
++
++/// `Session::auto_version`: while live, a photo's automatic version is made by whoever edited it, not by everyone who
++/// leaves it after their change arrived.
++pub fn others_edit(id: PhotoId) -> bool {
++    live() && !OWN_EDITS.with_borrow_mut(|own| own.remove(&id))
++}

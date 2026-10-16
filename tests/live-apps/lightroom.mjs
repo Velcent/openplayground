@@ -24,6 +24,12 @@ export default {
     await page.keyboard.press('2')
   },
   undo: (page) => page.keyboard.press('Control+z'),
+  // The owner points at the middle of the photo open in the loupe: the others see that pointer, and the owner's
+  // selection outlined in their filmstrip.
+  point: async (page) => {
+    await page.mouse.move(480, 345)
+    await until(() => page.evaluate(() => !!playgroundLiveAdapter.presence()?.pointer), 10000, 'the pointer on the photo')
+  },
   // File ▸ Import Photos… (file.addPhotos) opens the browser's file picker; the photo is a 16×16 PNG drawn here.
   importMedia: async (page) => {
     const png = await page.evaluate(async () => {
