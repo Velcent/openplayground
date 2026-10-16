@@ -19,10 +19,10 @@ index a4ded64..f67a6ca 100644
  photocraft-psd = { workspace = true }
 diff --git a/apps/photocraft-web/src/live.rs b/apps/photocraft-web/src/live.rs
 new file mode 100644
-index 0000000..44e3bf7
+index 0000000..8d9d521
 --- /dev/null
 +++ b/apps/photocraft-web/src/live.rs
-@@ -0,0 +1,794 @@
+@@ -0,0 +1,891 @@
 +//! Live editing in a Playground session (web only). Playground's `shell/live.js` drives it through [`web::attach`];
 +//! nothing here runs until it connects. The shared document is one open document as a checkpoint ([`encode`]): its
 +//! `.pcraft` manifest as canonical JSON without personal views, then every surface's tiles in a fixed order, so a
@@ -337,8 +337,18 @@ index 0000000..44e3bf7
 +    }
 +}
 +
-+/// The document `parts` describe, through the `.pcraft` loader (which checks every tile against its hash). Views
-+/// get placeholders: `Session::install_remote` puts the local ones back.
++/// New pixels a document taken in may decode to, beyond the tiles decoded before: a small, highly compressible
++/// checkpoint must not take all the memory.
++const MAX_DECODED: u64 = 1 << 30;
++
++thread_local! {
++    /// The tiles of the document last loaded, decoded, and the compressed bytes they were checked from.
++    static DECODED: std::cell::RefCell<(photocraft_format::Tiles, HashMap<String, Rc<[u8]>>)> = Default::default();
++}
++
++/// The document `parts` describe, through the `.pcraft` loader (which checks every tile against its hash). Tiles the
++/// last load decoded from the same bytes are reused, not decoded again. Views get placeholders:
++/// `Session::install_remote` puts the local ones back.
 +fn document(parts: &Parts) -> Result<Document, String> {
 +    let mut doc = parts.doc.clone();
 +    surfaces(&mut doc, &mut |tiles| {
@@ -373,19 +383,41 @@ index 0000000..44e3bf7
 +        }
 +    }
 +    let manifest = serde_json::to_vec(&manifest).map_err(invalid)?;
-+    photocraft_format::load_bytes_source(&Source(manifest, parts), &LoadOptions::default()).map_err(invalid)
++    let (mut tiles, checked) = DECODED.take();
++    tiles.values_mut().for_each(|tiles| tiles.retain(|hash, _| parts.tiles.get(hash).is_some_and(|bytes| checked.get(hash) == Some(bytes))));
++    let options = LoadOptions { max_total_bytes: MAX_DECODED, ..LoadOptions::default() };
++    let loaded = photocraft_format::load_reusing(&Source(manifest, parts), &options, &mut tiles).map_err(invalid)?;
++    DECODED.set((tiles, parts.tiles.clone()));
++    Ok(loaded)
++}
++
++/// Derived pixels (the renders of type, shapes and smart objects, a fill layer's cache) as one value each (`[cache]`),
++/// or back: the tiles of two renders must not mix.
++fn whole_caches(v: &mut Value, whole: bool) {
++    match v {
++        Value::Object(m) => m.iter_mut().for_each(|(key, v)| match (key.as_str(), &mut *v) {
++            ("cache" | "fill_cache", Value::Object(_)) if whole => *v = Value::Array(vec![v.take()]),
++            ("cache" | "fill_cache", Value::Array(cache)) if !whole => *v = cache.pop().unwrap_or_default(),
++            _ => whole_caches(v, whole),
++        }),
++        Value::Array(items) => items.iter_mut().for_each(|v| whole_caches(v, whole)),
++        _ => {}
++    }
 +}
 +
 +/// The three-way merge of checkpoints: the document merges per field and per layer (by id), the pixels per surface
-+/// tile (by hash); a value or tile both sides changed is a conflict, even to the same thing. The result is checked by
-+/// loading it, and comes with its document.
++/// tile (by hash), a derived cache as a whole; a value or tile both sides changed is a conflict, even to the same
++/// thing. `current` is the side not yet accepted, `edited` the accepted change. The result is checked by loading it,
++/// and comes with its document.
 +fn merge(base: &[u8], current: &[u8], edited: &[u8]) -> Result<(Vec<u8>, Document), String> {
-+    let (base, current, edited) = (decode(base)?, decode(current)?, decode(edited)?);
-+    let mut parts = Parts { doc: template::merge(&base.doc, &current.doc, &edited.doc, &[])?, tiles: current.tiles, blobs: current.blobs };
++    let (mut base, mut current, mut edited) = (decode(base)?, decode(current)?, decode(edited)?);
++    [&mut base, &mut current, &mut edited].into_iter().for_each(|parts| whole_caches(&mut parts.doc, true));
++    let mut doc = template::merge(&base.doc, &current.doc, &edited.doc, &[])?;
++    whole_caches(&mut doc, false);
++    let mut parts = Parts { doc, tiles: current.tiles, blobs: current.blobs };
 +    parts.tiles.extend(edited.tiles);
 +    parts.blobs.extend(edited.blobs);
 +    let bytes = write(&parts)?;
-+    // ponytail: checking loads (decompresses) every tile; check only the merged surfaces if large photos lag.
 +    Ok((bytes, document(&parts)?))
 +}
 +
@@ -444,10 +476,20 @@ index 0000000..44e3bf7
 +    if let Some(doc) = app.session.documents().iter().find(|st| st.doc.id == bound).map(|st| &st.doc)
 +        && live.seen.as_ref().is_none_or(|seen| !Arc::ptr_eq(seen, doc))
 +    {
-+        live.encoded = Some(encode(&mut live.writer, doc).map(Rc::new));
++        // A new selection or the like (personal views) shares nothing: no need to encode.
++        if live.seen.as_ref().is_none_or(|seen| !views_only(seen, doc)) {
++            live.encoded = Some(encode(&mut live.writer, doc).map(Rc::new));
++        }
 +        live.seen = Some(doc.clone());
 +    }
 +    live.encoded.clone()
++}
++
++/// Whether `a` and `b` differ in personal views only (tiles compare by pointer first).
++fn views_only(a: &Document, b: &Document) -> bool {
++    let mut b = b.clone();
++    photocraft_engine::keep_views(&mut b, a);
++    *a == b
 +}
 +
 +pub fn connect() {
@@ -506,7 +548,8 @@ index 0000000..44e3bf7
 +    })
 +}
 +
-+/// `Services::live_undo`: while connected, Undo and Redo of the shared document go to the session.
++/// `Services::live_undo`: while connected, Undo and Redo of the shared document go to the session. Selection steps
++/// are personal, no session edits: Undo after one reverts this person's last shared edit and keeps the selection.
 +pub fn undo(active: Option<DocId>, redo: Option<bool>) -> bool {
 +    let taken = LIVE.with_borrow_mut(|live| {
 +        let taken = live.connected && live.bound.is_some() && live.bound == active;
@@ -758,8 +801,50 @@ index 0000000..44e3bf7
 +        assert_eq!(out.layers[0].surface().unwrap().pixel(905, 305), vec![0.0, 0.0, 1.0, 1.0]);
 +        assert_eq!(out.layers[1].opacity, 0.5);
 +        assert_eq!(bytes(&out), merged);
++        let (_, again) = merge(&bytes(&base), &bytes(&left), &bytes(&right)).unwrap();
++        let tile = |d: &Document| d.layers[0].surface().unwrap().tiles().next().unwrap().1.clone();
++        assert!(Arc::ptr_eq(&tile(&out), &tile(&again)), "tiles decoded before are reused");
 +        // The same tile changed on both sides is a conflict, even to the same pixels.
 +        assert!(merge(&bytes(&base), &bytes(&left), &bytes(&left)).unwrap_err().contains("Conflict"));
++    }
++
++    #[test]
++    fn a_derived_cache_merges_as_a_whole() {
++        let mut base = doc();
++        let mut cache = Surface::new(base.pixel_format());
++        cache.fill_rect(Rect::from_xywh(0, 0, 100, 40), &[0.0, 0.0, 0.0, 1.0]);
++        let text = photocraft_doc::TextLayer { text: "a".into(), cache: Some(cache), ..Default::default() };
++        base.layers.push(Layer::new("a", photocraft_doc::LayerContent::Text(text)));
++        let render = |d: &mut Document, r: Rect| match &mut d.layers[2].content {
++            photocraft_doc::LayerContent::Text(t) => t.cache.as_mut().unwrap().fill_rect(r, &[0.0, 0.0, 0.0, 1.0]),
++            _ => unreachable!(),
++        };
++        // One person types a second line (a new tile row of the render), the other makes the text larger.
++        let (mut typed, mut larger, mut faded) = (base.clone(), base.clone(), base.clone());
++        render(&mut typed, Rect::from_xywh(0, 300, 100, 40));
++        render(&mut larger, Rect::from_xywh(0, 0, 400, 80));
++        faded.layers[2].opacity = 0.5;
++        assert!(merge(&bytes(&base), &bytes(&typed), &bytes(&larger)).unwrap_err().contains("/cache"));
++        let (_, out) = merge(&bytes(&base), &bytes(&typed), &bytes(&faded)).unwrap();
++        assert_eq!((out.layers[2].opacity, out.layers[2].content.clone()), (0.5, typed.layers[2].content.clone()));
++    }
++
++    #[test]
++    fn concurrent_layer_additions_reach_the_same_bytes_on_the_coordinator_and_every_peer() {
++        let base = doc();
++        let add = |name: &str| {
++            let mut d = base.clone();
++            d.layers.push(Layer::raster(name, d.pixel_format()));
++            bytes(&d)
++        };
++        let (base, first, second) = (bytes(&base), add("first"), add("second"));
++        // Accepted first: `first`. The coordinator rebases `second` over it with its author's calls.
++        let coordinator = merge(&base, &merge(&base, &base, &second).unwrap().0, &first).unwrap().0;
++        let second_author = merge(&base, &second, &first).unwrap().0;
++        let first_author = merge(&first, &first, &coordinator).unwrap().0;
++        assert_eq!((&coordinator, &first_author), (&second_author, &second_author));
++        let names: Vec<_> = document(&decode(&coordinator).unwrap()).unwrap().layers.iter().map(|l| l.name.clone()).collect();
++        assert_eq!(names, ["Background", "Layer 1", "second", "first"]);
 +    }
 +
 +    #[test]
@@ -778,11 +863,13 @@ index 0000000..44e3bf7
 +        remote.name = "theirs".into();
 +        remote.selection = None;
 +        remote.layers[0].opacity = 0.25;
++        session.execute("history.newSnapshot", Value::Null).unwrap();
 +        assert!(session.install_remote(id, remote));
 +        let st = session.active().unwrap();
 +        assert_eq!((st.doc.layers[0].opacity, st.doc.name.as_str(), st.active_layer), (0.25, "Untitled-1", active));
 +        assert!(st.doc.selection.is_some(), "the selection is this person's");
 +        assert!(!st.history.can_undo(), "no native step to undo it, nor older ones without it");
++        assert!(st.snapshots.is_empty(), "nor a snapshot without it");
 +    }
 +
 +    #[test]
@@ -810,6 +897,16 @@ index 0000000..44e3bf7
 +        let changes = LIVE.with_borrow(|live| live.changes);
 +        frame(&mut app, &ctx);
 +        assert_eq!(LIVE.with_borrow(|live| live.changes), changes, "a merged remote change is not reported back");
++        let encoded = LIVE.with_borrow(|live| live.encoded.clone().unwrap().unwrap());
++        app.session
++            .edit("Select", |d, _| {
++                d.selection = selection();
++                Ok(())
++            })
++            .unwrap();
++        frame(&mut app, &ctx);
++        assert!(LIVE.with_borrow(|live| Rc::ptr_eq(live.encoded.as_ref().unwrap().as_ref().unwrap(), &encoded)), "a selection is not encoded");
++        assert_eq!(LIVE.with_borrow(|live| live.changes), changes);
 +        assert!(app.run("edit.undo", Value::Null).is_ok());
 +        app.session.add_document(doc(), None);
 +        assert!(!undo(app.session.active().map(|st| st.doc.id), None), "another document keeps its own Undo");
@@ -882,38 +979,24 @@ index eb350d1..d460620 100644
      }
  }
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index b8d6167..3681f44 100644
+index b8d6167..9beb503 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
-@@ -867,6 +867,38 @@ impl Session {
+@@ -867,6 +867,24 @@ impl Session {
          Ok(())
      }
  
-+    /// Makes `doc` the content of the open document `id` as a change made elsewhere (a live editing session). It is no
-+    /// history step: the native steps, which hold none of it, go. This person's views stay: the selection, Quick Mask,
-+    /// work path, groups' disclosure, Ruler tool line and active count group, the name and file settings, and the
-+    /// targeted layers that still exist. False when no open document has that id.
++    /// Makes `doc` the content of the open document `id` as a change made elsewhere (a live editing session), keeping
++    /// this person's [`keep_views`] and the targeted layers that still exist. It is no history step: the native steps
++    /// and History snapshots, which hold none of it, go (restoring one would revert it). False when no open document
++    /// has that id.
 +    pub fn install_remote(&mut self, id: photocraft_doc::DocId, mut doc: Document) -> bool {
-+        use photocraft_doc::{Layer, LayerContent::Group};
 +        let Some(st) = self.docs.iter_mut().find(|st| st.doc.id == id) else { return false };
-+        let local = &*st.doc;
-+        doc.id = local.id;
-+        doc.name.clone_from(&local.name);
-+        doc.file_encoding.clone_from(&local.file_encoding);
-+        doc.selection.clone_from(&local.selection);
-+        doc.quick_mask.clone_from(&local.quick_mask);
-+        doc.quick_mask_unselected = local.quick_mask_unselected;
-+        doc.work_path.clone_from(&local.work_path);
-+        doc.measurement.ruler = local.measurement.ruler;
-+        doc.measurement.active_count_group = local.measurement.active_count_group.min(doc.measurement.count_groups.len().saturating_sub(1));
-+        for (_, _, l) in local.walk() {
-+            if let (Group(g), Some(Layer { content: Group(mine), .. })) = (&l.content, doc.layer_mut(l.id)) {
-+                mine.expanded = g.expanded;
-+            }
-+        }
++        keep_views(&mut doc, &st.doc);
 +        let damage = layer_multi_cmds::step_damage(&st.doc, &doc);
 +        st.doc = Arc::new(doc);
 +        st.history.clear();
++        st.snapshots.clear();
 +        st.coalesce = None;
 +        fix_active(st);
 +        st.revision += 1;
@@ -924,6 +1007,81 @@ index b8d6167..3681f44 100644
      /// Re-renders the pixels of type layers whose font arrived after they were drawn (the web
      /// build fetches served fonts on demand, `photocraft_text::served`). The layers' model is
      /// unchanged, so this is no history step and leaves a clean document clean. Unknown documents
+@@ -958,6 +976,27 @@ impl Session {
+     }
+ }
+ 
++/// Copies `local`'s personal views into `doc`, the parts of a document a live editing session doesn't share: the
++/// selection, Quick Mask, work path, groups' disclosure, Ruler tool line and active count group, the id, name and file
++/// settings.
++pub fn keep_views(doc: &mut Document, local: &Document) {
++    use photocraft_doc::{Layer, LayerContent::Group};
++    doc.id = local.id;
++    doc.name.clone_from(&local.name);
++    doc.file_encoding.clone_from(&local.file_encoding);
++    doc.selection.clone_from(&local.selection);
++    doc.quick_mask.clone_from(&local.quick_mask);
++    doc.quick_mask_unselected = local.quick_mask_unselected;
++    doc.work_path.clone_from(&local.work_path);
++    doc.measurement.ruler = local.measurement.ruler;
++    doc.measurement.active_count_group = local.measurement.active_count_group.min(doc.measurement.count_groups.len().saturating_sub(1));
++    for (_, _, l) in local.walk() {
++        if let (Group(g), Some(Layer { content: Group(mine), .. })) = (&l.content, doc.layer_mut(l.id)) {
++            mine.expanded = g.expanded;
++        }
++    }
++}
++
+ /// Undo / redo: target the layers the restored state targeted, as far as they still exist.
+ fn restore_target(st: &mut DocState, layers: LayerTarget) {
+     // Deselect Layers is a valid history target, not a missing layer to replace with the top
+diff --git a/crates/format/src/lib.rs b/crates/format/src/lib.rs
+index 0c87720..f3aca5f 100644
+--- a/crates/format/src/lib.rs
++++ b/crates/format/src/lib.rs
+@@ -44,7 +44,7 @@ pub use autosave::{Autosaver, RecoveryEntry, discard_recovery, list_recovery, re
+ pub use convert::MAX_GROUP_DEPTH;
+ pub use manifest::{FORMAT_VERSION, Manifest};
+ pub use read::read_file;
+-pub use store::{ByteSource, DEFAULT_REVERIFY_BUDGET, PcraftWriter, SaveStats, read_entry};
++pub use store::{ByteSource, DEFAULT_REVERIFY_BUDGET, PcraftWriter, SaveStats, Tiles, load_reusing, read_entry};
+ 
+ /// File extension of the native format.
+ pub const EXTENSION: &str = "pcraft";
+diff --git a/crates/format/src/store.rs b/crates/format/src/store.rs
+index d047668..0b75e87 100644
+--- a/crates/format/src/store.rs
++++ b/crates/format/src/store.rs
+@@ -265,6 +265,15 @@ fn admit_canvas(size: photocraft_geom::Size, opts: &LoadOptions) -> Result<()> {
+ }
+ 
+ pub(crate) fn load(src: &dyn ByteSource, opts: &LoadOptions) -> Result<Document> {
++    load_reusing(src, opts, &mut Tiles::new())
++}
++
++/// Decoded tiles by sample type and content hash.
++pub type Tiles = HashMap<SampleType, HashMap<Hash, Arc<Tile>>>;
++
++/// Loads from any byte source like [`crate::load_bytes_source`], reusing `tiles` decoded before: those are not
++/// fetched or charged again (their sizes are still checked), and the tiles this load decodes are added.
++pub fn load_reusing(src: &dyn ByteSource, opts: &LoadOptions, tiles: &mut Tiles) -> Result<Document> {
+     let m = read_manifest(src, opts)?;
+     admit_canvas(m.document.size, opts)?;
+     let mut fetch = LoadFetch { src, opts: *opts, total: 0, blobs: HashMap::new() };
+@@ -274,9 +283,11 @@ pub(crate) fn load(src: &dyn ByteSource, opts: &LoadOptions) -> Result<Document>
+         id_map: HashMap::new(),
+         contents_id_map: HashMap::new(),
+         legacy_linked_contents: HashMap::new(),
+-        tiles: HashMap::new(),
++        tiles: std::mem::take(tiles),
+     };
+-    loader.document(&m.document)
++    let doc = loader.document(&m.document);
++    *tiles = loader.tiles;
++    doc
+ }
+ 
+ // ---------------------------------------------------------------------------
 diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
 index bde51ff..6d97d4e 100644
 --- a/crates/ui-egui/src/lib.rs
