@@ -12,14 +12,13 @@ export default {
   editB: async (page) => {},           // the editor's edit, to a different object
   undo: async (page) => {},            // the owner's Undo (its usual shortcut or button)
   ignore: ['/next_id'],                // optional: allocator counters, which Undo leaves raised
+  importMedia: async (page) => {},     // optional: the owner adds a photo/clip/sample kept outside the document; the
+                                       // editor and the late viewer must end up with the same bytes (adapter assets())
 }
 ```
 
 An app whose checkpoint is not JSON defines `globalThis.liveTestDocument()` in `ready`, returning the document as JSON
 text (see photoshop.mjs).
-
-```js
-```
 
 Build the patched app, install it with `LIVE_PUBLIC=~/.cache/live-e2e-public node scripts/live-overlay.mjs <slug>
 <dist> <path>`, then run `LIVE_PUBLIC=~/.cache/live-e2e-public LIVE_APPS=<slug> CHROMIUM=… node --test

@@ -7,7 +7,8 @@ import { until } from './helpers.mjs'
 // Live editing in real app builds that use patches/live/playground_live.rs (JSON documents). LIVE_PUBLIC is a public
 // directory holding each patched build at its URL path with the shell injected (tests/live-apps/README.md). Each
 // tests/live-apps/<slug>.mjs exports { path, viewport?, ready?(page), editA(page), editB(page), undo(page), ignore? }:
-// two edits to different objects, then Undo of the owner's; `ignore` lists path prefixes of allocator counters.
+// two edits to different objects, then Undo of the owner's; `ignore` lists path prefixes of allocator counters. An app
+// that keeps media outside the document also exports importMedia(page), which adds one in the owner's browser.
 const publicDir = process.env.LIVE_PUBLIC
 const only = process.env.LIVE_APPS?.split(',')
 const specs = readdirSync(new URL('./live-apps/', import.meta.url)).filter((f) => f.endsWith('.mjs'))
@@ -45,6 +46,16 @@ function changes(a, b, path = '', out = new Map()) {
   } else out.set(path, b)
   return out
 }
+// The media this page has, as `id sha256` lines: the same on every page once shared.
+const media = (page) => page.evaluate(async () => {
+  const hex = async (bytes) => [...new Uint8Array(await crypto.subtle.digest('SHA-256', await new Blob([bytes]).arrayBuffer()))].map((b) => b.toString(16).padStart(2, '0')).join('')
+  const list = await playgroundLiveAdapter.assets()
+  return list.every((a) => a.have) ? (await Promise.all(list.map(async (a) => `${a.id} ${await hex(await playgroundLiveAdapter.readAsset(a.id))}`))).sort().join('\n') : null
+})
+const sameMedia = (pages, what) => until(async () => {
+  const all = new Set(await Promise.all(pages.map(media)))
+  return all.size === 1 && !!all.values().next().value
+}, 60000, what)
 const at = (doc, path) => path.split('/').slice(1).reduce((v, k) => v?.[k], doc)
 
 for (const slug of specs) {
@@ -72,12 +83,18 @@ for (const slug of specs) {
     const checked = (path) => !(app.ignore ?? []).some((prefix) => path.startsWith(prefix))
     for (const [path] of changes(start, afterA)) if (checked(path)) assert.deepEqual(at(undone, path), at(start, path), `Undo reverts ${path}`)
     for (const [path, value] of changes(afterA, afterB)) if (checked(path)) assert.deepEqual(at(undone, path), value, `Undo keeps the editor's ${path}`)
+    if (app.importMedia) {
+      await app.importMedia(a)
+      await same([a, b], 'the owner\'s import to reach the editor', JSON.stringify(undone))
+      await sameMedia([a, b], 'the imported media to reach the editor')
+    }
 
     const c = await open(app)
     await c.evaluate(async (invite) => { window.session = await PeerSession.join(invite, { name: 'Carol' }) }, invite.viewer)
     await follow(c)
     await same([a, b, c], 'the late viewer to catch up')
     await until(async () => await status(c) === 'read-only', 10000, 'the viewer to be read-only')
+    if (app.importMedia) await sameMedia([a, c], 'the media to reach the late viewer')
     for (const page of [a, b, c]) await page.evaluate(() => session.leave())
   })
 }
