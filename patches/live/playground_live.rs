@@ -36,6 +36,27 @@ pub trait Live {
     {
         merge(base, current, edited, Self::COUNTERS)
     }
+    /// Whether a merged document is one every peer can install; checked after every merge, by the session's
+    /// coordinator before it records anything and by each receiver. An invalid document recorded once would fail on
+    /// every peer for good, so check what [`Self::live_adopt`] needs (deserialize, the app's own validation, sort
+    /// orders it relies on). The default only asks for an object.
+    fn live_check(document: &Value) -> Result<(), Error>
+    where
+        Self: Sized,
+    {
+        if document.is_object() {
+            Ok(())
+        } else {
+            Err("Conflict: not a document".into())
+        }
+    }
+}
+
+/// [`Live::live_merge`], then [`Live::live_check`] on the result.
+fn checked_merge<A: Live>(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
+    let merged = A::live_merge(base, current, edited)?;
+    A::live_check(&merged)?;
+    Ok(merged)
 }
 
 /// A conflict or an invalid document.
@@ -439,7 +460,7 @@ fn adopt<A: Live>(
     let edited = parse(edited)?;
     let current = app.live_document();
     let (document, replaced) = match base {
-        Some(base) => (A::live_merge(&parse(base)?, &current, &edited)?, None),
+        Some(base) => (checked_merge::<A>(&parse(base)?, &current, &edited)?, None),
         None => (edited, Some(canonical(&current))),
     };
     app.live_adopt(document)?;
@@ -503,7 +524,8 @@ pub mod web {
                      edited: Uint8Array|
          -> Result<Uint8Array, JsValue> {
             let parse = |bytes: Uint8Array| super::parse(&bytes.to_vec());
-            let merged = (|| A::live_merge(&parse(base)?, &parse(current)?, &parse(edited)?))();
+            let merged =
+                (|| super::checked_merge::<A>(&parse(base)?, &parse(current)?, &parse(edited)?))();
             Ok(
                 super::canonical(&merged.map_err(|e| JsValue::from_str(&e))?)
                     .as_slice()
@@ -663,6 +685,10 @@ mod tests {
             canonical(&json!(-0.0)),
             canonical(&json!(0.0)),
             "the merge treats them as equal"
+        );
+        assert!(
+            checked_merge::<Doc>(&json!({"a": 1}), &json!({"a": 1}), &json!(null)).is_err(),
+            "never a non-document"
         );
         let points = |v: Vec<u32>| json!({"points": v});
         assert!(m(points(vec![1, 2]), points(vec![1, 3]), points(vec![0, 2])).is_err());

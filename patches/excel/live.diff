@@ -1,22 +1,3 @@
-diff --git a/Cargo.lock b/Cargo.lock
-index 6d618a0..278478f 100644
---- a/Cargo.lock
-+++ b/Cargo.lock
-@@ -1643,12 +1643,14 @@ dependencies = [
-  "gridcraft-engine",
-  "gridcraft-xlsx",
-  "image",
-+ "js-sys",
-  "log",
-  "serde",
-  "serde_json",
-  "skrifa",
-  "sys-locale",
-  "toml",
-+ "wasm-bindgen",
-  "web-sys",
-  "zbus",
- ]
 diff --git a/apps/gridcraft-web/src/web.rs b/apps/gridcraft-web/src/web.rs
 index c0fcb22..b29ba60 100644
 --- a/apps/gridcraft-web/src/web.rs
