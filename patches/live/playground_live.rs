@@ -115,8 +115,8 @@ fn merge_at(
     }
     let key = path.rsplit('/').next().unwrap_or_default();
     // An allocator both sides raised (or both added) keeps the larger value, compared exactly as integers.
-    if let (Some(Value::Number(cn)), Some(Value::Number(en))) = (c, e) {
-        if counters.contains(&key) {
+    match (c, e) {
+        (Some(Value::Number(cn)), Some(Value::Number(en))) if counters.contains(&key) => {
             let larger = match (cn.as_u64(), en.as_u64(), cn.as_i64(), en.as_i64()) {
                 (Some(x), Some(y), _, _) => x >= y,
                 (_, _, Some(x), Some(y)) => x >= y,
@@ -124,6 +124,7 @@ fn merge_at(
             };
             return Ok(if larger { c.cloned() } else { e.cloned() });
         }
+        _ => {}
     }
     match (b, c, e) {
         (Some(Value::Object(b)), Some(Value::Object(c)), Some(Value::Object(e))) => {
@@ -239,10 +240,7 @@ fn keyed_merge(
         .rev()
         .collect();
     let mut rest = kept.into_iter().rev().collect::<Vec<_>>();
-    loop {
-        let Some(key) = stack.pop().or_else(|| rest.pop()) else {
-            break;
-        };
+    while let Some(key) = stack.pop().or_else(|| rest.pop()) {
         if let Some(children) = after.remove(&Some(key.clone())) {
             stack.extend(children.into_iter().rev());
         }
@@ -363,6 +361,11 @@ pub fn fresh_id(next: &mut u64) -> u64 {
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         >> 12;
     (1 << 52) | (random & ((1 << 52) - 1))
+}
+
+/// Whether a session is connected.
+pub fn connected() -> bool {
+    SESSION.with_borrow(|s| s.connected)
 }
 
 /// Passes Undo or Redo to the session while connected: whether it did. Call it first in the app's Undo and Redo.
