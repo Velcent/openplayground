@@ -110,3 +110,86 @@
 - file: apps/web/src/legacy.rs
   find: 'pub const TAB_LOCK: &str = "lightcraft-library";'
   replace: 'pub const TAB_LOCK: &str = "lightcraft-classic-library";'
+
+# Live editing in Playground sessions (patches/lightroom-classic/live.diff + patches/live/playground_live.rs)
+# What it's for: two or more people edit one library together in a Playground session: the shared document is the
+#   catalog (develop settings, History, Versions, ratings, flags, labels, metadata, collections and saved creations,
+#   stacks, keywords, saved locations) and imported originals travel as session files; views and this browser's own
+#   records stay local, and while connected Undo and Redo go to the session.
+# How: live.diff only adds files: apps/web/src/live.rs (the adapter, media and command hooks), apps/web/src/live_web.rs
+#   (the host side, a child of web.rs) and a `live` module in the catalog, engine and ui-egui crates. The rules below
+#   declare those modules and add one-line calls into them; native builds never set the hooks, so nothing changes there.
+# Verify: open /lightroom-classic/ twice (two browser profiles), start a session in one and join from the other: a
+#   rating or an imported photo shows in both, each keeps its own photo on screen, and Ctrl+Z undoes only its author's
+#   step (tests/live-apps/lightroom-classic.mjs).
+# If upstream changes: re-anchor the rule that no longer matches on the same function's signature (or the file's end
+#   for module declarations); a compile error inside an inserted line means a field or parameter it names was renamed.
+
+# The adapter module (native tests compile it too).
+- live: true
+  file: apps/web/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
+# The host side of live editing, a child of web.rs so it reaches the web app's fields.
+- live: true
+  file: apps/web/src/web.rs
+  find: '(?![\s\S])'
+  after: "\n#[path = \"live_web.rs\"]\nmod live_web;\n"
+# The web app runs inside live_web::Shared: each frame ends with the session's turn, and the hooks reach the app.
+- live: true
+  file: apps/web/src/web.rs
+  find: 'Box::new\(\s*WebApp::new\('
+  replace: 'live_web::wrap(WebApp::new('
+# A Playground invitation (?pg-session=<room id>) opens a library of its own, never this browser's.
+- live: true
+  file: apps/web/src/web.rs
+  find: 'for\s+name\s+in\s+LIBRARY_FILES\s*\{'
+  before: "lib_dir = live_web::session_library().unwrap_or(lib_dir);\n        "
+# New ids while connected are ones nobody else in the session can pick (crates/catalog/src/live.rs).
+- live: true
+  file: crates/catalog/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\npub mod live;\n"
+- live: true
+  file: crates/catalog/src/lib.rs
+  find: 'pub\s+fn\s+alloc_photo_id\s*\(\s*&mut\s+self\s*\)\s*->\s*PhotoId\s*\{'
+  after: "\n        if let Some(id) = crate::live::alloc(&mut self.next_photo) { return PhotoId(id); }"
+- live: true
+  file: crates/catalog/src/lib.rs
+  find: 'pub\s+fn\s+alloc_album_id\s*\(\s*&mut\s+self\s*\)\s*->\s*AlbumId\s*\{'
+  after: "\n        if let Some(id) = crate::live::alloc(&mut self.next_album) { return AlbumId(id); }"
+- live: true
+  file: crates/catalog/src/lib.rs
+  find: 'pub\s+fn\s+alloc_stack_id\s*\(\s*&mut\s+self\s*\)\s*->\s*StackId\s*\{'
+  after: "\n        if let Some(id) = crate::live::alloc(&mut self.next_stack) { return StackId(id); }"
+# Installing other people's changes, and automatic versions only of this person's own edits (crates/engine/src/live.rs).
+- live: true
+  file: crates/engine/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\npub mod live;\n"
+- live: true
+  file: crates/engine/src/lib.rs
+  find: 'pub\s+fn\s+commit\s*\(\s*&mut\s+self\s*,\s*\w+\s*:\s*&str\s*,\s*(\w+)\s*:\s*Op\s*\)[^{]*\{'
+  replace: "$&\n        crate::live::committed(&$1);"
+- live: true
+  file: crates/engine/src/lib.rs
+  find: 'pub\s+fn\s+auto_version\s*\(\s*&mut\s+self\s*,\s*(\w+)\s*:\s*PhotoId\s*\)[^{]*\{'
+  replace: "$&\n        if crate::live::not_mine($1) { return; }"
+# Undo and Redo go to the session while connected, saved creations are not saved over, the Edit menu says so, and the
+# Presets panel's Amount keeps undoing its own step (crates/ui-egui/src/live.rs).
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\npub mod live;\n"
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: 'pub\s+fn\s+run(?:_typed)?\s*\(\s*&mut\s+self\s*,\s*(\w+)\s*:\s*&str\s*,\s*(\w+)\s*:\s*Value\s*\)[^{]*\{'
+  replace: "$&\n        if let Some(r) = crate::live::command(self, $1, &$2) { return r; }"
+- live: true
+  file: crates/ui-egui/src/menubar.rs
+  find: 'fn\s+item\s*\(\s*id\s*:\s*&str\s*,[^)]*\)\s*->\s*MenuNode\s*\{'
+  after: "\n    let (label, enabled) = crate::live::menu_item(id, label.into(), enabled);"
+- live: true
+  file: crates/ui-egui/src/panels/presets.rs
+  find: 'pub\s+fn\s+show\s*\(\s*app\s*:\s*&mut\s+\w+\s*,[^)]*\)\s*\{'
+  after: "\n    let _native = crate::live::native();"
