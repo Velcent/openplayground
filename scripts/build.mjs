@@ -43,12 +43,16 @@ const WASM_FEATURES = ['bulk-memory', 'bulk-memory-opt', 'call-indirect-overlong
 // checkout, which cargo merges with the app's own (rustflags arrays add up); RUSTFLAGS would replace the app's.
 const SIMD = '[target.wasm32-unknown-unknown]\nrustflags = ["-Ctarget-feature=+simd128"]\n'
 
+// The live-editing adapter template (tools.yaml `live:`), copied into the app before its patches apply.
+const LIVE = new URL('../patches/live/playground_live.rs', import.meta.url)
+
 // Changes when the build recipe or the tool's patches change, so either one triggers a rebuild.
 const buildHash = (t) =>
   createHash('sha256')
     .update(readFileSync(import.meta.filename))
     .update(readFileSync(new URL('diffs.mjs', import.meta.url)))
     .update(t.patches ? readFileSync(t.patches) : '')
+    .update(t.live ? readFileSync(LIVE) : '')
     .update(diffDir(t) ? readdirSync(diffDir(t)).sort().map((f) => f + readFileSync(join(diffDir(t), f), 'utf8')).join('') : '')
     .digest('hex')
     .slice(0, 8)
@@ -114,6 +118,7 @@ const prepare = async (slug, channel, { dir = 'src', patch = true } = {}) => {
   } else {
     run('git', ['clone', '--quiet', '--depth', '1', '--branch', release.tag_name, `https://github.com/${t.repo}.git`, src])
   }
+  if (t.live && patch) cpSync(LIVE, join(src, t.live, 'playground_live.rs'))
   const merged = patch ? applyDiffs(src, t, channel) : []
   if (t.patches && patch) applyPatches(src, t.patches)
   const web = webDir(src)

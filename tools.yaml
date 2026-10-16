@@ -18,6 +18,8 @@
 #           serves the upstream release (with the theme script) instead.
 #   build: false uses upstream releases only (already optimized by the app's own CI)
 #   isolated: true sends the cross-origin isolation headers required by shared-memory WASM
+#   live:   the source folder that gets patches/live/playground_live.rs, the live-editing adapter the tool's diffs
+#           wire in (optional; Honeydew has its own)
 #   opens:  file types (extensions) the app is the natural home for: Files shows its icon on them and opens them
 #           in it by default (no browser-side Open yet: [])
 #   imports: other types its browser build takes in (imports, places, inserts): offered in Files' right-click menu
