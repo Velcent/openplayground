@@ -80,6 +80,7 @@ groups:
         repo: storytold/lightcraft
         icon: icons/lightcraft.png
         patches: patches/lightroom.yaml
+        live: apps/lightcraft-web/src
         accent: "#31A8FF"
         base: "#001E36"
 
