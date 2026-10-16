@@ -173,19 +173,22 @@ index ddd5427..264db8a 100644
          }
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..6da3ced
+index 0000000..5d414cd
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,297 @@
 +//! Live editing in a Playground session (web only). The shared document is the session without anyone's views: no
 +//! Edit-window state (`edit`: selection, playhead, zoom, tools, modes, view flags), and per track no height, lane view,
-+//! folder state, pin, record arm or input monitor. Audio stays in each browser's pool.
++//! folder state, pin, record arm or input monitor. Audio reaches everyone as session files, one per source id (the
++//! built-in demo's synthesized audio excepted: every browser makes the same).
 +
 +use crate::SoundApp;
 +use serde_json::Value;
 +use serde::Deserialize as _;
 +use soundcraft_model::playground_live::{self, Live};
-+use soundcraft_model::{EditState, Session, Track};
++use soundcraft_audio_io::{BitDepth, EncodeOptions, FileFormat};
++use soundcraft_model::{EditState, Session, Source, SourceAudio, SourceId, Track};
++use std::sync::Arc;
 +
 +/// Copies what each person keeps of a track for themselves.
 +fn keep_views(t: &mut Track, from: &Track) {
@@ -212,8 +215,12 @@ index 0000000..6da3ced
 +
 +/// Whether a live editing session shares the open session, which then stays open: nothing replaces it.
 +pub(crate) fn connected() -> bool {
-+    // Only a connected session hands out ids from 2^52 up.
-+    playground_live::fresh_id(&mut 0) >= 1 << 52
++    playground_live::connected()
++}
++
++/// Whether two records describe the same audio (saving changes only where it is kept).
++fn same_audio(a: &Source, b: &Source) -> bool {
++    (&a.name, a.channels, a.frames, a.sample_rate) == (&b.name, b.channels, b.frames, b.sample_rate)
 +}
 +
 +impl Live for SoundApp {
@@ -272,6 +279,13 @@ index 0000000..6da3ced
 +            src.unsaved = current.source(src.id).is_some_and(|c| c.unsaved);
 +        }
 +        s.pool = current.pool.clone();
++        // Source ids before the session were counted on each side: this browser's own audio under a shared source's id
++        // is not that source's (it then arrives as a session file).
++        for src in &s.sources {
++            if current.source(src.id).is_some_and(|c| !same_audio(c, src)) {
++                s.pool.remove(src.id);
++            }
++        }
 +        s.folder = current.folder.clone();
 +        *self.engine.session_mut() = s;
 +        Ok(())
@@ -293,6 +307,34 @@ index 0000000..6da3ced
 +
 +    fn live_disconnected(&mut self) {
 +        self.engine.clear_history();
++    }
++
++    fn live_assets(&self) -> Vec<(String, String, bool)> {
++        let (s, demo) = (self.engine.session(), soundcraft_engine::demo::cached_demo_session());
++        let built_in = |id| matches!((s.pool.get(id), demo.pool.get(id)), (Some(a), Some(b)) if Arc::ptr_eq(a, b));
++        s.sources.iter().filter(|src| !built_in(src.id)).map(|src| (src.id.0.to_string(), format!("{}.wav", src.name), s.pool.contains(src.id))).collect()
++    }
++
++    /// Every source id (the demo's too, which `live_assets` leaves out: nobody shares it).
++    fn live_assets_of(document: &Value) -> Vec<String> {
++        document["sources"].as_array().into_iter().flatten().filter_map(|s| s["id"].as_u64()).map(|id| id.to_string()).collect()
++    }
++
++    /// The source's audio as a 32-bit float WAV, as a saved bundle carries it.
++    fn live_read_asset(&self, id: &str) -> Option<Vec<u8>> {
++        let audio = self.engine.session().pool.get(SourceId(id.parse().ok()?))?;
++        let wav = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Float32, dither: false, bwf: None };
++        soundcraft_audio_io::encode(&audio.buffer, &wav).ok()
++    }
++
++    /// Into the pool, as opening a bundle decodes it, if it is the audio the source describes.
++    fn live_write_asset(&mut self, id: &str, _name: &str, bytes: Vec<u8>) {
++        let Some(src) = id.parse().ok().and_then(|id| self.engine.session().source(SourceId(id))) else { return };
++        let Ok((_, buf)) = soundcraft_audio_io::decode(&bytes, Some("wav")) else { return };
++        if (buf.num_channels(), buf.frames() as u64, buf.sample_rate) == (usize::from(src.channels), src.frames, src.sample_rate) {
++            let id = src.id;
++            self.engine.session_mut().pool.insert(id, Arc::new(SourceAudio::new(buf)));
++        }
 +    }
 +}
 +
@@ -377,6 +419,29 @@ index 0000000..6da3ced
 +        live::disconnect();
 +        app.live_disconnected();
 +        assert!(!app.engine.can_undo());
++    }
++
++    #[test]
++    fn imported_audio_travels_by_source_id_and_installs_without_an_edit() {
++        let with_import = |level: f32, frames: usize| {
++            let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
++            let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![level; frames]] };
++            let wav = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Float32, dither: false, bwf: None };
++            let bytes = soundcraft_audio_io::encode(&buf, &wav).unwrap();
++            soundcraft_engine::io::import_audio_bytes(&mut app.engine, "a.wav", &bytes, None, None, 0).unwrap();
++            app
++        };
++        let (owner, mut peer) = (with_import(0.5, 480), with_import(-0.25, 960));
++        let listed = owner.live_assets();
++        let id = owner.engine.session().sources.last().unwrap().id.to_string();
++        assert_eq!(listed, [(id.clone(), "a.wav".into(), true)], "the demo's audio is not shared");
++        assert!(SoundApp::live_assets_of(&owner.live_document()).contains(&id));
++        peer.live_adopt(owner.live_document()).unwrap();
++        assert_eq!(peer.live_assets(), [(id.clone(), "a.wav".into(), false)], "the peer's own audio under that id is not it");
++        let doc = canonical(&peer.live_document());
++        peer.live_write_asset(&id, "a.wav", owner.live_read_asset(&id).unwrap());
++        assert_eq!(peer.live_read_asset(&id), owner.live_read_asset(&id));
++        assert!(canonical(&peer.live_document()) == doc && !peer.engine.can_undo());
 +    }
 +
 +    #[test]
