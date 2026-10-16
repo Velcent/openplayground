@@ -1,5 +1,5 @@
 diff --git a/apps/filmcraft-web/src/lib.rs b/apps/filmcraft-web/src/lib.rs
-index 21512cc..fadee32 100644
+index 21512cc..5739be3 100644
 --- a/apps/filmcraft-web/src/lib.rs
 +++ b/apps/filmcraft-web/src/lib.rs
 @@ -113,6 +113,11 @@ impl eframe::App for WebApp {
@@ -14,7 +14,17 @@ index 21512cc..fadee32 100644
      }
  }
  
-@@ -219,6 +224,16 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
+@@ -138,7 +143,8 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
+ 
+     // Media kept in OPFS by earlier sessions come back under their paths (recovery).
+     let restored = if opfs::available() && !query_flag("fresh") { recovery::restore_media().await } else { 0 };
+-    let recovered = if query_flag("fresh") || query_flag("norecover") { None } else { recovery::load_snapshot().await };
++    // A Playground session's page shows the session's project, not this browser's unsaved one.
++    let recovered = if query_flag("fresh") || query_flag("norecover") || query_flag("pg-session") { None } else { recovery::load_snapshot().await };
+     webcodecs::probe().await;
+ 
+     api::install()?;
+@@ -219,6 +225,16 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
          )
          .await?;
      set_info("startupMs", json!(t0.elapsed().as_secs_f64() * 1000.0));
@@ -31,6 +41,64 @@ index 21512cc..fadee32 100644
      // keep the runner alive for the page's lifetime
      std::mem::forget(runner);
      if let Some(el) = doc.get_element_by_id("loading") {
+diff --git a/apps/filmcraft-web/src/recovery.rs b/apps/filmcraft-web/src/recovery.rs
+index 6001531..96a9300 100644
+--- a/apps/filmcraft-web/src/recovery.rs
++++ b/apps/filmcraft-web/src/recovery.rs
+@@ -17,8 +17,17 @@ use serde_json::{Value, json};
+ use crate::opfs;
+ use crate::recovery_policy::{Action, Policy};
+ 
+-const SNAPSHOT: &str = "recovery/snapshot.fcproj";
+-const META: &str = "recovery/meta.json";
++/// A recovery file. A page opened for a Playground session (`?pg-session=<room>`) keeps its own folder, so the shared
++/// project never takes the place of this browser's own unsaved one.
++fn recovery(file: &str) -> String {
++    let search = web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default();
++    let room = web_sys::UrlSearchParams::new_with_str(&search).ok().and_then(|p| p.get("pg-session"));
++    match room.map(|r| r.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>()) {
++        Some(room) if !room.is_empty() => format!("recovery/{room}/{file}"),
++        _ => format!("recovery/{file}"),
++    }
++}
++
+ /// Media larger than this are not copied to OPFS.
+ const KEEP_MAX: f64 = 4.0 * 1024.0 * 1024.0 * 1024.0;
+ 
+@@ -67,8 +76,8 @@ impl Autosave {
+                 let meta = json!({"dirty": true, "name": s.project.name, "revision": s.revision, "time": js_sys::Date::now()});
+                 let d1 = done(self.outcomes.clone(), failed.clone(), left.clone(), ctx.clone());
+                 let d2 = done(self.outcomes.clone(), failed, left, ctx.clone());
+-                opfs::write_then(SNAPSHOT.into(), filmcraft_format::encode(&s.project, false), Some(d1));
+-                opfs::write_then(META.into(), meta.to_string().into_bytes(), Some(d2));
++                opfs::write_then(recovery("snapshot.fcproj"), filmcraft_format::encode(&s.project, false), Some(d1));
++                opfs::write_then(recovery("meta.json"), meta.to_string().into_bytes(), Some(d2));
+             }
+             Action::WriteClean => {
+                 let (out, ctx) = (self.outcomes.clone(), ctx.clone());
+@@ -76,7 +85,7 @@ impl Autosave {
+                     out.borrow_mut().push(Outcome::Clean { ok });
+                     ctx.request_repaint();
+                 });
+-                opfs::write_then(META.into(), json!({"dirty": false}).to_string().into_bytes(), Some(done));
++                opfs::write_then(recovery("meta.json"), json!({"dirty": false}).to_string().into_bytes(), Some(done));
+             }
+         }
+     }
+@@ -87,11 +96,11 @@ pub async fn load_snapshot() -> Option<(String, Vec<u8>)> {
+     if !opfs::available() {
+         return None;
+     }
+-    let meta: Value = serde_json::from_slice(&opfs::read(META).await?).ok()?;
++    let meta: Value = serde_json::from_slice(&opfs::read(&recovery("meta.json")).await?).ok()?;
+     if meta.get("dirty").and_then(Value::as_bool) != Some(true) {
+         return None;
+     }
+-    let bytes = opfs::read(SNAPSHOT).await?;
++    let bytes = opfs::read(&recovery("snapshot.fcproj")).await?;
+     let name = meta.get("name").and_then(Value::as_str).unwrap_or("Recovered").to_string();
+     Some((format!("{name}.fcproj"), bytes))
+ }
 diff --git a/crates/edit/src/lib.rs b/crates/edit/src/lib.rs
 index 2f2588d..be99895 100644
 --- a/crates/edit/src/lib.rs
@@ -58,17 +126,33 @@ index 1566a59..ed0d536 100644
              v
          };
          let mut track = filmcraft_captions::track_from_document(&doc, tid, &track_name, format.track_format(), &mut alloc);
+diff --git a/crates/interchange/src/lib.rs b/crates/interchange/src/lib.rs
+index ad05375..7cafd8a 100644
+--- a/crates/interchange/src/lib.rs
++++ b/crates/interchange/src/lib.rs
+@@ -435,7 +435,8 @@ pub fn merge_into(target: &mut Project, fragment: Imported, bin: Option<BinId>)
+     let mut new_items: BTreeMap<ItemId, filmcraft_project::ProjectItem> = BTreeMap::new();
+     for (old, mut it) in frag.items {
+         it.id = items[&old];
+-        it.created = it.id.0;
++        // Live editing (web) hands out ids above the counter: Date Created stays a counter value.
++        it.created = it.id.0.min(target.next_id);
+         match &mut it.kind {
+             ItemKind::Sequence(seq) => {
+                 let seq = std::sync::Arc::make_mut(seq);
 diff --git a/crates/project/Cargo.toml b/crates/project/Cargo.toml
-index 29f4301..ac608d1 100644
+index 29f4301..508e0cd 100644
 --- a/crates/project/Cargo.toml
 +++ b/crates/project/Cargo.toml
-@@ -18,5 +18,13 @@ serde = { workspace = true }
+@@ -18,5 +18,15 @@ serde = { workspace = true }
  serde_json = { workspace = true }
  thiserror = { workspace = true }
  
 +[target.'cfg(target_arch = "wasm32")'.dependencies]
 +js-sys = "0.3"
 +wasm-bindgen = "0.2"
++# Live editing: equal documents give equal bytes on every peer only if floats read back exactly.
++serde_json = { workspace = true, features = ["float_roundtrip"] }
 +
  [dev-dependencies]
  proptest = { workspace = true }
@@ -136,20 +220,20 @@ index cb4a234..1021d1b 100644
  pub mod panels;
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..d67db37
+index 0000000..b3d80ec
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,309 @@
 +//! Live editing in a Playground session (web only). The shared document is the open project (`Project`). What each
 +//! person sees for themselves (selection, playheads, open sequences, Timeline zoom and scroll, panels, the Source
-+//! monitor) already lives outside it, in the engine's `EditorState` and the UI. Imported media stay in the browser
-+//! that imported them.
++//! monitor) already lives outside it, in the engine's `EditorState` and the UI; so does what belongs to this machine:
++//! the renderer, the scratch disks and record-armed tracks. Imported media stay in the browser that imported them.
 +
 +use std::cell::Cell;
 +use std::sync::Arc;
 +
-+use filmcraft_project::Project;
 +use filmcraft_project::playground_live::{self, Live};
++use filmcraft_project::{Project, ProjectSettings};
 +use serde_json::Value;
 +
 +use crate::FilmcraftApp;
@@ -158,6 +242,12 @@ index 0000000..d67db37
 +    /// The last frame had a pointer button down or a text field focused.
 +    static INPUT: Cell<bool> = const { Cell::new(false) };
 +}
++
++/// Project settings that belong to this machine.
++const LOCAL_SETTINGS: [&str; 2] = ["renderer", "scratch"];
++
++/// Lists the model keeps in time order (`start`).
++const TIMED: [&str; 4] = ["items", "transitions", "markers", "captions"];
 +
 +/// The end of a frame: [`playground_live::frame`], with what egui knows of the pointer and the keyboard.
 +pub fn frame(app: &mut FilmcraftApp, ctx: &egui::Context) {
@@ -181,6 +271,50 @@ index 0000000..d67db37
 +    }
 +}
 +
++/// Puts back in time order the lists a merge combined from both sides: two people's clips added after the same one
++/// come in the order of the sides, and clips must stay sorted by start (the Timeline searches them). A value taken
++/// whole from one side is that person's own and stays as it is.
++fn by_start(key: &str, merged: &mut Value, current: Option<&Value>, edited: Option<&Value>) {
++    if current == Some(&*merged) || edited == Some(&*merged) {
++        return;
++    }
++    match merged {
++        Value::Object(map) => {
++            for (k, v) in map.iter_mut() {
++                by_start(k, v, current.and_then(|c| c.get(k)), edited.and_then(|e| e.get(k)));
++            }
++        }
++        Value::Array(list) => {
++            fn by_id<'a>(side: Option<&'a Value>, id: Option<&Value>) -> Option<&'a Value> {
++                let id = id?;
++                side?.as_array()?.iter().find(|x| x.get("id") == Some(id))
++            }
++            for item in list.iter_mut() {
++                let id = item.get("id").cloned();
++                by_start("", item, by_id(current, id.as_ref()), by_id(edited, id.as_ref()));
++            }
++            if TIMED.contains(&key) && list.iter().all(|x| x.get("start").is_some_and(Value::is_i64)) {
++                list.sort_by_key(|x| (x["start"].as_i64(), x.get("id").and_then(Value::as_u64)));
++            }
++        }
++        _ => {}
++    }
++}
++
++/// The project a shared document describes, with this machine's `local` settings.
++fn project_of(mut document: Value, local: &ProjectSettings) -> Result<Project, String> {
++    if let Some(root) = document.get_mut("root") {
++        key_bins(root, false);
++    }
++    let local = serde_json::to_value(local).map_err(|e| e.to_string())?;
++    if let Some(settings) = document.get_mut("settings").and_then(Value::as_object_mut) {
++        for key in LOCAL_SETTINGS {
++            settings.insert(key.into(), local[key].clone());
++        }
++    }
++    serde_json::from_value(document).map_err(|e| format!("Invalid project: {e}"))
++}
++
 +impl Live for FilmcraftApp {
 +    const COUNTERS: &'static [&'static str] = &["next_id"];
 +
@@ -189,26 +323,54 @@ index 0000000..d67db37
 +        if let Some(root) = doc.get_mut("root") {
 +            key_bins(root, true);
 +        }
++        if let Some(settings) = doc.get_mut("settings").and_then(Value::as_object_mut) {
++            for key in LOCAL_SETTINGS {
++                settings.remove(key);
++            }
++        }
++        let sequences = doc.get_mut("items").and_then(Value::as_object_mut).into_iter().flat_map(|items| items.values_mut());
++        for q in sequences.filter_map(|item| item.get_mut("kind")?.get_mut("Sequence")?.as_object_mut()) {
++            let tracks = q.iter_mut().filter(|(k, _)| matches!(k.as_str(), "video_tracks" | "audio_tracks" | "submix_tracks"));
++            for track in tracks.flat_map(|(_, list)| list.as_array_mut().into_iter().flatten()) {
++                if let Some(mixer) = track.get_mut("mixer").and_then(Value::as_object_mut) {
++                    mixer.remove("record_arm");
++                }
++            }
++        }
 +        doc
 +    }
 +
-+    fn live_adopt(&mut self, mut document: Value) -> Result<(), String> {
-+        if let Some(root) = document.get_mut("root") {
-+            key_bins(root, false);
-+        }
-+        let project: Project = serde_json::from_value(document).map_err(|e| format!("Invalid project: {e}"))?;
-+        let s = &mut self.session;
-+        // A merge that breaks a sequence (clips overlapping, a sequence nested in itself) is a conflict.
++    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
++        let mut merged = playground_live::merge(base, current, edited, Self::COUNTERS)?;
++        by_start("", &mut merged, Some(current), Some(edited));
++        Ok(merged)
++    }
++
++    /// What every peer can install: a project whose sequences keep their invariants (clips sorted, none overlapping,
++    /// none nested in itself).
++    fn live_check(document: &Value) -> Result<(), String> {
++        let project = project_of(document.clone(), &ProjectSettings::default())?;
 +        for item in project.sequences() {
-+            let check = |p: &Project| p.sequence(item.id).map(|q| q.check());
-+            if let Some(Err(e)) = check(&project)
-+                && !matches!(check(&s.project), Some(Err(_)))
-+            {
++            if let Some(Err(e)) = project.sequence(item.id).map(|q| q.check()) {
 +                return Err(format!("Conflict: {e}"));
 +            }
 +        }
-+        if project.nest_cycle().is_some() && s.project.nest_cycle().is_none() {
-+            return Err("Conflict: a sequence nested in itself".into());
++        match project.nest_cycle() {
++            Some(_) => Err("Conflict: a sequence nested in itself".into()),
++            None => Ok(()),
++        }
++    }
++
++    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
++        let s = &mut self.session;
++        let mut project = project_of(document, &s.project.settings)?;
++        for item in project.items.values_mut() {
++            let old = s.project.sequence(item.id);
++            let Some(q) = item.as_sequence_mut() else { continue };
++            for t in q.video_tracks.iter_mut().chain(&mut q.audio_tracks).chain(&mut q.submix_tracks) {
++                let mut was = old.into_iter().flat_map(|o| o.video_tracks.iter().chain(&o.audio_tracks).chain(&o.submix_tracks));
++                t.mixer.record_arm = was.find(|o| o.id == t.id).is_some_and(|o| o.mixer.record_arm);
++            }
 +        }
 +        s.project = Arc::new(project);
 +        s.fix_state();
@@ -254,6 +416,23 @@ index 0000000..d67db37
 +        clip
 +    }
 +
++    /// Sets what belongs to this machine: the renderer, a scratch disk, the record arm of A1.
++    fn local(app: &mut FilmcraftApp, name: &str) {
++        let seq = app.session.state.active_sequence.unwrap();
++        let p = Arc::make_mut(&mut app.session.project);
++        (p.settings.renderer, p.settings.scratch.captured) = (name.into(), Some(name.into()));
++        p.sequence_mut(seq).unwrap().audio_tracks[0].mixer.record_arm = true;
++    }
++
++    /// Adds a copy of V1's last clip, `gap` clip durations after it, with id `id`.
++    fn append(app: &mut FilmcraftApp, id: u64, gap: i64) {
++        let seq = app.session.state.active_sequence.unwrap();
++        let track = &mut Arc::make_mut(&mut app.session.project).sequence_mut(seq).unwrap().video_tracks[0];
++        let mut clip = track.items.last().unwrap().clone();
++        (clip.id, clip.link, clip.start) = (filmcraft_project::ClipId(id), None, track.end() + Tick(clip.duration.0 * gap));
++        track.items.push(clip);
++    }
++
 +    fn enabled(app: &FilmcraftApp, track: usize) -> bool {
 +        app.session.active_sequence().unwrap().video_tracks[track].items[0].enabled
 +    }
@@ -265,7 +444,8 @@ index 0000000..d67db37
 +        app.session.set_playhead(Tick(48_000));
 +        app.session.state.selection = vec![app.session.active_sequence().unwrap().video_tracks[0].items[1].id];
 +        app.session.state.open_sequences.clear();
-+        assert_eq!(canonical(&app.live_document()), before, "views are not shared");
++        local(&mut app, "this machine");
++        assert_eq!(canonical(&app.live_document()), before, "views and this machine's settings are not shared");
 +        toggle(&mut app, 0);
 +        let doc = app.live_document();
 +        assert_ne!(canonical(&doc), before);
@@ -278,11 +458,14 @@ index 0000000..d67db37
 +        let (mut a, mut b) = (demo(), demo());
 +        toggle(&mut b, 0);
 +        a.session.set_playhead(Tick(48_000));
++        local(&mut a, "mine");
 +        let (playhead, steps) = (a.session.playhead(), a.session.history.undo.len());
 +        a.live_adopt(b.live_document()).unwrap();
 +        assert_eq!(canonical(&a.live_document()), canonical(&b.live_document()));
 +        assert!(!enabled(&a, 0));
 +        assert_eq!((a.session.playhead(), a.session.history.undo.len()), (playhead, steps));
++        assert_eq!(a.session.project.settings.renderer, "mine");
++        assert!(a.session.active_sequence().unwrap().audio_tracks[0].mixer.record_arm);
 +        // Two people add a bin each (the ids differ while connected).
 +        let base = a.live_document();
 +        a.session.execute("file.newBin", json!({"name": "A"})).unwrap();
@@ -290,11 +473,39 @@ index 0000000..d67db37
 +        b.session.execute("file.newBin", json!({"name": "B"})).unwrap();
 +        let merged = FilmcraftApp::live_merge(&base, &a.live_document(), &b.live_document()).unwrap();
 +        a.live_adopt(merged).unwrap();
-+        let names: Vec<_> = a.session.project.root.children.iter().filter_map(|e| match e {
-+            filmcraft_project::BinEntry::Bin(b) => Some(b.name.as_str()),
-+            _ => None,
-+        }).collect();
++        let names: Vec<_> = a
++            .session
++            .project
++            .root
++            .children
++            .iter()
++            .filter_map(|e| match e {
++                filmcraft_project::BinEntry::Bin(b) => Some(b.name.as_str()),
++                _ => None,
++            })
++            .collect();
 +        assert!(names.contains(&"A") && names.contains(&"B"), "{names:?}");
++    }
++
++    #[test]
++    fn clips_two_people_add_after_the_same_clip_merge_in_time_order_and_overlaps_conflict() {
++        let base = demo();
++        let merge = |later: i64, earlier: i64| {
++            let (mut a, mut b) = (demo(), demo());
++            append(&mut a, 900_001, later);
++            append(&mut b, 900_002, earlier);
++            // The side merged first (this one's) added the later clip: in side order the track would be unsorted.
++            FilmcraftApp::live_merge(&base.live_document(), &a.live_document(), &b.live_document())
++        };
++        let merged = merge(3, 1).unwrap();
++        FilmcraftApp::live_check(&merged).unwrap();
++        let mut app = demo();
++        app.live_adopt(merged).unwrap();
++        let items = &app.session.active_sequence().unwrap().video_tracks[0].items;
++        assert_eq!(items.iter().rev().take(2).map(|i| i.id.0).collect::<Vec<_>>(), [900_001, 900_002]);
++        // Two clips put in the same place cannot both stay: a conflict, never a document no one can install.
++        assert!(FilmcraftApp::live_check(&merge(1, 1).unwrap()).unwrap_err().contains("overlap"));
++        assert!(FilmcraftApp::live_check(&json!(null)).is_err());
 +    }
 +
 +    #[test]
