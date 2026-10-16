@@ -13,6 +13,9 @@ export default {
   // ; moves the selection down to Snare (a personal view), then Shift+M mutes it.
   editB: (page) => key(page, 'Semicolon', 'Shift+M'),
   undo: (page) => key(page, 'Control+z'),
+  // Hovers over the Kick clip (the Kick lane is the first track row, y 230-318; the timeline starts at x 308), leaving
+  // the selection as it is: Kick selected, the insertion point at bar 5.
+  point: async (page) => { await page.mouse.move(700, 275); await page.waitForTimeout(500) },
   // File > Import > Audio (Ctrl+Shift+I) opens the browser's file picker (web.rs take_path_prompt, rfd's file input,
   // which a picker nobody answers cancels): a 10 ms mono 16-bit WAV goes onto a new track.
   importMedia: async (page) => {

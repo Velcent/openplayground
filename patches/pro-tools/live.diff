@@ -1,194 +1,115 @@
-diff --git a/apps/soundcraft-web/src/web.rs b/apps/soundcraft-web/src/web.rs
-index 3682fab..b877e63 100644
---- a/apps/soundcraft-web/src/web.rs
-+++ b/apps/soundcraft-web/src/web.rs
-@@ -31,11 +31,15 @@ pub fn start() {
-         {
-             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
-         }
--        let result = eframe::WebRunner::new()
-+        let runner = eframe::WebRunner::new();
-+        let repaint = Rc::new(std::cell::OnceCell::<egui::Context>::new());
-+        let created = repaint.clone();
-+        let result = runner
-             .start(
-                 canvas,
-                 options,
-                 Box::new(move |cc| {
-+                    let _ = created.set(cc.egui_ctx.clone());
-                     if let Some(rs) = &cc.wgpu_render_state {
-                         log::info!("soundcraft-web: wgpu backend {:?}", rs.adapter.get_info().backend);
-                     }
-@@ -46,6 +50,21 @@ pub fn start() {
-                 }),
-             )
-             .await;
-+        if result.is_ok() {
-+            // Live editing in a Playground session.
-+            let attached = soundcraft_model::playground_live::web::attach::<SoundApp>(
-+                concat!("pro-tools:1:", env!("CARGO_PKG_VERSION")),
-+                move |with| runner.app_mut::<WebShell>().map(|mut shell| with(&mut shell.app)).is_some(),
-+                move || {
-+                    if let Some(ctx) = repaint.get() {
-+                        ctx.request_repaint();
-+                    }
-+                },
-+            );
-+            if let Err(e) = attached {
-+                log::error!("live editing: {e:?}");
-+            }
-+        }
-         if let Some(el) = document.get_element_by_id(LOADING_ID) {
-             match result {
-                 Ok(()) => el.remove(),
-@@ -222,6 +241,11 @@ impl eframe::App for WebShell {
- 
-     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-         self.app.ui(ui);
-+        soundcraft_model::playground_live::frame(&mut self.app);
+diff --git a/apps/soundcraft-web/src/web/live.rs b/apps/soundcraft-web/src/web/live.rs
+new file mode 100644
+index 0000000..93161d3
+--- /dev/null
++++ b/apps/soundcraft-web/src/web/live.rs
+@@ -0,0 +1,77 @@
++//! Live editing in a Playground session: the page's runner, kept for the session to reach the app, and the shell
++//! around [`WebShell`] that ends each frame with the session's frame hook.
++
++use super::WebShell;
++use soundcraft_model::playground_live;
++use soundcraft_ui_egui::SoundApp;
++use std::cell::OnceCell;
++
++thread_local! {
++    static RUNNER: OnceCell<eframe::WebRunner> = const { OnceCell::new() };
++    static CONTEXT: OnceCell<egui::Context> = const { OnceCell::new() };
++}
++
++/// A new web runner, kept for [`wrap`].
++pub(super) fn runner() -> eframe::WebRunner {
++    let runner = eframe::WebRunner::new();
++    RUNNER.with(|kept| kept.get_or_init(|| runner.clone()).clone())
++}
++
++/// The app eframe runs: `shell`, offered to the page for live editing.
++pub(super) fn wrap(shell: WebShell) -> Box<dyn eframe::App> {
++    let attached = playground_live::web::attach::<SoundApp>(
++        concat!("pro-tools:1:", env!("CARGO_PKG_VERSION")),
++        |with| RUNNER.with(|runner| runner.get().and_then(|r| r.app_mut::<Live>().map(|mut live| with(&mut live.0.app))).is_some()),
++        || {
++            CONTEXT.with(|ctx| {
++                if let Some(ctx) = ctx.get() {
++                    ctx.request_repaint();
++                }
++            });
++        },
++    );
++    if let Err(e) = attached {
++        log::error!("live editing: {e:?}");
++    }
++    Box::new(Live(shell))
++}
++
++struct Live(WebShell);
++
++impl eframe::App for Live {
++    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
++        CONTEXT.with(|kept| {
++            kept.get_or_init(|| ctx.clone());
++        });
++        self.0.logic(ctx, frame);
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        self.0.ui(ui, frame);
++        playground_live::frame(&mut self.0.app);
 +    }
 +
 +    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
 +        Some(self)
-     }
- }
- 
-diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 6cc1c90..96bc8c3 100644
---- a/crates/engine/src/lib.rs
-+++ b/crates/engine/src/lib.rs
-@@ -238,6 +238,11 @@ impl Engine {
-     pub fn redo_label(&self) -> Option<&str> {
-         self.redo.last().map(|h| h.label.as_str())
-     }
-+    /// Forget Undo and Redo (a live editing session ended: its steps hold other people's edits).
-+    pub fn clear_history(&mut self) {
-+        self.undo.clear();
-+        self.redo.clear();
 +    }
-     pub fn undo_history(&self) -> Vec<String> {
-         self.undo.iter().map(|h| h.label.clone()).collect()
-     }
-diff --git a/crates/model/Cargo.toml b/crates/model/Cargo.toml
-index c948d93..47a381b 100644
---- a/crates/model/Cargo.toml
-+++ b/crates/model/Cargo.toml
-@@ -15,8 +15,16 @@ serde.workspace = true
- serde_json.workspace = true
- thiserror.workspace = true
- 
-+[target.'cfg(target_arch = "wasm32")'.dependencies]
-+js-sys = "0.3"
-+wasm-bindgen = "0.2"
 +
- [dev-dependencies]
- proptest.workspace = true
- 
-+[features]
-+# Playground live editing's adapter (`playground_live`) in native test builds of the crates that use it.
-+live = []
-+
- [lints]
- workspace = true
-diff --git a/crates/model/src/lib.rs b/crates/model/src/lib.rs
-index 61596b7..01ed4da 100644
---- a/crates/model/src/lib.rs
-+++ b/crates/model/src/lib.rs
-@@ -11,6 +11,9 @@ mod clip;
- mod ids;
- mod markers;
- mod mixer;
-+// Live editing in a Playground session (web only).
-+#[cfg(any(target_arch = "wasm32", test, feature = "live"))]
-+pub mod playground_live;
- mod session;
- mod source;
- mod track;
-diff --git a/crates/model/src/session.rs b/crates/model/src/session.rs
-index 449d82d..b42d332 100644
---- a/crates/model/src/session.rs
-+++ b/crates/model/src/session.rs
-@@ -374,6 +374,9 @@ impl Session {
-     pub fn alloc(&mut self) -> u64 {
-         let id = self.next_id.max(1);
-         self.next_id = id.saturating_add(1);
-+        // Live editing (web): an id no one else editing at the same time picks.
-+        #[cfg(target_arch = "wasm32")]
-+        let id = crate::playground_live::fresh_id(&mut { id });
-         id
-     }
- 
-diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
-index 66158bb..269fb4a 100644
---- a/crates/ui-egui/Cargo.toml
-+++ b/crates/ui-egui/Cargo.toml
-@@ -29,6 +29,7 @@ image.workspace = true
- 
- [dev-dependencies]
- egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
-+soundcraft-model = { workspace = true, features = ["live"] }
- 
- [lints]
- workspace = true
-diff --git a/crates/ui-egui/src/bounce.rs b/crates/ui-egui/src/bounce.rs
-index 4368b4e..d23d303 100644
---- a/crates/ui-egui/src/bounce.rs
-+++ b/crates/ui-egui/src/bounce.rs
-@@ -39,6 +39,11 @@ pub fn step(app: &mut SoundApp, ctx: &egui::Context) {
- /// Refuses to replace the session while a bounce holds its own copy: two large sessions could run
- /// out of memory. True when refused; the status line says why.
- pub fn refuses_session_switch(app: &mut SoundApp) -> bool {
-+    #[cfg(any(target_arch = "wasm32", test))]
-+    if crate::live::connected() {
-+        app.ui.status = "Leave the live session first: it shares this session".into();
-+        return true;
++    fn save(&mut self, storage: &mut dyn eframe::Storage) {
++        self.0.save(storage);
 +    }
-     if app.bounce.is_some() {
-         app.ui.status = "Finish or cancel the bounce first".into();
-     }
-diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index ddd5427..264db8a 100644
---- a/crates/ui-egui/src/lib.rs
-+++ b/crates/ui-egui/src/lib.rs
-@@ -13,6 +13,9 @@ pub mod edit_window;
- pub mod extra_windows;
- pub mod fonts;
- pub mod icons;
-+// Live editing in a Playground session (web only).
-+#[cfg(any(target_arch = "wasm32", test))]
-+mod live;
- pub mod menus;
- pub mod midi_editor;
- pub mod mix_window;
-@@ -412,6 +415,10 @@ impl SoundApp {
- 
-     /// Run a command; errors go to the status line. Returns the result.
-     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
-+        #[cfg(any(target_arch = "wasm32", test))]
-+        if matches!(id, "edit.undo" | "edit.redo") && soundcraft_model::playground_live::undo(id == "edit.redo") {
-+            return Ok(Value::Null);
-+        }
-         if matches!(id, "session.new" | "session.open" | "session.close" | "session.revert") && bounce::refuses_session_switch(self) {
-             return Err(self.ui.status.clone());
-         }
++
++    fn auto_save_interval(&self) -> std::time::Duration {
++        self.0.auto_save_interval()
++    }
++
++    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
++        self.0.clear_color(visuals)
++    }
++
++    fn persist_egui_memory(&self) -> bool {
++        self.0.persist_egui_memory()
++    }
++
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
++        self.0.raw_input_hook(ctx, raw_input);
++    }
++}
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..5d414cd
+index 0000000..8ee5265
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,427 @@
 +//! Live editing in a Playground session (web only). The shared document is the session without anyone's views: no
 +//! Edit-window state (`edit`: selection, playhead, zoom, tools, modes, view flags), and per track no height, lane view,
 +//! folder state, pin, record arm or input monitor. Audio reaches everyone as session files, one per source id (the
-+//! built-in demo's synthesized audio excepted: every browser makes the same).
++//! built-in demo's synthesized audio excepted: every browser makes the same). Presence: each person's pointer over the
++//! Edit window's tracks (track, time, height in the row) and selection (tracks, clips, time range), drawn over the others'
++//! tracks in their color.
 +
 +use crate::SoundApp;
-+use serde_json::Value;
++use crate::edit_window::{rect, sample_at, x_of};
++use egui::{Color32, Pos2, Rect, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
++use serde_json::{Value, json};
 +use serde::Deserialize as _;
 +use soundcraft_model::playground_live::{self, Live};
 +use soundcraft_audio_io::{BitDepth, EncodeOptions, FileFormat};
-+use soundcraft_model::{EditState, Session, Source, SourceAudio, SourceId, Track};
++use soundcraft_model::playground_live::Presence;
++use soundcraft_model::{ClipId, EditState, Session, Source, SourceAudio, SourceId, Track, TrackId};
++use std::cell::RefCell;
 +use std::sync::Arc;
++
++thread_local! {
++    /// The others in the session, as the shell last gave them.
++    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
++}
 +
 +/// Copies what each person keeps of a track for themselves.
 +fn keep_views(t: &mut Track, from: &Track) {
@@ -213,14 +134,89 @@ index 0000000..5d414cd
 +    items(doc.get_mut("tracks")).flat_map(|t| items(t.get_mut("playlists"))).filter_map(|p| p.get_mut("clips").and_then(Value::as_array_mut))
 +}
 +
-+/// Whether a live editing session shares the open session, which then stays open: nothing replaces it.
-+pub(crate) fn connected() -> bool {
-+    playground_live::connected()
++/// Undo and Redo ([`SoundApp::run`]) go to the session while one is connected: true when it took them.
++pub(crate) fn undo(command: &str) -> bool {
++    matches!(command, "edit.undo" | "edit.redo") && playground_live::undo(command == "edit.redo")
++}
++
++/// A connected session shares the open session, which then stays open: nothing replaces it (see
++/// [`crate::bounce::refuses_session_switch`]). True when refused; the status line says why.
++pub(crate) fn refuses_session_switch(app: &mut SoundApp) -> bool {
++    let refused = playground_live::connected();
++    if refused {
++        app.ui.status = "Leave the live session first: it shares this session".into();
++    }
++    refused
 +}
 +
 +/// Whether two records describe the same audio (saving changes only where it is kept).
 +fn same_audio(a: &Source, b: &Source) -> bool {
 +    (&a.name, a.channels, a.frames, a.sample_rate) == (&b.name, b.channels, b.frames, b.sample_rate)
++}
++
++/// The Edit window's track under `p`, the time there and how far down its row (0 to 1), as of the last frame.
++fn pointer_at(app: &SoundApp, p: Pos2) -> Option<Value> {
++    let tl = rect(app.edit_layout.timeline);
++    let (track, r) = app.edit_layout.rows.iter().find(|(_, r)| (r[1]..r[3]).contains(&p.y)).filter(|_| tl.contains(p))?;
++    let y = (f64::from((p.y - r[1]) / (r[3] - r[1])) * 100.0).round() / 100.0;
++    Some(json!({"track": track, "at": sample_at(app.engine.session(), tl, p.x), "y": y}))
++}
++
++/// Where another person's pointer ([`pointer_at`]) is on this person's Edit window.
++fn pointer_pos(app: &SoundApp, v: &Value) -> Option<Pos2> {
++    let (track, at, y) = (v["track"].as_u64()?, v["at"].as_i64().filter(|at| at.unsigned_abs() < 1 << 48)?, v["y"].as_f64()?);
++    let (_, r) = app.edit_layout.rows.iter().find(|(id, _)| *id == track)?;
++    let tl = rect(app.edit_layout.timeline);
++    let p = pos2(x_of(app.engine.session(), tl, at), r[1] + (r[3] - r[1]) * y.clamp(0.0, 1.0) as f32);
++    tl.contains(p).then_some(p)
++}
++
++/// The others' pointers with their names, and outlines around what they selected, over the Edit window's tracks.
++pub(crate) fn draw_presence(app: &SoundApp, ui: &Ui) {
++    let (s, tl) = (app.engine.session(), rect(app.edit_layout.timeline));
++    let painter = ui.painter().with_clip_rect(tl);
++    let ids = |v: &Value| v.as_array().into_iter().flatten().filter_map(Value::as_u64).take(50).collect::<Vec<_>>();
++    let x = |at: Option<i64>| at.filter(|at| at.unsigned_abs() < 1 << 48).map(|at| x_of(s, tl, at));
++    // An outline from time `a` to `b` (at least 2 points wide: an insertion point) on a lane, when any of it shows.
++    let outline = |a: f32, b: f32, (y0, y1): (f32, f32), width: f32, color: Color32| {
++        if b >= tl.min.x && a <= tl.max.x {
++            let r = Rect::from_min_max(pos2(a.max(tl.min.x - 4.0), y0), pos2(b.max(a + 2.0).min(tl.max.x + 4.0), y1));
++            painter.rect_stroke(r, 2.0, Stroke::new(width, color), StrokeKind::Inside);
++        }
++    };
++    // The main lane of a track's row (alternate playlists below it are this person's view).
++    let lane = |track: u64| {
++        let (_, r) = app.edit_layout.rows.iter().find(|(id, _)| *id == track)?;
++        let h = s.track(TrackId(track)).map_or(r[3] - r[1], |t| t.height.points().min(r[3] - r[1]));
++        Some((r[1] + 1.0, r[1] + h - 1.0))
++    };
++    OTHERS.with_borrow(|others| {
++        for o in others {
++            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
++            let state = &o.state["selection"];
++            let range = &state["range"];
++            if let (Some(a), Some(b)) = (x(range[0].as_i64()), x(range[1].as_i64())) {
++                for ys in ids(&state["tracks"]).into_iter().filter_map(lane) {
++                    outline(a, b, ys, 1.5, color);
++                }
++            }
++            for clip in ids(&state["clips"]) {
++                if let Some((track, c)) = s.find_clip(ClipId(clip))
++                    && let (Some(ys), Some(a), Some(b)) = (lane(track.0), x(Some(c.start)), x(Some(c.end())))
++                {
++                    outline(a, b, ys, 2.0, color);
++                }
++            }
++            if let Some(p) = pointer_pos(app, &o.state["pointer"]) {
++                let arrow = vec![p, p + vec2(0.0, 15.0), p + vec2(10.0, 10.5)];
++                painter.add(Shape::convex_polygon(arrow, color, Stroke::new(1.0, Color32::WHITE)));
++                let name = painter.layout_no_wrap(o.name.clone(), crate::theme::regular(11.0), Color32::WHITE);
++                let tag = Rect::from_min_size(p + vec2(10.0, 12.0), name.size() + vec2(8.0, 4.0));
++                painter.rect_filled(tag, 3.0, color);
++                painter.galley(tag.min + vec2(4.0, 2.0), name, Color32::WHITE);
++            }
++        }
++    });
 +}
 +
 +impl Live for SoundApp {
@@ -305,8 +301,33 @@ index 0000000..5d414cd
 +        Some(self.engine.revision)
 +    }
 +
++    /// Forgets Undo and Redo: their steps hold other people's edits. A step pushed with no history kept clears both.
 +    fn live_disconnected(&mut self) {
-+        self.engine.clear_history();
++        let limit = std::mem::replace(&mut self.engine.history_limit, 0);
++        self.engine.push_undo("", Arc::new(Session::default()));
++        self.engine.history_limit = limit;
++    }
++
++    /// `{ pointer?: { track, at, y }, selection: { tracks, clips, range: [start, end] } }` (see [`pointer_at`]; an
++    /// empty range is the insertion point).
++    fn live_presence(&self) -> Value {
++        let s = self.engine.session();
++        let edit = self.ui.window == crate::MainWindow::Edit || self.ui.mix_separate;
++        let hover = self.docking_context.as_ref().and_then(|ctx| ctx.input(|i| i.pointer.hover_pos())).filter(|_| edit);
++        let selection = json!({
++            "tracks": s.edit.selected_tracks.iter().take(50).collect::<Vec<_>>(),
++            "clips": s.edit.selected_clips.iter().take(50).collect::<Vec<_>>(),
++            "range": [s.edit.selection.start, s.edit.selection.end],
++        });
++        let mut state = json!({"selection": selection});
++        if let Some(pointer) = hover.and_then(|p| pointer_at(self, p)) {
++            state["pointer"] = pointer;
++        }
++        state
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        OTHERS.set(others);
 +    }
 +
 +    fn live_assets(&self) -> Vec<(String, String, bool)> {
@@ -442,6 +463,25 @@ index 0000000..5d414cd
 +        peer.live_write_asset(&id, "a.wav", owner.live_read_asset(&id).unwrap());
 +        assert_eq!(peer.live_read_asset(&id), owner.live_read_asset(&id));
 +        assert!(canonical(&peer.live_document()) == doc && !peer.engine.can_undo());
++    }
++
++    #[test]
++    fn a_pointer_travels_as_track_time_and_height_and_lands_through_the_viewers_own_zoom() {
++        let mut app = two_tracks();
++        let ids: Vec<u64> = app.engine.session().tracks.iter().map(|t| t.id.0).collect();
++        app.edit_layout.timeline = [100.0, 50.0, 900.0, 600.0];
++        app.edit_layout.rows = vec![(ids[0], [0.0, 50.0, 900.0, 150.0]), (ids[1], [0.0, 151.0, 900.0, 251.0])];
++        let pointer = pointer_at(&app, pos2(400.0, 201.0)).unwrap();
++        assert_eq!((pointer["track"].as_u64(), pointer["y"].as_f64()), (Some(ids[1]), Some(0.5)));
++        assert!(pointer_at(&app, pos2(50.0, 201.0)).is_none(), "over the track headers");
++        let mut other = two_tracks();
++        other.engine.session_mut().edit.zoom.samples_per_px *= 2.0;
++        other.edit_layout.timeline = app.edit_layout.timeline;
++        other.edit_layout.rows = vec![(ids[1], [0.0, 50.0, 900.0, 250.0])];
++        assert_eq!(pointer_pos(&other, &pointer), Some(pos2(250.0, 150.0)), "half as far at twice the samples per point");
++        for junk in [json!({"track": ids[1], "at": i64::MAX, "y": 0.5}), json!({"track": "a", "at": 0, "y": 0}), json!(null)] {
++            assert_eq!(pointer_pos(&other, &junk), None);
++        }
 +    }
 +
 +    #[test]
