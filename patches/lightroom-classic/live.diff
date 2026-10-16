@@ -46,10 +46,10 @@ index 3034b82..c72310a 100644
  #[cfg(target_arch = "wasm32")]
 diff --git a/apps/web/src/live.rs b/apps/web/src/live.rs
 new file mode 100644
-index 0000000..1952a33
+index 0000000..c508c5f
 --- /dev/null
 +++ b/apps/web/src/live.rs
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,260 @@
 +//! Playground live editing (`playground_live`): the shared document is the library's catalog as JSON (every photo's
 +//! develop settings, History, Versions, rating, flag, label and metadata; collections including saved Book, Print,
 +//! Slideshow and Web creations, stacks, the keyword list, folder labels, the Map's saved locations), without what only
@@ -89,6 +89,7 @@ index 0000000..1952a33
 +pub fn attach(with_app: impl Fn(&mut dyn FnMut(&mut LccApp)) -> bool + 'static, repaint: impl Fn() + 'static) {
 +    let _ = lcc_engine::catalog::FRESH_ID.set(playground_live::fresh_id);
 +    let _ = lcc_ui_egui::UNDO.set(playground_live::undo);
++    let _ = lcc_ui_egui::LIVE.set(playground_live::connected);
 +    if let Err(e) = playground_live::web::attach::<LccApp>(FORMAT, with_app, repaint) {
 +        log::error!("live editing unavailable: {e:?}");
 +    }
@@ -97,6 +98,11 @@ index 0000000..1952a33
 +/// A photo record only this browser has: seen while browsing a Local folder, not in the library.
 +fn own(photo: &Value) -> bool {
 +    photo.get("local") == Some(&Value::Bool(true))
++}
++
++/// The ids of this browser's own photo records.
++fn own_ids(catalog: &Value) -> Vec<Value> {
++    catalog["photos"].as_object().map_or_else(Vec::new, |photos| photos.values().filter(|p| own(p)).map(|p| p["id"].clone()).collect())
 +}
 +
 +/// The catalog a shared document holds, refusing one that does not hold together (concurrent stacks sharing a photo,
@@ -114,6 +120,7 @@ index 0000000..1952a33
 +
 +    fn live_document(&self) -> Value {
 +        let mut doc = serde_json::to_value(&self.session.catalog).unwrap_or(Value::Null);
++        let local = own_ids(&doc);
 +        if let Some(c) = doc.as_object_mut() {
 +            OWN.iter().for_each(|k| _ = c.remove(*k));
 +            if let Some(photos) = c.get_mut("photos").and_then(Value::as_object_mut) {
@@ -121,12 +128,27 @@ index 0000000..1952a33
 +                // the sidecar stamps say what this device's files were
 +                photos.values_mut().filter_map(Value::as_object_mut).for_each(|p| _ = p.remove("xmp"));
 +            }
++            // stacks hold library photos only; one left with fewer than two is this browser's own
++            if let Some(stacks) = c.get_mut("stacks").and_then(Value::as_object_mut) {
++                stacks.retain(|_, st| {
++                    let Some(photos) = st.get_mut("photos").and_then(Value::as_array_mut) else { return true };
++                    let before = photos.len();
++                    photos.retain(|id| !local.contains(id));
++                    photos.len() == before || photos.len() >= 2
++                });
++                if stacks.is_empty() {
++                    // as the catalog writes none
++                    c.remove("stacks");
++                }
++            }
 +        }
 +        doc
 +    }
 +
 +    fn live_adopt(&mut self, mut document: Value) -> Result<(), String> {
++        Self::live_check(&document)?;
 +        let mine = serde_json::to_value(&self.session.catalog).map_err(|e| e.to_string())?;
++        let local = own_ids(&mine);
 +        if let (Some(doc), Some(mine)) = (document.as_object_mut(), mine.as_object()) {
 +            for k in OWN {
 +                if let Some(v) = mine.get(k) {
@@ -142,8 +164,25 @@ index 0000000..1952a33
 +                    }
 +                }
 +            }
++            // this browser's photos go back into its stacks: the shared stack, or its own one
++            if let Some(old) = mine.get("stacks").and_then(Value::as_object) {
++                let stacks = doc.entry("stacks").or_insert_with(|| Value::Object(Default::default()));
++                for (id, st) in old {
++                    let Some(photos) = st["photos"].as_array() else { continue };
++                    let (theirs, ours): (Vec<&Value>, Vec<&Value>) = photos.iter().partition(|p| !local.contains(p));
++                    if ours.is_empty() {
++                        continue;
++                    }
++                    match stacks.get_mut(id).and_then(|s| s["photos"].as_array_mut()) {
++                        Some(shared) => shared.extend(ours.into_iter().filter(|p| !shared.contains(p)).cloned().collect::<Vec<_>>()),
++                        None if theirs.len() < 2 => _ = stacks.as_object_mut().map(|s| s.insert(id.clone(), st.clone())),
++                        None => {}
++                    }
++                }
++            }
 +        }
-+        self.session.adopt_catalog(catalog(&document)?);
++        // checked as shared above; this browser's own records need no repair to be its own
++        self.session.adopt_catalog(Catalog::deserialize(&document).map_err(|e| format!("Conflict: {e}"))?);
 +        Ok(())
 +    }
 +
@@ -175,7 +214,7 @@ index 0000000..1952a33
 +mod tests {
 +    use super::*;
 +    use lcc_engine::Session;
-+    use lcc_engine::catalog::{Op, Photo, PreviewEntry, Source};
++    use lcc_engine::catalog::{Op, Photo, PreviewEntry, Source, Stack};
 +    use lcc_ui_egui::Services;
 +    use playground_live::canonical;
 +    use serde_json::json;
@@ -196,10 +235,14 @@ index 0000000..1952a33
 +        seen.local = true;
 +        a.session.catalog.apply(Op::AddPhoto { photo: Box::new(seen.clone()) }).map_err(|e| e.to_string())?;
 +        let first = a.session.selection.active.ok_or("no active photo")?;
++        // ... and stacked it with a library photo: the stack stays its own too
++        let stack = Stack { id: a.session.catalog.alloc_stack_id(), photos: vec![first, seen.id], collapsed: false };
++        a.session.catalog.apply(Op::AddStack { stack }).map_err(|e| e.to_string())?;
 +        let preview = PreviewEntry { size: 1024, one_to_one: false, settings_hash: 7, built_at: "2026-01-01T00:00:00".into() };
 +        a.session.catalog.apply(Op::SetPreview { id: first, entry: Some(preview) }).map_err(|e| e.to_string())?;
 +        let start = canonical(&a.live_document());
 +        assert!(!String::from_utf8_lossy(&start).contains("seen.jpg") && !String::from_utf8_lossy(&start).contains("previews"));
++        assert!(!String::from_utf8_lossy(&start).contains("stacks") && LccApp::live_check(&playground_live::parse(&start)?).is_ok());
 +        a.run("library.next", json!({}))?;
 +        assert_eq!(canonical(&a.live_document()), start, "views are not shared");
 +        let (selected, undo_steps) = (a.session.selection.clone(), a.session.undo.len());
@@ -229,10 +272,14 @@ index 0000000..1952a33
 +        assert_eq!(a.session.catalog.photo(other).map(|p| p.rating), Some(5));
 +        assert_eq!(a.session.catalog.photo(seen.id).map(|p| p.file_name.as_str()), Some("seen.jpg"));
 +        assert!(serde_json::to_value(&a.session.catalog).map_err(|e| e.to_string())?["previews"].get(first.0.to_string()).is_some());
++        assert_eq!(a.session.catalog.stack_of(seen.id).map(|s| s.photos.clone()), Some(vec![first, seen.id]));
 +        assert_eq!((a.session.selection.clone(), a.session.undo.len()), (selected, undo_steps));
 +
 +        // New ids are this peer's own; the counter goes past them, so the catalog needs no repair.
 +        assert!(seen.id.0 >> 52 == 1 && a.session.catalog.alloc_album_id().0 >> 52 == 1 && a.session.catalog.repair().is_empty());
++        // A shared library whose counters never saw A's own photo (a session joined) still installs, keeping it.
++        a.live_adopt(demo().live_document())?;
++        assert!(a.session.catalog.photo(seen.id).is_some());
 +        playground_live::disconnect();
 +        Ok(())
 +    }
@@ -264,7 +311,7 @@ index 0000000..1952a33
 +    }
 +}
 diff --git a/apps/web/src/web.rs b/apps/web/src/web.rs
-index 076cc8a..3ed224a 100644
+index 878242d..e448c0d 100644
 --- a/apps/web/src/web.rs
 +++ b/apps/web/src/web.rs
 @@ -15,7 +15,7 @@ use wasm_bindgen::JsCast;
@@ -293,7 +340,7 @@ index 076cc8a..3ed224a 100644
          }
      }
  }
-@@ -300,7 +303,7 @@ async fn boot(opts: Options) -> Boot {
+@@ -302,7 +305,7 @@ async fn boot(opts: Options) -> Boot {
      };
      let files = Files::default();
      let mut index = ThumbIndex::default();
@@ -302,7 +349,7 @@ index 076cc8a..3ed224a 100644
      if let Some(b) = &backend {
          if opts.reset {
              // everything this site keeps in the browser, photos included: never without asking
-@@ -318,7 +321,9 @@ async fn boot(opts: Options) -> Boot {
+@@ -320,7 +323,9 @@ async fn boot(opts: Options) -> Boot {
              }
          }
          // a restored backup lives in its own folder (see `backup`)
@@ -313,7 +360,7 @@ index 076cc8a..3ed224a 100644
              let d = String::from_utf8_lossy(&d).trim().to_string();
              if valid_library_dir(&d) {
                  lib_dir = d;
-@@ -443,6 +448,10 @@ impl WebApp {
+@@ -445,6 +450,10 @@ impl WebApp {
              app.ui = ui;
          }
          app.ui = app.ui.sanitized();
@@ -324,7 +371,7 @@ index 076cc8a..3ed224a 100644
          app.library_problem = problem;
          let n = opts.workers.unwrap_or_else(|| {
              let cores = window().map_or(1, |w| w.navigator().hardware_concurrency() as usize);
-@@ -663,11 +672,16 @@ impl eframe::App for WebApp {
+@@ -665,11 +674,16 @@ impl eframe::App for WebApp {
  
      fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
          self.app.ui(ui);
@@ -341,7 +388,7 @@ index 076cc8a..3ed224a 100644
  }
  
  /// Start the app with the separately fetched Simplified Chinese font (empty in font-free builds).
-@@ -709,6 +723,11 @@ pub fn start(chinese_font: Vec<u8>) {
+@@ -711,6 +725,11 @@ pub fn start(chinese_font: Vec<u8>) {
          let r = runner.start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(WebApp::new(cc, boot, chinese_font))))).await;
          match r {
              Ok(()) => {
@@ -354,11 +401,11 @@ index 076cc8a..3ed224a 100644
                      el.remove();
                  }
 diff --git a/crates/catalog/src/lib.rs b/crates/catalog/src/lib.rs
-index 2dd1aeb..cb0f75b 100644
+index eed161c..6c46066 100644
 --- a/crates/catalog/src/lib.rs
 +++ b/crates/catalog/src/lib.rs
-@@ -374,6 +374,17 @@ pub struct Catalog {
-     sort_cache: query::SortCache,
+@@ -449,6 +449,17 @@ impl PartialEq for Changes {
+     }
  }
  
 +/// Set by the web build for live editing: while several people edit one library, each new id is one none of the others
@@ -375,7 +422,7 @@ index 2dd1aeb..cb0f75b 100644
  impl Catalog {
      /// The Map module's saved locations, by name.
      pub fn saved_locations(&self) -> impl Iterator<Item = &lcc_geo::SavedLocation> {
-@@ -396,19 +407,13 @@ impl Catalog {
+@@ -471,19 +482,13 @@ impl Catalog {
      // ---- ids
  
      pub fn alloc_photo_id(&mut self) -> PhotoId {
@@ -398,29 +445,152 @@ index 2dd1aeb..cb0f75b 100644
      }
  
      // ---- reads
+diff --git a/crates/engine/src/creations.rs b/crates/engine/src/creations.rs
+index 5cff6fb..5f2169b 100644
+--- a/crates/engine/src/creations.rs
++++ b/crates/engine/src/creations.rs
+@@ -353,6 +353,7 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
+     let id = s.catalog.alloc_album_id();
+     let album = Album { photos, creation: Some(Creation { kind: kind_name(kind).into(), document }), ..Album::new(id, name) };
+     s.commit(&format!("Save {}", kind.label()), Op::AddAlbum { album })?;
++    seen(s, id);
+     Ok(json!({"id": id.0, "kind": kind_name(kind), "pages": doc.pages.len()}))
+ }
+ 
+@@ -363,6 +364,7 @@ fn album_id(c: &str, p: &Value) -> Result<AlbumId> {
+ fn get(s: &mut Session, p: &Value) -> Result<Value> {
+     let c = "creation.get";
+     let id = album_id(c, p)?;
++    seen(s, id);
+     let a = s.catalog.album(id).ok_or_else(|| bad(c, "no such collection"))?;
+     let cr = a.creation.as_ref().ok_or_else(|| bad(c, "not a saved creation"))?;
+     let doc: Value = serde_json::from_str(&cr.document).map_err(|e| bad(c, format!("the stored layout is damaged: {e}")))?;
+@@ -379,6 +381,7 @@ fn update(s: &mut Session, p: &Value) -> Result<Value> {
+         let cr = a.creation.as_ref().ok_or_else(|| bad(c, "not a saved creation"))?;
+         creation_kind(c, &json!({"kind": cr.kind}))?
+     };
++    unchanged_since_seen(s, id, kind)?;
+     if p.get("document").is_none() && settings_kind(kind) {
+         let settings = p.get("settings").cloned().ok_or_else(|| bad(c, "missing document or settings"))?;
+         let photos = ids_param(s, p);
+@@ -408,6 +411,7 @@ fn update(s: &mut Session, p: &Value) -> Result<Value> {
+     let ops =
+         vec![Op::SetAlbumCreation { id, creation: Some(Creation { kind: kind_name(kind).into(), document }) }, Op::SetAlbumPhotos { id, photos }];
+     s.commit(&format!("Edit {}", kind.label()), Op::Batch { ops })?;
++    seen(s, id);
+     Ok(json!({"id": id.0, "pages": doc.pages.len()}))
+ }
+ 
+@@ -472,17 +476,48 @@ pub fn save_settings(s: &mut Session, kind: CreationKind, name: &str, settings:
+     let id = s.catalog.alloc_album_id();
+     let album = Album { photos, creation: Some(Creation { kind: kind_name(kind).into(), document }), ..Album::new(id, name.trim()) };
+     s.commit(&format!("Save {}", kind.label()), Op::AddAlbum { album })?;
++    seen(s, id);
+     Ok(id)
+ }
+ 
+ /// Replaces a slideshow / web creation's settings (and its photos, when given).
+ pub fn update_settings(s: &mut Session, id: AlbumId, kind: CreationKind, settings: Value, photos: Option<Vec<PhotoId>>) -> Result<()> {
++    unchanged_since_seen(s, id, kind)?;
+     let document = settings_document(kind, settings)?;
+     let mut ops = vec![Op::SetAlbumCreation { id, creation: Some(Creation { kind: kind_name(kind).into(), document }) }];
+     if let Some(photos) = photos {
+         ops.push(Op::SetAlbumPhotos { id, photos });
+     }
+-    s.commit(&format!("Edit {}", kind.label()), Op::Batch { ops })
++    s.commit(&format!("Edit {}", kind.label()), Op::Batch { ops })?;
++    seen(s, id);
++    Ok(())
++}
++
++/// The hash of creation `id`'s stored document.
++fn document_hash(s: &Session, id: AlbumId) -> Option<u64> {
++    use std::hash::{Hash, Hasher};
++    let cr = s.catalog.album(id)?.creation.as_ref()?;
++    let mut h = std::collections::hash_map::DefaultHasher::new();
++    cr.document.hash(&mut h);
++    Some(h.finish())
++}
++
++/// This person now has creation `id` as stored (opened or saved it): what a later save of theirs replaces.
++pub fn seen(s: &mut Session, id: AlbumId) {
++    if let Some(h) = document_hash(s, id) {
++        s.creations_seen.insert(id, h);
++    }
++}
++
++/// While live (others save too), a save replaces only the layout this person opened: one someone else saved since
++/// would be lost.
++fn unchanged_since_seen(s: &Session, id: AlbumId, kind: CreationKind) -> Result<()> {
++    let seen = s.creations_seen.get(&id).copied();
++    if s.own_edits.is_some() && seen.is_some() && seen != document_hash(s, id) {
++        let what = kind.label();
++        return Err(bad("creation.update", format!("someone else saved this {what} since you opened it: open it again to see theirs, or save yours under another name")));
++    }
++    Ok(())
+ }
+ 
+ /// The `ids` a call gives (photos not in the catalog dropped); `None` without `ids`.
+@@ -636,4 +671,32 @@ mod tests {
+         // a print creation still needs a layout
+         assert!(s.execute("creation.update", &json!({"id": id})).is_err());
+     }
++
++    #[test]
++    fn while_live_a_save_does_not_replace_one_someone_else_saved_since() {
++        let mut s = Session::with_demo();
++        let ids: Vec<u64> = s.catalog.photos().take(2).map(|p| p.id.0).collect();
++        let id = s.execute("creation.save", &json!({"kind": "slideshow", "name": "Trip", "settings": {"a": 1}, "ids": ids})).unwrap()["id"].as_u64().unwrap();
++        let save = |s: &mut Session, a| s.execute("creation.update", &json!({"id": id, "settings": {"a": a}}));
++        let theirs = |s: &Session| {
++            let mut shared = s.catalog.clone();
++            let document = settings_document(CreationKind::Slideshow, json!({"a": 2})).unwrap();
++            shared.apply(Op::SetAlbumCreation { id: AlbumId(id), creation: Some(Creation { kind: "slideshow".into(), document }) }).unwrap();
++            shared
++        };
++        // not live: a save replaces whatever is stored, as always
++        s.adopt_catalog(theirs(&s));
++        assert!(save(&mut s, 3).is_ok());
++        // live: someone else's save since this person opened it stays until they open it again
++        s.own_edits = Some(Default::default());
++        s.adopt_catalog(theirs(&s));
++        assert!(save(&mut s, 4).is_err());
++        // (the plug-in field index, never shared, outlives a remote change)
++        let p = PhotoId(ids[0]);
++        s.catalog.set_plugin_fields(p, [("x/y".to_string(), json!(1))].into()).unwrap();
++        s.adopt_catalog(serde_json::from_value(serde_json::to_value(&s.catalog).unwrap()).unwrap());
++        assert_eq!(s.catalog.photo(p).unwrap().plugin_fields.get("x/y"), Some(&json!(1)));
++        s.execute("creation.get", &json!({"id": id})).unwrap();
++        assert!(save(&mut s, 4).is_ok());
++    }
+ }
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 06e81d4..6870710 100644
+index abeb30a..7d4427e 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
-@@ -215,6 +215,9 @@ pub struct Session {
+@@ -248,6 +248,12 @@ pub struct Session {
      /// Photos in the current source with no filter on (cached like `visible`).
      total: Option<((u64, String), usize)>,
      pub undo: Vec<UndoEntry>,
 +    /// Live editing: the photos whose develop settings this person committed since their last automatic version.
 +    /// `None` (not live): every edited photo gets one when left. While live, others' edits are theirs to keep.
 +    pub own_edits: Option<std::collections::BTreeSet<PhotoId>>,
++    /// Each saved creation's layout as this person last opened or saved it (a hash of its document): while live, a
++    /// save over one someone else saved since is refused ([`creations`]).
++    pub creations_seen: std::collections::HashMap<lcc_catalog::AlbumId, u64>,
      /// Undo steps committed in this session, ever (the history drops its oldest past 1000, so
      /// its length can't tell how many steps a command just made; see [`Session::commits`]).
      commits: u64,
-@@ -414,6 +417,7 @@ impl Session {
+@@ -494,6 +500,8 @@ impl Session {
              visible_gen: 0,
              total: None,
              undo: Vec::new(),
 +            own_edits: None,
++            creations_seen: Default::default(),
              commits: 0,
              redo: Vec::new(),
              pending_sidecar_repairs: Vec::new(),
-@@ -579,6 +583,16 @@ impl Session {
+@@ -680,6 +688,16 @@ impl Session {
      pub fn commit(&mut self, label: &str, op: Op) -> Result<()> {
          let fwd = op.clone();
          let inv = self.apply_catalog(op)?;
@@ -437,7 +607,7 @@ index 06e81d4..6870710 100644
          self.pending_log.push(fwd);
          self.undo.push(UndoEntry { label: label.to_string(), op: inv, folder: None, retry_inverse: Vec::new(), retry_sidecars: Vec::new() });
          self.commits = self.commits.wrapping_add(1);
-@@ -639,6 +653,23 @@ impl Session {
+@@ -758,6 +776,27 @@ impl Session {
          Ok(())
      }
  
@@ -447,6 +617,10 @@ index 06e81d4..6870710 100644
 +        for p in self.catalog.photos() {
 +            if catalog.photo(p.id).is_none_or(|n| (&n.source, &n.content_hash) != (&p.source, &p.content_hash)) {
 +                self.media.forget(p.id);
++            }
++            // the plug-in field index is this session's, never saved: it stays
++            if !p.plugin_fields.is_empty() {
++                let _ = catalog.set_plugin_fields(p.id, p.plugin_fields.clone());
 +            }
 +        }
 +        // caches keyed on the revision (the grid's list among them) see a new one, with nothing remembered of how it got there
@@ -461,7 +635,7 @@ index 06e81d4..6870710 100644
      /// Leaving photo `id` after editing it: keep its settings as an automatic version (when they
      /// differ from its latest version; at most [`AUTO_VERSIONS`] auto versions, oldest dropped).
      /// Saved with the library but not an undo step.
-@@ -647,6 +678,9 @@ impl Session {
+@@ -766,6 +805,9 @@ impl Session {
          if !p.is_edited() || p.versions.last().is_some_and(|v| *v.settings == *p.develop) || self.interaction.is_some() {
              return;
          }
@@ -472,10 +646,10 @@ index 06e81d4..6870710 100644
          let created = (self.clock)();
          let name = lcc_catalog::dates::display_time(&created);
 diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index cc8b9a1..301dd73 100644
+index ae53c4d..a4a6026 100644
 --- a/crates/ui-egui/src/lib.rs
 +++ b/crates/ui-egui/src/lib.rs
-@@ -252,6 +252,10 @@ pub trait VideoGpu {
+@@ -297,6 +297,18 @@ pub trait VideoGpu {
      fn grade(&mut self, img: &lcc_raster::Rgb32f, key: u64, lut: &lcc_pipeline::grade::GradeLut) -> Result<(egui::TextureId, [usize; 2]), String>;
  }
  
@@ -483,10 +657,18 @@ index cc8b9a1..301dd73 100644
 +/// `{"native": true}` (the Presets panel's Amount, which replaces the step it made).
 +pub static UNDO: std::sync::OnceLock<fn(bool) -> bool> = std::sync::OnceLock::new();
 +
++/// Set by that host: whether it has Undo and Redo now. The Edit menu then offers both, naming no step of this
++/// session's own history.
++pub static LIVE: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
++
++pub(crate) fn live() -> bool {
++    LIVE.get().is_some_and(|live| live())
++}
++
  /// Platform services injected by the host app (desktop or web).
  #[derive(Default)]
  pub struct Services {
-@@ -640,6 +644,9 @@ impl LccApp {
+@@ -722,6 +734,9 @@ impl LccApp {
      /// [`LccApp::run`], keeping what kind of error a refusal is: for code that decides on it
      /// (offer a model's download, treat a cancel as one) instead of reading the message.
      pub fn run_typed(&mut self, id: &str, params: Value) -> Result<Value, CommandError> {
@@ -496,8 +678,58 @@ index cc8b9a1..301dd73 100644
          shortcuts::set_active(self.ui.settings.keymap_set);
          if let Some(result) = model_setup::intercept(self, id, &params) {
              return result.map_err(CommandError::from);
+diff --git a/crates/ui-egui/src/menubar.rs b/crates/ui-egui/src/menubar.rs
+index 035be68..a994e66 100644
+--- a/crates/ui-egui/src/menubar.rs
++++ b/crates/ui-egui/src/menubar.rs
+@@ -407,6 +407,7 @@ pub fn checked(app: &LccApp, id: &str) -> Option<bool> {
+ fn live_label(app: &LccApp, id: &str, label: &str) -> String {
+     let n = app.session.selection.ids.len();
+     match id {
++        "edit.undo" | "edit.redo" if crate::live() => label.to_string(),
+         "edit.undo" => {
+             app.session.undo.last().map(|e| crate::i18n::tr_format!("Undo {}", crate::i18n::tr(&e.label))).unwrap_or_else(|| "Undo".into())
+         }
+@@ -1294,6 +1295,24 @@ mod tests {
+         assert_eq!(*checked, Some(app.ui.filmstrip));
+     }
+ 
++    #[test]
++    fn a_host_that_has_undo_offers_undo_and_redo_unnamed() {
++        thread_local! { static LIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
++        let _ = crate::LIVE.set(|| LIVE.get());
++        let mut app = app();
++        run_item(&mut app, "photo.rate", json!({"rating": 3})).unwrap();
++        let edit = |app: &LccApp| {
++            let all: Vec<MenuNode> = menu_bar(app).into_iter().flat_map(|(_, v)| v).collect();
++            ["edit.undo", "edit.redo"].map(|id| match find(&all, id) {
++                Some(MenuNode::Item { label, enabled, .. }) => (label.clone(), *enabled),
++                _ => panic!("no {id}"),
++            })
++        };
++        assert_eq!(edit(&app), [("Undo Set Rating".to_string(), true), ("Redo".to_string(), false)]);
++        LIVE.set(true);
++        assert_eq!(edit(&app), [("Undo".to_string(), true), ("Redo".to_string(), true)]);
++    }
++
+     #[test]
+     fn quit_ends_the_file_menu_after_unlisted_entries() {
+         let app = app();
+diff --git a/crates/ui-egui/src/menus.rs b/crates/ui-egui/src/menus.rs
+index 4e5467c..dbda9fa 100644
+--- a/crates/ui-egui/src/menus.rs
++++ b/crates/ui-egui/src/menus.rs
+@@ -2349,7 +2349,7 @@ pub fn menu_entries(app: &LccApp) -> Vec<MenuEntry> {
+                 label: c.label.into(),
+                 menu: c.menu.iter().map(|s| s.to_string()).collect(),
+                 shortcut: crate::shortcuts::shortcut_of(&app.ui.settings.keymap, c.id).map(str::to_string),
+-                enabled: c.enabled,
++                enabled: c.enabled || (matches!(c.id, "edit.undo" | "edit.redo") && crate::live()),
+             });
+         }
+     }
 diff --git a/crates/ui-egui/src/panels/presets.rs b/crates/ui-egui/src/panels/presets.rs
-index cbe8690..761e122 100644
+index 71ea31c..49366cc 100644
 --- a/crates/ui-egui/src/panels/presets.rs
 +++ b/crates/ui-egui/src/panels/presets.rs
 @@ -38,17 +38,24 @@ struct AppliedPreset {
@@ -557,7 +789,7 @@ index cbe8690..761e122 100644
                      ui.data_mut(|d| d.remove::<AppliedPreset>(amt_id));
                  }
              }
-@@ -443,4 +458,26 @@ mod tests {
+@@ -445,4 +460,26 @@ mod tests {
          session.execute("library.select", &json!({"ids": [other.0]})).unwrap();
          assert!(!state.is_current(&session), "the preset belongs to the earlier selection");
      }
@@ -584,3 +816,27 @@ index cbe8690..761e122 100644
 +        assert!(!state.is_current(&session), "undoing the preset now would drop someone else's change");
 +    }
  }
+diff --git a/crates/ui-egui/src/slideshow_ui.rs b/crates/ui-egui/src/slideshow_ui.rs
+index 9da4e11..d04778d 100644
+--- a/crates/ui-egui/src/slideshow_ui.rs
++++ b/crates/ui-egui/src/slideshow_ui.rs
+@@ -178,6 +178,7 @@ fn open_saved(app: &mut LccApp, p: &Value) -> Result<Value, String> {
+         }
+     };
+     let c = found.ok_or("no such saved slideshow")?;
++    lcc_engine::creations::seen(&mut app.session, c.id);
+     let settings: Settings = serde_json::from_value(c.settings.clone()).unwrap_or_default();
+     app.ui.slides.settings = settings.sanitized();
+     app.ui.slides.open = Some(c.name);
+diff --git a/crates/ui-egui/src/web_module.rs b/crates/ui-egui/src/web_module.rs
+index a766d8b..9b29f09 100644
+--- a/crates/ui-egui/src/web_module.rs
++++ b/crates/ui-egui/src/web_module.rs
+@@ -69,6 +69,7 @@ pub fn open_creation(app: &mut LccApp, id: u64) -> Result<Value, String> {
+ fn take_pending(app: &mut LccApp, st: &mut WebUi) {
+     let Some(id) = PENDING.with(std::cell::Cell::take) else { return };
+     if let Some(c) = lcc_engine::creations::creations_of(&app.session, Some(lcc_layout::CreationKind::Web)).into_iter().find(|c| c.id.0 == id) {
++        lcc_engine::creations::seen(&mut app.session, c.id);
+         st.settings = GallerySettings::default().merged(&c.settings).unwrap_or_default();
+         st.gallery_name = c.name;
+         st.loaded = false;

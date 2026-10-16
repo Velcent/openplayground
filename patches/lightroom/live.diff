@@ -1,5 +1,5 @@
 diff --git a/apps/lightcraft-web/src/backup.rs b/apps/lightcraft-web/src/backup.rs
-index 00ec12a..083818e 100644
+index 00ec12a4..083818ed 100644
 --- a/apps/lightcraft-web/src/backup.rs
 +++ b/apps/lightcraft-web/src/backup.rs
 @@ -47,6 +47,14 @@ pub fn valid_library_dir(name: &str) -> bool {
@@ -28,7 +28,7 @@ index 00ec12a..083818e 100644
  
      #[test]
 diff --git a/apps/lightcraft-web/src/lib.rs b/apps/lightcraft-web/src/lib.rs
-index 58966e6..81b37e6 100644
+index 58966e6e..81b37e63 100644
 --- a/apps/lightcraft-web/src/lib.rs
 +++ b/apps/lightcraft-web/src/lib.rs
 @@ -22,6 +22,12 @@ pub mod files;
@@ -46,10 +46,10 @@ index 58966e6..81b37e6 100644
  #[cfg(target_arch = "wasm32")]
 diff --git a/apps/lightcraft-web/src/live.rs b/apps/lightcraft-web/src/live.rs
 new file mode 100644
-index 0000000..2f0f6ca
+index 00000000..933276fd
 --- /dev/null
 +++ b/apps/lightcraft-web/src/live.rs
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,201 @@
 +//! Playground live editing (`playground_live`): the shared document is the library's catalog as JSON (every photo's
 +//! develop settings, History, Versions, rating, flag, label and metadata; albums, stacks, the keyword list), without
 +//! this browser's own browsing records (when it browsed Local folders and the photos seen there) and without views
@@ -85,6 +85,7 @@ index 0000000..2f0f6ca
 +pub fn attach(with_app: impl Fn(&mut dyn FnMut(&mut LightcraftApp)) -> bool + 'static, repaint: impl Fn() + 'static) {
 +    let _ = lightcraft_engine::catalog::FRESH_ID.set(playground_live::fresh_id);
 +    let _ = lightcraft_ui_egui::UNDO.set(playground_live::undo);
++    let _ = lightcraft_ui_egui::LIVE.set(playground_live::connected);
 +    if let Err(e) = playground_live::web::attach::<LightcraftApp>(FORMAT, with_app, repaint) {
 +        log::error!("live editing unavailable: {e:?}");
 +    }
@@ -188,6 +189,10 @@ index 0000000..2f0f6ca
 +        a.run("library.next", json!({}))?;
 +        assert_eq!(canonical(&a.live_document()), start, "views are not shared");
 +        let (selected, undo_steps) = (a.session.selection.clone(), a.session.undo.len());
++        // The Edit menu's Undo and Redo are the session's, whatever the native history holds.
++        let _ = lightcraft_ui_egui::LIVE.set(playground_live::connected);
++        let enabled = |id: &str| lightcraft_ui_egui::menus::menu_entries(&a).into_iter().any(|e| e.id == id && e.enabled);
++        assert!(a.session.redo.is_empty() && enabled("edit.undo") && enabled("edit.redo"));
 +        // A merge that no longer holds together (two stacks sharing a photo) is refused, not repaired by every peer.
 +        let mut stacked = playground_live::parse(&start)?;
 +        stacked["stacks"] = json!({"1": {"id": 1, "photos": [1, 2]}, "2": {"id": 2, "photos": [2, 3]}});
@@ -247,7 +252,7 @@ index 0000000..2f0f6ca
 +    }
 +}
 diff --git a/apps/lightcraft-web/src/web.rs b/apps/lightcraft-web/src/web.rs
-index 6a4487d..651eb68 100644
+index 6a4487d0..651eb682 100644
 --- a/apps/lightcraft-web/src/web.rs
 +++ b/apps/lightcraft-web/src/web.rs
 @@ -15,7 +15,7 @@ use wasm_bindgen::JsCast;
@@ -337,7 +342,7 @@ index 6a4487d..651eb68 100644
                      el.remove();
                  }
 diff --git a/crates/catalog/src/lib.rs b/crates/catalog/src/lib.rs
-index 1776c89..43aa475 100644
+index 1776c895..43aa475c 100644
 --- a/crates/catalog/src/lib.rs
 +++ b/crates/catalog/src/lib.rs
 @@ -357,6 +357,17 @@ impl PartialEq for Changes {
@@ -382,7 +387,7 @@ index 1776c89..43aa475 100644
  
      // ---- reads
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 8a282ce..727dbb1 100644
+index 8a282ce3..727dbb19 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
 @@ -228,6 +228,9 @@ pub struct Session {
@@ -456,21 +461,27 @@ index 8a282ce..727dbb1 100644
          let created = (self.clock)();
          let name = lightcraft_catalog::dates::display_time(&created);
 diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index bb290bd..50f6cb5 100644
+index bb290bd8..68ec4316 100644
 --- a/crates/ui-egui/src/lib.rs
 +++ b/crates/ui-egui/src/lib.rs
-@@ -228,6 +228,10 @@ pub type HostAction = Box<dyn FnMut(&mut Session) -> Result<Value, String>>;
+@@ -228,6 +228,16 @@ pub type HostAction = Box<dyn FnMut(&mut Session) -> Result<Value, String>>;
  /// last heard and wakes the UI itself when that changes; it is never polled for changes.
  pub type SystemThemeFn = Box<dyn Fn(&egui::Context) -> Option<egui::Theme>>;
  
 +/// Set by a host that takes Undo and Redo over while it returns true (the web build's live editing); not those run with
 +/// `{"native": true}` (the Presets panel's Amount, which replaces the step it made).
 +pub static UNDO: std::sync::OnceLock<fn(bool) -> bool> = std::sync::OnceLock::new();
++/// Set by a host with live editing: whether it is connected (then the Edit menu's Undo and Redo are the session's).
++pub static LIVE: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
++
++pub(crate) fn live() -> bool {
++    LIVE.get().is_some_and(|connected| connected())
++}
 +
  /// Platform services injected by the host app (desktop or web).
  #[derive(Default)]
  pub struct Services {
-@@ -599,6 +603,9 @@ impl LightcraftApp {
+@@ -599,6 +609,9 @@ impl LightcraftApp {
      /// [`LightcraftApp::run`], keeping what kind of error a refusal is: for code that decides on it
      /// (offer a model's download, treat a cancel as one) instead of reading the message.
      pub fn run_typed(&mut self, id: &str, params: Value) -> Result<Value, CommandError> {
@@ -480,8 +491,33 @@ index bb290bd..50f6cb5 100644
          if let Some(result) = model_setup::intercept(self, id, &params) {
              return result.map_err(CommandError::from);
          }
+diff --git a/crates/ui-egui/src/menubar.rs b/crates/ui-egui/src/menubar.rs
+index c5e4e45c..ef9e1802 100644
+--- a/crates/ui-egui/src/menubar.rs
++++ b/crates/ui-egui/src/menubar.rs
+@@ -377,6 +377,7 @@ pub fn checked(app: &LightcraftApp, id: &str) -> Option<bool> {
+ fn live_label(app: &LightcraftApp, id: &str, label: &str) -> String {
+     let n = app.session.selection.ids.len();
+     match id {
++        "edit.undo" | "edit.redo" if crate::live() => label.to_string(),
+         "edit.undo" => {
+             app.session.undo.last().map(|e| crate::i18n::tr_format!("Undo {}", crate::i18n::tr(&e.label))).unwrap_or_else(|| "Undo".into())
+         }
+diff --git a/crates/ui-egui/src/menus.rs b/crates/ui-egui/src/menus.rs
+index 9fcfc8b9..af03a1b5 100644
+--- a/crates/ui-egui/src/menus.rs
++++ b/crates/ui-egui/src/menus.rs
+@@ -2209,7 +2209,7 @@ pub fn menu_entries(app: &LightcraftApp) -> Vec<MenuEntry> {
+                 label: c.label.into(),
+                 menu: c.menu.iter().map(|s| s.to_string()).collect(),
+                 shortcut: crate::shortcuts::shortcut_of(&app.ui.settings.keymap, c.id).map(str::to_string),
+-                enabled: c.enabled,
++                enabled: c.enabled || (matches!(c.id, "edit.undo" | "edit.redo") && crate::live()),
+             });
+         }
+     }
 diff --git a/crates/ui-egui/src/panels/presets.rs b/crates/ui-egui/src/panels/presets.rs
-index ca0243c..d144ba3 100644
+index ca0243cc..d144ba3e 100644
 --- a/crates/ui-egui/src/panels/presets.rs
 +++ b/crates/ui-egui/src/panels/presets.rs
 @@ -27,17 +27,24 @@ struct AppliedPreset {
