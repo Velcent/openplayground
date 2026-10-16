@@ -22,7 +22,11 @@ async function eventually(check, ms = 10000) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 class App {
-  constructor(values = [0, 0, 0], format = 'honeydew:1:test') { this.doc = Uint8Array.from(values); this.busy = null; this.gesture = false; this.format = format }
+  constructor(values = [0, 0, 0], format = 'honeydew:1:test') { this.doc = Uint8Array.from(values); this.busy = null; this.gesture = false; this.format = format; this.refs = []; this.media = new Map() }
+  // Media the document refers to but keeps outside it, as a photo or audio app does.
+  assets() { return this.refs.map((id) => ({ id, name: `${id}.bin`, have: this.media.has(id) })) }
+  async readAsset(id) { return this.media.get(id) }
+  async writeAsset(id, name, bytes) { this.media.set(id, new Blob([bytes])) }
   checkpoint() { if (this.gesture) throw 'busy'; return this.doc.slice() }
   // 9 in the first field stands for "no document": the app's own merge refuses it, as a real app's validation would.
   merge(base, current, edited) { if ([base, current, edited].some((d) => d[0] === 9)) throw 'not a document'; return merge(base, current, edited) }
@@ -42,7 +46,7 @@ class App {
 }
 
 class Hub {
-  constructor() { this.sessions = new Map(); this.gates = new Map(); this.sent = [] }
+  constructor() { this.sessions = new Map(); this.gates = new Map(); this.sent = []; this.pool = new Map() }
   // Holds messages from `from` to `to`, in order, until released.
   hold(from, to) {
     let release
@@ -64,6 +68,18 @@ class Hub {
         if (from?.document.readyState === 'open') target.dispatchEvent(Object.assign(new Event('document'), { peer: from, value: await message }))
       })
     }
+    // The session's file transfer, as one pool every member sees (PeerSession's verified transfer in the shell).
+    Object.assign(session, { files: [], accepted: false, available: new Set(), store: { file: async (asset) => this.pool.get(asset) } })
+    session.share = async (files, ids) => {
+      for (const [i, file] of files.entries()) {
+        const asset = `${ids[i]}:${file.size}`
+        this.pool.set(asset, file)
+        for (const s of this.sessions.values()) s.files = [...s.files.filter((f) => f.id !== ids[i]), { id: ids[i], name: file.name, size: file.size, asset }]
+      }
+      session.accepted = true
+      for (const s of this.sessions.values()) { if (s.accepted) for (const f of s.files) s.available.add(f.asset); s.dispatchEvent(new Event('change')) }
+    }
+    session.receive = async () => { session.accepted = true; for (const f of session.files) session.available.add(f.asset); session.dispatchEvent(new Event('change')) }
     this.sessions.set(id, session)
     const others = () => [...this.sessions.values()].filter((other) => other !== session)
     if (linkFirst) { for (const other of others()) this.link(session, other); await sleep(50) }
@@ -261,4 +277,19 @@ test('the owner shares nothing until it has a document every peer can install', 
   app.doc = Uint8Array.from([1, 2, 3])
   const owner = await starting, editor = await hub.join(e, 'editor')
   await converge([owner, editor], [1, 2, 3])
+})
+
+test('media the document refers to reaches the people who lack it, and only them', async () => {
+  const hub = new Hub(), [o, e] = ids(), ownerApp = new App(), editorApp = new App()
+  ownerApp.refs = editorApp.refs = ['photo-1']
+  ownerApp.media.set('photo-1', new Blob([Uint8Array.of(1, 2, 3)]))
+  const owner = await hub.join(o, 'owner', ownerApp), editor = await hub.join(e, 'editor', editorApp)
+  await live(owner, editor)
+  await eventually(async () => assert.deepEqual([...new Uint8Array(await editorApp.media.get('photo-1')?.arrayBuffer() ?? new ArrayBuffer(0))], [1, 2, 3]))
+  // A photo the editor adds later reaches the owner the same way.
+  editorApp.media.set('photo-2', new Blob([Uint8Array.of(9)]))
+  ownerApp.refs = editorApp.refs = ['photo-1', 'photo-2']
+  editorApp.edit(0, 1)
+  await eventually(async () => assert.deepEqual([...new Uint8Array(await ownerApp.media.get('photo-2')?.arrayBuffer() ?? new ArrayBuffer(0))], [9]))
+  assert.equal(owner.session.files.length, 2)
 })

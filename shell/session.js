@@ -400,10 +400,10 @@ export class PeerSession extends EventTarget {
       peer.progress = { received: value.received, total: value.total, status: String(value.status).slice(0, 40) }; this.changed()
     } else throw new Error('Unknown session message')
   }
-  async share(files) {
+  async share(files, ids = []) {
     if (this.role === 'viewer') throw new Error('Viewers cannot share or replace files')
-    for (const file of files) {
-      const entry = await describe(file)
+    for (const [i, file] of files.entries()) {
+      const entry = await describe(file, ids[i])
       await this.mergeFiles([entry], true)
       for (let i = 0; i < entry.hashes.length; i++) await this.store.putChunk(entry.asset, i, new Uint8Array(await file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE).arrayBuffer()))
     }

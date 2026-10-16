@@ -27,6 +27,18 @@ pub trait Live {
     }
     /// The session ended: native Undo starts again from the current document.
     fn live_disconnected(&mut self) {}
+    /// Media the document refers to but keeps outside it (photos, audio, video), as `(id, file name, present here)`.
+    /// The session carries each to the people who lack it. IDs should name the content (a hash): two people adding the
+    /// same file then agree, and different files never collide.
+    fn live_assets(&self) -> Vec<(String, String, bool)> {
+        Vec::new()
+    }
+    /// The bytes of an asset [`Self::live_assets`] lists as present.
+    fn live_read_asset(&self, _id: &str) -> Option<Vec<u8>> {
+        None
+    }
+    /// Installs an asset someone else shared, without touching the document or the undo history.
+    fn live_write_asset(&mut self, _id: &str, _name: &str, _bytes: Vec<u8>) {}
     /// Object keys whose numbers are allocators: merged by maximum, so concurrent additions do not conflict on them.
     const COUNTERS: &'static [&'static str] = &[];
     /// The three-way merge of shared documents: [`merge`] with [`Self::COUNTERS`] unless the model needs its own (text).
@@ -469,8 +481,9 @@ fn adopt<A: Live>(
 
 /// The adapter object the Playground shell drives (`shell/live.js`): `format`, `checkpoint()` (throws `busy` while a
 /// gesture is under way), `merge(base, current, edited)`, `apply(base | null, edited)` (a promise, settled at the next
-/// quiet frame; a whole adopted document resolves to the one it replaced), `connect({ changed, undo })` and
-/// `disconnect()`. The hooks are called from inside a frame: the shell defers its calls back.
+/// quiet frame; a whole adopted document resolves to the one it replaced), `connect({ changed, undo })`,
+/// `disconnect()`, and `assets()`, `readAsset(id)`, `writeAsset(id, name, bytes)` (all three throw `busy` while the app
+/// is not running). The hooks are called from inside a frame: the shell defers its calls back.
 #[cfg(target_arch = "wasm32")]
 pub mod web {
     use super::{Live, SESSION};
@@ -585,6 +598,60 @@ pub mod web {
         set(
             "disconnect",
             Closure::<dyn Fn()>::new(disconnect).into_js_value(),
+        )?;
+        let app = with_app.clone();
+        let assets = move || -> Result<js_sys::Array, JsValue> {
+            let mut list = None;
+            app(&mut |app: &mut A| list = Some(app.live_assets()));
+            let item = |(id, name, have): (String, String, bool)| {
+                let item = Object::new();
+                for (key, value) in [
+                    ("id", id.into()),
+                    ("name", name.into()),
+                    ("have", have.into()),
+                ] {
+                    Reflect::set(&item, &key.into(), &value)?;
+                }
+                Ok::<_, JsValue>(item)
+            };
+            list.ok_or("busy")?.into_iter().map(item).collect()
+        };
+        set(
+            "assets",
+            Closure::<dyn Fn() -> _>::new(assets).into_js_value(),
+        )?;
+        let app = with_app.clone();
+        let read_asset = move |id: String| -> Result<Uint8Array, JsValue> {
+            let mut bytes = None;
+            app(&mut |app: &mut A| bytes = Some(app.live_read_asset(&id)));
+            Ok(bytes
+                .ok_or("busy")?
+                .ok_or("Missing media")?
+                .as_slice()
+                .into())
+        };
+        set(
+            "readAsset",
+            Closure::<dyn Fn(_) -> _>::new(read_asset).into_js_value(),
+        )?;
+        let app = with_app.clone();
+        let write_asset =
+            move |id: String, name: String, bytes: Uint8Array| -> Result<(), JsValue> {
+                let mut bytes = Some(bytes.to_vec());
+                let written = app(&mut |app: &mut A| {
+                    app.live_write_asset(&id, &name, bytes.take().unwrap_or_default())
+                });
+                if !written {
+                    return Err("busy".into());
+                }
+                if let Some(repaint) = SESSION.with_borrow(|s| s.repaint.clone()) {
+                    repaint();
+                }
+                Ok(())
+            };
+        set(
+            "writeAsset",
+            Closure::<dyn Fn(_, _, _) -> _>::new(write_asset).into_js_value(),
         )?;
         let global = js_sys::global();
         Reflect::set(&global, &"playgroundLiveAdapter".into(), &adapter)?;

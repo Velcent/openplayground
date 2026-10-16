@@ -7,7 +7,9 @@
 // The app supplies an adapter (Honeydew: src/app/live.rs; others: patches/live/playground_live.rs): format;
 // checkpoint(), which throws 'busy' while a gesture is under way; merge(base, current, edited); apply(base, edited) and
 // apply(null, document), promises settled at the next quiet frame, the second resolving to the document it replaced;
-// connect({ changed, undo }) and disconnect().
+// connect({ changed, undo }) and disconnect(). Apps that keep media outside the document (photos, audio) also offer
+// assets() → [{ id, name, have }], readAsset(id) → bytes or Blob, and writeAsset(id, name, bytes), each of which may
+// throw 'busy'; those travel as session files.
 import { DocumentHistory, stacks } from './document-history.js'
 import { applyDelta, delta } from './document-delta.js'
 
@@ -15,6 +17,16 @@ const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i])
 const busy = (e) => e === 'busy' || e?.message === 'busy'
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const RETAINED = 100, MAX_WANTED = 8
+const fileIds = new Map()
+// The session file that carries an app's asset: one per asset ID, whoever shares it first.
+async function fileId(asset) {
+  if (!fileIds.has(asset)) {
+    const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(asset)))
+    fileIds.set(asset, 'live-' + btoa(String.fromCharCode(...hash)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''))
+  }
+  return fileIds.get(asset)
+}
+const fileName = (name) => String(name).replace(/[\/\\\x00-\x1f\x7f]/g, '_').slice(0, 255) || 'asset'
 
 // The app's adapter: set before the shell loads (globalThis.playgroundLiveAdapter) or offered through attach.
 let adapter = globalThis.playgroundLiveAdapter ?? null
@@ -52,11 +64,12 @@ export class LiveDocument extends EventTarget {
   constructor(session, adapter, store) {
     super()
     Object.assign(this, { session, adapter, store, acked: null, entries: [], inflight: null, wanted: [], error: null, unsaved: [] })
-    this.work = this.coordinating = Promise.resolve()
+    this.work = this.coordinating = this.assetWork = Promise.resolve()
     this.handlers = {
       document: (e) => this.receive(e.peer, e.value),
       'document-open': (e) => this.opened(e.peer),
       'document-close': (e) => this.closed(e.peer),
+      change: () => this.syncAssets(),
     }
   }
   get editable() { return this.session.role !== 'viewer' }
@@ -66,7 +79,7 @@ export class LiveDocument extends EventTarget {
     if (this.session.stopped || (!this.history && !this.coordinator())) return 'paused'
     return this.editable ? 'live' : 'read-only'
   }
-  changed() { this.dispatchEvent(new Event('change')) }
+  changed() { this.dispatchEvent(new Event('change')); this.syncAssets() }
   report(error) { this.error = error?.message ?? String(error); this.changed() }
   stop() {
     this.stopped = true
@@ -237,6 +250,27 @@ export class LiveDocument extends EventTarget {
       this.unsaved.push(replaced)
       this.report(new Error(`Your replaced work could not be saved as a draft (${e?.message ?? e}). Keep this page open.`))
     }
+  }
+  // Shares the media the shared document refers to that nobody shared yet, and installs what this browser lacks once
+  // it has arrived. Coalesced: one pass at a time, at most one more queued.
+  syncAssets() {
+    if (!this.adapter.assets || this.stopped || this.assetsQueued) return
+    this.assetsQueued = true
+    this.assetWork = this.assetWork.then(() => { this.assetsQueued = false; return this.exchangeAssets() })
+      .catch((e) => busy(e) ? setTimeout(() => this.syncAssets(), 100) : this.report(e))
+  }
+  async exchangeAssets() {
+    if (this.status !== 'live' && this.status !== 'read-only') return
+    const files = new Map(this.session.files.map((f) => [f.id, f])), share = [], ids = []
+    for (const { id, name, have } of await this.adapter.assets()) {
+      const file = files.get(await fileId(id))
+      if (have && !file && this.editable) { share.push(new File([await this.adapter.readAsset(id)], fileName(name))); ids.push(await fileId(id)) }
+      else if (!have && file) {
+        if (!this.session.accepted) await this.session.receive()
+        if (this.session.available.has(file.asset)) await this.adapter.writeAsset(id, file.name, new Uint8Array(await (await this.session.store.file(file.asset)).arrayBuffer()))
+      }
+    }
+    if (share.length) await this.session.share(share, ids)
   }
   undo(redo) {
     if (this.status === 'live' && this.wanted.length < MAX_WANTED) this.wanted.push(redo)
