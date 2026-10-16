@@ -1,5 +1,5 @@
 diff --git a/apps/gridcraft-web/src/web.rs b/apps/gridcraft-web/src/web.rs
-index c0fcb22..b29ba60 100644
+index c0fcb22..6ac245d 100644
 --- a/apps/gridcraft-web/src/web.rs
 +++ b/apps/gridcraft-web/src/web.rs
 @@ -29,11 +29,15 @@ pub fn start() {
@@ -45,7 +45,7 @@ index c0fcb22..b29ba60 100644
          if let Some(bridge) = &self.bridge {
              bridge.sync(&mut self.app);
          }
-+        gridcraft_ui_egui::playground_live::frame(&mut self.app);
++        gridcraft_ui_egui::live::frame(&mut self.app, ui.ctx());
 +    }
 +
 +    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -68,7 +68,7 @@ index 85a24dd..1a0d592 100644
  [build-dependencies]
  serde_json = { workspace = true }
 diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index f96cdac..79f9f28 100644
+index f96cdac..05c1fbc 100644
 --- a/crates/ui-egui/src/lib.rs
 +++ b/crates/ui-egui/src/lib.rs
 @@ -22,10 +22,15 @@ pub mod i18n;
@@ -77,7 +77,7 @@ index f96cdac..79f9f28 100644
  pub mod keytips;
 +// Live editing in a Playground session (web only).
 +#[cfg(any(target_arch = "wasm32", test))]
-+mod live;
++pub mod live;
  pub mod outline;
  pub mod panes;
  pub mod paper_view;
@@ -87,17 +87,18 @@ index f96cdac..79f9f28 100644
  pub mod printing;
  pub mod ribbon;
  pub mod selection_glide;
-@@ -377,6 +382,16 @@ impl SheetApp {
+@@ -377,6 +382,17 @@ impl SheetApp {
          {
              self.commit_text_box_edit()?;
          }
-+        // Live editing (web): the session undoes or redoes this person's last operations.
++        // Live editing (web): in the workbook a session shares, the session undoes or redoes this person's last operations.
 +        #[cfg(target_arch = "wasm32")]
 +        if let Some(redo) = match id {
 +            "edit.undo" => Some(false),
 +            "edit.redo" => Some(true),
 +            _ => None,
-+        } && (0..params.get("steps").and_then(Json::as_u64).unwrap_or(1).max(1)).all(|_| playground_live::undo(redo))
++        } && live::shared_active(&self.session)
++            && (0..params.get("steps").and_then(Json::as_u64).unwrap_or(1).max(1)).all(|_| playground_live::undo(redo))
 +        {
 +            return Ok(Json::Null);
 +        }
@@ -106,16 +107,18 @@ index f96cdac..79f9f28 100644
          }
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..2f0d8fa
+index 0000000..5bfc807
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,292 @@
-+//! Live editing in a Playground session (web only): the shared document is the workbook open when the session started,
-+//! as JSON. Sheets are keyed by name, cells by address with their style inline (style ids are positions in a table
-+//! each copy grows on its own), objects by id. Formula results are recalculated where the workbook is, not shared.
-+//! This person's active sheet, zoom, sheet view mode, scroll position and active cell, Watch Window, selection and the
+@@ -0,0 +1,390 @@
++//! Live editing in a Playground session (web only): the shared document is the workbook open when the session started
++//! (pinned by uid; if its window closes the session goes on with it as it was), as JSON. Sheets are keyed by name,
++//! cells by address with their style inline (style ids are positions in a table each copy grows on its own), objects
++//! by id. Formula results are recalculated where the workbook is, not shared. This person's active sheet, zoom, sheet
++//! view mode, gridlines, headings and Show Formulas, scroll position and active cell, Watch Window, selection and the
 +//! file data GridCraft does not model stay local.
 +
++use std::cell::{Cell as Flag, RefCell};
 +use std::sync::Arc;
 +
 +use gridcraft_engine::core::{CellRef, Value as CellValue};
@@ -126,23 +129,52 @@ index 0000000..2f0d8fa
 +
 +use crate::SheetApp;
 +use crate::grid::Drag;
-+use crate::playground_live::Live;
++use crate::playground_live::{self, Live};
 +
 +/// Sheet fields that are this person's view.
-+const VIEW: [&str; 4] = ["zoom", "view", "view_active", "view_top_left"];
++const VIEW: [&str; 7] = ["zoom", "view", "view_active", "view_top_left", "show_gridlines", "show_headings", "show_formulas"];
 +/// The defined name holding the Watch Window's list, which the app keeps through Undo as view state.
 +const WATCH: &str = "_sc_watch";
 +
 +thread_local! {
 +    /// The shared workbook's `DocState::uid` (0: none yet).
-+    static SHARED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++    static SHARED: Flag<u64> = const { Flag::new(0) };
++    /// The shared workbook as last seen, which the session goes on with if its window closes.
++    static LAST: RefCell<Option<Arc<Workbook>>> = const { RefCell::new(None) };
++    /// A pointer is down or a text field has the keyboard (as of the last frame).
++    static GESTURE: Flag<bool> = const { Flag::new(false) };
 +}
 +
-+/// The shared workbook's index: the one the session started with, else (closed) the active one.
-+fn shared(s: &Session) -> Option<usize> {
-+    let i = s.documents().iter().position(|d| d.uid == SHARED.get()).or_else(|| s.active().map(|_| s.active_index()))?;
-+    SHARED.set(s.documents().get(i)?.uid);
-+    Some(i)
++/// The end of each frame (web): [`playground_live::frame`], told whether a pointer or the keyboard is busy.
++pub fn frame(app: &mut SheetApp, ctx: &egui::Context) {
++    GESTURE.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
++    playground_live::frame(app);
++}
++
++/// Whether the active workbook is the one the session shares (its Undo and Redo go to the session).
++pub fn shared_active(s: &Session) -> bool {
++    SHARED.get() != 0 && s.active().is_some_and(|d| d.uid == SHARED.get())
++}
++
++/// The shared workbook's index, pinning the active one when nothing is shared yet; `None` once its window closed.
++fn pinned(s: &Session) -> Option<usize> {
++    if SHARED.get() == 0
++        && let Some(d) = s.active()
++    {
++        SHARED.set(d.uid);
++    }
++    s.documents().iter().position(|d| d.uid == SHARED.get())
++}
++
++/// The shared workbook: the pinned one, else as it was when its window closed (a blank one if none was ever open).
++fn shared(s: &Session) -> Arc<Workbook> {
++    match pinned(s).and_then(|i| s.documents().get(i)) {
++        Some(d) => {
++            LAST.set(Some(d.wb.clone()));
++            d.wb.clone()
++        }
++        None => LAST.with_borrow(Clone::clone).unwrap_or_default(),
++    }
 +}
 +
 +/// Runs `f` on document `i` (the session lends out only the active one).
@@ -238,11 +270,17 @@ index 0000000..2f0d8fa
 +        for (a1, cell) in serde_json::from_value::<Map<String, Value>>(cells).map_err(json)? {
 +            let at = CellRef::parse(&a1).ok_or_else(|| format!("invalid cell `{a1}`"))?;
 +            let c: SharedCell = serde_json::from_value(cell).map_err(json)?;
++            // A merge can combine fields into a cell GridCraft would store differently, which would change it again.
++            let empty = c.value.is_empty() && c.formula.is_none() && c.style.is_none();
++            if empty || (c.formula.is_some() && !c.value.is_empty()) || c.style.as_ref() == Some(wb.styles.get(StyleId::DEFAULT)) {
++                return Err(format!("cell {a1} of {} is not one GridCraft stores", sh.name));
++            }
 +            let style = c.style.map_or(StyleId::DEFAULT, |s| wb.styles.intern(s));
 +            sh.cells.set(at, Cell { value: c.value, formula: c.formula, style });
 +        }
 +        if let Some(old) = local.sheets.iter().find(|old| old.name == sh.name) {
 +            (sh.zoom, sh.view, sh.view_active, sh.view_top_left) = (old.zoom, old.view, old.view_active, old.view_top_left);
++            (sh.show_gridlines, sh.show_headings, sh.show_formulas) = (old.show_gridlines, old.show_headings, old.show_formulas);
 +            sh.preserved = old.preserved.clone();
 +        }
 +        wb.sheets.push(Arc::new(sh));
@@ -259,35 +297,44 @@ index 0000000..2f0d8fa
 +
 +impl Live for SheetApp {
 +    fn live_document(&self) -> Value {
-+        let s = &self.session;
-+        shared(s).and_then(|i| s.documents().get(i)).and_then(|d| document(&d.wb).ok()).unwrap_or_default()
++        // Serializing the model cannot fail (every map key is text); a null would fail every peer's check.
++        document(&shared(&self.session)).unwrap_or_default()
 +    }
 +
 +    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
 +        let s = &mut self.session;
-+        let i = match shared(s) {
-+            Some(i) => i,
-+            None => {
-+                s.new_workbook();
-+                shared(s).ok_or("No workbook")?
-+            }
++        if SHARED.get() == 0 && s.active().is_none() {
++            // Joining with no workbook open: a window for the shared one.
++            s.new_workbook();
++        }
++        let current = shared(s);
++        if self::document(&current).ok().as_ref() == Some(&document) {
++            return Ok(());
++        }
++        let mut wb = install(&current, document).map_err(|e| format!("Invalid shared workbook: {e}"))?;
++        let Some(i) = pinned(s) else {
++            LAST.set(Some(Arc::new(wb)));
++            return Ok(());
 +        };
 +        with_doc(s, i, |d| {
-+            if self::document(&d.wb).ok().as_ref() == Some(&document) {
-+                return Ok(());
-+            }
-+            let mut wb = install(&d.wb, document).map_err(|e| format!("Invalid shared workbook: {e}"))?;
 +            d.calc.recalc_all(&mut wb);
 +            d.wb = Arc::new(wb);
 +            d.revision += 1;
-+            Ok(())
-+        })
-+        .ok_or("No workbook")?
++            LAST.set(Some(d.wb.clone()));
++        });
++        Ok(())
++    }
++
++    /// Whether every peer can install `document` (two people deleting a sheet each can leave none).
++    fn live_check(document: &Value) -> Result<(), String> {
++        // ponytail: decodes the whole workbook per merge (O(cells)); a lighter schema check if big sessions lag.
++        install(&Workbook::default(), document.clone()).map(drop).map_err(|e| format!("Conflict: {e}"))
 +    }
 +
 +    fn live_quiet(&self) -> bool {
 +        let g = &self.grid;
-+        self.editor.is_none()
++        !GESTURE.get()
++            && self.editor.is_none()
 +            && self.text_box_editor.is_none()
 +            && self.session.mode == Mode::Ready
 +            && g.drag == Drag::None
@@ -301,35 +348,45 @@ index 0000000..2f0d8fa
 +    fn live_generation(&self) -> Option<u64> {
 +        use std::hash::{Hash, Hasher};
 +        let s = &self.session;
-+        let d = s.documents().get(shared(s)?)?;
 +        let mut h = std::hash::DefaultHasher::new();
-+        (d.uid, d.revision, Arc::as_ptr(&d.wb) as usize).hash(&mut h);
++        match pinned(s).and_then(|i| s.documents().get(i)) {
++            Some(d) => (d.uid, d.revision, Arc::as_ptr(&d.wb) as usize).hash(&mut h),
++            None => LAST.with_borrow(|wb| wb.as_ref().map(Arc::as_ptr)).hash(&mut h),
++        }
 +        Some(h.finish())
 +    }
 +
 +    fn live_disconnected(&mut self) {
 +        let s = &mut self.session;
-+        if let Some(i) = shared(s) {
++        if let Some(i) = s.documents().iter().position(|d| d.uid == SHARED.get()) {
 +            // Its steps hold other people's edits.
 +            with_doc(s, i, |d| {
 +                d.undo.clear();
 +                d.redo.clear();
 +            });
 +        }
-+        SHARED.set(0);
++        (SHARED.set(0), LAST.set(None));
 +    }
 +}
 +
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
-+    use crate::playground_live::{self as live, canonical};
 +    use crate::Services;
++    use crate::playground_live::{self as live, canonical};
 +
++    /// Another person's app, its workbook not shared yet (each page pins its own).
 +    fn app() -> SheetApp {
 +        let mut s = Session::new();
 +        s.new_workbook();
++        pin(None);
 +        SheetApp::new(s, Services::default())
++    }
++
++    /// Switches the test to `app`'s page: its active workbook is the shared one.
++    fn pin(app: Option<&SheetApp>) {
++        SHARED.set(app.and_then(|a| a.session.active()).map_or(0, |d| d.uid));
++        LAST.set(None);
 +    }
 +
 +    fn run(app: &mut SheetApp, id: &str, params: Value) {
@@ -356,6 +413,7 @@ index 0000000..2f0d8fa
 +
 +        // Views are not shared.
 +        run(&mut a, "view.zoom", json!({"percent": 150}));
++        run(&mut a, "view.gridlines", json!({"on": false}));
 +        run(&mut a, "sheet.activate", json!({"sheet": 0}));
 +        a.store_view_state();
 +        assert_eq!(canonical(&a.live_document()), canonical(&doc));
@@ -386,9 +444,11 @@ index 0000000..2f0d8fa
 +        run(&mut b, "cell.set", json!({"cell": "C3", "input": "x"}));
 +        run(&mut b, "home.bold", json!({"range": "C3", "on": true}));
 +        let edited = b.live_document();
++        pin(Some(&a));
 +        let merged = SheetApp::live_merge(&base, &a.live_document(), &edited).unwrap();
 +        assert_eq!(merged["sheets"][0]["cells"]["A1"]["style"]["font"]["italic"], true);
 +        assert_eq!(merged["sheets"][0]["cells"]["C3"]["style"]["font"]["bold"], true);
++        SheetApp::live_check(&merged).unwrap();
 +
 +        a.begin_edit(Some("5".into()), false);
 +        assert!(!a.live_quiet());
@@ -400,5 +460,44 @@ index 0000000..2f0d8fa
 +        live::frame(&mut a);
 +        assert_eq!((input(&a, "A1"), input(&a, "C3")), ("1".into(), "x".into()));
 +        live::disconnect();
++    }
++
++    #[test]
++    fn the_shared_workbook_stays_pinned_after_its_window_closes_and_undo_elsewhere_stays_native() {
++        let mut a = app();
++        run(&mut a, "cell.set", json!({"cell": "A1", "input": "shared"}));
++        let doc = a.live_document();
++        assert!(shared_active(&a.session));
++        a.session.new_workbook();
++        run(&mut a, "cell.set", json!({"cell": "A1", "input": "private"}));
++        assert!(!shared_active(&a.session), "Undo in another workbook is its own");
++        assert_eq!(canonical(&a.live_document()), canonical(&doc));
++        let shared = a.session.documents().iter().position(|d| d.title == "Book1").unwrap();
++        a.session.close_document(shared);
++        assert_eq!(canonical(&a.live_document()), canonical(&doc), "not the private workbook");
++        a.session.close_document(0);
++        assert_eq!(canonical(&a.live_document()), canonical(&doc), "never null");
++        let mut edited = doc.clone();
++        edited["sheets"][0]["cells"]["B2"] = json!({"value": {"t": "Number", "v": 7.0}});
++        a.live_adopt(edited.clone()).unwrap();
++        assert_eq!(canonical(&a.live_document()), canonical(&edited), "remote changes go on in it");
++    }
++
++    #[test]
++    fn a_merge_every_peer_would_refuse_is_a_conflict() {
++        let mut a = app();
++        run(&mut a, "home.insertSheet", json!({"name": "S2"}));
++        let base = a.live_document();
++        let mut b = app();
++        b.live_adopt(base.clone()).unwrap();
++        run(&mut b, "home.deleteSheet", json!({"sheet": 1}));
++        let edited = b.live_document();
++        pin(Some(&a));
++        run(&mut a, "home.deleteSheet", json!({"sheet": 0}));
++        let merged = SheetApp::live_merge(&base, &a.live_document(), &edited).unwrap();
++        assert_eq!(merged["sheets"], json!([]), "each deleted a different sheet");
++        assert!(SheetApp::live_check(&merged).is_err());
++        assert!(SheetApp::live_check(&Value::Null).is_err());
++        SheetApp::live_check(&base).unwrap();
 +    }
 +}
