@@ -47,6 +47,14 @@ pub trait Live {
     }
     /// Installs an asset someone else shared, without touching the document or the undo history.
     fn live_write_asset(&mut self, _id: &str, _name: &str, _bytes: Vec<u8>) {}
+    /// This person's presence for the others: a small JSON value (under 4 KiB) such as the pointer in document
+    /// coordinates, the selected object ids and the page shown. `Null`: nothing to show.
+    fn live_presence(&self) -> Value {
+        Value::Null
+    }
+    /// The others' presence, all of them each time it changes (empty when the session ends), for the app to draw
+    /// (pointer, name, selection outlines in their color). Their states come from other people: read them defensively.
+    fn live_show_presence(&mut self, _others: Vec<Presence>) {}
     /// Object keys whose numbers are allocators: merged by maximum, so concurrent additions do not conflict on them.
     const COUNTERS: &'static [&'static str] = &[];
     /// The three-way merge of shared documents: [`merge`] with [`Self::COUNTERS`] unless the model needs its own (text).
@@ -81,6 +89,38 @@ fn checked_merge<A: Live>(base: &Value, current: &Value, edited: &Value) -> Resu
 
 /// A conflict or an invalid document.
 pub type Error = String;
+
+/// Another person in the session, as [`Live::live_show_presence`] gets them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Presence {
+    pub id: String,
+    pub name: String,
+    pub color: [u8; 3],
+    /// What their [`Live::live_presence`] gave.
+    pub state: Value,
+}
+
+impl Presence {
+    /// The shell's list (`[{ id, name, color: "#rrggbb", state }]`); malformed entries are skipped.
+    pub fn list(value: &Value) -> Vec<Presence> {
+        let item = |v: &Value| {
+            let hex = v["color"].as_str()?.strip_prefix('#')?;
+            let channel = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
+            Some(Presence {
+                id: v["id"].as_str()?.to_owned(),
+                name: v["name"].as_str().unwrap_or_default().to_owned(),
+                color: [channel(0)?, channel(2)?, channel(4)?],
+                state: v["state"].clone(),
+            })
+        };
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(item)
+            .collect()
+    }
+}
 
 /// Canonical bytes: object keys sorted at every level, so equal documents give equal bytes on every peer.
 pub fn canonical(value: &Value) -> Vec<u8> {
@@ -490,8 +530,8 @@ fn adopt<A: Live>(
 /// The adapter object the Playground shell drives (`shell/live.js`): `format`, `checkpoint()` (throws `busy` while a
 /// gesture is under way), `merge(base, current, edited)`, `apply(base | null, edited)` (a promise, settled at the next
 /// quiet frame; a whole adopted document resolves to the one it replaced), `connect({ changed, undo })`,
-/// `disconnect()`, `assets()`, `assetsOf(document)`, `readAsset(id)` and `writeAsset(id, name, bytes)` (the ones that
-/// read the app throw `busy` while it is not running). The hooks are called from inside a frame: the shell defers its calls back.
+/// `disconnect()`, `assets()`, `assetsOf(document)`, `readAsset(id)`, `writeAsset(id, name, bytes)`, `presence()` and
+/// `showPresence(others)` (the ones that read the app throw `busy` while it is not running). The hooks are called from inside a frame: the shell defers its calls back.
 #[cfg(target_arch = "wasm32")]
 pub mod web {
     use super::{Live, SESSION};
@@ -673,6 +713,36 @@ pub mod web {
             "writeAsset",
             Closure::<dyn Fn(_, _, _) -> _>::new(write_asset).into_js_value(),
         )?;
+        let app = with_app.clone();
+        let presence = move || -> Result<JsValue, JsValue> {
+            let mut state = None;
+            app(&mut |app: &mut A| state = Some(app.live_presence()));
+            js_sys::JSON::parse(&state.ok_or("busy")?.to_string())
+        };
+        set(
+            "presence",
+            Closure::<dyn Fn() -> _>::new(presence).into_js_value(),
+        )?;
+        let app = with_app.clone();
+        let show_presence = move |others: JsValue| -> Result<(), JsValue> {
+            let text: String = js_sys::JSON::stringify(&others)?.into();
+            let mut others = Some(super::Presence::list(
+                &serde_json::from_str(&text).unwrap_or_default(),
+            ));
+            let shown =
+                app(&mut |app: &mut A| app.live_show_presence(others.take().unwrap_or_default()));
+            if !shown {
+                return Err("busy".into());
+            }
+            if let Some(repaint) = SESSION.with_borrow(|s| s.repaint.clone()) {
+                repaint();
+            }
+            Ok(())
+        };
+        set(
+            "showPresence",
+            Closure::<dyn Fn(_) -> _>::new(show_presence).into_js_value(),
+        )?;
         let global = js_sys::global();
         Reflect::set(&global, &"playgroundLiveAdapter".into(), &adapter)?;
         let attach = Reflect::get(&global, &"playgroundLive".into())
@@ -693,6 +763,22 @@ mod tests {
 
     fn m(b: Value, c: Value, e: Value) -> Result<Value, Error> {
         merge(&b, &c, &e, &["next_id"])
+    }
+
+    #[test]
+    fn presence_lists_read_colors_and_skip_malformed_entries() {
+        let list = json!([
+            {"id": "a", "name": "Ann", "color": "#e6194b", "state": {"cursor": [1, 2]}},
+            {"id": "b", "color": "red", "state": null},
+            {"name": "no id", "color": "#000000"}
+        ]);
+        let ann = Presence {
+            id: "a".into(),
+            name: "Ann".into(),
+            color: [0xe6, 0x19, 0x4b],
+            state: json!({"cursor": [1, 2]}),
+        };
+        assert_eq!(Presence::list(&list), [ann]);
     }
 
     #[test]

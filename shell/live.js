@@ -10,13 +10,17 @@
 // connect({ changed, undo }) and disconnect(). Apps that keep media outside the document (photos, audio) also offer
 // assets() → [{ id, name, have }] for the live document, assetsOf(document) → the same IDs for a document, readAsset(id)
 // → bytes or Blob, and writeAsset(id, name, bytes), any of which may throw 'busy'; those media travel as session files.
+// For presence, presence() → a small JSON value (where this person points, what they selected) and showPresence(others)
+// with [{ id, name, color, state }]; both may throw 'busy'. Presence goes peer to peer and never into the document.
 import { DocumentHistory, stacks } from './document-history.js'
 import { applyDelta, delta } from './document-delta.js'
 
 const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i])
 const busy = (e) => e === 'busy' || e?.message === 'busy'
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-const RETAINED = 100, MAX_WANTED = 8
+const RETAINED = 100, MAX_WANTED = 8, PRESENCE_MS = 100, MAX_PRESENCE = 4096
+const COLORS = ['#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4', '#0fa5b5', '#f032e6', '#9a6324']
+const color = (id) => COLORS[parseInt(id.replaceAll('-', '').slice(-8), 16) % COLORS.length]
 const fileIds = new Map()
 // The session file that carries an app's asset: one per asset ID, whoever shares it first.
 async function fileId(asset) {
@@ -59,13 +63,14 @@ export class LiveDocument extends EventTarget {
     for (const peer of session.peers.values()) if (peer.document?.readyState === 'open') live.opened(peer)
     // A snapshot the owner sent before this document listened is gone: ask again.
     live.resync()
+    if (adapter.presence || adapter.showPresence) live.presenceTimer = setInterval(() => live.presenceTick(), PRESENCE_MS)
     return live
   }
   constructor(session, adapter, store) {
     super()
     // `mine`: the media this browser may share, those its own document or edits brought in. Someone else referring to
     // a file this browser happens to have never makes it share that file.
-    Object.assign(this, { session, adapter, store, acked: null, entries: [], inflight: null, wanted: [], error: null, unsaved: [], mine: new Set() })
+    Object.assign(this, { session, adapter, store, acked: null, entries: [], inflight: null, wanted: [], error: null, unsaved: [], mine: new Set(), others: new Map() })
     this.work = this.coordinating = this.assetWork = Promise.resolve()
     this.handlers = {
       document: (e) => this.receive(e.peer, e.value),
@@ -85,6 +90,8 @@ export class LiveDocument extends EventTarget {
   report(error) { this.error = error?.message ?? String(error); this.changed() }
   stop() {
     this.stopped = true
+    clearInterval(this.presenceTimer)
+    try { this.adapter.showPresence?.([]) } catch {}
     for (const [type, handler] of Object.entries(this.handlers)) this.session.removeEventListener(type, handler)
     this.adapter.disconnect()
   }
@@ -154,11 +161,13 @@ export class LiveDocument extends EventTarget {
     })
   }
   opened(peer) {
+    this.presenceSent = null
     if (this.history) this.snapshot(peer)
     else if (peer.role === 'owner') this.resyncing = false
     this.changed()
   }
   closed(peer) {
+    if (this.others.delete(peer.id)) this.presenceDirty = true
     if (peer.role === 'owner') this.changed()
   }
   resync() {
@@ -171,6 +180,7 @@ export class LiveDocument extends EventTarget {
   // Client. `peer` is null for the coordinator in this browser.
   receive(peer, value) {
     if (this.stopped) return
+    if (peer && value?.type === 'presence') return this.presence(peer, value.state)
     if (this.history && peer) {
       if (value?.type === 'propose') this.coordinateProposal(peer.id, value.proposal, (reply) => this.session.sendDocument(peer, reply).catch(() => {}))
       else if (value?.type === 'resync') this.snapshot(peer)
@@ -283,6 +293,28 @@ export class LiveDocument extends EventTarget {
       }
     }
     if (share.length) await this.session.share(share, ids)
+  }
+  // Presence, ten times a second at most: this person's, when it changed (to everyone again when someone arrives), and
+  // the others' as the app shows them.
+  presence(peer, state) {
+    if (JSON.stringify(state ?? null).length > MAX_PRESENCE) return
+    this.others.set(peer.id, state ?? null); this.presenceDirty = true
+  }
+  presenceTick() {
+    if (this.stopped || !this.acked || this.incompatible) return
+    try {
+      const text = JSON.stringify(this.adapter.presence?.() ?? null)
+      if (text !== this.presenceSent && text.length <= MAX_PRESENCE) {
+        this.presenceSent = text
+        for (const peer of this.session.peers.values()) {
+          if (peer.document?.readyState === 'open') this.session.sendDocument(peer, { type: 'presence', state: JSON.parse(text) }).catch(() => {})
+        }
+      }
+      if (this.presenceDirty) {
+        this.adapter.showPresence?.([...this.others].map(([id, state]) => ({ id, name: this.session.peers.get(id)?.name ?? '', color: color(id), state })))
+        this.presenceDirty = false
+      }
+    } catch (e) { if (!busy(e)) this.report(e) }
   }
   undo(redo) {
     if (this.status === 'live' && this.wanted.length < MAX_WANTED) this.wanted.push(redo)

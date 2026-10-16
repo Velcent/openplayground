@@ -14,6 +14,8 @@ export default {
   ignore: ['/next_id'],                // optional: allocator counters, which Undo leaves raised
   importMedia: async (page) => {},     // optional: the owner adds a photo/clip/sample kept outside the document; the
                                        // editor and the late viewer must end up with the same bytes (adapter assets())
+  point: async (page) => {},           // optional: the owner points at or selects something; the editor's app must
+                                       // be shown the owner's presence() (draw it; check once with a screenshot)
 }
 ```
 

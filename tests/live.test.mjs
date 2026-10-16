@@ -1,4 +1,4 @@
-import test from 'node:test'
+import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
 import { pack, unpack } from '../shell/session-protocol.js'
 import { LiveDocument } from '../shell/live.js'
@@ -27,6 +27,9 @@ class App {
   assetsOf(doc) { return [...doc].flatMap((v, i) => v ? [`photo-${i}`] : []) }
   assets() { return this.assetsOf(this.doc).map((id) => ({ id, name: `${id}.bin`, have: this.media.has(id) })) }
   async readAsset(id) { return this.media.get(id) }
+  // Where this person points and what they selected, and what the app shows of the others.
+  presence() { return this.here ?? null }
+  showPresence(others) { this.shown = others }
   async writeAsset(id, name, bytes) { this.media.set(id, new Blob([bytes])) }
   checkpoint() { if (this.gesture) throw 'busy'; return this.doc.slice() }
   // 9 in the first field stands for "no document": the app's own merge refuses it, as a real app's validation would.
@@ -46,8 +49,11 @@ class App {
   hold() { let release; this.busy = new Promise((resolve) => { release = resolve }); return () => { this.busy = null; release() } }
 }
 
+// Every live document a test started stops at the end, presence timers with them.
+const hubs = []
+after(() => { for (const hub of hubs) for (const s of hub.sessions.values()) s.live?.stop() })
 class Hub {
-  constructor() { this.sessions = new Map(); this.gates = new Map(); this.sent = []; this.pool = new Map() }
+  constructor() { hubs.push(this); this.sessions = new Map(); this.gates = new Map(); this.sent = []; this.pool = new Map() }
   // Holds messages from `from` to `to`, in order, until released.
   hold(from, to) {
     let release
@@ -295,4 +301,18 @@ test('media reach the people who lack them, shared only by whoever added them to
   await eventually(async () => assert.deepEqual(await bytes(ownerApp, 'photo-2'), [9]))
   assert.equal(owner.session.files.length, 2)
   assert.equal(editorApp.media.has('photo-0'), false)
+})
+
+test('presence reaches the others, stays out of the document, and goes when they leave', async () => {
+  const hub = new Hub(), [o, e] = ids(), ownerApp = new App(), editorApp = new App()
+  ownerApp.here = { cursor: [1, 2] }
+  const owner = await hub.join(o, 'owner', ownerApp), editor = await hub.join(e, 'editor', editorApp)
+  await eventually(() => assert.deepEqual(editorApp.shown?.map((p) => [p.id, p.state]), [[o, { cursor: [1, 2] }]]))
+  editorApp.here = { selection: [7] }
+  await eventually(() => assert.deepEqual(ownerApp.shown?.map((p) => p.state), [{ selection: [7] }]))
+  assert.match(ownerApp.shown[0].color, /^#[0-9a-f]{6}$/)
+  assert.deepEqual(values(owner, editor), [[0, 0, 0], [0, 0, 0]])
+  hub.drop(e)
+  await eventually(() => assert.deepEqual(ownerApp.shown, []))
+  owner.live.stop()
 })

@@ -8,7 +8,8 @@ import { until } from './helpers.mjs'
 // directory holding each patched build at its URL path with the shell injected (tests/live-apps/README.md). Each
 // tests/live-apps/<slug>.mjs exports { path, viewport?, ready?(page), editA(page), editB(page), undo(page), ignore? }:
 // two edits to different objects, then Undo of the owner's; `ignore` lists path prefixes of allocator counters. An app
-// that keeps media outside the document also exports importMedia(page), which adds one in the owner's browser.
+// that keeps media outside the document also exports importMedia(page), which adds one in the owner's browser; one
+// that shows the others' pointers and selections exports point(page), which moves or selects in the owner's.
 const publicDir = process.env.LIVE_PUBLIC
 const only = process.env.LIVE_APPS?.split(',')
 const specs = readdirSync(new URL('./live-apps/', import.meta.url)).filter((f) => f.endsWith('.mjs'))
@@ -73,6 +74,17 @@ for (const slug of specs) {
     await until(async () => await status(a) === 'live' && await status(b) === 'live', 30000, 'live editing')
     const start = JSON.parse(await same([a, b], 'the joiner to adopt the owner\'s document'))
 
+    if (app.point) {
+      // What the editor's app is given to show of the others.
+      await b.evaluate(() => {
+        const show = playgroundLiveAdapter.showPresence
+        playgroundLiveAdapter.showPresence = (others) => { window.shownPresence = others; return show(others) }
+      })
+      await app.point(a)
+      const [id, mine] = await a.evaluate(() => [session.id, playgroundLiveAdapter.presence()])
+      assert.notEqual(mine, null, 'point() gives the owner a presence')
+      await until(() => b.evaluate(([id, mine]) => JSON.stringify(window.shownPresence?.find((p) => p.id === id)?.state) === JSON.stringify(mine), [id, mine]), 10000, 'the owner\'s presence to reach the editor')
+    }
     await app.editA(a)
     const afterA = JSON.parse(await same([a, b], 'the owner\'s edit to reach the editor', JSON.stringify(start)))
     await app.editB(b)
