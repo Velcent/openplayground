@@ -1,5 +1,62 @@
+diff --git a/apps/filmcraft-web/src/fs.rs b/apps/filmcraft-web/src/fs.rs
+index 416fbf9..a1e139e 100644
+--- a/apps/filmcraft-web/src/fs.rs
++++ b/apps/filmcraft-web/src/fs.rs
+@@ -99,6 +99,22 @@ pub fn register_blob(name: &str, blob: web_sys::Blob) -> String {
+     })
+ }
+ 
++/// Register a `Blob` at exactly `path` (media from a Playground session keep the path the project gives them);
++/// false, and nothing changes, when the path is taken.
++pub fn register_blob_at(path: &str, blob: web_sys::Blob) -> bool {
++    FS.with(|fs| {
++        let mut fs = fs.borrow_mut();
++        if fs.entries.contains_key(path) {
++            return false;
++        }
++        let (id, size) = (fs.next_id, blob.size() as u64);
++        fs.next_id += 1;
++        fs.blobs.insert(id, blob);
++        fs.entries.insert(path.to_string(), Entry::Blob { id, size });
++        true
++    })
++}
++
+ /// Put bytes at a path (no download).
+ pub fn put(path: &str, data: Vec<u8>) {
+     FS.with(|fs| fs.borrow_mut().entries.insert(path.to_string(), Entry::Mem(data.into())));
+diff --git a/apps/filmcraft-web/src/import.rs b/apps/filmcraft-web/src/import.rs
+index a075f9a..d849af2 100644
+--- a/apps/filmcraft-web/src/import.rs
++++ b/apps/filmcraft-web/src/import.rs
+@@ -155,6 +155,25 @@ pub fn take_files(files: Vec<web_sys::File>) {
+     });
+ }
+ 
++/// Live editing in a Playground session: the media the shared project refers to travel as session files. They are
++/// read as the `Blob`s this browser has, and media another person imported are installed under the project's path,
++/// kept in OPFS like an import, without an edit. A path this browser uses already keeps its own file.
++pub fn share_media() -> Result<(), JsValue> {
++    let adapter = js_sys::Reflect::get(&js_sys::global(), &"playgroundLiveAdapter".into())?;
++    let read = |path: String| fs::blob(&path).ok_or_else(|| JsValue::from_str("Missing media"));
++    js_sys::Reflect::set(&adapter, &"readAsset".into(), &Closure::<dyn Fn(String) -> Result<web_sys::Blob, JsValue>>::new(read).into_js_value())?;
++    let write = |path: String, _name: String, bytes: js_sys::Uint8Array| -> Result<(), JsValue> {
++        let file = web_sys::File::new_with_u8_array_sequence(&js_sys::Array::of1(&bytes), path.rsplit('/').next().unwrap_or(&path))?;
++        if fs::register_blob_at(&path, file.clone().into()) {
++            crate::recovery::keep_media(&path, &file);
++            crate::post(move |w, _| filmcraft_ui_egui::live::media_arrived(&mut w.app, &path));
++        }
++        Ok(())
++    };
++    js_sys::Reflect::set(&adapter, &"writeAsset".into(), &Closure::<dyn Fn(String, String, js_sys::Uint8Array) -> Result<(), JsValue>>::new(write).into_js_value())?;
++    Ok(())
++}
++
+ /// Files a picker returned: imported, or with a relink hint, the first one is registered under
+ /// `/files/<name>` and the hint's command runs on it (#111).
+ fn picked(files: Vec<web_sys::File>, relink: Option<RelinkHint>) {
 diff --git a/apps/filmcraft-web/src/lib.rs b/apps/filmcraft-web/src/lib.rs
-index 21512cc..5739be3 100644
+index 21512cc..8022165 100644
 --- a/apps/filmcraft-web/src/lib.rs
 +++ b/apps/filmcraft-web/src/lib.rs
 @@ -113,6 +113,11 @@ impl eframe::App for WebApp {
@@ -24,7 +81,7 @@ index 21512cc..5739be3 100644
      webcodecs::probe().await;
  
      api::install()?;
-@@ -219,6 +225,16 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
+@@ -219,6 +225,17 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
          )
          .await?;
      set_info("startupMs", json!(t0.elapsed().as_secs_f64() * 1000.0));
@@ -34,7 +91,8 @@ index 21512cc..5739be3 100644
 +        concat!("premiere:1:", env!("CARGO_PKG_VERSION")),
 +        move |with| live.app_mut::<WebApp>().map(|mut web| with(&mut web.app)).is_some(),
 +        repaint,
-+    );
++    )
++    .and_then(|()| import::share_media());
 +    if let Err(e) = attached {
 +        log::error!("live editing: {e:?}");
 +    }
@@ -220,20 +278,22 @@ index cb4a234..1021d1b 100644
  pub mod panels;
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..b3d80ec
+index 0000000..bb0c5c8
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,373 @@
 +//! Live editing in a Playground session (web only). The shared document is the open project (`Project`). What each
 +//! person sees for themselves (selection, playheads, open sequences, Timeline zoom and scroll, panels, the Source
 +//! monitor) already lives outside it, in the engine's `EditorState` and the UI; so does what belongs to this machine:
-+//! the renderer, the scratch disks and record-armed tracks. Imported media stay in the browser that imported them.
++//! the renderer, the scratch disks and record-armed tracks. Imported media (files the project refers to by path,
++//! `/files/<name>` on the web) travel as session files: the web host reads and installs their bytes.
 +
 +use std::cell::Cell;
++use std::collections::BTreeSet;
 +use std::sync::Arc;
 +
 +use filmcraft_project::playground_live::{self, Live};
-+use filmcraft_project::{Project, ProjectSettings};
++use filmcraft_project::{MediaClip, MediaRef, Project, ProjectItem, ProjectSettings};
 +use serde_json::Value;
 +
 +use crate::FilmcraftApp;
@@ -253,6 +313,25 @@ index 0000000..b3d80ec
 +pub fn frame(app: &mut FilmcraftApp, ctx: &egui::Context) {
 +    INPUT.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
 +    playground_live::frame(app);
++}
++
++/// The files a media item reads: its media and its proxy (generators have none).
++fn files(m: &MediaClip) -> impl Iterator<Item = &str> {
++    [Some(&m.media), m.proxy.as_ref()].into_iter().flatten().filter_map(|r| match r {
++        MediaRef::File { path } => Some(path.as_str()),
++        MediaRef::Generator(_) => None,
++    })
++}
++
++/// Media someone else imported arrived at `path` (the web host registered them): the items that showed them missing
++/// read them again. Not an edit: the project refers to them already.
++pub fn media_arrived(app: &mut FilmcraftApp, path: &str) {
++    let s = &mut app.session;
++    for item in s.project.items.values().filter(|i| i.as_media().is_some_and(|m| files(m).any(|f| f == path))) {
++        s.media.remove(item.id);
++    }
++    filmcraft_engine::relink::refresh(s);
++    s.bump_view();
 +}
 +
 +/// Gives each bin entry the id of the item or bin it holds (`keyed`), or takes it away again, so what two people add
@@ -377,6 +456,21 @@ index 0000000..b3d80ec
 +        s.bump_view();
 +        s.previews.live.publish_project(s.project.clone());
 +        Ok(())
++    }
++
++    /// The files the project refers to, by path: two different files imported under one name by two people each keep
++    /// their own.
++    fn live_assets(&self) -> Vec<(String, String, bool)> {
++        let s = &self.session;
++        let paths: BTreeSet<&str> = s.project.items.values().filter_map(ProjectItem::as_media).flat_map(files).collect();
++        let name = |p: &str| p.rsplit(['/', '\\']).next().unwrap_or(p).to_string();
++        paths.into_iter().map(|p| (p.to_string(), name(p), s.services.file_size(p).is_ok())).collect()
++    }
++
++    fn live_assets_of(document: &Value) -> Vec<String> {
++        let media = document["items"].as_object().into_iter().flat_map(|items| items.values()).filter_map(|i| i["kind"].get("Media"));
++        let paths: BTreeSet<&str> = media.flat_map(|m| [&m["media"], &m["proxy"]]).filter_map(|r| r["File"]["path"].as_str()).collect();
++        paths.into_iter().map(String::from).collect()
 +    }
 +
 +    fn live_quiet(&self) -> bool {
@@ -506,6 +600,34 @@ index 0000000..b3d80ec
 +        // Two clips put in the same place cannot both stay: a conflict, never a document no one can install.
 +        assert!(FilmcraftApp::live_check(&merge(1, 1).unwrap()).unwrap_err().contains("overlap"));
 +        assert!(FilmcraftApp::live_check(&json!(null)).is_err());
++    }
++
++    #[test]
++    fn imported_media_are_shared_by_path_and_come_back_when_they_arrive() {
++        let mut app = demo();
++        let dir = std::env::temp_dir().join(format!("filmcraft-live-media-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("tone.wav").to_string_lossy().into_owned();
++        let wav = filmcraft_media::wav::write_wav16(&[0.25; 4800], 1, 48_000);
++        std::fs::write(&path, &wav).unwrap();
++        let out = app.session.execute("file.import", json!({"paths": [path]})).unwrap();
++        let item = filmcraft_project::ItemId(out["items"][0].as_u64().unwrap());
++        assert_eq!(app.live_assets(), [(path.clone(), "tone.wav".into(), true)], "the demo's generators are not shared");
++        assert_eq!(FilmcraftApp::live_assets_of(&app.live_document()), [path.clone()]);
++        // Another person's browser: the file has not arrived yet, so the item shows the offline slate.
++        std::fs::remove_file(&path).unwrap();
++        let s = &app.session;
++        s.media.remove(item);
++        s.media.source_for(&s.project, item, &*s.services);
++        assert!(s.media.offline_status(item).is_some() && !app.live_assets()[0].2);
++        let (doc, steps) = (canonical(&app.live_document()), app.session.history.undo.len());
++        std::fs::write(&path, &wav).unwrap();
++        media_arrived(&mut app, &path);
++        let s = &app.session;
++        s.media.source_for(&s.project, item, &*s.services);
++        assert!(s.media.offline_status(item).is_none() && app.live_assets()[0].2);
++        assert_eq!((canonical(&app.live_document()), app.session.history.undo.len()), (doc, steps), "no edit");
++        std::fs::remove_dir_all(&dir).unwrap();
 +    }
 +
 +    #[test]
