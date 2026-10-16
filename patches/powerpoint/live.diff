@@ -1,0 +1,397 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index e2bc796..6612642 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1196,12 +1196,14 @@ name = "deckcraft-web"
+ version = "0.7.0"
+ dependencies = [
+  "deckcraft-engine",
++ "deckcraft-format",
+  "deckcraft-ui-egui",
+  "eframe",
+  "egui",
+  "js-sys",
+  "log",
+  "rfd",
++ "serde",
+  "serde_json",
+  "wasm-bindgen",
+  "wasm-bindgen-futures",
+diff --git a/apps/deckcraft-web/Cargo.toml b/apps/deckcraft-web/Cargo.toml
+index 7014421..9bdf91a 100644
+--- a/apps/deckcraft-web/Cargo.toml
++++ b/apps/deckcraft-web/Cargo.toml
+@@ -15,9 +15,11 @@ path = "src/main.rs"
+ 
+ [dependencies]
+ deckcraft-engine = { workspace = true }
++deckcraft-format = { workspace = true }
+ deckcraft-ui-egui = { workspace = true }
+ egui = { workspace = true }
+ log = { workspace = true }
++serde = { workspace = true }
+ serde_json = { workspace = true }
+ 
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+diff --git a/apps/deckcraft-web/src/live.rs b/apps/deckcraft-web/src/live.rs
+new file mode 100644
+index 0000000..fc4ccfc
+--- /dev/null
++++ b/apps/deckcraft-web/src/live.rs
+@@ -0,0 +1,230 @@
++//! Playground live editing (`playground_live`): the shared document is one open presentation's model as JSON (written
++//! as the native save writes it, non-finite numbers as 0) with its media's bytes and without the id counter or this
++//! person's views (selection, current slide, zoom, panes). Native undo history stays local; while connected Undo and
++//! Redo go to the session.
++
++use crate::playground_live::{self, Live};
++use deckcraft_engine::DocState;
++use deckcraft_engine::cmd::{base64_decode, base64_encode};
++use deckcraft_engine::model::Presentation;
++use deckcraft_format::finite::Finite;
++use deckcraft_ui_egui::SlideApp;
++use serde::Deserialize as _;
++use serde_json::Value;
++use std::cell::{Cell, RefCell};
++use std::sync::Arc;
++
++pub const FORMAT: &str = concat!("powerpoint:1:", env!("CARGO_PKG_VERSION"));
++
++thread_local! {
++    /// The shared presentation's `uid`: the one active when the session first read it.
++    static SHARED: Cell<Option<u64>> = const { Cell::new(None) };
++    /// A pointer is down or a text field (the notes, a ribbon box) has the keyboard.
++    static UI_BUSY: Cell<bool> = const { Cell::new(false) };
++    static CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
++}
++
++/// The end of a frame.
++pub fn frame(app: &mut SlideApp, ctx: &egui::Context) {
++    UI_BUSY.set(ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input());
++    CTX.with_borrow_mut(|c| _ = c.get_or_insert_with(|| ctx.clone()));
++    playground_live::frame(app);
++}
++
++pub fn repaint() {
++    CTX.with_borrow(|c| c.iter().for_each(egui::Context::request_repaint));
++}
++
++/// The shared presentation's index; when it was closed (or none was chosen yet), the active one becomes it.
++fn shared(app: &SlideApp) -> Option<usize> {
++    let docs = app.session.documents();
++    let i = SHARED.get().and_then(|uid| docs.iter().position(|d| d.uid == uid)).or(app.session.active_index())?;
++    SHARED.set(docs.get(i).map(|d| d.uid));
++    Some(i)
++}
++
++fn json<T: serde::Serialize + ?Sized>(value: &T) -> Value {
++    serde_json::to_value(Finite(value)).unwrap_or_default()
++}
++
++fn project(doc: &Presentation) -> Value {
++    let mut v = json(doc);
++    v.as_object_mut().map(|o| o.remove("nextId"));
++    for (m, item) in v.get_mut("media").and_then(Value::as_array_mut).into_iter().flatten().zip(&doc.media) {
++        m["data"] = base64_encode(&item.data).into();
++    }
++    v
++}
++
++/// Old `Arc`s for the items whose JSON did not change, so caches keyed by them (slide textures) stay warm and parts the
++/// JSON leaves out (a chart's kept package parts) stay.
++fn reuse<T: serde::Serialize>(new: &mut [Arc<T>], incoming: &Value, old: &[Arc<T>]) {
++    let was = json(old);
++    let (Some(incoming), Some(was)) = (incoming.as_array(), was.as_array()) else { return };
++    // ponytail: quadratic in the item count, fine for slides and masters; index by id if decks grow huge.
++    for (n, v) in new.iter_mut().zip(incoming) {
++        if let Some(j) = was.iter().position(|w| w == v) {
++            *n = old[j].clone();
++        }
++    }
++}
++
++fn invalid(e: impl std::fmt::Display) -> String {
++    format!("Invalid shared document: {e}")
++}
++
++impl Live for SlideApp {
++    fn live_document(&self) -> Value {
++        shared(self).map_or(Value::Null, |i| project(&self.session.documents()[i].doc))
++    }
++
++    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
++        if document.is_null() {
++            return Ok(());
++        }
++        let mut doc = Presentation::deserialize(&document).map_err(invalid)?;
++        let i = match shared(self) {
++            Some(i) => i,
++            None => {
++                let title = self.session.next_untitled();
++                let i = self.session.add_document(DocState::new(Presentation::default(), None, title));
++                SHARED.set(self.session.documents().get(i).map(|d| d.uid));
++                i
++            }
++        };
++        let active = self.session.active_index();
++        self.session.set_active(i);
++        let st = self.session.active_mut().ok_or("No presentation")?;
++        let old = st.doc.clone();
++        reuse(&mut doc.slides, &document["slides"], &old.slides);
++        reuse(&mut doc.masters, &document["masters"], &old.masters);
++        for (extra, was, key) in [(&mut doc.notes_master, &old.notes_master, "notesMaster"), (&mut doc.handout_master, &old.handout_master, "handoutMaster")] {
++            if json(was) == document[key] {
++                extra.clone_from(was);
++            }
++        }
++        for (item, v) in doc.media.iter_mut().zip(document["media"].as_array().into_iter().flatten()) {
++            let data = v["data"].as_str().and_then(base64_decode).unwrap_or_default();
++            item.data = old.media.iter().find(|o| o.id == item.id && *o.data == data).map_or_else(|| Arc::new(data), |o| o.data.clone());
++        }
++        doc.next_id = old.next_id;
++        doc.fix_next_id();
++        // The same slide stays current, and text being edited stays so unless it changed.
++        let slide = old.slides.get(st.selection.slide).map(|s| s.id);
++        let text = |st: &DocState| {
++            st.selection.text.as_ref().map(|t| (t.notes.then(|| st.current_slide().map(|s| s.notes.clone())), st.shape(t.shape).cloned()))
++        };
++        let editing = text(st);
++        st.doc = Arc::new(doc);
++        st.revision += 1;
++        if let Some(at) = slide.and_then(|id| st.doc.slide_index(id)) {
++            st.selection.slide = at;
++        }
++        if text(st) != editing {
++            st.selection.text = None;
++        }
++        let _ = self.session.select(|_, _| {});
++        if let Some(active) = active {
++            self.session.set_active(active);
++        }
++        Ok(())
++    }
++
++    fn live_quiet(&self) -> bool {
++        !UI_BUSY.get()
++            && !self.session.tool.dragging()
++            && !self.session.tool.drawing_freeform()
++            && self.session.documents().iter().all(|d| d.interaction.is_none() && d.composition.is_none())
++    }
++
++    fn live_generation(&self) -> Option<u64> {
++        use std::hash::{Hash as _, Hasher as _};
++        let st = &self.session.documents()[shared(self)?];
++        let mut h = std::collections::hash_map::DefaultHasher::new();
++        (st.uid, st.revision, Arc::as_ptr(&st.doc)).hash(&mut h);
++        Some(h.finish())
++    }
++
++    fn live_disconnected(&mut self) {
++        let uid = SHARED.take();
++        if let Some(i) = self.session.documents().iter().position(|d| Some(d.uid) == uid) {
++            let active = self.session.active_index();
++            self.session.set_active(i);
++            if let Some(st) = self.session.active_mut() {
++                st.history.undo.clear();
++                st.history.redo.clear();
++            }
++            if let Some(active) = active {
++                self.session.set_active(active);
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use deckcraft_engine::{Interaction, Mods, Session};
++    use deckcraft_ui_egui::Services;
++    use playground_live::canonical;
++    use serde_json::json;
++
++    fn sample() -> Result<SlideApp, String> {
++        let mut app = SlideApp::new(Session::new(), Services::default());
++        deckcraft_engine::sample::open_sample(&mut app.session).map_err(|e| e.to_string())?;
++        Ok(app)
++    }
++
++    #[test]
++    fn shares_the_deck_without_views_adopts_it_without_an_undo_step_and_waits_for_a_gesture() -> Result<(), String> {
++        let _ = deckcraft_engine::model::FRESH_ID.set(playground_live::fresh_id);
++        let _ = deckcraft_engine::UNDO.set(playground_live::undo);
++        let e = |e: deckcraft_engine::EngineError| e.to_string();
++        let mut a = sample()?;
++        playground_live::connect();
++        let start = canonical(&a.live_document());
++        let ids: Vec<u64> = a.session.doc().map_err(e)?.doc.slides[0].shapes.iter().map(|s| u64::from(s.id.0)).collect();
++        a.session.execute("edit.select", &json!({"ids": [ids[0]]})).map_err(e)?;
++        a.session.execute("slide.next", &json!({})).map_err(e)?;
++        a.ui.zoom = Some(2.0);
++        assert_eq!(canonical(&a.live_document()), start, "views are not shared");
++        assert!(!String::from_utf8_lossy(&start).contains("\"nextId\""));
++
++        // A joiner adopts it whole and shares the same bytes.
++        let mut b = sample()?;
++        b.session.execute("slide.new", &json!({})).map_err(e)?;
++        b.live_adopt(serde_json::from_slice(&start).map_err(|e| e.to_string())?)?;
++        assert_eq!(canonical(&b.live_document()), start);
++
++        // B types into the subtitle; A merges it at a quiet frame, keeping its views, its undo history and the slides
++        // that did not change.
++        b.session.execute("edit.select", &json!({"ids": [ids[1]]})).map_err(e)?;
++        b.session.type_text("B").map_err(e)?;
++        b.session.key("Escape", Mods::default()).map_err(e)?;
++        let edited = canonical(&b.live_document());
++        let st = a.session.doc().map_err(e)?;
++        let (undo_steps, selection, second) = (st.history.undo.len(), st.selection.clone(), st.doc.slides[1].clone());
++        let done = std::rc::Rc::new(Cell::new(false));
++        let to = done.clone();
++        playground_live::queue(Some(start.clone()), edited.clone(), Box::new(move |r| to.set(r.is_ok())));
++        let st = a.session.doc_mut().map_err(e)?;
++        st.interaction = Some(Interaction { label: "Move".into(), doc: st.doc.clone(), selection: st.selection.clone() });
++        playground_live::frame(&mut a);
++        assert!(!done.get(), "a gesture under way holds remote changes");
++        a.session.doc_mut().map_err(e)?.interaction = None;
++        playground_live::frame(&mut a);
++        assert!(done.get());
++        assert_eq!(canonical(&a.live_document()), edited);
++        let st = a.session.doc().map_err(e)?;
++        assert_eq!((st.history.undo.len(), &st.selection), (undo_steps, &selection));
++        assert!(Arc::ptr_eq(&st.doc.slides[1], &second), "an unchanged slide keeps its Arc");
++
++        // Undo goes to the session; new objects get ids unique to this peer.
++        assert_eq!(a.session.execute("edit.undo", &json!({})).map_err(e)?, Value::Null);
++        assert_eq!(playground_live::activity().1, [false]);
++        let id = a.session.edit(|d, _| Ok(d.alloc_id())).map_err(e)?.unwrap_or_default();
++        assert!((0x4000_0000..0x8000_0000).contains(&id) && a.session.doc().map_err(e)?.doc.next_id >= id);
++        playground_live::disconnect();
++        Ok(())
++    }
++}
+diff --git a/apps/deckcraft-web/src/main.rs b/apps/deckcraft-web/src/main.rs
+index 6d2b7e9..052f7f1 100644
+--- a/apps/deckcraft-web/src/main.rs
++++ b/apps/deckcraft-web/src/main.rs
+@@ -21,6 +21,13 @@
+ #[cfg(target_arch = "wasm32")]
+ mod web;
+ 
++#[cfg(any(target_arch = "wasm32", test))]
++#[cfg_attr(test, allow(dead_code))]
++mod live;
++#[cfg(any(target_arch = "wasm32", test))]
++#[allow(dead_code)]
++mod playground_live;
++
+ #[cfg(target_arch = "wasm32")]
+ fn main() {
+     web::start();
+diff --git a/apps/deckcraft-web/src/web.rs b/apps/deckcraft-web/src/web.rs
+index dabad8a..b63b291 100644
+--- a/apps/deckcraft-web/src/web.rs
++++ b/apps/deckcraft-web/src/web.rs
+@@ -28,7 +28,8 @@ pub fn start() {
+         {
+             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
+         }
+-        let result = eframe::WebRunner::new()
++        let runner = eframe::WebRunner::new();
++        let result = runner
+             .start(
+                 canvas,
+                 options,
+@@ -53,6 +54,15 @@ pub fn start() {
+                 }),
+             )
+             .await;
++        if result.is_ok() {
++            // Playground live editing (inert until its shell connects).
++            let _ = deckcraft_engine::model::FRESH_ID.set(crate::playground_live::fresh_id);
++            let _ = deckcraft_engine::UNDO.set(crate::playground_live::undo);
++            let with_app = move |f: &mut dyn FnMut(&mut SlideApp)| runner.app_mut::<WebShell>().map(|mut shell| f(&mut shell.app)).is_some();
++            if let Err(e) = crate::playground_live::web::attach::<SlideApp>(crate::live::FORMAT, with_app, crate::live::repaint) {
++                log::error!("live editing unavailable: {e:?}");
++            }
++        }
+         if let Some(el) = document.get_element_by_id(LOADING_ID) {
+             match result {
+                 Ok(()) => el.remove(),
+@@ -106,6 +116,11 @@ impl eframe::App for WebShell {
+ 
+     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+         self.app.ui(ui);
++        crate::live::frame(&mut self.app, ui.ctx());
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
+     }
+ }
+ 
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index ac25d66..ebbb179 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -443,6 +443,9 @@ pub struct Clipboard {
+     pub pastes: u32,
+ }
+ 
++/// Set by the web app for live editing: takes Undo (false) or Redo (true) instead of the history when it returns true.
++pub static UNDO: std::sync::OnceLock<fn(bool) -> bool> = std::sync::OnceLock::new();
++
+ pub struct Session {
+     docs: Vec<DocState>,
+     active: Option<usize>,
+@@ -586,6 +589,9 @@ impl Session {
+         if self.depth == 0 && (spec.journal || spec.undoable) && !matches!(id, "text.compose" | "text.commit") {
+             self.end_composition();
+         }
++        if self.depth == 0 && matches!(id, "edit.undo" | "edit.redo") && UNDO.get().is_some_and(|undo| undo(id == "edit.redo")) {
++            return Ok(Value::Null);
++        }
+         if let Err(e) = (spec.enabled)(self) {
+             let named = (e == cmd::NOTHING_SELECTED || e == cmd::SELECT_TWO) && (params.get("ids").is_some() || params.get("id").is_some());
+             if !named {
+diff --git a/crates/format/src/lib.rs b/crates/format/src/lib.rs
+index f1d0dc8..ccbe930 100644
+--- a/crates/format/src/lib.rs
++++ b/crates/format/src/lib.rs
+@@ -4,7 +4,7 @@
+ #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+ #![forbid(unsafe_code)]
+ 
+-mod finite;
++pub mod finite;
+ 
+ use std::io::{Cursor, Read, Write};
+ use std::sync::Arc;
+diff --git a/crates/model/src/lib.rs b/crates/model/src/lib.rs
+index 275f944..f30b4ed 100644
+--- a/crates/model/src/lib.rs
++++ b/crates/model/src/lib.rs
+@@ -1022,6 +1022,10 @@ impl Default for Presentation {
+     }
+ }
+ 
++/// Set by the web app for live editing: makes the ids [`Presentation::alloc_id`] hands out unique among the people
++/// editing at once.
++pub static FRESH_ID: std::sync::OnceLock<fn(&mut u64) -> u64> = std::sync::OnceLock::new();
++
+ impl Presentation {
+     /// A fresh id, unique across slides, shapes, layouts, masters and media in this deck. `None`
+     /// once every id is in use (a hostile file can arrive that way): the deck cannot grow
+@@ -1029,7 +1033,12 @@ impl Presentation {
+     pub fn alloc_id(&mut self) -> Option<u32> {
+         let next = self.next_id.max(1).checked_add(1)?;
+         self.next_id = next;
+-        Some(next)
++        let Some(fresh) = FRESH_ID.get() else { return Some(next) };
++        // While live editing `fresh` gives 52 random bits above u32's range: keep 30 of them, in 2^30..2^31.
++        let id = fresh(&mut u64::from(next));
++        let id = u32::try_from(id).unwrap_or(0x4000_0000 | (id as u32 & 0x3FFF_FFFF));
++        self.next_id = self.next_id.max(id);
++        Some(id)
+     }
+     /// Make sure `next_id` is above every id in use (after loading a file).
+     pub fn fix_next_id(&mut self) {
