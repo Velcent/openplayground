@@ -325,9 +325,10 @@ pub fn checkpoint<A: Live>(app: &A) -> Result<Vec<u8>, Error> {
     Ok(canonical(&app.live_document()))
 }
 
-/// A new object id from the app's counter `next`, which goes up as before. While connected the id is also unique
-/// across peers (random high bits), so two people adding objects at once do not pick the same one. For apps whose ids
-/// are opaque 64-bit numbers; ids that index arrays or show to people need the app's own scheme.
+/// A new object id from the app's counter `next`, which goes up as before. While connected the id is instead 2^52 plus
+/// 52 random bits, so two people adding objects at once practically never pick the same one (and it stays below 2^53,
+/// exact in JSON and the shell). For apps whose ids are opaque numbers; ids that index arrays or show to people need
+/// the app's own scheme.
 pub fn fresh_id(next: &mut u64) -> u64 {
     let id = *next;
     *next += 1;
@@ -339,11 +340,16 @@ pub fn fresh_id(next: &mut u64) -> u64 {
         return id;
     }
     #[cfg(target_arch = "wasm32")]
-    let random = (js_sys::Math::random() * (1u64 << 20) as f64) as u64;
+    let random = {
+        let half = || (js_sys::Math::random() * (1u64 << 26) as f64) as u64;
+        (half() << 26) | half()
+    };
     #[cfg(not(target_arch = "wasm32"))]
-    let random = SESSION.with_borrow(|s| s.ids).wrapping_mul(0x9E37_79B9) & 0xF_FFFF;
-    // Below 2^53, so the shell and JSON keep them exact.
-    (1 << 52) | (random << 32) | (id & 0xFFFF_FFFF)
+    let random = SESSION
+        .with_borrow(|s| s.ids)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        >> 12;
+    (1 << 52) | (random & ((1 << 52) - 1))
 }
 
 /// Passes Undo or Redo to the session while connected: whether it did. Call it first in the app's Undo and Redo.

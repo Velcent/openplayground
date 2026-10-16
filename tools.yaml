@@ -66,6 +66,7 @@ groups:
         icon: icons/designcraft.png
         theme: themes/indesign.js
         patches: patches/indesign.yaml
+        live: apps/designcraft-web/src
         accent: "#FF3366"
         base: "#49021F"
 
