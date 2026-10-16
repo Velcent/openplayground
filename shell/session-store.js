@@ -1,4 +1,4 @@
-import { CHUNK_SIZE, MAX_FILE, MAX_MANIFEST, UUID, HASH, assetId, digest, validateManifest } from './session-protocol.js'
+import { CHUNK_SIZE, MAX_FILE, MAX_MANIFEST, UUID, HASH, assetId, digest, pack, unpack, validateManifest } from './session-protocol.js'
 
 const write = async (dir, name, bytes) => {
   const out = await (await dir.getFileHandle(name, { create: true })).createWritable()
@@ -122,6 +122,19 @@ export class SessionStore {
   async connection(value) {
     if (value !== undefined) await write(await this.root(), 'connection.json', JSON.stringify(value))
     return readJSON(await this.root(), 'connection.json')
+  }
+  // The live document's recovery record (the coordinator's journal); written atomically on every commit.
+  async document(record) {
+    const dir = await this.root()
+    if (record !== undefined) return write(dir, 'document.bin', pack(record))
+    try { return unpack(new Uint8Array(await (await (await dir.getFileHandle('document.bin')).getFile()).arrayBuffer())) }
+    catch (e) { if (e.name === 'NotFoundError') return null; throw e }
+  }
+  // Local work a live document could not keep: a rejected or conflicting draft, or what a session replaced.
+  // ponytail: drafts accumulate until the session is removed; prune or list them once there is a drafts UI.
+  async draft(bytes) {
+    const dir = await (await this.root()).getDirectoryHandle('drafts', { create: true })
+    await write(dir, `${Date.now()}-${crypto.randomUUID()}.bin`, bytes)
   }
   async finish(asset) {
     if ((await this.missing(asset)).length) throw new Error('File is still syncing')

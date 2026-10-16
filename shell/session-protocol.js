@@ -71,3 +71,37 @@ export async function validateManifest(files) {
   }
   return files
 }
+
+// A value with Uint8Array fields as one binary blob: a 4-byte JSON length, the JSON with each array replaced by
+// {$bytes: length}, then the arrays' bytes in the same order. Used for document messages and recovery records.
+export function pack(value) {
+  const parts = []
+  const json = text.encode(JSON.stringify(value, function (key, v) {
+    const raw = this[key]
+    return raw instanceof Uint8Array ? (parts.push(raw), { $bytes: raw.length }) : v
+  }))
+  const head = new Uint8Array(4)
+  new DataView(head.buffer).setUint32(0, json.length)
+  return new Blob([head, json, ...parts])
+}
+export function unpack(bytes) {
+  const invalid = () => new Error('Invalid document data')
+  if (!(bytes instanceof Uint8Array) || bytes.length < 4) throw invalid()
+  const length = new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0)
+  if (length > bytes.length - 4) throw invalid()
+  let at = 4 + length
+  const revive = (node) => {
+    if (!node || typeof node !== 'object') return node
+    const keys = Object.keys(node)
+    if (keys.includes('__proto__')) throw invalid()
+    if (keys.length === 1 && keys[0] === '$bytes') {
+      if (!Number.isSafeInteger(node.$bytes) || node.$bytes < 0 || node.$bytes > bytes.length - at) throw invalid()
+      return bytes.slice(at, at += node.$bytes)
+    }
+    for (const key of keys) node[key] = revive(node[key])
+    return node
+  }
+  const value = revive(JSON.parse(string.decode(bytes.subarray(4, 4 + length))))
+  if (at !== bytes.length) throw invalid()
+  return value
+}

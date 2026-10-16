@@ -1,10 +1,9 @@
-import { CHUNK_SIZE, FRAME_SIZE, MAX_MANIFEST, MAX_SIGNAL, randomToken, tokenHash, signalKey, seal, open, readInvite, inviteURL, validateManifest } from './session-protocol.js'
+import { CHUNK_SIZE, FRAME_SIZE, MAX_MANIFEST, MAX_SIGNAL, pack, unpack, randomToken, tokenHash, signalKey, seal, open, readInvite, inviteURL, validateManifest } from './session-protocol.js'
 import { SessionStore, describe } from './session-store.js'
 import { MAX_DOCUMENT } from './document-delta.js'
 
 const cleanName = (name) => String(name || 'Guest').replace(/[\x00-\x1f\x7f]/g, '').slice(0, 40)
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-const text = new TextEncoder(), untext = new TextDecoder()
 // A document message: a delta's two spans or a snapshot with its retained history, plus its JSON.
 const MAX_DOCUMENT_MESSAGE = 4 * MAX_DOCUMENT + 4 * 1024 ** 2
 async function request(room, action, data, token) {
@@ -261,7 +260,7 @@ export class PeerSession extends EventTarget {
     channel.send(data)
   }
   // Live document traffic has its own ordered channel, so bulk file transfers never hold it up. Each message is a
-  // short {size} string, then its JSON and byte fields as binary frames; Uint8Array fields travel as raw bytes.
+  // short {size} string, then its packed bytes (session-protocol.js) as binary frames.
   documentChannel(peer, channel) {
     if (peer.document) { channel.close(); return }
     peer.document = channel; peer.documentSends = Promise.resolve(); peer.documentIn = null; channel.binaryType = 'arraybuffer'
@@ -290,32 +289,10 @@ export class PeerSession extends EventTarget {
     peer.documentIn = null
     const bytes = new Uint8Array(incoming.size)
     incoming.frames.reduce((at, frame) => (bytes.set(frame, at), at + frame.length), 0)
-    const length = new DataView(bytes.buffer).getUint32(0)
-    if (length > bytes.length - 4) throw new Error('Invalid document message')
-    let at = 4 + length
-    const revive = (node) => {
-      if (!node || typeof node !== 'object') return node
-      const keys = Object.keys(node)
-      if (keys.includes('__proto__')) throw new Error('Invalid document message')
-      if (keys.length === 1 && keys[0] === '$bytes') {
-        if (!Number.isSafeInteger(node.$bytes) || node.$bytes < 0 || node.$bytes > bytes.length - at) throw new Error('Invalid document message')
-        return bytes.slice(at, at += node.$bytes)
-      }
-      for (const key of keys) node[key] = revive(node[key])
-      return node
-    }
-    const value = revive(JSON.parse(untext.decode(bytes.subarray(4, 4 + length))))
-    if (at !== bytes.length) throw new Error('Invalid document message')
-    return { value }
+    return { value: unpack(bytes) }
   }
   sendDocument(peer, value) {
-    const parts = []
-    const json = text.encode(JSON.stringify(value, function (key, v) {
-      const raw = this[key]
-      return raw instanceof Uint8Array ? (parts.push(raw), { $bytes: raw.length }) : v
-    }))
-    const head = new Uint8Array(4); new DataView(head.buffer).setUint32(0, json.length)
-    const blob = new Blob([head, json, ...parts])
+    const blob = pack(value)
     if (blob.size > MAX_DOCUMENT_MESSAGE) return Promise.reject(new Error('Document message too large'))
     const channel = peer.document
     if (!channel) return Promise.reject(new Error('Peer disconnected'))

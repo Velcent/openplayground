@@ -31,6 +31,18 @@ async function fingerprint({ base, kind, target, edit }) {
   return digest(await new Blob(edit ? [head, edit.remove, edit.insert] : [head]).arrayBuffer())
 }
 
+// An author's Undo and Redo stacks follow from the retained entries; expired targets simply drop out.
+export function stacks(entries, author) {
+  const undo = [], redo = []
+  for (const entry of entries) {
+    if (entry.author !== author) continue
+    if (entry.kind === 'edit') { undo.push(entry.revision); redo.length = 0 }
+    else if (entry.kind === 'undo') { undo.pop(); redo.push(entry.revision) }
+    else { redo.pop(); undo.push(entry.revision) }
+  }
+  return { undo, redo }
+}
+
 // ponytail: each submit copies and commits the whole record and runs up to one merge per retained revision; fine for
 // typical songs, a ceiling near the 128 MiB document and 256 MiB history limits. Commit deltas incrementally if that shows.
 // Orders authored changes for one shared document. Merges are checked against every retained revision after a
@@ -52,6 +64,16 @@ export class DocumentHistory {
   static async create(options) {
     const history = new DocumentHistory(options)
     await history.#commit(history.snapshot())
+    return history
+  }
+
+  // Continues from this browser's own last committed record.
+  static restore(record, options) {
+    const history = new DocumentHistory({ ...options, document: record?.document, format: record?.format, bytes: record?.bytes })
+    const { revision, entries } = record
+    if (record.version !== 1 || !Array.isArray(entries) || entries.length > MAX_ENTRIES || !Number.isSafeInteger(revision) || revision < entries.length
+      || !entries.every((e, i) => e?.revision === revision - entries.length + 1 + i && e.change?.remove instanceof Uint8Array && e.change.insert instanceof Uint8Array)) throw new Error('Invalid document history record')
+    history.#revision = revision; history.#entries = entries.map(copyEntry)
     return history
   }
 
@@ -89,18 +111,6 @@ export class DocumentHistory {
     return bytes
   }
 
-  // Undo and Redo stacks follow from the retained entries; expired targets simply drop out.
-  #stacks(author) {
-    const undo = [], redo = []
-    for (const entry of this.#entries) {
-      if (entry.author !== author) continue
-      if (entry.kind === 'edit') { undo.push(entry.revision); redo.length = 0 }
-      else if (entry.kind === 'undo') { undo.pop(); redo.push(entry.revision) }
-      else { redo.pop(); undo.push(entry.revision) }
-    }
-    return { undo, redo }
-  }
-
   async #apply(author, p) {
     // Identity and role come from the authenticated caller at processing time, never from the proposal.
     if (typeof author !== 'string' || !UUID.test(author) || await this.#allowed(author) !== true) throw new Error('Sender lacks editing permission')
@@ -123,7 +133,7 @@ export class DocumentHistory {
       }
     } else {
       if (p.target <= this.#oldest) throw new Error('Undo or Redo target expired')
-      const { undo, redo } = this.#stacks(author)
+      const { undo, redo } = stacks(this.#entries, author)
       if ((p.kind === 'undo' ? undo : redo).at(-1) !== p.target) throw new Error('Invalid Undo or Redo target')
       const before = await this.#at(p.target - 1)
       const after = await applyDelta(before, this.#entries[p.target - this.#oldest - 1].change)
