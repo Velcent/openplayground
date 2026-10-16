@@ -45,8 +45,8 @@ export function stacks(entries, author) {
 
 // ponytail: each submit copies and commits the whole record and runs up to one merge per retained revision; fine for
 // typical songs, a ceiling near the 128 MiB document and 256 MiB history limits. Commit deltas incrementally if that shows.
-// Orders authored changes for one shared document. Merges are checked against every retained revision after a
-// proposal's base, so changing a value and changing it back still fences stale work. Undo and Redo revert the
+// Orders authored changes for one shared document. A proposal is rebased over every retained revision after its base,
+// one at a time, so changing a value and changing it back still fences stale work. Undo and Redo revert the
 // author's own latest operation and are checked against other authors' later changes only.
 export class DocumentHistory {
   #document; #format; #merge; #commit; #allowed
@@ -124,12 +124,16 @@ export class DocumentHistory {
     let next
     if (p.kind === 'edit') {
       if (p.base < this.#oldest) throw new Error('Base revision expired')
+      // Rebased over each later entry in turn, with the arguments its author's browser uses for the same entries
+      // (merge(before, local, after)): both reach the same bytes, and a change made and reverted in between still
+      // conflicts at its own step.
       const base = await this.#at(p.base), edited = await applyDelta(base, p.edit)
       let state = base
-      next = await this.#check(base, state, edited)
+      next = await this.#check(base, base, edited)
       for (const entry of this.#entries.slice(p.base - this.#oldest)) {
+        const before = state
         state = await applyDelta(state, entry.change)
-        next = await this.#check(base, state, edited)
+        next = await this.#check(before, next, state)
       }
     } else {
       if (p.target <= this.#oldest) throw new Error('Undo or Redo target expired')

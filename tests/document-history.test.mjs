@@ -166,3 +166,20 @@ test('pruned history expires stale proposals and old Undo without losing recent 
   assert.deepEqual(state(j), [100, 1, 0])
   assert.equal(j.snapshot().entries.length, 100)
 })
+
+test('a proposal is rebased entry by entry, exactly as its author rebases it, so both reach the same bytes', async () => {
+  // An ordered-list merge that is path-dependent: items the edited side added go after the current side's.
+  const append = (base, current, edited) => {
+    const added = [...edited].filter((v) => !base.includes(v))
+    if ([...base].some((v) => !current.includes(v) || !edited.includes(v))) throw new Error('Conflicting removal')
+    return Uint8Array.from([...current, ...added])
+  }
+  const j = await setup({ bytes: bytes(1), merge: append })
+  await j.submit(bob, await edit(0, [1], [1, 2]))
+  await j.submit(bob, await edit(1, [1, 2], [1, 2, 3]))
+  const proposal = bytes(1, 9)
+  await j.submit(alice, await edit(0, [1], [...proposal]))
+  // Alice's browser merged each accepted entry into her work in turn: merge(a(k-1), local, a(k)).
+  const local = append(bytes(1, 2), append(bytes(1), proposal, bytes(1, 2)), bytes(1, 2, 3))
+  assert.deepEqual(state(j), [...local])
+})
