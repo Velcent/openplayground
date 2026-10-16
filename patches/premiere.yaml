@@ -317,3 +317,105 @@
 - file: crates/ui-egui/src/header.rs
   find: '\n[ \t]*if btn\(ui, Icon::Fullscreen,[^{]*\{[^}]*\}'
   replace: ''
+
+# Live editing in Playground sessions (patches/premiere/live.diff + patches/live/playground_live.rs)
+# The adapter lives in new files: crates/ui-egui/src/live.rs (the shared document, merge, adoption, media listing,
+# presence) and apps/filmcraft-web/src/live.rs (the Shell wrapper that ends each frame with the session's frame hook,
+# the adapter's attachment, media files). The rules below only declare them and call in: each inserts one line at the
+# end of a file or after a function's signature, except rule 21, which wraps the app the web runner starts. Native
+# builds behave as before: the hooks compile on wasm, and in debug builds (the native tests) where nothing connects.
+# Verify all: node scripts/build.mjs check premiere head|release, then the e2e (tests/live-apps/premiere.mjs) and
+# `cargo test -p filmcraft-ui-egui --lib live::`. If upstream renames a function named below, anchor on its new
+# signature.
+#
+# Rule 10: the template in filmcraft-project (wasm, and debug builds for the native tests).
+# Rule 11: its wasm dependencies, under a target spelling nobody else uses; serde_json reads floats back exactly so
+#   equal documents give equal bytes on every peer. Drop one once the crate has it for wasm itself.
+- live: true
+  file: crates/project/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (patches/live/playground_live.rs).\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))]\npub mod playground_live;\n"
+- live: true
+  file: crates/project/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\njs-sys = \"0.3\"\nwasm-bindgen = \"0.2\"\nserde_json = { workspace = true, features = [\"float_roundtrip\"] }\n"
+
+# Rules 12–14: ids no one else in the session picks. One counter (`next_id`) numbers every object, so two people
+#   adding at once would get the same id. While connected, each allocator takes playground_live::fresh_id (the
+#   counter still goes up): Project::alloc_id, EditCtx::alloc (crates/edit, edits' clips and transitions) and the
+#   caption import's `alloc` closure. Verify: two people add a bin each at once and both stay (native merge test).
+# Rules 15 and 16: Date Created (`created`, taken from the id) stays a counter value for items added in a session,
+#   in Project::add_item and interchange's merge_into. Delete with rules 12–14.
+- live: true
+  file: crates/project/src/lib.rs
+  find: 'pub\s+fn\s+alloc_id\s*\(\s*&mut\s+self\s*\)[^{]*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] if crate::playground_live::connected() { return crate::playground_live::fresh_id(&mut self.next_id); }"
+- live: true
+  file: crates/edit/src/lib.rs
+  find: 'pub\s+fn\s+alloc\s*\(\s*&mut\s+self\s*\)[^{]*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] if filmcraft_project::playground_live::connected() { return filmcraft_project::playground_live::fresh_id(&mut *self.next_id); }"
+- live: true
+  file: crates/engine/src/captions.rs
+  find: 'let\s+mut\s+alloc\s*=\s*\|\|\s*\{'
+  after: "\n            #[cfg(target_arch = \"wasm32\")] if filmcraft_project::playground_live::connected() { return filmcraft_project::playground_live::fresh_id(&mut next); }"
+- live: true
+  file: crates/project/src/lib.rs
+  find: 'let\s+created\s*=\s*id\.0\s*;'
+  after: " #[cfg(target_arch = \"wasm32\")] let created = created.min(self.next_id - 1);"
+- live: true
+  file: crates/interchange/src/lib.rs
+  find: 'it\.created\s*=\s*it\.id\.0\s*;'
+  after: " #[cfg(target_arch = \"wasm32\")] if it.created > target.next_id { it.created = target.next_id; }"
+
+# Rules 17 and 18: Undo and Redo go to the session while connected, which takes back only this person's edits.
+#   First in Session::undo and Session::redo, which every Undo goes through (Edit menu, shortcuts, the History panel,
+#   `edit.undo`). Verify: the e2e's undo step reverts only the owner's edit.
+- live: true
+  file: crates/engine/src/lib.rs
+  find: 'pub\s+fn\s+undo\s*\(\s*&mut\s+self\s*\)[^{]*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", debug_assertions))] if filmcraft_project::playground_live::undo(false) { return None; }"
+- live: true
+  file: crates/engine/src/lib.rs
+  find: 'pub\s+fn\s+redo\s*\(\s*&mut\s+self\s*\)[^{]*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", debug_assertions))] if filmcraft_project::playground_live::undo(true) { return None; }"
+
+# Rule 19: the UI crate's live module (wasm, and the crate's own tests).
+# Rule 20: the others' pointers and selected clips, drawn on the Timeline in their colors: in timeline::show right
+#   before its interaction pass (the clips are drawn; `layout` is this frame's). If that call moves, call it anywhere
+#   in timeline::show after the clips are painted, with the frame's Layout.
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web only).\n#[cfg(any(target_arch = \"wasm32\", test))]\npub mod live;\n"
+- live: true
+  file: crates/ui-egui/src/panels/timeline.rs
+  find: '^\s*interact\(app,'
+  before: "    #[cfg(any(target_arch = \"wasm32\", test))] crate::live::paint_timeline(app, ui, &layout);\n"
+
+# Rules 21–23: the web glue. The module; the app the web runner starts wrapped in live::Shell, which delegates every
+#   eframe::App method to WebApp, then runs the session's frame hook, and gives the runner `as_any_mut`; and the
+#   adapter attached once the runner has started, right before it is kept alive.
+- live: true
+  file: apps/*-web/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session.\npub mod live;\n"
+- live: true
+  file: apps/*-web/src/lib.rs
+  find: 'Ok\(Box::new\((WebApp\s*\{[^;]*?\})\)\)'
+  replace: 'Ok(Box::new(live::Shell($1)))'
+- live: true
+  file: apps/*-web/src/lib.rs
+  find: 'std::mem::forget\(runner\);'
+  before: "live::attach(&runner);\n    "
+
+# Rules 24 and 25: a page opened for a session (`?pg-session=<room>`) shows the session's project, so it neither
+#   reopens this browser's unsaved-changes snapshot nor overwrites it: first in recovery::load_snapshot and
+#   Autosave::tick. Verify: with unsaved changes in one tab, join a session in another, reload the first: it recovers.
+- live: true
+  file: apps/*-web/src/recovery.rs
+  find: 'pub\s+async\s+fn\s+load_snapshot\s*\([^{]*\{'
+  after: "\n    if crate::live::in_session() { return None; }"
+- live: true
+  file: apps/*-web/src/recovery.rs
+  find: 'pub\s+fn\s+tick\s*\(\s*&mut\s+self\b[^{]*\{'
+  after: "\n        if crate::live::in_session() { return; }"

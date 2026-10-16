@@ -1,307 +1,148 @@
-diff --git a/apps/filmcraft-web/src/fs.rs b/apps/filmcraft-web/src/fs.rs
-index 416fbf9..a1e139e 100644
---- a/apps/filmcraft-web/src/fs.rs
-+++ b/apps/filmcraft-web/src/fs.rs
-@@ -99,6 +99,22 @@ pub fn register_blob(name: &str, blob: web_sys::Blob) -> String {
-     })
- }
- 
-+/// Register a `Blob` at exactly `path` (media from a Playground session keep the path the project gives them);
-+/// false, and nothing changes, when the path is taken.
-+pub fn register_blob_at(path: &str, blob: web_sys::Blob) -> bool {
-+    FS.with(|fs| {
-+        let mut fs = fs.borrow_mut();
-+        if fs.entries.contains_key(path) {
-+            return false;
-+        }
-+        let (id, size) = (fs.next_id, blob.size() as u64);
-+        fs.next_id += 1;
-+        fs.blobs.insert(id, blob);
-+        fs.entries.insert(path.to_string(), Entry::Blob { id, size });
-+        true
-+    })
-+}
+diff --git a/apps/filmcraft-web/src/live.rs b/apps/filmcraft-web/src/live.rs
+new file mode 100644
+index 0000000..cea9cd3
+--- /dev/null
++++ b/apps/filmcraft-web/src/live.rs
+@@ -0,0 +1,99 @@
++//! Live editing in a Playground session (`patches/premiere.yaml` wires it in): the web app wrapped so each frame ends
++//! with the session's work, the adapter attached to the running app, and the media the shared project refers to
++//! read from and installed into the browser's file table ([`crate::fs`]). The model side is
++//! `filmcraft_ui_egui::live`.
 +
- /// Put bytes at a path (no download).
- pub fn put(path: &str, data: Vec<u8>) {
-     FS.with(|fs| fs.borrow_mut().entries.insert(path.to_string(), Entry::Mem(data.into())));
-diff --git a/apps/filmcraft-web/src/import.rs b/apps/filmcraft-web/src/import.rs
-index a075f9a..d849af2 100644
---- a/apps/filmcraft-web/src/import.rs
-+++ b/apps/filmcraft-web/src/import.rs
-@@ -155,6 +155,25 @@ pub fn take_files(files: Vec<web_sys::File>) {
-     });
- }
- 
-+/// Live editing in a Playground session: the media the shared project refers to travel as session files. They are
-+/// read as the `Blob`s this browser has, and media another person imported are installed under the project's path,
-+/// kept in OPFS like an import, without an edit. A path this browser uses already keeps its own file.
-+pub fn share_media() -> Result<(), JsValue> {
-+    let adapter = js_sys::Reflect::get(&js_sys::global(), &"playgroundLiveAdapter".into())?;
-+    let read = |path: String| fs::blob(&path).ok_or_else(|| JsValue::from_str("Missing media"));
-+    js_sys::Reflect::set(&adapter, &"readAsset".into(), &Closure::<dyn Fn(String) -> Result<web_sys::Blob, JsValue>>::new(read).into_js_value())?;
-+    let write = |path: String, _name: String, bytes: js_sys::Uint8Array| -> Result<(), JsValue> {
-+        let file = web_sys::File::new_with_u8_array_sequence(&js_sys::Array::of1(&bytes), path.rsplit('/').next().unwrap_or(&path))?;
-+        if fs::register_blob_at(&path, file.clone().into()) {
-+            crate::recovery::keep_media(&path, &file);
-+            crate::post(move |w, _| filmcraft_ui_egui::live::media_arrived(&mut w.app, &path));
-+        }
-+        Ok(())
-+    };
-+    js_sys::Reflect::set(&adapter, &"writeAsset".into(), &Closure::<dyn Fn(String, String, js_sys::Uint8Array) -> Result<(), JsValue>>::new(write).into_js_value())?;
-+    Ok(())
-+}
++use filmcraft_engine::Services;
++use filmcraft_engine::project::playground_live::web;
++use filmcraft_ui_egui::FilmcraftApp;
++use wasm_bindgen::prelude::*;
 +
- /// Files a picker returned: imported, or with a relink hint, the first one is registered under
- /// `/files/<name>` and the hint's command runs on it (#111).
- fn picked(files: Vec<web_sys::File>, relink: Option<RelinkHint>) {
-diff --git a/apps/filmcraft-web/src/lib.rs b/apps/filmcraft-web/src/lib.rs
-index 21512cc..8022165 100644
---- a/apps/filmcraft-web/src/lib.rs
-+++ b/apps/filmcraft-web/src/lib.rs
-@@ -113,6 +113,11 @@ impl eframe::App for WebApp {
- 
-     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-         self.app.ui(ui, frame);
-+        filmcraft_ui_egui::live::frame(&mut self.app, ui.ctx());
++use crate::{WebApp, fs};
++
++/// The web app, ending each frame with live editing's ([`filmcraft_ui_egui::live::frame`]).
++pub struct Shell(pub WebApp);
++
++impl eframe::App for Shell {
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        self.0.ui(ui, frame);
++        filmcraft_ui_egui::live::frame(&mut self.0.app, ui.ctx());
++    }
++
++    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
++        self.0.logic(ctx, frame);
++    }
++
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
++        self.0.raw_input_hook(ctx, raw_input);
++    }
++
++    fn save(&mut self, storage: &mut dyn eframe::Storage) {
++        self.0.save(storage);
++    }
++
++    fn auto_save_interval(&self) -> std::time::Duration {
++        self.0.auto_save_interval()
++    }
++
++    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
++        self.0.clear_color(visuals)
++    }
++
++    fn persist_egui_memory(&self) -> bool {
++        self.0.persist_egui_memory()
 +    }
 +
 +    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
 +        Some(self)
-     }
- }
- 
-@@ -138,7 +143,8 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
- 
-     // Media kept in OPFS by earlier sessions come back under their paths (recovery).
-     let restored = if opfs::available() && !query_flag("fresh") { recovery::restore_media().await } else { 0 };
--    let recovered = if query_flag("fresh") || query_flag("norecover") { None } else { recovery::load_snapshot().await };
-+    // A Playground session's page shows the session's project, not this browser's unsaved one.
-+    let recovered = if query_flag("fresh") || query_flag("norecover") || query_flag("pg-session") { None } else { recovery::load_snapshot().await };
-     webcodecs::probe().await;
- 
-     api::install()?;
-@@ -219,6 +225,17 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
-         )
-         .await?;
-     set_info("startupMs", json!(t0.elapsed().as_secs_f64() * 1000.0));
-+    // Live editing in a Playground session.
-+    let live = runner.clone();
-+    let attached = filmcraft_engine::project::playground_live::web::attach::<FilmcraftApp>(
-+        concat!("premiere:1:", env!("CARGO_PKG_VERSION")),
-+        move |with| live.app_mut::<WebApp>().map(|mut web| with(&mut web.app)).is_some(),
-+        repaint,
-+    )
-+    .and_then(|()| import::share_media());
-+    if let Err(e) = attached {
-+        log::error!("live editing: {e:?}");
-+    }
-     // keep the runner alive for the page's lifetime
-     std::mem::forget(runner);
-     if let Some(el) = doc.get_element_by_id("loading") {
-diff --git a/apps/filmcraft-web/src/recovery.rs b/apps/filmcraft-web/src/recovery.rs
-index 6001531..96a9300 100644
---- a/apps/filmcraft-web/src/recovery.rs
-+++ b/apps/filmcraft-web/src/recovery.rs
-@@ -17,8 +17,17 @@ use serde_json::{Value, json};
- use crate::opfs;
- use crate::recovery_policy::{Action, Policy};
- 
--const SNAPSHOT: &str = "recovery/snapshot.fcproj";
--const META: &str = "recovery/meta.json";
-+/// A recovery file. A page opened for a Playground session (`?pg-session=<room>`) keeps its own folder, so the shared
-+/// project never takes the place of this browser's own unsaved one.
-+fn recovery(file: &str) -> String {
-+    let search = web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default();
-+    let room = web_sys::UrlSearchParams::new_with_str(&search).ok().and_then(|p| p.get("pg-session"));
-+    match room.map(|r| r.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>()) {
-+        Some(room) if !room.is_empty() => format!("recovery/{room}/{file}"),
-+        _ => format!("recovery/{file}"),
 +    }
 +}
 +
- /// Media larger than this are not copied to OPFS.
- const KEEP_MAX: f64 = 4.0 * 1024.0 * 1024.0 * 1024.0;
- 
-@@ -67,8 +76,8 @@ impl Autosave {
-                 let meta = json!({"dirty": true, "name": s.project.name, "revision": s.revision, "time": js_sys::Date::now()});
-                 let d1 = done(self.outcomes.clone(), failed.clone(), left.clone(), ctx.clone());
-                 let d2 = done(self.outcomes.clone(), failed, left, ctx.clone());
--                opfs::write_then(SNAPSHOT.into(), filmcraft_format::encode(&s.project, false), Some(d1));
--                opfs::write_then(META.into(), meta.to_string().into_bytes(), Some(d2));
-+                opfs::write_then(recovery("snapshot.fcproj"), filmcraft_format::encode(&s.project, false), Some(d1));
-+                opfs::write_then(recovery("meta.json"), meta.to_string().into_bytes(), Some(d2));
-             }
-             Action::WriteClean => {
-                 let (out, ctx) = (self.outcomes.clone(), ctx.clone());
-@@ -76,7 +85,7 @@ impl Autosave {
-                     out.borrow_mut().push(Outcome::Clean { ok });
-                     ctx.request_repaint();
-                 });
--                opfs::write_then(META.into(), json!({"dirty": false}).to_string().into_bytes(), Some(done));
-+                opfs::write_then(recovery("meta.json"), json!({"dirty": false}).to_string().into_bytes(), Some(done));
-             }
-         }
-     }
-@@ -87,11 +96,11 @@ pub async fn load_snapshot() -> Option<(String, Vec<u8>)> {
-     if !opfs::available() {
-         return None;
-     }
--    let meta: Value = serde_json::from_slice(&opfs::read(META).await?).ok()?;
-+    let meta: Value = serde_json::from_slice(&opfs::read(&recovery("meta.json")).await?).ok()?;
-     if meta.get("dirty").and_then(Value::as_bool) != Some(true) {
-         return None;
-     }
--    let bytes = opfs::read(SNAPSHOT).await?;
-+    let bytes = opfs::read(&recovery("snapshot.fcproj")).await?;
-     let name = meta.get("name").and_then(Value::as_str).unwrap_or("Recovered").to_string();
-     Some((format!("{name}.fcproj"), bytes))
- }
-diff --git a/crates/edit/src/lib.rs b/crates/edit/src/lib.rs
-index 2f2588d..be99895 100644
---- a/crates/edit/src/lib.rs
-+++ b/crates/edit/src/lib.rs
-@@ -69,6 +69,9 @@ impl EditCtx<'_> {
-     pub fn alloc(&mut self) -> u64 {
-         let v = *self.next_id;
-         *self.next_id += 1;
-+        // Live editing (web): an id no one else editing at the same time picks.
-+        #[cfg(target_arch = "wasm32")]
-+        let v = filmcraft_project::playground_live::fresh_id(&mut { v });
-         v
-     }
- }
-diff --git a/crates/engine/src/captions.rs b/crates/engine/src/captions.rs
-index 1566a59..ed0d536 100644
---- a/crates/engine/src/captions.rs
-+++ b/crates/engine/src/captions.rs
-@@ -130,6 +130,8 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format, name: O
-         let mut alloc = || {
-             let v = next;
-             next += 1;
-+            #[cfg(target_arch = "wasm32")]
-+            let v = filmcraft_project::playground_live::fresh_id(&mut { v });
-             v
-         };
-         let mut track = filmcraft_captions::track_from_document(&doc, tid, &track_name, format.track_format(), &mut alloc);
-diff --git a/crates/interchange/src/lib.rs b/crates/interchange/src/lib.rs
-index ad05375..7cafd8a 100644
---- a/crates/interchange/src/lib.rs
-+++ b/crates/interchange/src/lib.rs
-@@ -435,7 +435,8 @@ pub fn merge_into(target: &mut Project, fragment: Imported, bin: Option<BinId>)
-     let mut new_items: BTreeMap<ItemId, filmcraft_project::ProjectItem> = BTreeMap::new();
-     for (old, mut it) in frag.items {
-         it.id = items[&old];
--        it.created = it.id.0;
-+        // Live editing (web) hands out ids above the counter: Date Created stays a counter value.
-+        it.created = it.id.0.min(target.next_id);
-         match &mut it.kind {
-             ItemKind::Sequence(seq) => {
-                 let seq = std::sync::Arc::make_mut(seq);
-diff --git a/crates/project/Cargo.toml b/crates/project/Cargo.toml
-index 29f4301..508e0cd 100644
---- a/crates/project/Cargo.toml
-+++ b/crates/project/Cargo.toml
-@@ -18,5 +18,15 @@ serde = { workspace = true }
- serde_json = { workspace = true }
- thiserror = { workspace = true }
- 
-+[target.'cfg(target_arch = "wasm32")'.dependencies]
-+js-sys = "0.3"
-+wasm-bindgen = "0.2"
-+# Live editing: equal documents give equal bytes on every peer only if floats read back exactly.
-+serde_json = { workspace = true, features = ["float_roundtrip"] }
++/// This page shows a Playground session (`?pg-session=<room>`): the session's project is not this browser's own, so
++/// it neither reopens nor overwrites the browser's unsaved-changes snapshot ([`crate::recovery`]).
++pub fn in_session() -> bool {
++    let search = web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default();
++    web_sys::UrlSearchParams::new_with_str(&search).is_ok_and(|p| p.has("pg-session"))
++}
 +
- [dev-dependencies]
- proptest = { workspace = true }
++/// Offers the running app to a Playground session (`runner` has started it).
++pub fn attach(runner: &eframe::WebRunner) {
++    let live = runner.clone();
++    let attached = web::attach::<FilmcraftApp>(
++        concat!("premiere:1:", env!("CARGO_PKG_VERSION")),
++        move |with| live.app_mut::<Shell>().map(|mut shell| with(&mut shell.0.app)).is_some(),
++        crate::repaint,
++    )
++    .and_then(|()| share_media());
++    if let Err(e) = attached {
++        log::error!("live editing: {e:?}");
++    }
++}
 +
-+[features]
-+# Playground live editing's adapter (`playground_live`) in native test builds of the crates that use it.
-+live = []
-diff --git a/crates/project/src/lib.rs b/crates/project/src/lib.rs
-index fb55786..dc70c2a 100644
---- a/crates/project/src/lib.rs
-+++ b/crates/project/src/lib.rs
-@@ -21,6 +21,9 @@ pub mod mask;
- pub mod mixer;
- pub mod multicam;
- pub mod narration;
-+// Live editing in a Playground session (web only).
-+#[cfg(any(target_arch = "wasm32", test, feature = "live"))]
-+pub mod playground_live;
- pub mod transcript;
- pub mod vtransition;
- 
-@@ -1359,13 +1362,16 @@ impl Project {
-     pub fn alloc_id(&mut self) -> u64 {
-         let id = self.next_id;
-         self.next_id += 1;
-+        // Live editing (web): an id no one else editing at the same time picks.
-+        #[cfg(target_arch = "wasm32")]
-+        let id = playground_live::fresh_id(&mut { id });
-         id
-     }
- 
-     /// Add an item to a bin (root when None / not found).
-     pub fn add_item(&mut self, name: &str, label: Label, kind: ItemKind, bin: Option<BinId>) -> ItemId {
-+        let created = self.next_id;
-         let id = ItemId(self.alloc_id());
--        let created = id.0;
-         self.items.insert(id, ProjectItem { id, name: name.into(), label, kind, metadata: BTreeMap::new(), created, split: SplitMarks::default() });
-         if let Some(b) = bin.and_then(|b| self.root.find_bin_mut(b)) {
-             b.children.push(BinEntry::Item(id));
-diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
-index b63880d..966f231 100644
---- a/crates/ui-egui/Cargo.toml
-+++ b/crates/ui-egui/Cargo.toml
-@@ -53,6 +53,7 @@ filmcraft-codecs = { workspace = true }
- filmcraft-platform = { workspace = true }
- filmcraft-interchange = { workspace = true }
- egui_kittest = { workspace = true, features = ["eframe", "wgpu"] }
-+filmcraft-project = { workspace = true, features = ["live"] }
- 
- # build.rs bakes contributors/contributors.json into the binary (About ▸ Contributors).
- [build-dependencies]
-diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index cb4a234..1021d1b 100644
---- a/crates/ui-egui/src/lib.rs
-+++ b/crates/ui-egui/src/lib.rs
-@@ -45,6 +45,9 @@ pub mod header;
- pub mod i18n;
- pub mod icons;
- pub mod links;
-+// Live editing in a Playground session (web only).
-+#[cfg(any(target_arch = "wasm32", test))]
-+pub mod live;
- pub mod menus;
- pub mod native_dialogs;
- pub mod panels;
++/// The media the shared project refers to travel as session files: read as the `Blob`s this browser has, and media
++/// another person imported installed under the project's path (imported files kept in OPFS like an import), without an
++/// edit. A path this browser uses already keeps its own file.
++fn share_media() -> Result<(), JsValue> {
++    let adapter = js_sys::Reflect::get(&js_sys::global(), &"playgroundLiveAdapter".into())?;
++    let read = |path: String| fs::blob(&path).ok_or_else(|| JsValue::from_str("Missing media"));
++    let read = Closure::<dyn Fn(String) -> Result<web_sys::Blob, JsValue>>::new(read);
++    js_sys::Reflect::set(&adapter, &"readAsset".into(), &read.into_js_value())?;
++    let write = |path: String, _name: String, bytes: js_sys::Uint8Array| -> Result<(), JsValue> {
++        if fs::WebServices.file_size(&path).is_ok() {
++            return Ok(());
++        }
++        match path.strip_prefix("/files/") {
++            // Free, so registering the name gives exactly this path.
++            Some(name) => {
++                let file = web_sys::File::new_with_u8_array_sequence(&js_sys::Array::of1(&bytes), name)?;
++                let at = fs::register_blob(name, file.clone().into());
++                crate::recovery::keep_media(&at, &file);
++            }
++            None => fs::put(&path, bytes.to_vec()),
++        }
++        crate::post(move |w, _| filmcraft_ui_egui::live::media_arrived(&mut w.app, &path));
++        Ok(())
++    };
++    let write = Closure::<dyn Fn(String, String, js_sys::Uint8Array) -> Result<(), JsValue>>::new(write);
++    js_sys::Reflect::set(&adapter, &"writeAsset".into(), &write.into_js_value())?;
++    Ok(())
++}
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..bb0c5c8
+index 0000000..36f1702
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,468 @@
 +//! Live editing in a Playground session (web only). The shared document is the open project (`Project`). What each
 +//! person sees for themselves (selection, playheads, open sequences, Timeline zoom and scroll, panels, the Source
 +//! monitor) already lives outside it, in the engine's `EditorState` and the UI; so does what belongs to this machine:
 +//! the renderer, the scratch disks and record-armed tracks. Imported media (files the project refers to by path,
 +//! `/files/<name>` on the web) travel as session files: the web host reads and installs their bytes.
++//! Presence: each person's sequence, Timeline pointer (track and time) and selected clips, drawn on the others'
++//! Timeline in that person's color.
 +
-+use std::cell::Cell;
++use std::cell::{Cell, RefCell};
 +use std::collections::BTreeSet;
 +use std::sync::Arc;
 +
-+use filmcraft_project::playground_live::{self, Live};
-+use filmcraft_project::{MediaClip, MediaRef, Project, ProjectItem, ProjectSettings};
-+use serde_json::Value;
++use egui::{Color32, FontId, Pos2, Rect, Shape, Stroke, StrokeKind, pos2, vec2};
++use filmcraft_project::playground_live::{self, Live, Presence};
++use filmcraft_project::{ClipId, MediaClip, MediaRef, Project, ProjectItem, ProjectSettings};
++use filmcraft_time::Tick;
++use serde_json::{Map, Value, json};
 +
 +use crate::FilmcraftApp;
++use crate::panels::timeline::Layout;
 +
 +thread_local! {
 +    /// The last frame had a pointer button down or a text field focused.
 +    static INPUT: Cell<bool> = const { Cell::new(false) };
++    /// Where the pointer was at the end of the last frame that showed the Timeline.
++    static POINTER: Cell<Option<Pos2>> = const { Cell::new(None) };
++    /// The Timeline was shown this frame ([`paint_timeline`]).
++    static SHOWN: Cell<bool> = const { Cell::new(false) };
++    /// The others in the session.
++    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
 +}
++
++/// Clips sent as this person's selection, at most.
++const MAX_SELECTION: usize = 50;
 +
 +/// Project settings that belong to this machine.
 +const LOCAL_SETTINGS: [&str; 2] = ["renderer", "scratch"];
@@ -312,7 +153,49 @@ index 0000000..bb0c5c8
 +/// The end of a frame: [`playground_live::frame`], with what egui knows of the pointer and the keyboard.
 +pub fn frame(app: &mut FilmcraftApp, ctx: &egui::Context) {
 +    INPUT.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
++    POINTER.set(if SHOWN.take() { ctx.pointer_hover_pos() } else { None });
 +    playground_live::frame(app);
++}
++
++/// The others' pointers and selected clips on this person's Timeline, in their colors, when they show the same
++/// sequence. Called after the Timeline drew its clips (`layout` is this frame's).
++pub fn paint_timeline(app: &FilmcraftApp, ui: &egui::Ui, layout: &Layout) {
++    SHOWN.set(true);
++    let (Some(id), Some(seq)) = (app.session.state.active_sequence, app.session.active_sequence()) else { return };
++    let painter = ui.painter().with_clip_rect(layout.content);
++    // Remote numbers: clamped to the visible area (a pointer off it is left out).
++    let (left, right) = (layout.content.min.x - 8.0, layout.content.max.x + 8.0);
++    let x = |t: i64| layout.x_of(Tick(t)).clamp(left, right);
++    let row = |track: u64| layout.rows.iter().find(|r| r.track.0 == track);
++    OTHERS.with_borrow(|others| {
++        for o in others.iter().filter(|o| o.state["sequence"].as_u64() == Some(id.0)) {
++            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
++            for clip in o.state["selection"].as_array().into_iter().flatten().take(MAX_SELECTION).filter_map(Value::as_u64) {
++                let Some((track, item)) = seq.find_item(ClipId(clip)) else { continue };
++                let Some(r) = row(track.0) else { continue };
++                let (x0, x1) = (x(item.start.0), x(item.end().0));
++                painter.rect_stroke(Rect::from_x_y_ranges(x0..=x1, r.rect.y_range()), 2.0, Stroke::new(2.0, color), StrokeKind::Inside);
++            }
++            let pointer = &o.state["pointer"];
++            let px = pointer["time"].as_i64().map(x).filter(|x| (left..right).contains(x));
++            if let (Some(r), Some(x)) = (pointer["track"].as_u64().and_then(row), px) {
++                arrow(&painter, pos2(x, r.rect.center().y), color, &o.name);
++            }
++        }
++    });
++}
++
++/// A pointer arrow at `tip` with a name tag, in `color`.
++fn arrow(painter: &egui::Painter, tip: Pos2, color: Color32, name: &str) {
++    let points = [vec2(0.0, 0.0), vec2(0.0, 16.0), vec2(11.0, 11.0)].map(|v| tip + v).to_vec();
++    painter.add(Shape::convex_polygon(points, color, Stroke::new(1.0, Color32::WHITE)));
++    if name.is_empty() {
++        return;
++    }
++    let text = painter.layout_no_wrap(name.to_owned(), FontId::proportional(11.0), Color32::WHITE);
++    let tag = Rect::from_min_size(tip + vec2(10.0, 13.0), text.size() + vec2(8.0, 4.0));
++    painter.rect_filled(tag, 3.0, color);
++    painter.galley(tag.min + vec2(4.0, 2.0), text, Color32::WHITE);
 +}
 +
 +/// The files a media item reads: its media and its proxy (generators have none).
@@ -473,6 +356,27 @@ index 0000000..bb0c5c8
 +        paths.into_iter().map(String::from).collect()
 +    }
 +
++    /// The sequence shown, the Timeline pointer as track and time, the selected clips.
++    fn live_presence(&self) -> Value {
++        let Some(sequence) = self.session.state.active_sequence else { return Value::Null };
++        let mut state = Map::new();
++        state.insert("sequence".into(), json!(sequence.0));
++        let layout = self.tl.layout.as_ref();
++        let at = POINTER.get().zip(layout).filter(|(p, l)| l.content.contains(*p));
++        if let Some((p, l)) = at
++            && let Some(row) = l.row_at(p.y)
++        {
++            state.insert("pointer".into(), json!({"track": row.track.0, "time": l.tick_at(p.x).0}));
++        }
++        let selection: Vec<u64> = self.session.state.selection.iter().take(MAX_SELECTION).map(|c| c.0).collect();
++        state.insert("selection".into(), json!(selection));
++        Value::Object(state)
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        OTHERS.set(others);
++    }
++
 +    fn live_quiet(&self) -> bool {
 +        let s = &self.session;
 +        !INPUT.get() && s.trim_play.dynamic.is_none() && !s.mixrec.active() && !s.mcrec.active() && !s.voiceover.recording()
@@ -631,6 +535,24 @@ index 0000000..bb0c5c8
 +    }
 +
 +    #[test]
++    fn presence_is_the_sequence_the_timeline_pointer_as_track_and_time_and_the_selected_clips() {
++        let mut app = demo();
++        let seq = app.session.active_sequence().unwrap();
++        let (v1, clip) = (seq.video_tracks[0].id, seq.video_tracks[0].items[1].id);
++        let content = Rect::from_min_max(pos2(100.0, 50.0), pos2(1100.0, 450.0));
++        let rect = Rect::from_min_max(pos2(100.0, 50.0), pos2(1100.0, 100.0));
++        let row = crate::panels::timeline::Row { track: v1, kind: filmcraft_project::TrackKind::Video, index: 0, rect, lane: false };
++        app.tl.layout = Some(Layout { content, ruler: content, rows: vec![row], pps: 100.0, scroll: 2.0, split_y: 300.0 });
++        app.session.state.selection = vec![clip];
++        POINTER.set(Some(pos2(350.0, 75.0)));
++        let sequence = app.session.state.active_sequence.unwrap().0;
++        let pointer = json!({"track": v1.0, "time": Tick::from_seconds_f64(4.5).0});
++        assert_eq!(app.live_presence(), json!({"sequence": sequence, "pointer": pointer, "selection": [clip.0]}));
++        POINTER.set(Some(pos2(350.0, 200.0)));
++        assert_eq!(app.live_presence(), json!({"sequence": sequence, "selection": [clip.0]}), "no track under the pointer");
++    }
++
++    #[test]
 +    fn a_remote_change_waits_while_recording_and_undo_goes_to_the_session() {
 +        let (mut a, mut b) = (demo(), demo());
 +        let ctx = egui::Context::default();
@@ -655,34 +577,3 @@ index 0000000..bb0c5c8
 +        assert!(!a.session.history.can_undo());
 +    }
 +}
-diff --git a/crates/ui-egui/src/menus.rs b/crates/ui-egui/src/menus.rs
-index 48b4b82..b407b83 100644
---- a/crates/ui-egui/src/menus.rs
-+++ b/crates/ui-egui/src/menus.rs
-@@ -178,6 +178,10 @@ pub fn targets_source(app: &FilmcraftApp, params: &Value) -> bool {
- 
- /// Execute a UI or engine command by id.
- pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut params: Value) -> Result<Value, String> {
-+    #[cfg(any(target_arch = "wasm32", test))]
-+    if matches!(id, "edit.undo" | "edit.redo") && filmcraft_project::playground_live::undo(id == "edit.redo") {
-+        return Ok(Value::Null);
-+    }
-     if id == "edit.selectAll" && (crate::panels::graphics::select_all_edited_text(app) || crate::panels::effect_controls::select_all_keyframes(app)) {
-         return Ok(Value::Null);
-     }
-diff --git a/crates/ui-egui/src/panels/misc.rs b/crates/ui-egui/src/panels/misc.rs
-index f5bc5f1..c230fda 100644
---- a/crates/ui-egui/src/panels/misc.rs
-+++ b/crates/ui-egui/src/panels/misc.rs
-@@ -38,6 +38,11 @@ pub fn history(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
-         }
-     });
-     if let Some(n) = target {
-+        // Live editing (web): the steps go to the session, which takes back only this person's edits.
-+        #[cfg(target_arch = "wasm32")]
-+        if (0..n.unsigned_abs()).all(|_| filmcraft_project::playground_live::undo(n > 0)) {
-+            return;
-+        }
-         if n < 0 {
-             for _ in 0..-n {
-                 app.session.undo();

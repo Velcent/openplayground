@@ -2,6 +2,8 @@
 // state.rs). Ctrl+Down is Select Next Clip (engine keyboard.rs: with nothing selected, the clips at the playhead on the
 // targeted tracks), Shift+E is Clip > Enable, a toggle (commands.rs). Selection is personal, so the editor steps twice
 // to reach the next clips. Ctrl+Z is Undo. Media: files dropped on the page are imported (filmcraft-web import.rs).
+// Presence: the owner clicks V1's third clip (selected, with its linked audio) and the pointer stays on it; the
+// owner's edit starts with Ctrl+Shift+A (Deselect All) so it still picks the first clips.
 const key = async (page, ...keys) => {
   await page.focus('#filmcraft_canvas')
   for (const k of keys) { await page.keyboard.press(k); await page.waitForTimeout(300) }
@@ -11,8 +13,23 @@ export default {
   path: '/filmcraft/',
   viewport: { width: 1280, height: 800 },
   ready: (page) => page.waitForTimeout(1500),
+  // Selects V1's third clip: the window.filmcraft control API gives its place on the canvas.
+  point: async (page) => {
+    const at = await page.evaluate(async () => {
+      const { sequence } = playgroundLiveAdapter.presence()
+      const doc = JSON.parse(new TextDecoder().decode(playgroundLiveAdapter.checkpoint()))
+      const { x, y } = await filmcraft.request('ui.timeline.locate', { clip: doc.items[sequence].kind.Sequence.video_tracks[0].items[2].id })
+      const canvas = document.querySelector('#filmcraft_canvas').getBoundingClientRect()
+      return { x: canvas.left + x, y: canvas.top + y }
+    })
+    await page.mouse.move(at.x, at.y)
+    await page.mouse.down()
+    await page.waitForTimeout(100)
+    await page.mouse.up()
+    await page.waitForTimeout(500)
+  },
   // Disables the first clips (V1 and its linked audio).
-  editA: (page) => key(page, 'Control+ArrowDown', 'Shift+E'),
+  editA: (page) => key(page, 'Control+Shift+A', 'Control+ArrowDown', 'Shift+E'),
   // Disables the second clips.
   editB: (page) => key(page, 'Control+ArrowDown', 'Control+ArrowDown', 'Shift+E'),
   undo: (page) => key(page, 'Control+z'),
