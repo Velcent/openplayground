@@ -1,0 +1,377 @@
+diff --git a/apps/vectorcraft-web/src/web.rs b/apps/vectorcraft-web/src/web.rs
+index cfe8458..083b8c7 100644
+--- a/apps/vectorcraft-web/src/web.rs
++++ b/apps/vectorcraft-web/src/web.rs
+@@ -81,10 +81,27 @@ pub fn start() {
+             restarts: 0,
+         };
+         track_paste(&host.pasted);
++        attach_live(&host);
+         run(host, canvas, None).await;
+     });
+ }
+ 
++/// Offer live editing to the page (a Playground session): on the app the runner has, while it has one.
++fn attach_live(host: &Host) {
++    let (runner, pasted) = (host.runner.clone(), host.pasted.clone());
++    let attached = vectorcraft_ui_egui::live::attach(
++        move |f| runner.app_mut::<WebShell>().and_then(|mut shell| shell.app.as_mut().map(|app| f(app))).is_some(),
++        move || {
++            if let Some(ctx) = pasted.try_borrow().ok().and_then(|p| p.ctx.clone()) {
++                ctx.request_repaint();
++            }
++        },
++    );
++    if let Err(e) = attached {
++        log::error!("vectorcraft-web: no live editing: {}", js_err(e));
++    }
++}
++
+ /// An app whose graphics were lost, on its way to new ones.
+ struct Moving {
+     app: VectorcraftApp,
+@@ -398,8 +415,14 @@ impl eframe::App for WebShell {
+     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+         if let Some(app) = &mut self.app {
+             app.ui(ui);
++            vectorcraft_ui_egui::live::frame(app, ui.ctx());
+         }
+     }
++
++    // Live editing reaches the app through the runner.
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
++    }
+ }
+ 
+ fn services(inbox: Inbox, place_inbox: PlaceInbox, ctx: egui::Context, locks: Option<WebLocks>) -> Services {
+diff --git a/crates/doc/src/lib.rs b/crates/doc/src/lib.rs
+index cc4f1c7..1731018 100644
+--- a/crates/doc/src/lib.rs
++++ b/crates/doc/src/lib.rs
+@@ -737,6 +737,11 @@ pub struct Document {
+     index: id_index::IdIndex,
+ }
+ 
++/// Live editing (web only): where [`Document::alloc_id`] takes ids from once set, from the counter,
++/// so that people editing a document at once give new objects different ids.
++#[cfg(target_arch = "wasm32")]
++pub static FRESH_ID: std::sync::OnceLock<fn(&mut u64) -> u64> = std::sync::OnceLock::new();
++
+ fn ppi72() -> f64 {
+     72.0
+ }
+@@ -829,6 +834,10 @@ impl Document {
+ 
+     /// Allocate a fresh node id.
+     pub fn alloc_id(&mut self) -> NodeId {
++        #[cfg(target_arch = "wasm32")]
++        if let Some(fresh) = FRESH_ID.get().filter(|_| self.next_id < MAX_NEXT_ID) {
++            return NodeId(fresh(&mut self.next_id));
++        }
+         let id = NodeId(self.next_id);
+         // Never reached from a counter [`Self::fix_next_id`] has seen (it stays under
+         // [`MAX_NEXT_ID`]); saturating so that no counter can overflow.
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index cd59089..8611998 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -1273,7 +1273,7 @@ impl Session {
+     /// what is fitted to type's bounds (an envelope warping it) would come out differently. That
+     /// holds for the type in symbol definitions, pattern tiles, graph designs and opacity masks too,
+     /// not only in the layers (#1738).
+-    pub(crate) fn refresh_text_bounds(doc: &mut Document) {
++    pub fn refresh_text_bounds(doc: &mut Document) {
+         // Inline graphics in text take their size from their symbols' art (not saved either).
+         doc.resolve_inline_art();
+         let trees = doc.layers.iter_mut().chain(doc.symbols.iter_mut().map(|s| &mut s.art));
+diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
+index 193832b..3fed07e 100644
+--- a/crates/ui-egui/Cargo.toml
++++ b/crates/ui-egui/Cargo.toml
+@@ -37,6 +37,9 @@ log = { workspace = true }
+ # `now_ms` (src/lib.rs) reads the page's `performance.now()` with this crate in the web build. It is
+ # MIT OR Apache-2.0 and already in the build through eframe.
+ web-time = "1"
++# Live editing in a Playground session (live/playground_live.rs).
++js-sys = "0.3"
++wasm-bindgen = "0.2"
+ 
+ [dev-dependencies]
+ egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
+diff --git a/crates/ui-egui/live/live.rs b/crates/ui-egui/live/live.rs
+new file mode 100644
+index 0000000..63687cf
+--- /dev/null
++++ b/crates/ui-egui/live/live.rs
+@@ -0,0 +1,239 @@
++//! Live editing in a Playground session (web only): [`crate::playground_live`] is what the page drives.
++//!
++//! The shared document is the open document the session started on, as its JSON with the images' bytes and without
++//! what is this person's: the id counter, the view and Layers rows written at save, the export and print settings. A
++//! remote change replaces that document at a quiet frame and keeps the selection, tools and views, with no native undo
++//! step. New ids come from `playground_live::fresh_id` while connected, so additions at once don't collide.
++
++use std::cell::{Cell, RefCell};
++use std::sync::Arc;
++
++use serde_json::Value;
++use vectorcraft_doc::{Document, ImageBlob};
++use vectorcraft_engine::{DocState, Session};
++
++use crate::VectorcraftApp;
++use crate::playground_live::{self, Live};
++
++/// Document fields that are this person's, or written at save only: not shared.
++const LOCAL: [&str; 5] = ["next_id", "last_view", "layers_open", "export_settings", "print_setup"];
++
++thread_local! {
++    /// The shared document ([`DocState::uid`]), from the session's first look at it.
++    static BOUND: Cell<Option<u64>> = const { Cell::new(None) };
++    /// A pointer button was down in the last frame.
++    static POINTER: Cell<bool> = const { Cell::new(false) };
++    /// The document last compared: held, so that any change to it makes a new one.
++    static SEEN: RefCell<Option<Arc<Document>>> = const { RefCell::new(None) };
++}
++
++/// The end of each frame: applies the remote changes waiting and reports this person's, once quiet.
++pub fn frame(app: &mut VectorcraftApp, ctx: &egui::Context) {
++    POINTER.set(ctx.input(|i| i.pointer.any_down()));
++    playground_live::frame(app);
++}
++
++/// Offers live editing to the page: `with_app` runs a closure on the running app (false: none), `repaint` asks for a
++/// frame.
++#[cfg(target_arch = "wasm32")]
++pub fn attach(
++    with_app: impl Fn(&mut dyn FnMut(&mut VectorcraftApp)) -> bool + 'static,
++    repaint: impl Fn() + 'static,
++) -> Result<(), wasm_bindgen::JsValue> {
++    let _ = vectorcraft_doc::FRESH_ID.set(playground_live::fresh_id);
++    playground_live::web::attach::<VectorcraftApp>(concat!("illustrator:1:", env!("CARGO_PKG_VERSION")), with_app, repaint)
++}
++
++/// Undo or Redo (`redo`) for the session, while it shares the active document: whether it took it.
++pub fn undo(app: &VectorcraftApp, redo: bool) -> bool {
++    BOUND.get().is_none_or(|uid| app.session.active().is_some_and(|d| d.uid == uid)) && playground_live::undo(redo)
++}
++
++/// The shared document: the bound one, else the active one (bound by `bind`).
++fn shared(app: &VectorcraftApp, bind: bool) -> Option<&DocState> {
++    if bind && BOUND.get().is_none() {
++        BOUND.set(app.session.active().map(|d| d.uid));
++    }
++    match BOUND.get() {
++        Some(uid) => app.session.documents().iter().find(|d| d.uid == uid),
++        None => app.session.active(),
++    }
++}
++
++impl Live for VectorcraftApp {
++    fn live_document(&self) -> Value {
++        // Once the shared document is closed here, the last one seen: a change from the others opens it again.
++        let Some(doc) = shared(self, true).map(|st| st.doc.clone()).or_else(|| SEEN.with_borrow(Clone::clone)) else {
++            return Value::Null;
++        };
++        let doc = doc.without_edit_modes();
++        let mut v = serde_json::to_value(&*doc).unwrap_or_default();
++        if let Some(o) = v.as_object_mut() {
++            for k in LOCAL {
++                o.remove(k);
++            }
++            if let Some(Value::Object(images)) = o.get_mut("images") {
++                for (k, blob) in &doc.images {
++                    if let Some(Value::Object(image)) = images.get_mut(k) {
++                        image.insert("data".into(), vectorcraft_format::base64_encode(&blob.bytes).into());
++                        if blob.is_proxy() {
++                            image.insert("proxy".into(), true.into());
++                        }
++                    }
++                }
++            }
++        }
++        v
++    }
++
++    fn live_adopt(&mut self, mut document: Value) -> Result<(), String> {
++        let current = shared(self, true).map(|st| st.doc.clone());
++        let o = document.as_object_mut().ok_or("The shared document is not a VectorCraft document")?;
++        let mut bytes = std::collections::BTreeMap::new();
++        if let Some(Value::Object(images)) = o.get_mut("images") {
++            for (k, image) in images.iter_mut() {
++                let data = image.as_object_mut().and_then(|i| i.remove("data"));
++                let data = data.as_ref().and_then(Value::as_str).and_then(vectorcraft_format::base64_decode);
++                let proxy = image.get("proxy") == Some(&Value::Bool(true));
++                bytes.insert(k.clone(), (data.ok_or_else(|| format!("Invalid image data for `{k}`"))?, proxy));
++            }
++        }
++        o.insert("next_id".into(), current.as_ref().map_or(1, |d| d.peek_next_id()).into());
++        let mut doc: Document = serde_json::from_value(document).map_err(|e| format!("Invalid shared document: {e}"))?;
++        for (k, blob) in &mut doc.images {
++            let Some((data, proxy)) = bytes.remove(k) else { continue };
++            *blob = match current.as_ref().and_then(|d| d.images.get(k)) {
++                // The same image stays the same blob (its decoded pixels are kept).
++                Some(old) if old.mime == blob.mime && *old.bytes == data => old.clone(),
++                _ => {
++                    let mut new = ImageBlob::new(blob.mime.clone(), data);
++                    new.proxy = proxy.then(|| new.bytes.clone());
++                    new
++                }
++            };
++        }
++        if let Some(d) = &current {
++            (doc.last_view, doc.layers_open) = (d.last_view.clone(), d.layers_open.clone());
++            (doc.export_settings, doc.print_setup) = (d.export_settings.clone(), d.print_setup.clone());
++        }
++        doc.fix_next_id();
++        doc.limit_depth();
++        Session::refresh_text_bounds(&mut doc);
++        match BOUND.get().and_then(|uid| self.session.document_mut(uid)) {
++            Some(st) => {
++                st.doc = Arc::new(doc);
++                st.selection.prune(&st.doc);
++                st.revision += 1;
++            }
++            // No document open (or the shared one was closed): it opens.
++            None => {
++                let i = self.session.add_document(doc, None);
++                BOUND.set(self.session.documents().get(i).map(|d| d.uid));
++            }
++        }
++        Ok(())
++    }
++
++    fn live_quiet(&self) -> bool {
++        let editing = |st: &DocState| {
++            st.interaction.is_some() || st.undo_group.is_some() || st.doc.mask_edit.is_some() || st.doc.pattern_edit.is_some()
++        };
++        !POINTER.get() && !self.picks.is_waiting() && self.ime_marked.is_none() && !shared(self, false).is_some_and(editing)
++    }
++
++    fn live_generation(&self) -> Option<u64> {
++        if let Some(st) = shared(self, true) {
++            SEEN.set(Some(st.doc.clone()));
++        }
++        SEEN.with_borrow(|d| d.as_ref().map(|d| Arc::as_ptr(d) as usize as u64))
++    }
++
++    fn live_disconnected(&mut self) {
++        // Native Undo starts again from here: its steps are from before the others' changes.
++        if let Some(st) = BOUND.take().and_then(|uid| self.session.document_mut(uid)) {
++            st.history.undo.clear();
++            st.history.redo.clear();
++        }
++        SEEN.set(None);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use serde_json::json;
++
++    use super::*;
++    use crate::playground_live::{activity, canonical, connect, disconnect, queue};
++
++    fn app_with_rect() -> VectorcraftApp {
++        let mut app = VectorcraftApp::new(Session::new(), crate::Services::default());
++        app.run("file.new", json!({})).unwrap();
++        app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 50, "height": 40})).unwrap();
++        app.session
++            .edit("Image", |d, _| {
++                d.images.insert("pic".into(), ImageBlob::png(vec![1, 2, 3]));
++                Ok(())
++            })
++            .unwrap();
++        app
++    }
++
++    #[test]
++    fn the_shared_document_leaves_views_out_and_adopting_one_keeps_them_without_an_undo_step() {
++        let mut app = app_with_rect();
++        let shared = app.live_document();
++        assert!(shared.get("next_id").is_none() && shared["images"]["pic"]["data"] == "AQID");
++        // Views, selection and Layers rows are this person's.
++        app.run("select.all", json!({})).unwrap();
++        let st = app.session.active_mut().unwrap();
++        st.transparency_grid = true;
++        Arc::make_mut(&mut st.doc).export_settings.insert("scale".into(), json!(2));
++        assert_eq!(canonical(&app.live_document()), canonical(&shared), "views don't change the shared document");
++
++        // A remote change: the rectangle renamed and a new layer.
++        let mut remote = shared.clone();
++        remote["layers"][0]["kind"]["children"][0]["name"] = json!("Box");
++        let mut layer = remote["layers"][0].clone();
++        layer["id"] = json!(1u64 << 52);
++        layer["kind"]["children"] = json!([]);
++        remote["layers"].as_array_mut().unwrap().push(layer);
++        let (undo_steps, selected) = {
++            let st = app.session.active().unwrap();
++            (st.history.undo.len(), st.selection.clone())
++        };
++        app.live_adopt(remote.clone()).unwrap();
++        assert_eq!(canonical(&app.live_document()), canonical(&remote));
++        let st = app.session.active().unwrap();
++        assert_eq!(st.history.undo.len(), undo_steps, "no native undo step");
++        assert_eq!(st.selection, selected, "the selection stays");
++        assert!(st.transparency_grid && st.doc.export_settings.contains_key("scale"), "views and settings stay");
++        assert_eq!(*st.doc.images["pic"].bytes, [1, 2, 3]);
++        assert!(st.doc.peek_next_id() > 1 << 52, "new ids come after the remote ones");
++    }
++
++    #[test]
++    fn a_remote_change_waits_while_busy_and_undo_goes_to_the_session() {
++        let mut app = app_with_rect();
++        connect();
++        let base = canonical(&app.live_document());
++        let mut remote = app.live_document();
++        remote["title"] = json!("Shared");
++        let done = std::rc::Rc::new(Cell::new(false));
++        let to = done.clone();
++        queue(Some(base), canonical(&remote), Box::new(move |r| to.set(r.is_ok())));
++        app.session.begin_interaction("Move").unwrap();
++        playground_live::frame(&mut app);
++        assert!(!done.get(), "a drag holds remote changes back");
++        app.session.commit_interaction().unwrap();
++        playground_live::frame(&mut app);
++        assert!(done.get());
++        assert_eq!(app.session.active().unwrap().doc.title, "Shared");
++        let undo_steps = app.session.active().unwrap().history.undo.len();
++        app.run("edit.undo", json!({})).unwrap();
++        assert_eq!(activity().1, [false]);
++        assert_eq!(app.session.active().unwrap().history.undo.len(), undo_steps, "native Undo waits");
++        disconnect();
++        app.live_disconnected();
++        assert!(app.session.active().unwrap().history.undo.is_empty(), "native Undo starts again");
++    }
++}
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 95af996..8bfc5bd 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -34,6 +34,14 @@ pub mod i18n;
+ pub mod icon_data;
+ pub mod icons;
+ pub mod io;
++// Live editing in a Playground session (web only). Outside src/: its strings are for the page, not
++// status-bar messages to translate (`i18n::tests::message_literals` reads src/).
++#[cfg(any(target_arch = "wasm32", test))]
++#[path = "../live/live.rs"]
++pub mod live;
++#[cfg(any(target_arch = "wasm32", test))]
++#[path = "../live/playground_live.rs"]
++pub mod playground_live;
+ pub mod menus;
+ pub mod native_menu;
+ pub mod opening;
+@@ -656,6 +664,11 @@ impl VectorcraftApp {
+ 
+     /// Run a UI or engine command by id. The single entry point for every frontend path.
+     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
++        // Live editing: Undo and Redo are the session's (they revert only this person's changes).
++        #[cfg(any(target_arch = "wasm32", test))]
++        if matches!(id, "edit.undo" | "edit.redo") && live::undo(self, id == "edit.redo") {
++            return Ok(Value::Null);
++        }
+         // A file dialog it shows off the UI thread runs it again with the path picked.
+         if self.picks.is_entry_free() {
+             let entry = picks::Entry::Command(id.to_string(), params.clone());

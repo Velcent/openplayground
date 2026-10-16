@@ -53,6 +53,7 @@ groups:
         icon: icons/vectorcraft.png
         theme: themes/illustrator.js
         patches: patches/illustrator.yaml
+        live: crates/ui-egui/live
         accent: "#FF9A00"
         base: "#330000"
 
