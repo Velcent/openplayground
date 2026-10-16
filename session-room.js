@@ -114,8 +114,10 @@ export class SessionRoom extends DurableObject {
         if (!hash || !member || member.hash !== hash) return error('Member authentication required', 403)
         if (!this.sockets().some((ws) => ws.deserializeAttachment().id === input.id)) return error('Connect to the session first', 403)
         if (!this.env.TURN_KEY_ID || !this.env.TURN_API_TOKEN) return error('Encrypted relay has not been configured', 503)
-        if (member.turnAt && Date.now() - member.turnAt < 60000) return error('Relay credentials requested too often', 429)
-        member.turnAt = Date.now(); this.save(room)
+        // A few a minute: a reload or a second tab needs its own, at once.
+        const recent = [].concat(member.turnAt ?? []).filter((at) => Date.now() - at < 60000)
+        if (recent.length >= 5) return error('Relay credentials requested too often', 429)
+        member.turnAt = [...recent, Date.now()]; this.save(room)
         const response = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(this.env.TURN_KEY_ID)}/credentials/generate-ice-servers`, {
           method: 'POST', headers: { authorization: `Bearer ${this.env.TURN_API_TOKEN}`, 'content-type': 'application/json' }, body: JSON.stringify({ ttl: 600 }), signal: AbortSignal.timeout(10000),
         })
