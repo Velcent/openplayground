@@ -5,10 +5,11 @@
 //! the shell connects.
 //!
 //! An app implements [`Live`], calls [`frame`] at the end of each frame and [`undo`] at the top of its Undo and Redo,
-//! and on the web calls [`web::attach`] once it runs.
+//! and on the web calls [`web::attach`] once it runs. Floats must round-trip exactly (serde_json's `float_roundtrip`),
+//! or equal documents could give different bytes on different peers.
 
 use serde_json::Value;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// What an app supplies for live editing.
 pub trait Live {
@@ -67,6 +68,8 @@ pub fn canonical(value: &Value) -> Vec<u8> {
                 }
                 out.push(b']');
             }
+            // -0.0 equals 0.0 to the merge, so it must give the same bytes or a proposer would resend it forever.
+            Value::Number(n) if n.as_f64() == Some(0.0) && n.is_f64() => out.extend(b"0.0"),
             scalar => out.extend(serde_json::to_vec(scalar).unwrap_or_default()),
         }
     }
@@ -93,20 +96,6 @@ pub fn merge(
         .ok_or_else(|| "Conflict: document removed".into())
 }
 
-pub fn merge_bytes(
-    base: &[u8],
-    current: &[u8],
-    edited: &[u8],
-    counters: &[&str],
-) -> Result<Vec<u8>, Error> {
-    Ok(canonical(&merge(
-        &parse(base)?,
-        &parse(current)?,
-        &parse(edited)?,
-        counters,
-    )?))
-}
-
 fn conflict(path: &str) -> Error {
     format!("Conflict at {}", if path.is_empty() { "/" } else { path })
 }
@@ -125,6 +114,17 @@ fn merge_at(
         return Ok(e.cloned());
     }
     let key = path.rsplit('/').next().unwrap_or_default();
+    // An allocator both sides raised (or both added) keeps the larger value, compared exactly as integers.
+    if let (Some(Value::Number(cn)), Some(Value::Number(en))) = (c, e) {
+        if counters.contains(&key) {
+            let larger = match (cn.as_u64(), en.as_u64(), cn.as_i64(), en.as_i64()) {
+                (Some(x), Some(y), _, _) => x >= y,
+                (_, _, Some(x), Some(y)) => x >= y,
+                _ => cn.as_f64() >= en.as_f64(),
+            };
+            return Ok(if larger { c.cloned() } else { e.cloned() });
+        }
+    }
     match (b, c, e) {
         (Some(Value::Object(b)), Some(Value::Object(c)), Some(Value::Object(e))) => {
             let mut out = serde_json::Map::new();
@@ -147,12 +147,6 @@ fn merge_at(
             if keyed(&[b, c, e]) =>
         {
             keyed_merge(b, c, e, counters, path).map(|v| Some(Value::Array(v)))
-        }
-        (Some(Value::Number(_)), Some(Value::Number(_)), Some(Value::Number(_)))
-            if counters.contains(&key) =>
-        {
-            let n = |v: Option<&Value>| v.and_then(Value::as_f64).unwrap_or(f64::MIN);
-            Ok(if n(c) >= n(e) { c.cloned() } else { e.cloned() })
         }
         _ => Err(conflict(path)),
     }
@@ -213,28 +207,46 @@ fn keyed_merge(
             .collect()
     };
     let (bo, co, eo) = (common(b), common(c), common(e));
-    let mut out = if co == bo {
+    let kept = if co == bo {
         eo
     } else if eo == bo {
         co
     } else {
         return Err(conflict(&format!("{path} order")));
     };
-    // Each side's additions go right after the item before them on that side.
+    // Each side's additions follow the item before them on that side (this side's first, then the other's), in one
+    // pass: additions hang off their predecessor, and the result walks the kept order.
+    let placed: HashSet<&String> = kept.iter().collect();
+    let mut after: HashMap<Option<String>, Vec<String>> = HashMap::new();
+    let mut added = HashSet::new();
     for side in [c, e] {
-        let mut after: Option<String> = None;
+        let mut previous: Option<String> = None;
         for key in order(side) {
-            if merged.contains_key(&key) && !out.contains(&key) {
-                let at = after
-                    .as_ref()
-                    .and_then(|a| out.iter().position(|k| k == a))
-                    .map_or(0, |i| i + 1);
-                out.insert(at, key.clone());
+            if !merged.contains_key(&key) {
+                continue;
             }
-            if out.contains(&key) {
-                after = Some(key);
+            if !placed.contains(&key) && added.insert(key.clone()) {
+                after.entry(previous.clone()).or_default().push(key.clone());
             }
+            previous = Some(key);
         }
+    }
+    let mut out = Vec::with_capacity(merged.len());
+    let mut stack: Vec<String> = after
+        .remove(&None)
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .collect();
+    let mut rest = kept.into_iter().rev().collect::<Vec<_>>();
+    loop {
+        let Some(key) = stack.pop().or_else(|| rest.pop()) else {
+            break;
+        };
+        if let Some(children) = after.remove(&Some(key.clone())) {
+            stack.extend(children.into_iter().rev());
+        }
+        out.push(key);
     }
     Ok(out.into_iter().filter_map(|k| merged.remove(&k)).collect())
 }
@@ -258,11 +270,11 @@ struct Session {
     ids: u64,
     /// The generation and the canonical document last reported.
     generation: Option<u64>,
-    reported: Option<Vec<u8>>,
+    reported: Option<u64>,
     remote: VecDeque<Remote>,
     changes: u64,
     undos: Vec<bool>,
-    repaint: Option<Box<dyn Fn()>>,
+    repaint: Option<std::rc::Rc<dyn Fn()>>,
     #[cfg(target_arch = "wasm32")]
     hooks: Option<web::Hooks>,
 }
@@ -272,12 +284,14 @@ thread_local! {
 }
 
 pub fn connect() {
-    SESSION.with_borrow_mut(|s| {
+    let repaint = SESSION.with_borrow_mut(|s| {
         (s.connected, s.generation, s.reported) = (true, None, None);
-        if let Some(repaint) = &s.repaint {
-            repaint();
-        }
+        s.repaint.clone()
     });
+    // Outside the borrow: a repaint may come straight back here.
+    if let Some(repaint) = repaint {
+        repaint();
+    }
 }
 
 /// Ends the session's hold on Undo; changes still waiting fail.
@@ -296,18 +310,17 @@ pub fn disconnect() {
 }
 
 pub fn queue(base: Option<Vec<u8>>, edited: Vec<u8>, done: Done) {
-    let done = SESSION.with_borrow_mut(|s| {
+    let refused = SESSION.with_borrow_mut(|s| {
         if !s.connected {
-            return Some(done);
+            return Err(done);
         }
         s.remote.push_back(Remote { base, edited, done });
-        if let Some(repaint) = &s.repaint {
-            repaint();
-        }
-        None
+        Ok(s.repaint.clone())
     });
-    if let Some(done) = done {
-        done(Err("Live editing is not connected".into()));
+    match refused {
+        Err(done) => done(Err("Live editing is not connected".into())),
+        Ok(Some(repaint)) => repaint(),
+        Ok(None) => {}
     }
 }
 
@@ -355,7 +368,7 @@ pub fn fresh_id(next: &mut u64) -> u64 {
 /// Passes Undo or Redo to the session while connected: whether it did. Call it first in the app's Undo and Redo.
 pub fn undo(redo: bool) -> bool {
     let connected = SESSION.with_borrow_mut(|s| {
-        if s.connected {
+        if s.connected && s.undos.len() < 64 {
             s.undos.push(redo);
         }
         s.connected
@@ -367,7 +380,8 @@ pub fn undo(redo: bool) -> bool {
     connected
 }
 
-/// Shared changes reported and Undo/Redo requests passed on so far, for tests.
+/// Shared changes reported and the first Undo/Redo requests passed on, for tests.
+#[allow(dead_code)]
 pub fn activity() -> (u64, Vec<bool>) {
     SESSION.with_borrow(|s| (s.changes, s.undos.clone()))
 }
@@ -390,10 +404,16 @@ pub fn frame<A: Live>(app: &mut A) {
     if generation.is_some() && SESSION.with_borrow(|s| s.generation == generation) {
         return;
     }
-    let document = canonical(&app.live_document());
+    let document = {
+        use std::hash::{Hash, Hasher};
+        // A fixed-key hash: only this browser compares it, and it saves keeping a copy of a large document.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        canonical(&app.live_document()).hash(&mut hasher);
+        hasher.finish()
+    };
     let changed = SESSION.with_borrow_mut(|s| {
         s.generation = generation;
-        let changed = s.reported.as_ref() != Some(&document);
+        let changed = s.reported != Some(document);
         if changed {
             s.reported = Some(document);
             s.changes += 1;
@@ -455,7 +475,7 @@ pub mod web {
         repaint: impl Fn() + 'static,
     ) -> Result<(), JsValue> {
         let with_app = std::rc::Rc::new(with_app);
-        SESSION.with_borrow_mut(|s| s.repaint = Some(Box::new(repaint)));
+        SESSION.with_borrow_mut(|s| s.repaint = Some(std::rc::Rc::new(repaint)));
         let adapter = Object::new();
         let set =
             |name: &str, value: JsValue| Reflect::set(&adapter, &name.into(), &value).map(drop);
@@ -465,7 +485,8 @@ pub mod web {
             let mut bytes = None;
             app(&mut |app: &mut A| bytes = Some(super::checkpoint(app)));
             Ok(bytes
-                .ok_or("The app is not running")?
+                // Not running yet (or restarting): the shell retries a busy checkpoint.
+                .ok_or("busy")?
                 .map_err(|e| JsValue::from_str(&e))?
                 .as_slice()
                 .into())
@@ -597,10 +618,24 @@ mod tests {
             json!([
                 item(3, "c"),
                 item(2, "B"),
-                item(5, "new e"),
-                item(4, "new c")
+                item(4, "new c"),
+                item(5, "new e")
             ])
         );
+        // Counters compare exactly, past what a float holds.
+        let big = |n: u64| json!({"next_id": n});
+        assert_eq!(
+            m(big(1), big((1 << 53) + 4), big((1 << 53) + 3)).unwrap(),
+            big((1 << 53) + 4)
+        );
+        // Merging large keyed lists stays linear.
+        let many = |n: u64| json!({"items": (0..n).map(|i| item(i, "x")).collect::<Vec<_>>()});
+        let (mut c2, mut e2) = (many(50_000), many(50_000));
+        c2["items"][10]["v"] = json!("c");
+        e2["items"][20]["v"] = json!("e");
+        let started = std::time::Instant::now();
+        assert!(m(many(50_000), c2, e2).is_ok());
+        assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
         // 1 was edited on one side and removed on the other.
         let edited_one = json!({"items": [item(1, "A"), item(2, "b"), item(3, "c")], "next_id": 4});
         let removed_one = json!({"items": [item(2, "b"), item(3, "c")], "next_id": 4});
@@ -621,6 +656,11 @@ mod tests {
         let b: Value = serde_json::from_str(r#"{"a":{"x":[3,1],"y":2},"b":1}"#).unwrap();
         assert_eq!(canonical(&a), canonical(&b));
         assert_eq!(canonical(&a), br#"{"a":{"x":[3,1],"y":2},"b":1}"#);
+        assert_eq!(
+            canonical(&json!(-0.0)),
+            canonical(&json!(0.0)),
+            "the merge treats them as equal"
+        );
         let points = |v: Vec<u32>| json!({"points": v});
         assert!(m(points(vec![1, 2]), points(vec![1, 3]), points(vec![0, 2])).is_err());
     }
