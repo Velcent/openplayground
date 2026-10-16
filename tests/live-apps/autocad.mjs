@@ -2,8 +2,8 @@ import { until } from '../helpers.mjs'
 
 // CADCraft (autocad): Drawing1 in model space; typed text goes to the command line wherever focus is (ui-egui
 // cmdline.rs). Every page draws the same two circles first (the joiner's copy is replaced by the owner's). The owner
-// moves the left one (a typed Window selection), the editor the right one (Last selection). Neither adds an object: the
-// handle counter (handseed, merged by maximum) stays where both left it, so it would not go back with an Undo.
+// adds a third circle (a fresh handle, appended to model space), the editor moves the right one (a typed Window
+// selection). The handle counter (handseed, merged by maximum) may stay raised after Undo.
 const pause = (page, ms = 250) => page.waitForTimeout(ms)
 // Each input followed by Enter ('' is Enter alone).
 async function type(page, ...inputs) {
@@ -24,8 +24,9 @@ export default {
     await type(page, 'circle', '3,4.5', '1')
     await type(page, 'circle', '9,4.5', '1')
   },
-  editA: (page) => type(page, 'move', 'w', '1.5,3', '4.5,6', '', '0,0', '0,1'),
-  editB: (page) => type(page, 'move', 'l', '', '0,0', '0,-1'),
+  editA: (page) => type(page, 'circle', '6,1', '0.5'),
+  editB: (page) => type(page, 'move', 'w', '7.5,3', '10.5,6', '', '0,0', '0,-1'),
+  ignore: ['/handseed'],
   undo: async (page) => {
     await page.focus('#cadcraft_canvas')
     await page.keyboard.press('Control+z')

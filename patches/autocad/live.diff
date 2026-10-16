@@ -1,36 +1,12 @@
-diff --git a/Cargo.lock b/Cargo.lock
-index c054dcf..23154c4 100644
---- a/Cargo.lock
-+++ b/Cargo.lock
-@@ -601,9 +601,11 @@ version = "0.7.0"
- dependencies = [
-  "cadcraft-color",
-  "cadcraft-geom",
-+ "js-sys",
-  "serde",
-  "serde_json",
-  "thiserror 2.0.21",
-+ "wasm-bindgen",
- ]
- 
- [[package]]
-@@ -711,6 +713,7 @@ dependencies = [
-  "cadcraft-engine",
-  "cadcraft-fonts",
-  "cadcraft-geom",
-+ "cadcraft-io",
-  "cadcraft-render",
-  "craft-ui",
-  "egui",
 diff --git a/apps/cadcraft-web/src/main.rs b/apps/cadcraft-web/src/main.rs
-index 5b4873e..f0c9c71 100644
+index 5b4873e..9b2452b 100644
 --- a/apps/cadcraft-web/src/main.rs
 +++ b/apps/cadcraft-web/src/main.rs
 @@ -55,6 +55,10 @@ mod web {
              if let Some((bridge, reported)) = &self.2 {
                  bridge.report_dirty(&self.0, reported);
              }
-+            cadcraft_engine::doc::playground_live::frame(&mut self.0);
++            cadcraft_ui_egui::live::frame(&mut self.0, ui.ctx());
 +        }
 +        fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
 +            Some(self)
@@ -93,7 +69,7 @@ index 7046fd4..0307858 100644
 +# Playground live editing's adapter (`playground_live`) in native test builds of the crates that use it.
 +live = []
 diff --git a/crates/doc/src/lib.rs b/crates/doc/src/lib.rs
-index 6462d3a..48786db 100644
+index 6462d3a..3803ef2 100644
 --- a/crates/doc/src/lib.rs
 +++ b/crates/doc/src/lib.rs
 @@ -15,6 +15,9 @@ mod header;
@@ -106,17 +82,25 @@ index 6462d3a..48786db 100644
  mod refedit;
  mod store;
  mod tables;
-@@ -190,6 +193,9 @@ impl Drawing {
+@@ -190,6 +193,17 @@ impl Drawing {
      pub fn new_handle(&mut self) -> Handle {
          let h = Handle(self.handseed);
          self.handseed = self.handseed.saturating_add(1);
-+        // Live editing (web): a handle no one else editing at the same time picks.
++        // Live editing (web): while connected, a random step past the counter, so people adding objects at once pick
++        // different handles, and the counter (merged by maximum) stays above them all ("handle >= seed" means new).
 +        #[cfg(any(target_arch = "wasm32", feature = "live"))]
-+        let h = Handle(playground_live::fresh_id(&mut { h.0 }));
++        let h = match playground_live::fresh_id(&mut { h.0 }) {
++            fresh if fresh != h.0 => {
++                let h = h.0.max(1 << 52) + (fresh & 0xFF_FFFF);
++                self.handseed = h + 1;
++                Handle(h)
++            }
++            _ => h,
++        };
          h
      }
      /// Make sure future handles don't collide with `h` (after loading a file).
-@@ -369,9 +375,14 @@ impl Drawing {
+@@ -369,9 +383,14 @@ impl Drawing {
  
      /// Next unused anonymous block name with the given prefix (e.g. `*D`).
      pub fn anonymous_block_name(&self, prefix: &str) -> String {
@@ -133,48 +117,67 @@ index 6462d3a..48786db 100644
                  return n;
              }
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 97f4b96..51f71dd 100644
+index 97f4b96..34ba4bc 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
-@@ -1595,6 +1595,11 @@ impl Session {
-     // ---------------- undo ----------------
+@@ -146,6 +146,11 @@ pub struct DocState {
+ 
+ static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+ 
++thread_local! {
++    /// Live editing (web): the `uid` of the drawing a Playground session shares (0: none).
++    pub static LIVE_UID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++}
++
+ impl DocState {
+     pub fn new(doc: Drawing, title: &str, path: Option<String>) -> Self {
+         let doc = Arc::new(doc);
+@@ -1596,6 +1601,15 @@ impl Session {
  
      pub fn undo(&mut self) -> Result<Option<String>> {
-+        // Live editing (web): the session undoes this person's last operation.
-+        #[cfg(target_arch = "wasm32")]
-+        if cadcraft_doc::playground_live::undo(false) {
-+            return Ok(None);
-+        }
          let st = self.state_mut()?;
++        // Live editing (web): in the drawing a Playground session shares, the session undoes this person's last
++        // operation; the step here only names it (and keeps UNDO n, Back and MREDO counting).
++        #[cfg(target_arch = "wasm32")]
++        if st.uid == LIVE_UID.get() && !st.undo.is_empty() && cadcraft_doc::playground_live::undo(false) {
++            let snap = st.undo.pop();
++            let label = snap.as_ref().map(|s| s.label.clone());
++            st.redo.extend(snap);
++            return Ok(label);
++        }
          let Some(snap) = st.undo.pop() else { return Ok(None) };
          let cur = Snapshot { label: snap.label.clone(), doc: st.doc.clone(), selection: st.selection.clone() };
-@@ -1606,6 +1611,11 @@ impl Session {
-         Ok(Some(snap.label))
+         st.doc = snap.doc;
+@@ -1607,6 +1621,15 @@ impl Session {
      }
      pub fn redo(&mut self) -> Result<Option<String>> {
-+        // Live editing (web): the session redoes this person's last operation.
-+        #[cfg(target_arch = "wasm32")]
-+        if cadcraft_doc::playground_live::undo(true) {
-+            return Ok(None);
-+        }
          let st = self.state_mut()?;
++        // Live editing (web): in the drawing a Playground session shares, the session redoes this person's last
++        // operation; the step here only names it (and keeps UNDO n, Back and MREDO counting).
++        #[cfg(target_arch = "wasm32")]
++        if st.uid == LIVE_UID.get() && !st.redo.is_empty() && cadcraft_doc::playground_live::undo(true) {
++            let snap = st.redo.pop();
++            let label = snap.as_ref().map(|s| s.label.clone());
++            st.undo.extend(snap);
++            return Ok(label);
++        }
          let Some(snap) = st.redo.pop() else { return Ok(None) };
          let cur = Snapshot { label: snap.label.clone(), doc: st.doc.clone(), selection: st.selection.clone() };
+         st.doc = snap.doc;
 diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
-index 630188d..1859bf2 100644
+index 630188d..cbefecc 100644
 --- a/crates/ui-egui/Cargo.toml
 +++ b/crates/ui-egui/Cargo.toml
-@@ -26,6 +26,8 @@ log = { workspace = true }
+@@ -26,6 +26,7 @@ log = { workspace = true }
  image = { workspace = true }
  
  [dev-dependencies]
 +cadcraft-doc = { workspace = true, features = ["live"] }
-+cadcraft-io = { workspace = true }
  egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
  # Validates the canvas WGSL and its GLSL ES 3.0 (WebGL2) translation in tests (same naga wgpu uses).
  naga = { version = "30", features = ["wgsl-in", "glsl-out"] }
 diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index 91c48e5..ae04281 100644
+index 91c48e5..14221a6 100644
 --- a/crates/ui-egui/src/lib.rs
 +++ b/crates/ui-egui/src/lib.rs
 @@ -34,6 +34,9 @@ pub mod grip_dyn;
@@ -183,28 +186,30 @@ index 91c48e5..ae04281 100644
  pub mod layers;
 +// Live editing in a Playground session (web only).
 +#[cfg(any(target_arch = "wasm32", test))]
-+mod live;
++pub mod live;
  pub mod managers;
  pub mod menus;
  pub mod opening;
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..f5aa445
+index 0000000..67981bd
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,306 @@
-+//! Live editing in a Playground session (web only): the shared document is the drawing open when the session started,
-+//! as JSON. Entities are keyed by handle, table records, layouts and blocks by name. This person's current layer,
-+//! colour, styles and other command defaults, the `*Active` viewport tiles, isolated objects, an in-place reference
-+//! edit and the file data CADCraft does not model stay local, as do views and the selection (outside the drawing).
+@@ -0,0 +1,407 @@
++//! Live editing in a Playground session (web only): the shared document is the drawing open when the session started
++//! (pinned by uid; if its tab closes the session goes on with it as it was), as JSON. Entities are keyed by handle,
++//! table records, layouts and blocks by name. This person's current layer, colour, styles and other command defaults,
++//! the `*Active` viewport tiles, isolated objects, an in-place reference edit and the file data CADCraft does not model
++//! stay local, as do views and the selection (outside the drawing). A layout viewport's view is the sheet's, so shared.
 +
-+use std::cell::Cell;
++use std::cell::{Cell, RefCell};
 +use std::collections::{HashMap, HashSet};
 +use std::sync::Arc;
 +
-+use cadcraft_engine::doc::playground_live::Live;
-+use cadcraft_engine::doc::{Block, Drawing, Entity, EntityStore, Header, Layout, Space, VportConfig};
 +use crate::CadApp;
++use cadcraft_engine::LIVE_UID;
++use cadcraft_engine::doc::playground_live::{self, Live};
++use cadcraft_engine::doc::{Block, Drawing, Entity, EntityStore, Header, Layout, Space, VportConfig};
 +use serde_json::{Map, Value};
 +
 +/// Header variables that are this person's current settings and command defaults, not the drawing's.
@@ -216,15 +221,40 @@ index 0000000..f5aa445
 +];
 +
 +thread_local! {
-+    /// The shared drawing's `DocState::uid` (0: none yet).
-+    static SHARED: Cell<u64> = const { Cell::new(0) };
++    /// A pointer is down or a text field has the keyboard (as of the last frame).
++    static GESTURE: Cell<bool> = const { Cell::new(false) };
++    /// The shared drawing whose native Undo history was last cleared.
++    static CLEARED: Cell<u64> = const { Cell::new(0) };
++    /// The shared drawing as last seen, which the session goes on with if its tab closes.
++    static LAST: RefCell<Option<Arc<Drawing>>> = const { RefCell::new(None) };
 +}
 +
-+/// The shared drawing's index: the one it started with, else (closed) the active one.
-+fn shared(s: &cadcraft_engine::Session) -> Option<usize> {
-+    let i = s.docs.iter().position(|d| d.uid == SHARED.get()).or_else(|| s.state().ok().map(|_| s.active))?;
-+    SHARED.set(s.docs.get(i)?.uid);
-+    Some(i)
++/// The end of each frame (web): [`playground_live::frame`], told whether a pointer or the keyboard is busy.
++pub fn frame(app: &mut CadApp, ctx: &egui::Context) {
++    GESTURE.set(ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input());
++    playground_live::frame(app);
++    // Newly shared: its native Undo starts here, as the session's does.
++    let uid = LIVE_UID.get();
++    if uid != CLEARED.replace(uid)
++        && let Some(st) = app.session.docs.iter_mut().find(|d| d.uid == uid)
++    {
++        st.undo.clear();
++        st.redo.clear();
++    }
++}
++
++/// The shared drawing's index, pinning the active one when nothing is shared yet; `None` once its tab closed.
++fn pinned(s: &cadcraft_engine::Session) -> Option<usize> {
++    if LIVE_UID.get() == 0
++        && let Ok(st) = s.state()
++    {
++        LIVE_UID.set(st.uid);
++    }
++    s.docs.iter().position(|d| d.uid == LIVE_UID.get())
++}
++
++fn invalid(e: serde_json::Error) -> String {
++    format!("Invalid shared drawing: {e}")
 +}
 +
 +macro_rules! fields {
@@ -353,23 +383,37 @@ index 0000000..f5aa445
 +
 +    fn live_document(&self) -> Value {
 +        let s = &self.session;
-+        shared(s).and_then(|i| s.docs.get(i)).and_then(|st| document(&st.doc).ok()).unwrap_or_default()
++        let d = match pinned(s).and_then(|i| s.docs.get(i)) {
++            Some(st) => {
++                LAST.set(Some(st.drawing().clone()));
++                st.drawing().clone()
++            }
++            // Its tab closed: the drawing as it was (an empty one if none was ever open).
++            None => LAST.with_borrow(Clone::clone).unwrap_or_default(),
++        };
++        document(&d).unwrap_or_default()
 +    }
 +
 +    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
 +        let s = &mut self.session;
-+        let i = match shared(s) {
-+            Some(i) => i,
-+            None if document.is_null() => return Ok(()),
-+            None => s.new_drawing(false),
++        if LIVE_UID.get() == 0 && s.docs.is_empty() {
++            // Joining from the Start tab: a tab for the shared drawing.
++            s.new_drawing(false);
++        }
++        let i = pinned(s);
++        let current = match i.and_then(|i| s.docs.get(i)) {
++            Some(st) => st.doc.clone(),
++            None => LAST.with_borrow(Clone::clone).unwrap_or_default(),
 +        };
-+        let st = s.docs.get_mut(i).ok_or("No drawing")?;
-+        let mut d = (*st.doc).clone();
-+        install(&mut d, document).map_err(|e| format!("Invalid shared drawing: {e}"))?;
-+        if d == *st.doc {
++        let mut d = (*current).clone();
++        install(&mut d, document).map_err(invalid)?;
++        if d == *current {
 +            return Ok(());
 +        }
-+        st.doc = Arc::new(d);
++        let d = Arc::new(d);
++        LAST.set(Some(d.clone()));
++        let Some(st) = i.and_then(|i| s.docs.get_mut(i)) else { return Ok(()) };
++        st.doc = d;
 +        st.revision += 1;
 +        if let Space::Paper(name) = &st.space
 +            && !st.doc.layouts.iter().any(|l| l.name == *name)
@@ -381,9 +425,18 @@ index 0000000..f5aa445
 +        Ok(())
 +    }
 +
++    /// [`playground_live::merge`], refusing anything that is not a drawing.
++    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
++        let merged = playground_live::merge(base, current, edited, Self::COUNTERS)?;
++        // ponytail: decodes the whole drawing per merge (O(entities)); a lighter schema check if big sessions lag.
++        install(&mut Drawing::default(), merged.clone()).map_err(invalid)?;
++        Ok(merged)
++    }
++
 +    fn live_quiet(&self) -> bool {
 +        let s = &self.session;
-+        s.running.is_none()
++        !GESTURE.get()
++            && s.running.is_none()
 +            && s.suspended.is_none()
 +            && s.pending_window.is_none()
 +            && s.select_mode.is_none()
@@ -399,24 +452,28 @@ index 0000000..f5aa445
 +    fn live_generation(&self) -> Option<u64> {
 +        use std::hash::{Hash, Hasher};
 +        let s = &self.session;
-+        let st = s.docs.get(shared(s)?)?;
 +        let mut h = std::hash::DefaultHasher::new();
-+        (st.uid, st.revision, Arc::as_ptr(&st.doc) as usize).hash(&mut h);
-+        // Panning and zooming inside a layout viewport changes its view in place.
-+        if let Some((vh, vp)) = st.active_viewport() {
-+            (vh, vp.view_center.x.to_bits(), vp.view_center.y.to_bits(), vp.view_height.to_bits()).hash(&mut h);
++        match pinned(s).and_then(|i| s.docs.get(i)) {
++            Some(st) => {
++                (st.uid, st.revision, Arc::as_ptr(st.drawing()) as usize).hash(&mut h);
++                // Panning and zooming inside a layout viewport changes its view in place.
++                if let Some((vh, vp)) = st.active_viewport() {
++                    (vh, vp.view_center.x.to_bits(), vp.view_center.y.to_bits(), vp.view_height.to_bits()).hash(&mut h);
++                }
++            }
++            None => LAST.with_borrow(|d| d.as_ref().map(Arc::as_ptr)).hash(&mut h),
 +        }
 +        Some(h.finish())
 +    }
 +
 +    fn live_disconnected(&mut self) {
-+        let s = &mut self.session;
-+        if let Some(st) = shared(s).and_then(|i| s.docs.get_mut(i)) {
++        let uid = LIVE_UID.replace(0);
++        if let Some(st) = self.session.docs.iter_mut().find(|d| d.uid == uid) {
 +            // Its steps hold other people's edits.
 +            st.undo.clear();
 +            st.redo.clear();
 +        }
-+        SHARED.set(0);
++        LAST.set(None);
 +    }
 +}
 +
@@ -427,38 +484,48 @@ index 0000000..f5aa445
 +    use cadcraft_engine::{Session, View};
 +    use serde_json::json;
 +
++    /// Another person's app (each page pins its own shared drawing).
 +    fn app(d: Drawing) -> CadApp {
++        (LIVE_UID.set(0), LAST.set(None));
 +        let mut s = Session::empty();
 +        s.open_drawing(d, "shared", None);
 +        CadApp::new(s, Default::default())
 +    }
 +
++    /// The floor plan sample with a block and an object in paper space.
 +    fn sample() -> Drawing {
-+        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/apartment.dxf")).unwrap();
-+        cadcraft_io::read(&bytes, "apartment.dxf").unwrap()
++        let mut d = cadcraft_engine::sample::floor_plan();
++        let mut chair = (**d.model.last().unwrap()).clone();
++        chair.handle = d.new_handle();
++        let mut b = Block::new("CHAIR");
++        b.entities.push(chair.clone());
++        d.blocks.insert("CHAIR".into(), Arc::new(b));
++        d.add(&Space::Paper("Layout1".into()), chair.common, chair.kind).unwrap();
++        d
 +    }
 +
 +    #[test]
 +    fn a_drawing_round_trips_and_views_and_current_settings_stay_local() {
-+        let mut a = app(sample());
++        let a = app(sample());
 +        let doc = a.live_document();
-+        assert!(doc["model"].as_array().is_some_and(|m| m.len() > 50 && m.iter().all(|e| e["id"] == e["handle"])));
++        assert!(doc["model"].as_array().is_some_and(|m| m.len() > 10 && m.iter().all(|e| e["id"] == e["handle"])));
 +        let mut b = app(Drawing::new_metric());
 +        b.session.doc_mut().unwrap().header.set_str("CLAYER", "Mine");
 +        b.session.state_mut().unwrap().set_view(View { center: cadcraft_engine::geom::Vec2::new(5.0, 5.0), height: 3.0 });
 +        b.live_adopt(doc.clone()).unwrap();
 +        assert_eq!(canonical(&b.live_document()), canonical(&doc), "the drawing arrives whole");
 +        let st = b.session.state().unwrap();
-+        assert_eq!(st.doc.model, a.session.doc().unwrap().model);
++        assert_eq!((&st.doc.model, &st.doc.blocks), (&a.session.doc().unwrap().model, &a.session.doc().unwrap().blocks));
 +        assert_eq!(st.doc.header.str("CLAYER", ""), "Mine", "the current layer is this person's");
 +        assert_eq!(st.view().height, 3.0, "and so is the view");
 +        assert!(st.undo.is_empty(), "no native undo step");
 +
 +        // Views, the selection and current settings are not shared; a moved object is, as one entity.
++        let mut a = app(sample());
 +        let handles = a.session.doc().unwrap().model.handles();
 +        a.session.set_selection(handles[..3].to_vec());
 +        a.session.state_mut().unwrap().set_view(View { center: cadcraft_engine::geom::Vec2::new(1.0, 2.0), height: 7.0 });
-+        a.session.execute("setvar", &json!({ "name": "CLAYER", "value": "0" })).unwrap();
++        a.session.execute("setvar", &json!({ "name": "CLAYER", "value": "A-WALL" })).unwrap();
 +        assert_eq!(canonical(&a.live_document()), canonical(&doc));
 +        let before = a.session.doc().unwrap().clone();
 +        a.session.execute("move", &json!({ "handles": [handles[0].0], "from": [0, 0], "to": [1, 0] })).unwrap();
@@ -469,25 +536,30 @@ index 0000000..f5aa445
 +            .collect();
 +        assert_eq!(changed, [json!(handles[0].0)]);
 +        // Adopting it keeps every other entity (and chunk) as it was.
++        let old = a.session.doc().unwrap().model.clone();
 +        let mut c = app(before);
 +        c.live_adopt(moved).unwrap();
-+        let (old, new) = (a.session.doc().unwrap(), c.session.doc().unwrap());
-+        assert!(new.model.iter().zip(old.model.iter()).filter(|(x, y)| !Arc::ptr_eq(x, y)).count() <= 1);
++        let new = &c.session.doc().unwrap().model;
++        assert!(new.iter().zip(old.iter()).filter(|(x, y)| !Arc::ptr_eq(x, y)).count() <= 1);
 +    }
 +
 +    #[test]
 +    fn concurrent_additions_merge_and_remote_changes_wait_for_the_running_command() {
-+        let mut a = app(Drawing::new_imperial());
 +        live::connect();
-+        let base = a.live_document();
 +        let mut b = app(Drawing::new_imperial());
-+        b.live_adopt(base.clone()).unwrap();
++        let mut a = app(Drawing::new_imperial());
++        let base = a.live_document();
 +        a.session.execute("circle", &json!({ "center": [1, 1], "radius": 1 })).unwrap();
++        let current = a.live_document();
++        (LIVE_UID.set(0), LAST.set(None));
++        b.live_adopt(base.clone()).unwrap();
 +        b.session.execute("circle", &json!({ "center": [5, 5], "radius": 1 })).unwrap();
 +        let edited = b.live_document();
-+        let merged = CadApp::live_merge(&base, &a.live_document(), &edited).unwrap();
++        let merged = CadApp::live_merge(&base, &current, &edited).unwrap();
 +        assert_eq!(merged["model"].as_array().map(Vec::len), Some(2), "fresh handles do not collide");
 +
++        (LIVE_UID.set(0), LAST.set(None));
++        a.live_document();
 +        a.session.cmdline("line").unwrap();
 +        assert!(!a.live_quiet(), "LINE keeps running across clicks");
 +        live::queue(Some(canonical(&base)), canonical(&edited), Box::new(|r| assert_eq!(r, Ok(None))));
@@ -497,5 +569,37 @@ index 0000000..f5aa445
 +        live::frame(&mut a);
 +        assert_eq!(a.session.doc().unwrap().model.len(), 2);
 +        live::disconnect();
++    }
++
++    #[test]
++    fn objects_drawn_while_connected_stay_old_to_arrayedit() {
++        live::connect();
++        let mut s = Session::new();
++        let c = s.execute("circle", &json!({ "center": [0, 0], "radius": 1 })).unwrap()["handle"].clone();
++        let a = s.execute("arrayrect", &json!({ "handles": [c], "rows": 1, "cols": 3, "colSpacing": 2 })).unwrap()["handle"].clone();
++        s.execute("circle", &json!({ "center": [50, 50], "radius": 1 })).unwrap();
++        let d = s.doc().unwrap();
++        assert!(d.model.iter().all(|e| e.handle.0 >> 52 == 1 && e.handle.0 < d.handseed), "random handles, under the counter");
++        s.execute("arrayedit", &json!({ "handle": a, "source": {} })).unwrap();
++        s.execute("arrayclose", &json!({ "save": false })).unwrap();
++        assert_eq!(s.doc().unwrap().model.len(), 2, "discarding the source edit keeps the circle drawn before it");
++        live::disconnect();
++    }
++
++    #[test]
++    fn the_session_keeps_its_drawing_when_the_tab_closes_and_refuses_non_drawings() {
++        let mut a = app(sample());
++        let doc = a.live_document();
++        a.session.new_drawing(false);
++        a.session.docs.remove(0);
++        a.session.active = 0;
++        assert_eq!(canonical(&a.live_document()), canonical(&doc), "not the other drawing");
++        let mut edited = doc.clone();
++        edited["handseed"] = json!(0x9000);
++        a.live_adopt(edited.clone()).unwrap();
++        assert_eq!(canonical(&a.live_document()), canonical(&edited), "kept up to date");
++        assert_eq!(a.session.doc().unwrap().handseed, 0x100, "the open drawing is not touched");
++        assert!(CadApp::live_merge(&doc, &doc, &Value::Null).is_err());
++        assert!(CadApp::live_merge(&doc, &doc, &json!({ "model": 1 })).is_err());
 +    }
 +}
