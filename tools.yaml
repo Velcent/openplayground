@@ -200,6 +200,8 @@ groups:
         opens: []
         imports: []
         repo: storytold/cadcraft
+        patches: patches/autocad.yaml
+        live: crates/doc/src
         icon: icons/cadcraft.png
         accent: "#E85984"
         base: "#3A0716"

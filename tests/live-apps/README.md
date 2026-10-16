@@ -11,6 +11,7 @@ export default {
   editA: async (page) => {},           // the owner's edit
   editB: async (page) => {},           // the editor's edit, to a different object
   undo: async (page) => {},            // the owner's Undo (its usual shortcut or button)
+  ignore: ['/next_id'],                // optional: allocator counters, which Undo leaves raised
 }
 ```
 

@@ -6,8 +6,8 @@ import { until } from './helpers.mjs'
 
 // Live editing in real app builds that use patches/live/playground_live.rs (JSON documents). LIVE_PUBLIC is a public
 // directory holding each patched build at its URL path with the shell injected (tests/live-apps/README.md). Each
-// tests/live-apps/<slug>.mjs exports { path, viewport?, ready?(page), editA(page), editB(page), undo(page) }: two
-// edits to different objects, then Undo of the owner's.
+// tests/live-apps/<slug>.mjs exports { path, viewport?, ready?(page), editA(page), editB(page), undo(page), ignore? }:
+// two edits to different objects, then Undo of the owner's; `ignore` lists path prefixes of allocator counters.
 const publicDir = process.env.LIVE_PUBLIC
 const only = process.env.LIVE_APPS?.split(',')
 const specs = readdirSync(new URL('./live-apps/', import.meta.url)).filter((f) => f.endsWith('.mjs'))
@@ -65,8 +65,10 @@ for (const slug of specs) {
     const afterB = JSON.parse(await same([a, b], 'the editor\'s edit to reach the owner', JSON.stringify(afterA)))
     await app.undo(a)
     const undone = JSON.parse(await same([a, b], 'the owner\'s Undo to reach the editor', JSON.stringify(afterB)))
-    for (const [path] of changes(start, afterA)) assert.deepEqual(at(undone, path), at(start, path), `Undo reverts ${path}`)
-    for (const [path, value] of changes(afterA, afterB)) assert.deepEqual(at(undone, path), value, `Undo keeps the editor's ${path}`)
+    // Allocator counters (the adapter's COUNTERS) only ever go up, so Undo leaves them where they are.
+    const checked = (path) => !(app.ignore ?? []).some((prefix) => path.startsWith(prefix))
+    for (const [path] of changes(start, afterA)) if (checked(path)) assert.deepEqual(at(undone, path), at(start, path), `Undo reverts ${path}`)
+    for (const [path, value] of changes(afterA, afterB)) if (checked(path)) assert.deepEqual(at(undone, path), value, `Undo keeps the editor's ${path}`)
 
     const c = await open(app)
     await c.evaluate(async (invite) => { window.session = await PeerSession.join(invite, { name: 'Carol' }) }, invite.viewer)
