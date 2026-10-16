@@ -1,0 +1,498 @@
+diff --git a/apps/effectcraft-web/js/host.js b/apps/effectcraft-web/js/host.js
+index 3db6ad3..16edd2c 100644
+--- a/apps/effectcraft-web/js/host.js
++++ b/apps/effectcraft-web/js/host.js
+@@ -9,8 +9,11 @@
+ 
+ // ------------------------------------------------------------------ storage
+ 
+-const DIR = "effectcraft";
+-const DB = "effectcraft";
++// A Playground live session (`?pg-session=<room>`) opens in a store of its own: the person's own last session,
++// auto-saves, settings and media stay as they were.
++const ROOM = new URLSearchParams(self.location?.search ?? "").get("pg-session")?.replace(/[^0-9a-f-]/gi, "");
++const DIR = ROOM ? `effectcraft-session-${ROOM}` : "effectcraft";
++const DB = DIR;
+ const STORE = "entries";
+ let backend = null;
+ 
+diff --git a/apps/effectcraft-web/src/app.rs b/apps/effectcraft-web/src/app.rs
+index 1a69524..175dbb4 100644
+--- a/apps/effectcraft-web/src/app.rs
++++ b/apps/effectcraft-web/src/app.rs
+@@ -118,6 +118,11 @@ impl eframe::App for WebApp {
+ 
+     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+         self.app.ui(ui, frame);
++        effectcraft_ui_egui::live::frame(&mut self.app, ui.ctx());
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
+     }
+ }
+ 
+@@ -266,6 +271,16 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
+             }),
+         )
+         .await?;
++    // Live editing in a Playground session.
++    let live = runner.clone();
++    let attached = effectcraft_engine::playground_live::web::attach::<EffectcraftApp>(
++        concat!("after-effects:1:", env!("CARGO_PKG_VERSION")),
++        move |with| live.app_mut::<WebApp>().map(|mut web| with(&mut web.app)).is_some(),
++        repaint,
++    );
++    if let Err(e) = attached {
++        log::error!("live editing: {e:?}");
++    }
+     // Hide the loading message once the app runs.
+     if let Some(el) = doc.get_element_by_id("loading") {
+         el.remove();
+diff --git a/crates/engine/Cargo.toml b/crates/engine/Cargo.toml
+index 68e761a..e222435 100644
+--- a/crates/engine/Cargo.toml
++++ b/crates/engine/Cargo.toml
+@@ -37,3 +37,11 @@ rayon = { workspace = true }
+ image = { workspace = true }
+ web-time = { workspace = true }
+ exr = { workspace = true }
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++js-sys = "0.3"
++wasm-bindgen = "0.2"
++
++[features]
++# Playground live editing's adapter (`playground_live`) in native test builds of the crates that use it.
++live = []
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 96e09b5..657d082 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -30,6 +30,9 @@ pub mod menus;
+ pub mod models;
+ pub mod offload;
+ pub mod perf;
++// Live editing in a Playground session (web only).
++#[cfg(any(target_arch = "wasm32", test, feature = "live"))]
++pub mod playground_live;
+ pub mod prefs;
+ pub mod preview;
+ pub mod psd_import;
+@@ -622,6 +625,15 @@ impl Session {
+ 
+     /// Run a command by id.
+     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
++        // Live editing (web): Undo, Redo and History jumps go to the session, which takes back only this person's edits.
++        #[cfg(any(target_arch = "wasm32", test, feature = "live"))]
++        if let Some(steps) = self.live_steps(id, &params) {
++            let n = steps?;
++            for _ in 0..n.unsigned_abs() {
++                playground_live::undo(n > 0);
++            }
++            return Ok(Value::Null);
++        }
+         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
+         if let Err(why) = (spec.enabled)(self) {
+             // Explicit targets (agents, scripts) don't need a UI selection.
+@@ -645,6 +657,34 @@ impl Session {
+         Ok(r)
+     }
+ 
++    /// Live editing, while connected: the steps along the History's working line (negative: back) that Undo, Redo or
++    /// a History jump takes, or an error for a state on another branch, which the session cannot reach.
++    #[cfg(any(target_arch = "wasm32", test, feature = "live"))]
++    fn live_steps(&self, id: &str, p: &Value) -> Option<Result<i64>> {
++        // Connected: new ids come from the session's range (0 otherwise).
++        if !matches!(id, "edit.undo" | "edit.redo" | "edit.history.goto") || playground_live::fresh_id(&mut 0) == 0 {
++            return None;
++        }
++        Some(match (id, p.get("steps").and_then(Value::as_i64)) {
++            ("edit.undo", _) => Ok(-1),
++            ("edit.redo", _) => Ok(1),
++            (_, Some(n)) => Ok(n),
++            _ => {
++                let line: Vec<_> = self.history_tree().into_iter().filter(|n| n.line).collect();
++                let at = |f: &dyn Fn(&history::HistoryNode) -> bool| line.iter().position(f);
++                let target = match (p.get("id").and_then(Value::as_str), p.get("index").and_then(Value::as_u64)) {
++                    (Some(id), _) => at(&|n| n.id == id),
++                    (None, Some(i)) => at(&|n| n.index as u64 == i),
++                    _ => None,
++                };
++                match (target, at(&|n| n.current)) {
++                    (Some(t), Some(c)) => Ok(t as i64 - c as i64),
++                    _ => Err(EngineError::Other("While editing live, only states on the History's current line can be reached".into())),
++                }
++            }
++        })
++    }
++
+     /// [`Session::execute`] for agents and scripts (MCP, CLI, control channel): unknown top-level
+     /// parameters are rejected with the accepted keys instead of being silently ignored.
+     pub fn execute_checked(&mut self, id: &str, params: Value) -> Result<Value> {
+@@ -679,28 +719,7 @@ impl Session {
+         let mut p = (*self.project).clone();
+         let mut st = self.state.clone();
+         let r = f(&mut p, &mut st)?;
+-        // Layer styles: one Global Light per comp, whichever layer edited it.
+-        effectcraft_project::styles::sync_global_light(&before, &mut p);
+-        // Essential Properties of precomp layers follow their comps' Essential Graphics.
+-        effectcraft_project::essential::sync_project(&before, &mut p);
+-        // Warp Stabilizer analyses made from other frames are cleared (and queued again).
+-        for w in warp::invalidate(&before, &mut p) {
+-            if !self.warp_pending.contains(&w) {
+-                self.warp_pending.push(w);
+-            }
+-        }
+-        // So are 3D Camera Tracker tracks (and solves made with other settings).
+-        for w in camera_track::invalidate(&before, &mut p) {
+-            if !self.camera_pending.contains(&w) {
+-                self.camera_pending.push(w);
+-            }
+-        }
+-        // Roto Brush Input Keys follow the frames; edited instances propagate again.
+-        for r in roto::sync(&before, &mut p) {
+-            if !self.roto_pending.contains(&r) {
+-                self.roto_pending.push(r);
+-            }
+-        }
++        self.derive(&before, &mut p);
+         // Nothing changed (a value set to what it already was): no undo step, not modified.
+         if p.same_content(&before) {
+             self.state = st;
+@@ -721,6 +740,33 @@ impl Session {
+         Ok(r)
+     }
+ 
++    /// What an edit from `before` to `p` changes elsewhere: a comp's shared Global Light, Essential Properties,
++    /// analyses to clear and queue again. Also for changes from elsewhere (live editing), which are no undo step.
++    pub fn derive(&mut self, before: &Project, p: &mut Project) {
++        // Layer styles: one Global Light per comp, whichever layer edited it.
++        effectcraft_project::styles::sync_global_light(before, p);
++        // Essential Properties of precomp layers follow their comps' Essential Graphics.
++        effectcraft_project::essential::sync_project(before, p);
++        // Warp Stabilizer analyses made from other frames are cleared (and queued again).
++        for w in warp::invalidate(before, p) {
++            if !self.warp_pending.contains(&w) {
++                self.warp_pending.push(w);
++            }
++        }
++        // So are 3D Camera Tracker tracks (and solves made with other settings).
++        for w in camera_track::invalidate(before, p) {
++            if !self.camera_pending.contains(&w) {
++                self.camera_pending.push(w);
++            }
++        }
++        // Roto Brush Input Keys follow the frames; edited instances propagate again.
++        for r in roto::sync(before, p) {
++            if !self.roto_pending.contains(&r) {
++                self.roto_pending.push(r);
++            }
++        }
++    }
++
+     pub fn bump(&mut self) {
+         self.revision += 1;
+         // Back at the saved state (undo, redo, a history jump or a rolled-back batch).
+diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
+index be02fef..d0898b1 100644
+--- a/crates/ui-egui/Cargo.toml
++++ b/crates/ui-egui/Cargo.toml
+@@ -39,6 +39,7 @@ egui_kittest = { workspace = true, features = ["eframe", "wgpu"] }
+ pollster = "0.4"
+ effectcraft-host = { workspace = true }
+ exr = { workspace = true }
++effectcraft-engine = { workspace = true, features = ["live"] }
+ 
+ [build-dependencies]
+ serde_json = { workspace = true }
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 105a075..9576947 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -22,6 +22,9 @@ pub mod gpu_failure;
+ pub mod header;
+ pub mod i18n;
+ pub mod icons;
++// Live editing in a Playground session (web only).
++#[cfg(any(target_arch = "wasm32", test))]
++pub mod live;
+ pub mod menu_keys;
+ pub mod menus;
+ pub mod native_menu;
+diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
+new file mode 100644
+index 0000000..c98b514
+--- /dev/null
++++ b/crates/ui-egui/src/live.rs
+@@ -0,0 +1,270 @@
++//! Live editing in a Playground session (web only). The shared document is the open project (`Project`), minus what is
++//! this person's: the id counter, each comp's Resolution (the viewer's, kept out of undo), which footage is missing in
++//! this browser, and the Render Queue (its jobs, outputs and status). Selection, current times, open comps, panels and
++//! tools already live outside the project. Property nodes carry their uid as `id`, so the property tree merges node
++//! by node, as layers (by `id`) and items (keyed by id) do. Imported media stay in the browser that imported them.
++
++use std::cell::Cell;
++use std::sync::Arc;
++
++use effectcraft_engine::playground_live::{self, Live};
++use effectcraft_project::{ItemKind, LayerSource, Project};
++use serde_json::Value;
++
++use crate::EffectcraftApp;
++
++/// New ids per person while connected: a range of this many from a random start (see [`own_ids`]). Past it (4M ids in
++/// one session) the counter would rescan every frame and run into ids others may hand out.
++const RANGE: u64 = 1 << 22;
++
++thread_local! {
++    /// The last frame had a pointer button down or a text field focused.
++    static INPUT: Cell<bool> = const { Cell::new(false) };
++    /// While connected: the start of this person's id range.
++    static IDS: Cell<Option<u64>> = const { Cell::new(None) };
++}
++
++/// The end of a frame: [`playground_live::frame`], with what egui knows of the pointer and the keyboard.
++pub fn frame(app: &mut EffectcraftApp, ctx: &egui::Context) {
++    INPUT.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
++    own_ids(app);
++    playground_live::frame(app);
++}
++
++/// Items, layers, property uids and Essential Graphics controls all take ids from `Project::next_id`, which about 150
++/// places copy and write back. While connected that counter counts in a range of this person's own (`2^52` up, at a
++/// random start), so what two people add at the same time gets different ids. Something that lifts the counter past
++/// every id in the project (Import Project's `fix_next_id`) is brought back to the range.
++fn own_ids(app: &mut EffectcraftApp) {
++    let start = match IDS.get() {
++        Some(start) => start,
++        None => {
++            // 2^52 plus 52 random bits while connected, 0 otherwise.
++            let random = playground_live::fresh_id(&mut 0);
++            if random == 0 {
++                return;
++            }
++            let start = (1 << 52) + ((random & ((1 << 52) - 1)) >> 1);
++            IDS.set(Some(start));
++            start
++        }
++    };
++    if !(start..start + RANGE).contains(&app.session.project.next_id) {
++        let next = after_own(&serde_json::to_value(&*app.session.project).unwrap_or_default(), start);
++        Arc::make_mut(&mut app.session.project).next_id = next;
++    }
++}
++
++/// The first id of the range from `start` above every number of `doc` in that range: others' additions to it are
++/// skipped.
++fn after_own(doc: &Value, start: u64) -> u64 {
++    match doc {
++        Value::Object(map) => map.values().map(|v| after_own(v, start)).fold(start, u64::max),
++        Value::Array(items) => items.iter().map(|v| after_own(v, start)).fold(start, u64::max),
++        _ => doc.as_u64().filter(|n| (start..start + RANGE).contains(n)).map_or(start, |n| n + 1),
++    }
++}
++
++/// Gives each property node its uid as `id`, so a children list merges node by node.
++fn key_nodes(value: &mut Value) {
++    match value {
++        Value::Object(map) => {
++            if map.contains_key("node")
++                && let Some(uid) = map.get("uid").cloned()
++            {
++                map.insert("id".into(), uid);
++            }
++            map.values_mut().for_each(key_nodes);
++        }
++        Value::Array(items) => items.iter_mut().for_each(key_nodes),
++        _ => {}
++    }
++}
++
++/// A composition nested in itself, directly or through others (`Project::comp_contains` would never return).
++fn nest_cycle(p: &Project) -> bool {
++    let mut left: std::collections::BTreeMap<_, Vec<_>> = p
++        .comps()
++        .map(|(id, c)| (*id, c.layers.iter().filter_map(|l| if let LayerSource::Comp { item } = l.source { Some(item) } else { None }).collect()))
++        .collect();
++    // Comps that nest no comp left go, until none can.
++    loop {
++        let leaves: Vec<_> = left.iter().filter(|(_, nested)| nested.iter().all(|n| !left.contains_key(n))).map(|(id, _)| *id).collect();
++        if leaves.is_empty() {
++            return !left.is_empty();
++        }
++        for id in leaves {
++            left.remove(&id);
++        }
++    }
++}
++
++impl Live for EffectcraftApp {
++    fn live_document(&self) -> Value {
++        let mut doc = serde_json::to_value(&*self.session.project).unwrap_or_default();
++        if let Some(map) = doc.as_object_mut() {
++            for local in ["next_id", "render_queue", "render_prefs"] {
++                map.remove(local);
++            }
++        }
++        for item in doc.get_mut("items").and_then(Value::as_object_mut).into_iter().flat_map(|items| items.values_mut()) {
++            if let Some(kind) = item.get_mut("kind").and_then(Value::as_object_mut) {
++                // A comp's Resolution, a footage item's Missing.
++                kind.remove("resolution");
++                kind.remove("missing");
++            }
++        }
++        key_nodes(&mut doc);
++        doc
++    }
++
++    fn live_adopt(&mut self, mut document: Value) -> Result<(), String> {
++        let s = &mut self.session;
++        let cur = s.project.clone();
++        let own = IDS.get().map(|start| after_own(&document, start));
++        document.as_object_mut().ok_or("Invalid project")?.insert("next_id".into(), cur.next_id.into());
++        // As a file opens: values out of bounds are corrected, the counter is lifted past every id.
++        let mut p = Project::from_json(&document.to_string()).map_err(|e| format!("Invalid project: {e}"))?;
++        if nest_cycle(&p) && !nest_cycle(&cur) {
++            return Err("Conflict: a composition nested in itself".into());
++        }
++        if let Some(own) = own {
++            p.next_id = cur.next_id.max(own);
++        }
++        p.render_queue = cur.render_queue.clone();
++        p.render_prefs = cur.render_prefs.clone();
++        for (id, item) in &mut p.items {
++            match (&mut item.kind, cur.items.get(id).map(|i| &i.kind)) {
++                (ItemKind::Comp(c), Some(ItemKind::Comp(old))) if c.resolution != old.resolution => Arc::make_mut(c).resolution = old.resolution,
++                (ItemKind::Footage(f), Some(ItemKind::Footage(old))) => f.missing = old.missing,
++                _ => {}
++            }
++        }
++        // What an edit would bring about elsewhere (a shared Global Light, analyses to redo), with no undo step.
++        s.derive(&cur, &mut p);
++        s.project = Arc::new(p);
++        s.sanitize_state();
++        s.bump();
++        Ok(())
++    }
++
++    fn live_quiet(&self) -> bool {
++        // A dialog may hold a preview it takes back on Cancel (Layer Styles); on-canvas text is being typed.
++        !INPUT.get() && self.dialog.is_none() && self.session.state.text_edit.is_none()
++    }
++
++    fn live_generation(&self) -> Option<u64> {
++        Some(self.session.revision)
++    }
++
++    /// Undo steps from the session hold other people's edits: native Undo starts again from here.
++    fn live_disconnected(&mut self) {
++        self.session.history.clear();
++        IDS.set(None);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use effectcraft_engine::Session;
++    use effectcraft_project::{ItemId, Resolution};
++    use playground_live::canonical;
++    use serde_json::json;
++
++    fn demo() -> EffectcraftApp {
++        let mut s = Session::default();
++        s.execute("file.openDemoProject", json!({})).unwrap();
++        EffectcraftApp::new(s)
++    }
++
++    fn comp(app: &EffectcraftApp) -> ItemId {
++        app.session.active_comp_id().unwrap()
++    }
++
++    /// Adds or removes a keyframe of a Transform property of the comp's `layer`th layer.
++    fn key(app: &mut EffectcraftApp, layer: usize, prop: &str) {
++        let id = app.session.active_comp().unwrap().layers[layer].id.0;
++        app.session.execute("keys.toggleTransform", json!({"layer": id, "prop": prop})).unwrap();
++    }
++
++    fn keys(app: &EffectcraftApp, layer: usize, prop: &str) -> usize {
++        app.session.active_comp().unwrap().layers[layer].props.prop(&format!("transform/{prop}")).unwrap().keys.len()
++    }
++
++    #[test]
++    fn the_shared_document_is_the_project_without_views_or_local_state() {
++        let mut app = demo();
++        let before = canonical(&app.live_document());
++        let c = comp(&app);
++        app.session.set_resolution(c, Resolution::Half).unwrap();
++        app.session.state.selected_layers = vec![app.session.active_comp().unwrap().layers[1].id];
++        app.session.state.times.insert(c, effectcraft_time::Tick(1000));
++        Arc::make_mut(&mut app.session.project).next_id += 10;
++        assert_eq!(canonical(&app.live_document()), before, "views, Resolution and the id counter are not shared");
++        key(&mut app, 0, "position");
++        let doc = app.live_document();
++        assert_ne!(canonical(&doc), before);
++        let node = &doc["items"][c.0.to_string()]["kind"]["layers"][0]["props"]["children"][0];
++        assert!(node["id"].is_u64() && node["id"] == node["uid"], "property nodes are keyed by uid: {node}");
++    }
++
++    #[test]
++    fn adopting_keeps_views_and_local_state_is_no_undo_step_and_layers_merge_property_by_property() {
++        let (mut a, mut b) = (demo(), demo());
++        let c = comp(&a);
++        a.session.set_resolution(c, Resolution::Quarter).unwrap();
++        let base = a.live_document();
++        // A keys layer 1's Position, B layer 1's Opacity: one layer, two properties.
++        let opacity = keys(&a, 0, "opacity");
++        key(&mut a, 0, "position");
++        key(&mut b, 0, "opacity");
++        let (position, steps) = (keys(&a, 0, "position"), a.session.history.undo.len());
++        let merged = EffectcraftApp::live_merge(&base, &a.live_document(), &b.live_document()).unwrap();
++        a.live_adopt(merged).unwrap();
++        assert_eq!(keys(&a, 0, "position"), position);
++        assert!(keys(&a, 0, "opacity") == keys(&b, 0, "opacity") && keys(&a, 0, "opacity") != opacity);
++        assert_eq!(a.session.history.undo.len(), steps, "no undo step");
++        assert_eq!(a.session.project.comp(c).unwrap().resolution, Resolution::Quarter, "Resolution stays");
++        // Adopting a document unchanged changes nothing that is shared.
++        let doc = a.live_document();
++        a.live_adopt(doc.clone()).unwrap();
++        assert_eq!(canonical(&a.live_document()), canonical(&doc));
++    }
++
++    #[test]
++    fn a_remote_change_waits_while_busy_ids_are_peer_unique_and_undo_goes_to_the_session() {
++        let (mut a, mut b) = (demo(), demo());
++        let ctx = egui::Context::default();
++        playground_live::connect();
++        frame(&mut a, &ctx);
++        let start = IDS.get().unwrap();
++        assert_eq!(a.session.project.next_id, start, "connected, ids come from this person's range");
++        let base = canonical(&a.live_document());
++        key(&mut b, 1, "opacity");
++        let done = std::rc::Rc::new(Cell::new(false));
++        let to = done.clone();
++        playground_live::queue(Some(base), canonical(&b.live_document()), Box::new(move |r| to.set(r.is_ok())));
++        a.dialog = Some(crate::Dialog::LayerStyles);
++        frame(&mut a, &ctx);
++        assert!(!done.get() && keys(&a, 1, "opacity") != keys(&b, 1, "opacity"), "an open dialog holds remote changes");
++        a.dialog = None;
++        frame(&mut a, &ctx);
++        assert!(done.get() && keys(&a, 1, "opacity") == keys(&b, 1, "opacity"));
++        a.session.execute("layer.newNull", json!({})).unwrap();
++        assert!(a.session.active_comp().unwrap().layers.iter().any(|l| (start..start + RANGE).contains(&l.id.0)));
++        // A counter lifted past others' ids (Import Project) comes back to the range.
++        Arc::make_mut(&mut a.session.project).next_id = start + RANGE + 5;
++        frame(&mut a, &ctx);
++        assert!(a.session.project.next_id > start && a.session.project.next_id < start + 100);
++        key(&mut a, 0, "position");
++        let (positions, steps) = (keys(&a, 0, "position"), a.session.history.undo.len());
++        a.session.execute("edit.undo", json!({})).unwrap();
++        a.session.execute("edit.history.goto", json!({"steps": 1})).unwrap();
++        assert_eq!((keys(&a, 0, "position"), a.session.history.undo.len()), (positions, steps), "Undo is the session's while connected");
++        assert_eq!(playground_live::activity().1, [false, true]);
++        playground_live::disconnect();
++        a.live_disconnected();
++        assert!(a.session.history.undo.is_empty() && IDS.get().is_none());
++    }
++}

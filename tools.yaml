@@ -120,6 +120,7 @@ groups:
         icon: icons/effectcraft.png
         theme: themes/after-effects.js
         patches: patches/after-effects.yaml
+        live: crates/engine/src
         accent: "#9999FF"
         base: "#00005B"
 
