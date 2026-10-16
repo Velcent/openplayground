@@ -133,6 +133,8 @@ groups:
         opens: [pdf]
         imports: [png, jpg, jpeg, tif, tiff, gif, bmp, jp2, j2k, jpx, txt]
         repo: storytold/pdfcraft
+        patches: patches/acrobat.yaml
+        live: crates/ui-egui/live
         icon: icons/pdfcraft.png
         theme: themes/acrobat.js
         accent: "#FA0F00"
