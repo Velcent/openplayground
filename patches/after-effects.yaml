@@ -5,3 +5,58 @@
 - file: apps/*-web/src/**/*.rs
   find: '(query_value\("frameworkers"\)[^;]*?\.unwrap_or\()\s*(\d+)\s*(?:usize)?\s*\)'
   replace: '$1if cc.wgpu_render_state.as_ref().is_some_and(|rs| rs.adapter.get_info().backend == eframe::wgpu::Backend::BrowserWebGpu) { 0usize } else { $2usize })'
+
+# Live editing in Playground sessions (patches/after-effects/live.diff + patches/live/playground_live.rs)
+# The adapter lives in new files: crates/engine/src/playground.rs (the template as its child module, the shared
+# project's binding, Undo/Redo/History hand-off) and crates/ui-egui/src/playground.rs (the shared document, merge
+# checks, media, presence, the kept runner and the web wrapper that ends each frame). These rules only declare them and
+# call in, at signatures, long-standing mod lines and file ends. Verify: node scripts/build.mjs check after-effects
+# head|release (and LIVE=0), then the e2e (tests/live-apps/after-effects.mjs).
+#
+# A session (`?pg-session=<room>`) opens in a browser store of its own, so this person's last session, auto-saves,
+# settings and media stay as they were: the OPFS folder and the IndexedDB database get `-session-<room>`. If upstream
+# renames DIR/DB, anchor on the declarations of the storage names that storeOpen uses.
+- live: true
+  file: apps/effectcraft-web/js/host.js
+  find: '^const\s+DIR\s*=\s*[^;\n]+'
+  after: ' + (new URLSearchParams(self.location?.search).get("pg-session")?.replace(/[^0-9a-f-]/gi, "").replace(/^(?=.)/, "-session-") ?? "")'
+- live: true
+  file: apps/effectcraft-web/js/host.js
+  find: '^const\s+DB\s*=\s*[^;\n]+'
+  after: ' + (new URLSearchParams(self.location?.search).get("pg-session")?.replace(/[^0-9a-f-]/gi, "").replace(/^(?=.)/, "-session-") ?? "")'
+# The web entry keeps its runner for the adapter and wraps its app, so each frame ends with the adapter's frame hook
+# and the first one offers the adapter to the page. If upstream renames WebApp or its `app` field, follow it here.
+- live: true
+  file: apps/effectcraft-web/src/app.rs
+  find: 'eframe::WebRunner::new\(\)'
+  replace: 'effectcraft_ui_egui::playground::runner()'
+- live: true
+  file: apps/effectcraft-web/src/app.rs
+  find: 'Ok\(Box::new\((?=\s*WebApp\b)'
+  replace: 'Ok(effectcraft_ui_egui::playground::boxed(|w: &mut WebApp| &mut w.app, '
+# The engine's module (wasm, and native debug builds so native tests reach it; they never connect), declared next to a
+# long-standing module, and Session::execute's first step: Undo, Redo and History jumps go to the session.
+- live: true
+  file: crates/engine/src/lib.rs
+  find: '^pub\s+mod\s+commands;'
+  after: "\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))] pub mod playground;"
+- live: true
+  file: crates/engine/src/lib.rs
+  find: 'pub\s+fn\s+execute\s*\([^{]*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", debug_assertions))] if let Some(r) = self.live_execute(id, &params) { return r; }"
+# The template's wasm dependencies, under a target spelling nobody else uses.
+- live: true
+  file: crates/engine/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\njs-sys = \"0.3\"\nwasm-bindgen = \"0.2\"\n"
+# The frontend's module (wasm, and native debug builds for its tests).
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: '^pub\s+mod\s+icons;'
+  after: "\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))] pub mod playground;"
+# The comp viewer's first step records that it is on screen (its layer and clip): the end-of-frame hook then reads this
+# person's pointer in comp pixels and draws the others' pointers, names and selected layers' outlines over it.
+- live: true
+  file: crates/ui-egui/src/panels/viewer.rs
+  find: 'pub\s+fn\s+show\s*\([^{]*\{'
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", debug_assertions))] crate::playground::viewer(ui);"

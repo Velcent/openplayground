@@ -14,8 +14,14 @@ export default {
   path: '/effectcraft/',
   viewport: { width: 1280, height: 800 },
   ready: (page) => page.waitForTimeout(1500),
-  // A Position keyframe on layer 1.
-  editA: (page) => key(page, 'Control+ArrowDown', 'Alt+Shift+P'),
+  // Presence: layer 1 selected (selection is personal) and the pointer over the comp viewer.
+  point: async (page) => {
+    await key(page, 'Control+ArrowDown')
+    await page.mouse.move(600, 300)
+    await page.waitForTimeout(300)
+  },
+  // A Position keyframe on layer 1 (F2 is Deselect All, after point()'s selection).
+  editA: (page) => key(page, 'F2', 'Control+ArrowDown', 'Alt+Shift+P'),
   // An Opacity keyframe on layer 2.
   editB: (page) => key(page, 'Control+ArrowDown', 'Control+ArrowDown', 'Alt+Shift+T'),
   undo: (page) => key(page, 'Control+z'),

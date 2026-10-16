@@ -1,113 +1,42 @@
-diff --git a/apps/effectcraft-web/js/host.js b/apps/effectcraft-web/js/host.js
-index 3db6ad3..16edd2c 100644
---- a/apps/effectcraft-web/js/host.js
-+++ b/apps/effectcraft-web/js/host.js
-@@ -9,8 +9,11 @@
- 
- // ------------------------------------------------------------------ storage
- 
--const DIR = "effectcraft";
--const DB = "effectcraft";
-+// A Playground live session (`?pg-session=<room>`) opens in a store of its own: the person's own last session,
-+// auto-saves, settings and media stay as they were.
-+const ROOM = new URLSearchParams(self.location?.search ?? "").get("pg-session")?.replace(/[^0-9a-f-]/gi, "");
-+const DIR = ROOM ? `effectcraft-session-${ROOM}` : "effectcraft";
-+const DB = DIR;
- const STORE = "entries";
- let backend = null;
- 
-diff --git a/apps/effectcraft-web/src/app.rs b/apps/effectcraft-web/src/app.rs
-index 1a69524..175dbb4 100644
---- a/apps/effectcraft-web/src/app.rs
-+++ b/apps/effectcraft-web/src/app.rs
-@@ -118,6 +118,11 @@ impl eframe::App for WebApp {
- 
-     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-         self.app.ui(ui, frame);
-+        effectcraft_ui_egui::live::frame(&mut self.app, ui.ctx());
-+    }
+diff --git a/crates/engine/src/playground.rs b/crates/engine/src/playground.rs
+new file mode 100644
+index 0000000..fb02668
+--- /dev/null
++++ b/crates/engine/src/playground.rs
+@@ -0,0 +1,60 @@
++//! Live editing in a Playground session (web only): the adapter template ([`playground_live`]), the shared project's
++//! binding ([`LIVE_PROJECT`]) and [`Session::execute`]'s first step, which hands Undo, Redo and History jumps to the
++//! session while the shared project is open. The frontend (`effectcraft_ui_egui::playground`) implements the adapter.
 +
-+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-+        Some(self)
-     }
- }
- 
-@@ -266,6 +271,16 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
-             }),
-         )
-         .await?;
-+    // Live editing in a Playground session.
-+    let live = runner.clone();
-+    let attached = effectcraft_engine::playground_live::web::attach::<EffectcraftApp>(
-+        concat!("after-effects:1:", env!("CARGO_PKG_VERSION")),
-+        move |with| live.app_mut::<WebApp>().map(|mut web| with(&mut web.app)).is_some(),
-+        repaint,
-+    );
-+    if let Err(e) = attached {
-+        log::error!("live editing: {e:?}");
-+    }
-     // Hide the loading message once the app runs.
-     if let Some(el) = doc.get_element_by_id("loading") {
-         el.remove();
-diff --git a/crates/engine/Cargo.toml b/crates/engine/Cargo.toml
-index 68e761a..e222435 100644
---- a/crates/engine/Cargo.toml
-+++ b/crates/engine/Cargo.toml
-@@ -37,3 +37,11 @@ rayon = { workspace = true }
- image = { workspace = true }
- web-time = { workspace = true }
- exr = { workspace = true }
++use serde_json::Value;
 +
-+[target.'cfg(target_arch = "wasm32")'.dependencies]
-+js-sys = "0.3"
-+wasm-bindgen = "0.2"
++use crate::{EngineError, Result, Session, history};
 +
-+[features]
-+# Playground live editing's adapter (`playground_live`) in native test builds of the crates that use it.
-+live = []
-diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 96e09b5..0f8be20 100644
---- a/crates/engine/src/lib.rs
-+++ b/crates/engine/src/lib.rs
-@@ -30,6 +30,15 @@ pub mod menus;
- pub mod models;
- pub mod offload;
- pub mod perf;
-+// Live editing in a Playground session (web only).
-+#[cfg(any(target_arch = "wasm32", test, feature = "live"))]
++#[path = "playground_live.rs"]
 +pub mod playground_live;
-+#[cfg(any(target_arch = "wasm32", test, feature = "live"))]
++
 +thread_local! {
-+    /// Live editing: the [`scriptui::ScriptUi::project_epoch`] of the project a connected session shares (the
-+    /// frontend sets it). Undo, Redo and History jumps go to the session only while that project is open.
++    /// The [`crate::scriptui::ScriptUi::project_epoch`] of the project a connected session shares (the frontend sets
++    /// it). Undo, Redo and History jumps go to the session only while that project is open.
 +    pub static LIVE_PROJECT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 +}
- pub mod prefs;
- pub mod preview;
- pub mod psd_import;
-@@ -622,6 +631,15 @@ impl Session {
- 
-     /// Run a command by id.
-     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
-+        // Live editing (web): Undo, Redo and History jumps go to the session, which takes back only this person's edits.
-+        #[cfg(any(target_arch = "wasm32", test, feature = "live"))]
-+        if let Some(steps) = self.live_steps(id, &params) {
-+            let n = steps?;
-+            for _ in 0..n.unsigned_abs() {
-+                playground_live::undo(n > 0);
-+            }
-+            return Ok(Value::Null);
++
++impl Session {
++    /// [`Session::execute`]'s first step: while the shared project is open in a connected session, Undo, Redo and
++    /// History jumps go to the session, which takes back only this person's edits. `None`: run the command as usual.
++    pub fn live_execute(&mut self, id: &str, params: &Value) -> Option<Result<Value>> {
++        let n = match self.live_steps(id, params)? {
++            Ok(n) => n,
++            Err(e) => return Some(Err(e)),
++        };
++        for _ in 0..n.unsigned_abs() {
++            playground_live::undo(n > 0);
 +        }
-         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
-         if let Err(why) = (spec.enabled)(self) {
-             // Explicit targets (agents, scripts) don't need a UI selection.
-@@ -645,6 +663,36 @@ impl Session {
-         Ok(r)
-     }
- 
-+    /// Live editing, while the shared project is open: the steps along the History's working line (negative: back)
-+    /// that Undo, Redo or a History jump takes, or an error for a state on another branch, which the session can't reach.
-+    #[cfg(any(target_arch = "wasm32", test, feature = "live"))]
++        Some(Ok(Value::Null))
++    }
++
++    /// The steps along the History's working line (negative: back) that Undo, Redo or a History jump takes, or an
++    /// error for a state on another branch, which the session can't reach.
 +    fn live_steps(&self, id: &str, p: &Value) -> Option<Result<i64>> {
 +        if !matches!(id, "edit.undo" | "edit.redo" | "edit.history.goto")
 +            || !playground_live::connected()
@@ -134,42 +63,13 @@ index 96e09b5..0f8be20 100644
 +            }
 +        })
 +    }
-+
-     /// [`Session::execute`] for agents and scripts (MCP, CLI, control channel): unknown top-level
-     /// parameters are rejected with the accepted keys instead of being silently ignored.
-     pub fn execute_checked(&mut self, id: &str, params: Value) -> Result<Value> {
-diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
-index be02fef..d0898b1 100644
---- a/crates/ui-egui/Cargo.toml
-+++ b/crates/ui-egui/Cargo.toml
-@@ -39,6 +39,7 @@ egui_kittest = { workspace = true, features = ["eframe", "wgpu"] }
- pollster = "0.4"
- effectcraft-host = { workspace = true }
- exr = { workspace = true }
-+effectcraft-engine = { workspace = true, features = ["live"] }
- 
- [build-dependencies]
- serde_json = { workspace = true }
-diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index 105a075..9576947 100644
---- a/crates/ui-egui/src/lib.rs
-+++ b/crates/ui-egui/src/lib.rs
-@@ -22,6 +22,9 @@ pub mod gpu_failure;
- pub mod header;
- pub mod i18n;
- pub mod icons;
-+// Live editing in a Playground session (web only).
-+#[cfg(any(target_arch = "wasm32", test))]
-+pub mod live;
- pub mod menu_keys;
- pub mod menus;
- pub mod native_menu;
-diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
++}
+diff --git a/crates/ui-egui/src/playground.rs b/crates/ui-egui/src/playground.rs
 new file mode 100644
-index 0000000..18f7358
+index 0000000..434e0a6
 --- /dev/null
-+++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,473 @@
++++ b/crates/ui-egui/src/playground.rs
+@@ -0,0 +1,634 @@
 +//! Live editing in a Playground session (web only). The shared document is the project open when the session started
 +//! (`Project`), minus what is this person's: the id counter, each comp's Resolution, Draft 3D and Hide Shy Layers
 +//! switches (viewer and Timeline toggles), which footage is missing in this browser, and the Render Queue (its jobs,
@@ -178,24 +78,38 @@ index 0000000..18f7358
 +//! (keyed by id) do. A remote change is only installed: what an edit brings about elsewhere (a shared Global Light,
 +//! Essential Properties, analyses to redo) comes from its author's own edit. The footage files the shared project names
 +//! (by path, in the page's file table) reach everyone through the session ([`media`]). Opening another project leaves
-+//! the session's document as it was, still merging remote changes.
++//! the session's document as it was, still merging remote changes. Presence: each person shares the comp they show,
++//! their pointer over its viewer in comp pixels and their selected layers; the others' are drawn over the viewer.
 +
 +use std::cell::{Cell, RefCell};
 +use std::collections::BTreeSet;
 +use std::sync::Arc;
 +
-+use effectcraft_engine::playground_live::{self, Live};
-+use effectcraft_engine::{LIVE_PROJECT, Services};
++use effectcraft_engine::Services;
++use effectcraft_engine::playground::LIVE_PROJECT;
++use effectcraft_engine::playground::playground_live::{self, Live, Presence};
++use effectcraft_engine::render::EvalCtx;
 +use effectcraft_project::{Footage, ItemKind, LayerSource, Project};
-+use serde_json::Value;
++use egui::{Color32, Rect, Stroke, vec2};
++use serde_json::{Value, json};
 +
 +use crate::EffectcraftApp;
++use crate::panels::viewer::{ViewerMap, layer_outline};
 +
 +/// New ids per person while connected: a range of this many (see [`bind`]). Past it (4M ids in one session) the
 +/// counter would rescan every frame and run into ids others may hand out.
 +const RANGE: u64 = 1 << 22;
 +
 +thread_local! {
++    /// The web entry's runner ([`runner`]).
++    #[cfg(target_arch = "wasm32")]
++    static RUNNER: RefCell<Option<eframe::WebRunner>> = const { RefCell::new(None) };
++    /// The comp viewer as shown last ([`viewer`]): the pass, its layer and clip.
++    static VIEWER: Cell<Option<(u64, egui::LayerId, Rect)>> = const { Cell::new(None) };
++    /// This person's pointer over the comp viewer in the last frame, in comp pixels.
++    static POINTER: Cell<Option<[f64; 2]>> = const { Cell::new(None) };
++    /// The others' presence ([`Live::live_show_presence`]).
++    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
 +    /// The last frame had a pointer button down or a text field focused.
 +    static INPUT: Cell<bool> = const { Cell::new(false) };
 +    /// While connected: the start of this person's id range.
@@ -203,6 +117,74 @@ index 0000000..18f7358
 +    /// While connected: the shared project as it last was here, which stays the session's document once another
 +    /// project is opened.
 +    static SHARED: RefCell<Option<Arc<Project>>> = const { RefCell::new(None) };
++}
++
++/// The web entry's runner, in place of `eframe::WebRunner::new()`: kept for the adapter's access to the app.
++#[cfg(target_arch = "wasm32")]
++pub fn runner() -> eframe::WebRunner {
++    let runner = eframe::WebRunner::new();
++    RUNNER.set(Some(runner.clone()));
++    runner
++}
++
++/// The web entry's app, in place of `Box::new(app)`: [`Web`], with `app` reaching the EffectCraft app inside.
++#[cfg(target_arch = "wasm32")]
++pub fn boxed<T: eframe::App + 'static>(app: fn(&mut T) -> &mut EffectcraftApp, inner: T) -> Box<dyn eframe::App> {
++    Box::new(Web { inner, app, attached: false })
++}
++
++/// The web app with live editing: each frame ends with [`frame`]; the first one offers the adapter to the page.
++#[cfg(target_arch = "wasm32")]
++pub struct Web<T> {
++    inner: T,
++    app: fn(&mut T) -> &mut EffectcraftApp,
++    attached: bool,
++}
++
++#[cfg(target_arch = "wasm32")]
++impl<T: eframe::App + 'static> eframe::App for Web<T> {
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
++        self.inner.raw_input_hook(ctx, raw_input);
++    }
++
++    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
++        self.inner.logic(ctx, frame);
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        self.inner.ui(ui, frame);
++        let ctx = ui.ctx().clone();
++        self::frame((self.app)(&mut self.inner), &ctx);
++        if !std::mem::replace(&mut self.attached, true) {
++            let with_app = |with: &mut dyn FnMut(&mut EffectcraftApp)| {
++                RUNNER.with_borrow(|r| r.as_ref().and_then(|r| r.app_mut::<Self>()).map(|mut web| with((web.app)(&mut web.inner))).is_some())
++            };
++            let format = concat!("after-effects:1:", env!("CARGO_PKG_VERSION"));
++            if let Err(e) = playground_live::web::attach::<EffectcraftApp>(format, with_app, move || ctx.request_repaint()) {
++                log::error!("live editing: {e:?}");
++            }
++        }
++    }
++
++    fn save(&mut self, storage: &mut dyn eframe::Storage) {
++        self.inner.save(storage);
++    }
++
++    fn auto_save_interval(&self) -> std::time::Duration {
++        self.inner.auto_save_interval()
++    }
++
++    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
++        self.inner.clear_color(visuals)
++    }
++
++    fn persist_egui_memory(&self) -> bool {
++        self.inner.persist_egui_memory()
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
++    }
 +}
 +
 +/// The end of a frame: [`playground_live::frame`], with what egui knows of the pointer and the keyboard.
@@ -213,6 +195,53 @@ index 0000000..18f7358
 +    if open(app) && playground_live::connected() {
 +        SHARED.set(Some(app.session.project.clone()));
 +    }
++    // The comp viewer's mapping, when it was shown this frame (`panels::viewer::show` publishes it).
++    let shown = VIEWER.get().filter(|(pass, ..)| *pass == ctx.cumulative_pass_nr());
++    let shown = shown.zip(ctx.data(|d| d.get_temp::<ViewerMap>(egui::Id::new("viewer-map"))));
++    POINTER.set(shown.and_then(|((_, layer, clip), map)| {
++        let at = ctx.pointer_hover_pos().filter(|p| map.area.intersect(clip).contains(*p))?;
++        ctx.layer_id_at(at).is_none_or(|l| l == layer).then(|| map.to_comp(at))
++    }));
++    if let Some(((_, layer, clip), map)) = shown {
++        OTHERS.with_borrow(|others| draw_others(app, &ctx.layer_painter(layer).with_clip_rect(map.area.intersect(clip)), &map, others));
++    }
++}
++
++/// The comp viewer's first step (`panels::viewer::show`): it is on screen this frame, on this layer.
++pub fn viewer(ui: &egui::Ui) {
++    VIEWER.set(Some((ui.ctx().cumulative_pass_nr(), ui.layer_id(), ui.clip_rect())));
++}
++
++/// The others who show this comp, over its viewer: the outlines of their selected layers and their pointer with their
++/// name, in their color. What doesn't resolve here (another comp, a layer gone, a wild number) is skipped.
++fn draw_others(app: &EffectcraftApp, painter: &egui::Painter, map: &ViewerMap, others: &[Presence]) {
++    let Some((cid, comp)) = app.session.active_comp_id().and_then(|c| Some((c, app.session.project.comp(c)?))) else { return };
++    let ectx = EvalCtx { project: &app.session.project, comp_id: cid, comp, time: app.session.time(), expr: app.session.expr.as_deref(), footage: None };
++    for p in others.iter().filter(|p| p.state["page"].as_u64() == Some(cid.0)) {
++        let color = Color32::from_rgb(p.color[0], p.color[1], p.color[2]);
++        let ids = p.state["selection"].as_array().into_iter().flatten().take(50).filter_map(Value::as_u64);
++        for l in ids.filter_map(|id| comp.layers.iter().find(|l| l.id.0 == id)) {
++            let outline = layer_outline(&ectx, l);
++            if outline.len() > 2 {
++                painter.add(egui::Shape::closed_line(outline.iter().map(|c| map.to_screen(*c)).collect(), Stroke::new(2.0, color)));
++            }
++        }
++        let Some(at) = point(&p.state["pointer"]).map(|c| map.to_screen(c)) else { continue };
++        let arrow = vec![at, at + vec2(0.0, 15.0), at + vec2(10.0, 10.5)];
++        painter.add(egui::Shape::convex_polygon(arrow, color, Stroke::new(1.0, Color32::WHITE)));
++        let [r, g, b] = p.color.map(f32::from);
++        let ink = if 0.299 * r + 0.587 * g + 0.114 * b > 150.0 { Color32::BLACK } else { Color32::WHITE };
++        let name = painter.layout_no_wrap(p.name.chars().take(32).collect(), egui::FontId::proportional(11.0), ink);
++        let tag = Rect::from_min_size(at + vec2(10.0, 14.0), name.size() + vec2(8.0, 4.0));
++        painter.rect_filled(tag, 3.0, color);
++        painter.galley(tag.min + vec2(4.0, 2.0), name, ink);
++    }
++}
++
++/// A pointer from someone else's presence: two finite numbers within reach of any comp.
++fn point(v: &Value) -> Option<[f64; 2]> {
++    let [x, y] = [v.get(0)?.as_f64()?, v.get(1)?.as_f64()?];
++    (x.abs() < 1e6 && y.abs() < 1e6).then_some([x, y])
 +}
 +
 +/// The shared project: the open one, or the one the session kept once another was opened.
@@ -455,6 +484,22 @@ index 0000000..18f7358
 +        if open(self) { Some(self.session.revision) } else { SHARED.with_borrow(|p| p.as_ref().map(|p| Arc::as_ptr(p) as u64)) }
 +    }
 +
++    /// The comp shown, the pointer over its viewer (comp pixels) and the selected layers; nothing while another project
++    /// is open.
++    fn live_presence(&self) -> Value {
++        let Some(comp) = self.session.active_comp_id().filter(|_| open(self)) else { return Value::Null };
++        let selection: Vec<u64> = self.session.state.selected_layers.iter().take(50).map(|l| l.0).collect();
++        let mut state = json!({ "page": comp.0, "selection": selection });
++        if let Some(p) = POINTER.get() {
++            state["pointer"] = json!(p.map(|v| (v * 10.0).round() / 10.0));
++        }
++        state
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        OTHERS.set(others);
++    }
++
 +    /// Undo steps from the session hold other people's edits: native Undo starts again from here.
 +    fn live_disconnected(&mut self) {
 +        if open(self) {
@@ -641,5 +686,21 @@ index 0000000..18f7358
 +        assert!(a.session.project.items.values().all(|i| !matches!(&i.kind, ItemKind::Footage(f) if f.missing)), "no longer Missing");
 +        assert_eq!((canonical(&a.live_document()), a.session.history.undo.len(), a.session.is_dirty()), (doc, steps, false));
 +        assert!(a.session.drain_events().contains(&effectcraft_engine::Event::PurgeCaches));
++    }
++
++    #[test]
++    fn presence_is_the_comp_pointer_and_selection_of_the_shared_project() {
++        let mut a = demo();
++        let c = comp(&a);
++        let layers: Vec<u64> = a.session.active_comp().unwrap().layers[..2].iter().map(|l| l.id.0).collect();
++        a.session.state.selected_layers = layers.iter().map(|id| effectcraft_project::LayerId(*id)).collect();
++        POINTER.set(Some([960.04, 540.66]));
++        assert_eq!(a.live_presence(), json!({"page": c.0, "selection": layers, "pointer": [960.0, 540.7]}));
++        POINTER.set(None);
++        assert!(a.live_presence().get("pointer").is_none());
++        LIVE_PROJECT.set(Some(a.session.script_ui.project_epoch + 1));
++        assert_eq!(a.live_presence(), Value::Null, "another project open: nothing to show");
++        LIVE_PROJECT.set(None);
++        assert_eq!(point(&json!([1e9, 0])), None);
 +    }
 +}
