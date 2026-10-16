@@ -15,6 +15,12 @@ export default {
 }
 ```
 
+An app whose checkpoint is not JSON defines `globalThis.liveTestDocument()` in `ready`, returning the document as JSON
+text (see photoshop.mjs).
+
+```js
+```
+
 Build the patched app, install it with `LIVE_PUBLIC=~/.cache/live-e2e-public node scripts/live-overlay.mjs <slug>
 <dist> <path>`, then run `LIVE_PUBLIC=~/.cache/live-e2e-public LIVE_APPS=<slug> CHROMIUM=… node --test
 --test-isolation=none tests/live-apps.e2e.test.mjs`.

@@ -25,8 +25,10 @@ async function open(app) {
   await app.ready?.(page)
   return page
 }
-// Normalized, so a document's text compares equal to its own JSON.stringify(JSON.parse(...)) (e.g. 104.0 and 104).
-const json = (page) => page.evaluate(() => JSON.stringify(JSON.parse(new TextDecoder().decode(playgroundLiveAdapter.checkpoint()))))
+// Normalized, so a document's text compares equal to its own JSON.stringify(JSON.parse(...)) (e.g. 104.0 and 104). An app
+// with a binary checkpoint defines globalThis.liveTestDocument() in its spec's `ready` to give it as JSON.
+const json = (page) => page.evaluate(() => JSON.stringify(JSON.parse(globalThis.liveTestDocument?.()
+  ?? new TextDecoder().decode(playgroundLiveAdapter.checkpoint()))))
 const status = (page) => page.evaluate(() => session.live?.status)
 const follow = (page) => page.evaluate(async () => { await (await import('/shell/live.js')).follow(session) })
 // Every page has the same document, different from `before` when given.
