@@ -105,6 +105,7 @@ groups:
         icon: icons/filmcraft.png
         theme: themes/premiere.js
         patches: patches/premiere.yaml
+        live: crates/project/src
         accent: "#9999FF"
         base: "#00005B"
 

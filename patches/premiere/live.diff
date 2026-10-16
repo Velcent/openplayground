@@ -1,0 +1,372 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index e50797e..f009b9c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2202,10 +2202,12 @@ dependencies = [
+  "filmcraft-geom",
+  "filmcraft-media",
+  "filmcraft-time",
++ "js-sys",
+  "proptest",
+  "serde",
+  "serde_json",
+  "thiserror 2.0.21",
++ "wasm-bindgen",
+ ]
+ 
+ [[package]]
+diff --git a/apps/filmcraft-web/src/lib.rs b/apps/filmcraft-web/src/lib.rs
+index 21512cc..fadee32 100644
+--- a/apps/filmcraft-web/src/lib.rs
++++ b/apps/filmcraft-web/src/lib.rs
+@@ -113,6 +113,11 @@ impl eframe::App for WebApp {
+ 
+     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+         self.app.ui(ui, frame);
++        filmcraft_ui_egui::live::frame(&mut self.app, ui.ctx());
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
+     }
+ }
+ 
+@@ -219,6 +224,16 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
+         )
+         .await?;
+     set_info("startupMs", json!(t0.elapsed().as_secs_f64() * 1000.0));
++    // Live editing in a Playground session.
++    let live = runner.clone();
++    let attached = filmcraft_engine::project::playground_live::web::attach::<FilmcraftApp>(
++        concat!("premiere:1:", env!("CARGO_PKG_VERSION")),
++        move |with| live.app_mut::<WebApp>().map(|mut web| with(&mut web.app)).is_some(),
++        repaint,
++    );
++    if let Err(e) = attached {
++        log::error!("live editing: {e:?}");
++    }
+     // keep the runner alive for the page's lifetime
+     std::mem::forget(runner);
+     if let Some(el) = doc.get_element_by_id("loading") {
+diff --git a/crates/edit/src/lib.rs b/crates/edit/src/lib.rs
+index 2f2588d..be99895 100644
+--- a/crates/edit/src/lib.rs
++++ b/crates/edit/src/lib.rs
+@@ -69,6 +69,9 @@ impl EditCtx<'_> {
+     pub fn alloc(&mut self) -> u64 {
+         let v = *self.next_id;
+         *self.next_id += 1;
++        // Live editing (web): an id no one else editing at the same time picks.
++        #[cfg(target_arch = "wasm32")]
++        let v = filmcraft_project::playground_live::fresh_id(&mut { v });
+         v
+     }
+ }
+diff --git a/crates/engine/src/captions.rs b/crates/engine/src/captions.rs
+index 1566a59..ed0d536 100644
+--- a/crates/engine/src/captions.rs
++++ b/crates/engine/src/captions.rs
+@@ -130,6 +130,8 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format, name: O
+         let mut alloc = || {
+             let v = next;
+             next += 1;
++            #[cfg(target_arch = "wasm32")]
++            let v = filmcraft_project::playground_live::fresh_id(&mut { v });
+             v
+         };
+         let mut track = filmcraft_captions::track_from_document(&doc, tid, &track_name, format.track_format(), &mut alloc);
+diff --git a/crates/project/Cargo.toml b/crates/project/Cargo.toml
+index 29f4301..ac608d1 100644
+--- a/crates/project/Cargo.toml
++++ b/crates/project/Cargo.toml
+@@ -18,5 +18,13 @@ serde = { workspace = true }
+ serde_json = { workspace = true }
+ thiserror = { workspace = true }
+ 
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++js-sys = "0.3"
++wasm-bindgen = "0.2"
++
+ [dev-dependencies]
+ proptest = { workspace = true }
++
++[features]
++# Playground live editing's adapter (`playground_live`) in native test builds of the crates that use it.
++live = []
+diff --git a/crates/project/src/lib.rs b/crates/project/src/lib.rs
+index fb55786..dc70c2a 100644
+--- a/crates/project/src/lib.rs
++++ b/crates/project/src/lib.rs
+@@ -21,6 +21,9 @@ pub mod mask;
+ pub mod mixer;
+ pub mod multicam;
+ pub mod narration;
++// Live editing in a Playground session (web only).
++#[cfg(any(target_arch = "wasm32", test, feature = "live"))]
++pub mod playground_live;
+ pub mod transcript;
+ pub mod vtransition;
+ 
+@@ -1359,13 +1362,16 @@ impl Project {
+     pub fn alloc_id(&mut self) -> u64 {
+         let id = self.next_id;
+         self.next_id += 1;
++        // Live editing (web): an id no one else editing at the same time picks.
++        #[cfg(target_arch = "wasm32")]
++        let id = playground_live::fresh_id(&mut { id });
+         id
+     }
+ 
+     /// Add an item to a bin (root when None / not found).
+     pub fn add_item(&mut self, name: &str, label: Label, kind: ItemKind, bin: Option<BinId>) -> ItemId {
++        let created = self.next_id;
+         let id = ItemId(self.alloc_id());
+-        let created = id.0;
+         self.items.insert(id, ProjectItem { id, name: name.into(), label, kind, metadata: BTreeMap::new(), created, split: SplitMarks::default() });
+         if let Some(b) = bin.and_then(|b| self.root.find_bin_mut(b)) {
+             b.children.push(BinEntry::Item(id));
+diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
+index b63880d..966f231 100644
+--- a/crates/ui-egui/Cargo.toml
++++ b/crates/ui-egui/Cargo.toml
+@@ -53,6 +53,7 @@ filmcraft-codecs = { workspace = true }
+ filmcraft-platform = { workspace = true }
+ filmcraft-interchange = { workspace = true }
+ egui_kittest = { workspace = true, features = ["eframe", "wgpu"] }
++filmcraft-project = { workspace = true, features = ["live"] }
+ 
+ # build.rs bakes contributors/contributors.json into the binary (About ▸ Contributors).
+ [build-dependencies]
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index cb4a234..1021d1b 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -45,6 +45,9 @@ pub mod header;
+ pub mod i18n;
+ pub mod icons;
+ pub mod links;
++// Live editing in a Playground session (web only).
++#[cfg(any(target_arch = "wasm32", test))]
++pub mod live;
+ pub mod menus;
+ pub mod native_dialogs;
+ pub mod panels;
+diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
+new file mode 100644
+index 0000000..d67db37
+--- /dev/null
++++ b/crates/ui-egui/src/live.rs
+@@ -0,0 +1,182 @@
++//! Live editing in a Playground session (web only). The shared document is the open project (`Project`). What each
++//! person sees for themselves (selection, playheads, open sequences, Timeline zoom and scroll, panels, the Source
++//! monitor) already lives outside it, in the engine's `EditorState` and the UI. Imported media stay in the browser
++//! that imported them.
++
++use std::cell::Cell;
++use std::sync::Arc;
++
++use filmcraft_project::Project;
++use filmcraft_project::playground_live::{self, Live};
++use serde_json::Value;
++
++use crate::FilmcraftApp;
++
++thread_local! {
++    /// The last frame had a pointer button down or a text field focused.
++    static INPUT: Cell<bool> = const { Cell::new(false) };
++}
++
++/// The end of a frame: [`playground_live::frame`], with what egui knows of the pointer and the keyboard.
++pub fn frame(app: &mut FilmcraftApp, ctx: &egui::Context) {
++    INPUT.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
++    playground_live::frame(app);
++}
++
++/// Gives each bin entry the id of the item or bin it holds (`keyed`), or takes it away again, so what two people add
++/// to one bin merges entry by entry.
++fn key_bins(bin: &mut Value, keyed: bool) {
++    for entry in bin.get_mut("children").and_then(Value::as_array_mut).into_iter().flatten() {
++        let Some(entry) = entry.as_object_mut() else { continue };
++        let id = entry.get("Item").cloned().or_else(|| entry.get("Bin").and_then(|b| b.get("id")).cloned());
++        match id {
++            Some(id) if keyed => entry.insert("id".into(), id),
++            _ => entry.remove("id"),
++        };
++        if let Some(bin) = entry.get_mut("Bin") {
++            key_bins(bin, keyed);
++        }
++    }
++}
++
++impl Live for FilmcraftApp {
++    const COUNTERS: &'static [&'static str] = &["next_id"];
++
++    fn live_document(&self) -> Value {
++        let mut doc = serde_json::to_value(&*self.session.project).unwrap_or_default();
++        if let Some(root) = doc.get_mut("root") {
++            key_bins(root, true);
++        }
++        doc
++    }
++
++    fn live_adopt(&mut self, mut document: Value) -> Result<(), String> {
++        if let Some(root) = document.get_mut("root") {
++            key_bins(root, false);
++        }
++        let project: Project = serde_json::from_value(document).map_err(|e| format!("Invalid project: {e}"))?;
++        let s = &mut self.session;
++        // A merge that breaks a sequence (clips overlapping, a sequence nested in itself) is a conflict.
++        for item in project.sequences() {
++            let check = |p: &Project| p.sequence(item.id).map(|q| q.check());
++            if let Some(Err(e)) = check(&project)
++                && !matches!(check(&s.project), Some(Err(_)))
++            {
++                return Err(format!("Conflict: {e}"));
++            }
++        }
++        if project.nest_cycle().is_some() && s.project.nest_cycle().is_none() {
++            return Err("Conflict: a sequence nested in itself".into());
++        }
++        s.project = Arc::new(project);
++        s.fix_state();
++        s.bump_view();
++        s.previews.live.publish_project(s.project.clone());
++        Ok(())
++    }
++
++    fn live_quiet(&self) -> bool {
++        let s = &self.session;
++        !INPUT.get() && s.trim_play.dynamic.is_none() && !s.mixrec.active() && !s.mcrec.active() && !s.voiceover.recording()
++    }
++
++    fn live_generation(&self) -> Option<u64> {
++        Some(self.session.revision)
++    }
++
++    /// Undo steps from the session hold other people's edits: native Undo starts again from here.
++    fn live_disconnected(&mut self) {
++        let h = &mut self.session.history;
++        (h.undo, h.redo, h.merge_key) = (Vec::new(), Vec::new(), None);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use filmcraft_engine::Session;
++    use filmcraft_time::Tick;
++    use playground_live::canonical;
++    use serde_json::json;
++
++    fn demo() -> FilmcraftApp {
++        let mut s = Session::default();
++        s.execute("file.openDemoProject", json!({})).unwrap();
++        FilmcraftApp::new(s)
++    }
++
++    /// Enables or disables the first clip of a video track.
++    fn toggle(app: &mut FilmcraftApp, track: usize) -> filmcraft_project::ClipId {
++        let clip = app.session.active_sequence().unwrap().video_tracks[track].items[0].id;
++        app.session.execute("clip.enable", json!({"clips": [clip.0]})).unwrap();
++        clip
++    }
++
++    fn enabled(app: &FilmcraftApp, track: usize) -> bool {
++        app.session.active_sequence().unwrap().video_tracks[track].items[0].enabled
++    }
++
++    #[test]
++    fn the_shared_document_is_the_project_without_views() {
++        let mut app = demo();
++        let before = canonical(&app.live_document());
++        app.session.set_playhead(Tick(48_000));
++        app.session.state.selection = vec![app.session.active_sequence().unwrap().video_tracks[0].items[1].id];
++        app.session.state.open_sequences.clear();
++        assert_eq!(canonical(&app.live_document()), before, "views are not shared");
++        toggle(&mut app, 0);
++        let doc = app.live_document();
++        assert_ne!(canonical(&doc), before);
++        let first = &doc["root"]["children"][0];
++        assert!(first["id"] == first["Item"] || first["id"] == first["Bin"]["id"], "bin entries are keyed");
++    }
++
++    #[test]
++    fn adopting_keeps_views_is_no_undo_step_and_bins_merge_entry_by_entry() {
++        let (mut a, mut b) = (demo(), demo());
++        toggle(&mut b, 0);
++        a.session.set_playhead(Tick(48_000));
++        let (playhead, steps) = (a.session.playhead(), a.session.history.undo.len());
++        a.live_adopt(b.live_document()).unwrap();
++        assert_eq!(canonical(&a.live_document()), canonical(&b.live_document()));
++        assert!(!enabled(&a, 0));
++        assert_eq!((a.session.playhead(), a.session.history.undo.len()), (playhead, steps));
++        // Two people add a bin each (the ids differ while connected).
++        let base = a.live_document();
++        a.session.execute("file.newBin", json!({"name": "A"})).unwrap();
++        Arc::make_mut(&mut b.session.project).next_id += 100;
++        b.session.execute("file.newBin", json!({"name": "B"})).unwrap();
++        let merged = FilmcraftApp::live_merge(&base, &a.live_document(), &b.live_document()).unwrap();
++        a.live_adopt(merged).unwrap();
++        let names: Vec<_> = a.session.project.root.children.iter().filter_map(|e| match e {
++            filmcraft_project::BinEntry::Bin(b) => Some(b.name.as_str()),
++            _ => None,
++        }).collect();
++        assert!(names.contains(&"A") && names.contains(&"B"), "{names:?}");
++    }
++
++    #[test]
++    fn a_remote_change_waits_while_recording_and_undo_goes_to_the_session() {
++        let (mut a, mut b) = (demo(), demo());
++        let ctx = egui::Context::default();
++        playground_live::connect();
++        let base = canonical(&a.live_document());
++        toggle(&mut b, 0);
++        let done = std::rc::Rc::new(Cell::new(false));
++        let to = done.clone();
++        playground_live::queue(Some(base), canonical(&b.live_document()), Box::new(move |r| to.set(r.is_ok())));
++        a.session.mixrec.seq = a.session.state.active_sequence;
++        frame(&mut a, &ctx);
++        assert!(!done.get() && enabled(&a, 0), "a mixer automation pass holds remote changes");
++        a.session.mixrec.seq = None;
++        frame(&mut a, &ctx);
++        assert!(done.get() && !enabled(&a, 0));
++        toggle(&mut a, 1);
++        crate::menus::invoke(&mut a, &ctx, "edit.undo", json!({})).unwrap();
++        assert!(!enabled(&a, 1), "Undo is the session's while connected");
++        assert_eq!(playground_live::activity().1, [false]);
++        playground_live::disconnect();
++        a.live_disconnected();
++        assert!(!a.session.history.can_undo());
++    }
++}
+diff --git a/crates/ui-egui/src/menus.rs b/crates/ui-egui/src/menus.rs
+index 48b4b82..b407b83 100644
+--- a/crates/ui-egui/src/menus.rs
++++ b/crates/ui-egui/src/menus.rs
+@@ -178,6 +178,10 @@ pub fn targets_source(app: &FilmcraftApp, params: &Value) -> bool {
+ 
+ /// Execute a UI or engine command by id.
+ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut params: Value) -> Result<Value, String> {
++    #[cfg(any(target_arch = "wasm32", test))]
++    if matches!(id, "edit.undo" | "edit.redo") && filmcraft_project::playground_live::undo(id == "edit.redo") {
++        return Ok(Value::Null);
++    }
+     if id == "edit.selectAll" && (crate::panels::graphics::select_all_edited_text(app) || crate::panels::effect_controls::select_all_keyframes(app)) {
+         return Ok(Value::Null);
+     }
+diff --git a/crates/ui-egui/src/panels/misc.rs b/crates/ui-egui/src/panels/misc.rs
+index f5bc5f1..c230fda 100644
+--- a/crates/ui-egui/src/panels/misc.rs
++++ b/crates/ui-egui/src/panels/misc.rs
+@@ -38,6 +38,11 @@ pub fn history(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
+         }
+     });
+     if let Some(n) = target {
++        // Live editing (web): the steps go to the session, which takes back only this person's edits.
++        #[cfg(target_arch = "wasm32")]
++        if (0..n.unsigned_abs()).all(|_| filmcraft_project::playground_live::undo(n > 0)) {
++            return;
++        }
+         if n < 0 {
+             for _ in 0..-n {
+                 app.session.undo();
