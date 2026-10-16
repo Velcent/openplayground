@@ -13,7 +13,8 @@ const only = process.env.LIVE_APPS?.split(',')
 const specs = readdirSync(new URL('./live-apps/', import.meta.url)).filter((f) => f.endsWith('.mjs'))
   .map((f) => f.slice(0, -4)).filter((slug) => !only || only.includes(slug))
 let site
-before(async () => { if (publicDir) site = await sessionSite({ publicDir }) })
+// LIVE_GPU=1 launches with WebGPU on the real GPU, which apps like SubCraft need.
+before(async () => { if (publicDir) site = await sessionSite({ publicDir, gpu: process.env.LIVE_GPU === '1' }) })
 after(async () => { await site?.close() })
 
 async function open(app) {

@@ -243,6 +243,8 @@ groups:
         opens: []
         imports: []
         repo: Aalzard/subcraft
+        patches: patches/substance-painter.yaml
+        live: crates/ui/src
         icon: icons/subcraft.png
         accent: "#FF7A1A"
         base: "#3A1A06"

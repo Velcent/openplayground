@@ -1,0 +1,1629 @@
+diff --git a/crates/app/src/session.rs b/crates/app/src/session.rs
+index 37c91c1..ca140d7 100644
+--- a/crates/app/src/session.rs
++++ b/crates/app/src/session.rs
+@@ -419,6 +419,16 @@ impl Session {
+         self.revision += 1;
+     }
+ 
++    /// Installs a document changed elsewhere (a live session) with no undo step of its own, adding the images it
++    /// uses; the selection is repaired as after Undo. `restart`: the history starts over from it.
++    pub fn adopt(&mut self, doc: Document, resources: Vec<Arc<subcraft_doc::Resource>>, restart: bool) {
++        for r in resources {
++            self.resources.insert_shared(r);
++        }
++        if restart { self.history.reset(doc, "Live session") } else { self.history.amend(doc) }
++        self.sync_after_history_move();
++    }
++
+     pub fn execute(&mut self, cmd: Command) -> Result<(), CommandError> {
+         if self.stroke.is_some() && !matches!(cmd, Command::Seal) {
+             return Err(CommandError::StrokeInProgress);
+diff --git a/crates/doc/src/history.rs b/crates/doc/src/history.rs
+index 7d96e89..893c78c 100644
+--- a/crates/doc/src/history.rs
++++ b/crates/doc/src/history.rs
+@@ -129,6 +129,12 @@ impl History {
+         Some(self.current())
+     }
+ 
++    /// Replace the current entry's document without a step of its own (a change made elsewhere, e.g. a live session).
++    pub fn amend(&mut self, doc: Document) {
++        self.entries[self.cursor].doc = doc;
++        self.sealed = true;
++    }
++
+     /// Replace the whole history (project load / new project).
+     pub fn reset(&mut self, doc: Document, label: impl Into<String>) {
+         *self = History { max_entries: self.max_entries, ..History::new(doc, label) };
+diff --git a/crates/ui/Cargo.toml b/crates/ui/Cargo.toml
+index f784ac0..15797df 100644
+--- a/crates/ui/Cargo.toml
++++ b/crates/ui/Cargo.toml
+@@ -38,6 +38,10 @@ pollster.workspace = true
+ 
+ [dev-dependencies]
+ subcraft-mesh.workspace = true
++# Playground live editing (web only; tested natively).
++subcraft-project.workspace = true
++uuid.workspace = true
++flate2 = "1"
+ 
+ # Web build: browser canvas, uploads and downloads.
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+@@ -45,3 +49,7 @@ wasm-bindgen = "0.2.106"
+ wasm-bindgen-futures = "0.4"
+ js-sys = "0.3"
+ web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "HtmlAnchorElement", "Blob", "BlobPropertyBag", "Url", "Response"] }
++# Playground live editing.
++subcraft-project.workspace = true
++uuid.workspace = true
++flate2 = "1"
+diff --git a/crates/ui/src/app.rs b/crates/ui/src/app.rs
+index 9ca775f..7629c8b 100644
+--- a/crates/ui/src/app.rs
++++ b/crates/ui/src/app.rs
+@@ -110,6 +110,18 @@ pub fn default_layout() -> DockState<Tab> {
+ 
+ const DOCK_KEY: &str = "subcraft_dock_v4";
+ 
++// Live editing in a Playground session (web only).
++#[cfg(any(target_arch = "wasm32", test))]
++pub(crate) mod live;
++
++/// A Playground live session holds Undo and Redo (web only): they stay available and History jumps are off.
++pub(crate) fn live_session() -> bool {
++    #[cfg(target_arch = "wasm32")]
++    return live::connected();
++    #[cfg(not(target_arch = "wasm32"))]
++    false
++}
++
+ #[cfg(test)]
+ mod launch_tests {
+     use super::*;
+@@ -347,6 +359,10 @@ impl SubcraftApp {
+                 }
+             }
+         }
++        #[cfg(target_arch = "wasm32")]
++        if matches!(action, Action::Undo | Action::Redo) && live::undo(action == Action::Redo) {
++            return;
++        }
+         match action {
+             Action::ResetCamera => self.state.camera = OrbitCamera::framing(&self.state.session.scene().mesh.bounds),
+             Action::BrushTool => self.state.tool = Tool::Brush,
+@@ -390,7 +406,7 @@ impl SubcraftApp {
+             }
+             ui.add_space(6.0);
+             let h = self.state.session.history();
+-            let (can_undo, can_redo) = (h.can_undo(), h.can_redo());
++            let (can_undo, can_redo) = (h.can_undo() || live_session(), h.can_redo() || live_session());
+             if ui.add_enabled_ui(can_redo, |ui| icon_button(ui, icons::REDO, "Redo (Ctrl+Y)")).inner.clicked() {
+                 self.perform(Action::Redo, now);
+             }
+@@ -509,7 +525,7 @@ impl SubcraftApp {
+                 let h = self.state.session.history();
+                 let undo = h.undo_label().map(|l| format!("Undo {l}")).unwrap_or("Undo".into());
+                 let redo = h.redo_label().map(|l| format!("Redo {l}")).unwrap_or("Redo".into());
+-                let (can_undo, can_redo) = (h.can_undo(), h.can_redo());
++                let (can_undo, can_redo) = (h.can_undo() || live_session(), h.can_redo() || live_session());
+                 if ui.add_enabled(can_undo, egui::Button::new(format!("{}   {undo}", icons::UNDO)).shortcut_text("Ctrl+Z")).clicked() {
+                     self.perform(Action::Undo, now);
+                 }
+@@ -870,6 +886,8 @@ impl eframe::App for SubcraftApp {
+             }
+             dialogs::run_pending(&mut self.state, action, &ctx, now);
+         }
++        #[cfg(target_arch = "wasm32")]
++        self.live_frame(&ctx);
+         let title = dialogs::title(&self.state);
+         if title != self.state.last_title {
+             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+@@ -892,6 +910,11 @@ impl eframe::App for SubcraftApp {
+         if let Ok(j) = serde_json::to_string(&self.state.welcome.recent) { storage.set_string(crate::welcome::RECENTS_KEY, j); }
+     }
+ 
++    #[cfg(target_arch = "wasm32")]
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
++    }
++
+     /// Clean exit: the recovery folder of this session is no longer needed.
+     fn on_exit(&mut self) {
+         self.state.recovery.autosaver.finish_clean();
+diff --git a/crates/ui/src/app/live.rs b/crates/ui/src/app/live.rs
+new file mode 100644
+index 0000000..0c79153
+--- /dev/null
++++ b/crates/ui/src/app/live.rs
+@@ -0,0 +1,298 @@
++//! Live editing in a Playground session (`shell/live.js` drives it through [`web`]); nothing here runs until the shell
++//! connects. The shared project is [`checkpoint`]'s canonical binary checkpoint: the layer trees and settings, the
++//! painted tiles, the images they use and the mesh, without anyone's views (camera, selection, tool, brush, open
++//! folders, panels). A remote change merges into the project at the end of a quiet frame, keeping this person's views
++//! and unsent work, and is no step of the native undo history. While connected, Undo and Redo go to the session,
++//! which reverts only this person's operations, and History jumps are off.
++
++pub(crate) mod checkpoint;
++
++use std::collections::VecDeque;
++
++use super::SubcraftApp;
++
++/// A remote change waiting for a quiet frame: `edited` relative to `base`, or with no base the whole shared project.
++struct Remote {
++    base: Option<Vec<u8>>,
++    edited: Vec<u8>,
++    done: Done,
++}
++
++/// Settles a remote change: a whole adopted project gives back the checkpoint it replaced, for the shell's draft.
++pub(crate) type Done = Box<dyn FnOnce(Result<Option<Vec<u8>>, String>)>;
++
++#[derive(Default)]
++struct Live {
++    connected: bool,
++    /// The last frame was not quiet: a checkpoint now would catch a gesture half done.
++    busy: bool,
++    /// The committed document as last reported.
++    seen: Option<subcraft_doc::Document>,
++    remote: VecDeque<Remote>,
++    /// Shared changes reported so far.
++    changes: u64,
++    #[cfg(test)]
++    undos: Vec<bool>,
++    #[cfg(target_arch = "wasm32")]
++    hooks: Option<web::Hooks>,
++    /// For a repaint when the shell queues a change between frames.
++    #[cfg(target_arch = "wasm32")]
++    ctx: Option<egui::Context>,
++}
++
++thread_local! {
++    static LIVE: std::cell::RefCell<Live> = std::cell::RefCell::default();
++}
++
++pub(crate) fn connect() {
++    LIVE.with_borrow_mut(|live| (live.connected, live.seen) = (true, None));
++}
++
++/// Ends the session's hold on Undo; changes still waiting fail.
++pub(crate) fn disconnect() {
++    let waiting = LIVE.with_borrow_mut(|live| {
++        live.connected = false;
++        #[cfg(target_arch = "wasm32")]
++        {
++            live.hooks = None;
++        }
++        std::mem::take(&mut live.remote)
++    });
++    for remote in waiting {
++        (remote.done)(Err("Live editing disconnected".into()));
++    }
++}
++
++pub(crate) fn queue(base: Option<Vec<u8>>, edited: Vec<u8>, done: Done) {
++    let refused = LIVE.with_borrow_mut(|live| {
++        if !live.connected {
++            return Some(done);
++        }
++        live.remote.push_back(Remote { base, edited, done });
++        #[cfg(target_arch = "wasm32")]
++        if let Some(ctx) = &live.ctx {
++            ctx.request_repaint();
++        }
++        None
++    });
++    if let Some(done) = refused {
++        done(Err("Live editing is not connected".into()));
++    }
++}
++
++pub(crate) fn connected() -> bool {
++    LIVE.with_borrow(|live| live.connected)
++}
++
++/// Passes Undo or Redo to the session while connected: whether it did.
++pub(crate) fn undo(redo: bool) -> bool {
++    let connected = LIVE.with_borrow_mut(|live| {
++        #[cfg(test)]
++        if live.connected {
++            live.undos.push(redo);
++        }
++        live.connected
++    });
++    #[cfg(target_arch = "wasm32")]
++    if connected {
++        web::call(|hooks| &hooks.undo, &redo.into());
++    }
++    connected
++}
++
++impl SubcraftApp {
++    /// The canonical shared project, unless the last frame was busy: then the next quiet frame reports it again.
++    pub(crate) fn live_checkpoint(&self) -> Result<Vec<u8>, String> {
++        let busy = LIVE.with_borrow_mut(|live| {
++            if live.busy {
++                live.seen = None;
++            }
++            live.busy
++        });
++        if busy {
++            return Err("busy".into());
++        }
++        self.live_encode()
++    }
++
++    fn live_encode(&self) -> Result<Vec<u8>, String> {
++        let s = &self.state.session;
++        checkpoint::encode(s.history().current(), s.resources(), &s.scene().mesh)
++    }
++
++    /// Nothing under way that a remote change would cut short or a checkpoint would catch half done: no pointer down
++    /// (a stroke, a slider drag still coalescing into one history entry), no pen edit or image still being applied,
++    /// no text being typed.
++    fn live_quiet(&self, ctx: &egui::Context) -> bool {
++        let s = &self.state;
++        !ctx.input(|i| i.pointer.any_down())
++            && !s.session.is_stroking()
++            && !s.painting
++            && !s.pen.is_editing()
++            && !s.pen.is_pending()
++            && !s.asset_preview.is_applying()
++            && !ctx.egui_wants_keyboard_input()
++    }
++
++    /// The end of a frame: the remote changes waiting, then a report if the committed document changed, once quiet.
++    pub(super) fn live_frame(&mut self, ctx: &egui::Context) {
++        let quiet = self.live_quiet(ctx);
++        let waiting = LIVE.with_borrow_mut(|live| {
++            #[cfg(target_arch = "wasm32")]
++            live.ctx.get_or_insert_with(|| ctx.clone());
++            live.busy = !quiet;
++            if live.connected && quiet { std::mem::take(&mut live.remote) } else { VecDeque::new() }
++        });
++        for remote in waiting {
++            let result = self.live_apply(remote.base.as_deref(), &remote.edited);
++            (remote.done)(result);
++            ctx.request_repaint();
++        }
++        let doc = self.state.session.history().current();
++        let changed = LIVE.with_borrow_mut(|live| {
++            if !live.connected || !quiet || live.seen.as_ref() == Some(doc) {
++                return false;
++            }
++            live.seen = Some(doc.clone());
++            live.changes += 1;
++            true
++        });
++        #[cfg(target_arch = "wasm32")]
++        if changed {
++            web::call(|hooks| &hooks.changed, &wasm_bindgen::JsValue::NULL);
++        }
++        #[cfg(not(target_arch = "wasm32"))]
++        let _ = changed;
++    }
++
++    /// Merges a remote change into the project (or adopts a whole one, giving back the checkpoint it replaced), with no
++    /// undo step of its own.
++    fn live_apply(&mut self, base: Option<&[u8]>, edited: &[u8]) -> Result<Option<Vec<u8>>, String> {
++        let local = self.live_encode()?;
++        let current = checkpoint::parse(&local)?;
++        let edited = checkpoint::parse(edited)?;
++        let target = match base {
++            Some(base) => checkpoint::merge(&checkpoint::parse(base)?, &current, &edited)?,
++            None => {
++                checkpoint::check_whole(&edited, &current)?;
++                edited
++            }
++        };
++        let s = &mut self.state.session;
++        let install = checkpoint::install(&target, s.history().current(), s.resources(), &s.scene().mesh)?;
++        match install.mesh {
++            None => s.adopt(install.doc, install.resources, false),
++            // Another model: a session of its own, as when opening one.
++            Some((mesh, bytes)) => {
++                let mut store = subcraft_doc::ResourceStore::default();
++                for r in install.resources {
++                    store.insert_shared(r);
++                }
++                self.state.set_session(subcraft_app::Session::from_parts(mesh, install.doc, store, "Live session"));
++                checkpoint::known_mesh(&self.state.session.scene().mesh, &bytes);
++            }
++        }
++        Ok(base.is_none().then_some(local))
++    }
++
++    /// The session ended: native Undo starts over from the project as the session left it.
++    fn live_disconnected(&mut self) {
++        let doc = self.state.session.history().current().clone();
++        self.state.session.adopt(doc, Vec::new(), true);
++    }
++}
++
++/// The adapter object the Playground shell drives (`shell/live.js`): `format`; `checkpoint()`, the canonical shared
++/// project, throwing `busy` while a gesture is under way; `merge(base, current, edited)`, the pure strict merge;
++/// `apply(base, edited)`, a promise that merges `edited` (with no base: adopts it whole, resolving to the checkpoint
++/// it replaced) at the end of the next quiet frame; `connect({ changed, undo })` and `disconnect()`. The hooks are
++/// called from inside a frame: the shell defers its calls back.
++#[cfg(target_arch = "wasm32")]
++pub(crate) mod web {
++    use super::{LIVE, SubcraftApp};
++    use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
++    use js_sys::{Function, Object, Promise, Reflect, Uint8Array};
++
++    pub(super) struct Hooks {
++        pub(super) changed: Function,
++        pub(super) undo: Function,
++    }
++
++    pub(super) fn call(pick: impl FnOnce(&Hooks) -> &Function, arg: &JsValue) {
++        if let Some(hook) = LIVE.with_borrow(|live| live.hooks.as_ref().map(|hooks| pick(hooks).clone())) {
++            let _ = hook.call1(&JsValue::NULL, arg);
++        }
++    }
++
++    /// Offers the adapter as `globalThis.playgroundLiveAdapter`, and to `globalThis.playgroundLive.attach` when the
++    /// shell is there already. A page without the shell never connects.
++    pub(crate) fn attach(runner: &eframe::WebRunner) -> Result<(), JsValue> {
++        let adapter = Object::new();
++        let set = |name: &str, value: JsValue| Reflect::set(&adapter, &name.into(), &value).map(drop);
++        set("format", format!("substance-painter:1:{}", env!("CARGO_PKG_VERSION")).into())?;
++        let app = runner.clone();
++        let checkpoint = move || -> Result<Uint8Array, JsValue> {
++            // Not running yet, or inside a frame: the shell retries a busy checkpoint.
++            let app = app.app_mut::<SubcraftApp>().ok_or("busy")?;
++            Ok(app.live_checkpoint().map_err(|e| JsValue::from_str(&e))?.as_slice().into())
++        };
++        set("checkpoint", Closure::<dyn Fn() -> _>::new(checkpoint).into_js_value())?;
++        let merge = |base: Uint8Array, current: Uint8Array, edited: Uint8Array| -> Result<Uint8Array, JsValue> {
++            let merged = super::checkpoint::merge_bytes(&base.to_vec(), &current.to_vec(), &edited.to_vec());
++            Ok(merged.map_err(|e| JsValue::from_str(&e))?.as_slice().into())
++        };
++        set("merge", Closure::<dyn Fn(_, _, _) -> _>::new(merge).into_js_value())?;
++        let apply = |base: JsValue, edited: Uint8Array| -> Promise {
++            let mut job = Some((base.dyn_ref::<Uint8Array>().map(Uint8Array::to_vec), edited.to_vec()));
++            Promise::new(&mut |resolve, reject| {
++                let Some((base, edited)) = job.take() else { return };
++                super::queue(
++                    base,
++                    edited,
++                    Box::new(move |result| {
++                        let _ = match result {
++                            Ok(None) => resolve.call0(&JsValue::NULL),
++                            Ok(Some(replaced)) => resolve.call1(&JsValue::NULL, &Uint8Array::from(replaced.as_slice())),
++                            Err(e) => reject.call1(&JsValue::NULL, &JsValue::from_str(&e)),
++                        };
++                    }),
++                );
++            })
++        };
++        set("apply", Closure::<dyn Fn(_, _) -> _>::new(apply).into_js_value())?;
++        let connect = |hooks: JsValue| -> Result<(), JsValue> {
++            let get = |name: &str| Reflect::get(&hooks, &name.into())?.dyn_into::<Function>();
++            let hooks = Hooks { changed: get("changed")?, undo: get("undo")? };
++            super::connect();
++            LIVE.with_borrow_mut(|live| {
++                live.hooks = Some(hooks);
++                if let Some(ctx) = &live.ctx {
++                    ctx.request_repaint();
++                }
++            });
++            Ok(())
++        };
++        set("connect", Closure::<dyn Fn(_) -> _>::new(connect).into_js_value())?;
++        let app = runner.clone();
++        let disconnect = move || {
++            super::disconnect();
++            if let Some(mut app) = app.app_mut::<SubcraftApp>() {
++                app.live_disconnected();
++            }
++        };
++        set("disconnect", Closure::<dyn Fn()>::new(disconnect).into_js_value())?;
++        let global = js_sys::global();
++        Reflect::set(&global, &"playgroundLiveAdapter".into(), &adapter)?;
++        let attach = Reflect::get(&global, &"playgroundLive".into())
++            .and_then(|live| Reflect::get(&live, &"attach".into()))
++            .ok()
++            .and_then(|attach| attach.dyn_into::<Function>().ok());
++        if let Some(attach) = attach {
++            attach.call1(&global, &adapter)?;
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/ui/src/app/live/checkpoint.rs b/crates/ui/src/app/live/checkpoint.rs
+new file mode 100644
+index 0000000..ddcfe1d
+--- /dev/null
++++ b/crates/ui/src/app/live/checkpoint.rs
+@@ -0,0 +1,886 @@
++//! The shared project as one canonical binary checkpoint (the same project gives the same bytes on every peer), and
++//! its strict three-way merge.
++//!
++//! Layout, little endian, every list sorted:
++//! - `SCLIVE01`;
++//! - u32 length + canonical JSON: texture sets with their settings and layer trees, in the project file's schema
++//!   (`DocumentV1`), without folder open state (personal) and with the rasters in the sections below;
++//! - u32 length + the mesh (`subcraft_mesh::serialize`, deflated);
++//! - u32 count + the images fills and image masks use, by id: 16-byte id, u8 kind, u32 length + name, u32 length +
++//!   the original file;
++//! - each layer with rasters, by id: u8 1, 16-byte id, u8 count + its images (slot, u8 components, u32 size, 4 × f32
++//!   fill bits), then its allocated tiles in tile order (images in slot order within a tile): u32 tile, u8 image, u32
++//!   length + the deflated f16 texels (low bytes, then high bytes); u32::MAX ends them. u8 0 ends the layers.
++//!
++//! A stroke changes only the bytes of the tiles it touched, a setting only the JSON, a layer move only the JSON: no
++//! count ahead of a layer's tiles, or of the layers, changes with them. Deflating is deterministic for one build
++//! (the format names the build), and a tile holding only its image's fill is left out like an unallocated one.
++
++use std::cell::RefCell;
++use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
++use std::io::{Read as _, Write as _};
++use std::rc::Rc;
++use std::sync::{Arc, Weak};
++
++use serde_json::Value;
++use subcraft_core::{AnchorId, ChannelKind, ChannelValue, EffectId, LayerId, ResourceId, TextureSetId};
++use subcraft_doc::{
++    ChannelBlend, ChannelDef, Document, FillChannel, FillContent, GroupContent, Layer, LayerContent, Mask, MaskEffect,
++    MaskEffectKind, PaintContent, PartMask, PenAnchor, PenPath, RESOLUTIONS, Resource, ResourceKind, ResourceStore,
++    TextureSet,
++};
++use subcraft_image::{TILE_SIZE, TILE_TEXELS, Tile, TiledImage};
++use subcraft_mesh::Mesh;
++use subcraft_project::schema::*;
++use uuid::Uuid;
++
++use crate::playground_live::canonical;
++
++/// The shell's document limit.
++pub(crate) const MAX_BYTES: usize = 128 << 20;
++const MAGIC: &[u8; 8] = b"SCLIVE01";
++const END: u32 = u32::MAX;
++const MASK: u8 = 0x40;
++const EFFECT: u8 = 0x80;
++
++type Error = String;
++
++fn invalid(what: impl std::fmt::Display) -> Error {
++    format!("Invalid shared project: {what}")
++}
++
++fn conflict(what: impl std::fmt::Display) -> Error {
++    format!("Conflict: both changed {what}")
++}
++
++fn too_large(bytes: usize) -> Error {
++    format!(
++        "This project is too large to edit live: {} MiB, over the {} MiB limit of a shared document. Lower the texture \
++         resolution or remove painted layers.",
++        bytes.div_ceil(1 << 20),
++        MAX_BYTES >> 20
++    )
++}
++
++/// Bytes borrowed from a checkpoint or shared with the encoder's cache and the resource store.
++#[derive(Clone, Debug)]
++pub(crate) enum Bytes<'a> {
++    Slice(&'a [u8]),
++    Shared(Rc<[u8]>),
++    File(Arc<Vec<u8>>),
++}
++
++impl std::ops::Deref for Bytes<'_> {
++    type Target = [u8];
++    fn deref(&self) -> &[u8] {
++        match self {
++            Bytes::Slice(s) => s,
++            Bytes::Shared(s) => s,
++            Bytes::File(f) => f,
++        }
++    }
++}
++
++impl PartialEq for Bytes<'_> {
++    fn eq(&self, other: &Self) -> bool {
++        **self == **other
++    }
++}
++
++/// Which raster of a layer: a paint channel (its index in [`ChannelKind::ALL`]), the mask base or a mask paint effect.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub(crate) enum Slot {
++    Channel(u8),
++    Mask,
++    Effect(Uuid),
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub(crate) struct Image<'a> {
++    comps: u8,
++    size: u32,
++    fill: [u32; 4],
++    tiles: BTreeMap<u32, Bytes<'a>>,
++}
++
++impl Image<'_> {
++    fn layout(&self) -> (u8, u32, [u32; 4]) {
++        (self.comps, self.size, self.fill)
++    }
++}
++
++#[derive(Clone, Debug, PartialEq)]
++struct Res<'a> {
++    kind: u8,
++    name: String,
++    bytes: Bytes<'a>,
++}
++
++type Images<'a> = BTreeMap<Slot, Image<'a>>;
++
++/// A parsed checkpoint.
++#[derive(Debug)]
++pub(crate) struct Checkpoint<'a> {
++    json: Value,
++    mesh: Bytes<'a>,
++    resources: BTreeMap<Uuid, Res<'a>>,
++    layers: BTreeMap<Uuid, Images<'a>>,
++}
++
++// ----- bytes ---------------------------------------------------------------------------------------------------------
++
++struct Reader<'a>(&'a [u8]);
++
++impl<'a> Reader<'a> {
++    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
++        if self.0.len() < n {
++            return Err(invalid("truncated"));
++        }
++        let (a, rest) = self.0.split_at(n);
++        self.0 = rest;
++        Ok(a)
++    }
++    fn u8(&mut self) -> Result<u8, Error> {
++        Ok(self.take(1)?[0])
++    }
++    fn u32(&mut self) -> Result<u32, Error> {
++        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
++    }
++    fn uuid(&mut self) -> Result<Uuid, Error> {
++        Ok(Uuid::from_bytes(self.take(16)?.try_into().expect("16 bytes")))
++    }
++    fn blob(&mut self) -> Result<&'a [u8], Error> {
++        let n = self.u32()? as usize;
++        self.take(n)
++    }
++}
++
++fn slot_byte(slot: Slot) -> u8 {
++    match slot {
++        Slot::Channel(i) => i,
++        Slot::Mask => MASK,
++        Slot::Effect(_) => EFFECT,
++    }
++}
++
++fn kind_byte(kind: ResourceKind) -> u8 {
++    match kind {
++        ResourceKind::Texture => 0,
++        ResourceKind::Alpha => 1,
++        ResourceKind::Environment => 2,
++    }
++}
++
++fn tiles_in(size: u32) -> u32 {
++    size.div_ceil(TILE_SIZE).pow(2)
++}
++
++pub(crate) fn parse(bytes: &[u8]) -> Result<Checkpoint<'_>, Error> {
++    if bytes.len() > MAX_BYTES {
++        return Err(too_large(bytes.len()));
++    }
++    let mut r = Reader(bytes);
++    if r.take(MAGIC.len())? != MAGIC {
++        return Err(invalid("not a SubCraft live checkpoint"));
++    }
++    let json: Value = serde_json::from_slice(r.blob()?).map_err(invalid)?;
++    if !json.is_object() {
++        return Err(invalid("no document"));
++    }
++    let mesh = Bytes::Slice(r.blob()?);
++    let mut resources = BTreeMap::new();
++    for _ in 0..r.u32()? {
++        let id = r.uuid()?;
++        let kind = r.u8()?;
++        let name = std::str::from_utf8(r.blob()?).map_err(invalid)?.to_owned();
++        let bytes = Bytes::Slice(r.blob()?);
++        if kind > 2 || resources.last_key_value().is_some_and(|(last, _)| *last >= id) {
++            return Err(invalid("image list"));
++        }
++        resources.insert(id, Res { kind, name, bytes });
++    }
++    let mut layers: BTreeMap<Uuid, Images> = BTreeMap::new();
++    loop {
++        match r.u8()? {
++            0 => break,
++            1 => {}
++            _ => return Err(invalid("layer list")),
++        }
++        let id = r.uuid()?;
++        if layers.last_key_value().is_some_and(|(last, _)| *last >= id) {
++            return Err(invalid("layer order"));
++        }
++        let mut slots = Vec::new();
++        let mut images = BTreeMap::new();
++        for _ in 0..r.u8()? {
++            let slot = match r.u8()? {
++                i if (i as usize) < ChannelKind::ALL.len() => Slot::Channel(i),
++                MASK => Slot::Mask,
++                EFFECT => Slot::Effect(r.uuid()?),
++                _ => return Err(invalid("raster slot")),
++            };
++            let (comps, size) = (r.u8()?, r.u32()?);
++            let fill = [r.u32()?, r.u32()?, r.u32()?, r.u32()?];
++            if !(1..=4).contains(&comps)
++                || !RESOLUTIONS.contains(&size)
++                || fill.iter().any(|f| !f32::from_bits(*f).is_finite())
++                || slots.last().is_some_and(|last| *last >= slot)
++            {
++                return Err(invalid("raster layout"));
++            }
++            slots.push(slot);
++            images.insert(slot, Image { comps, size, fill, tiles: BTreeMap::new() });
++        }
++        if images.is_empty() {
++            return Err(invalid("a layer without rasters"));
++        }
++        let mut last = None;
++        loop {
++            let tile = r.u32()?;
++            if tile == END {
++                break;
++            }
++            let index = r.u8()?;
++            let slot = *slots.get(index as usize).ok_or_else(|| invalid("raster index"))?;
++            let image = images.get_mut(&slot).expect("listed");
++            if last >= Some((tile, index)) || tile >= tiles_in(image.size) {
++                return Err(invalid("tile order"));
++            }
++            last = Some((tile, index));
++            image.tiles.insert(tile, Bytes::Slice(r.blob()?));
++        }
++        layers.insert(id, images);
++    }
++    if !r.0.is_empty() {
++        return Err(invalid("trailing bytes"));
++    }
++    Ok(Checkpoint { json, mesh, resources, layers })
++}
++
++pub(crate) fn write(cp: &Checkpoint) -> Result<Vec<u8>, Error> {
++    let json = canonical(&cp.json);
++    let size = MAGIC.len()
++        + 4
++        + json.len()
++        + 4
++        + cp.mesh.len()
++        + 4
++        + cp.resources.values().map(|r| 16 + 1 + 8 + r.name.len() + r.bytes.len()).sum::<usize>()
++        + cp.layers.values().map(|images| {
++            let image = |(s, i): (&Slot, &Image)| {
++                22 + if matches!(s, Slot::Effect(_)) { 16 } else { 0 } + i.tiles.values().map(|t| 9 + t.len()).sum::<usize>()
++            };
++            22 + images.iter().map(image).sum::<usize>()
++        }).sum::<usize>()
++        + 1;
++    if size > MAX_BYTES {
++        return Err(too_large(size));
++    }
++    let mut out = Vec::with_capacity(size);
++    let u32 = |out: &mut Vec<u8>, v: usize| out.extend_from_slice(&(v as u32).to_le_bytes());
++    let blob = |out: &mut Vec<u8>, b: &[u8]| {
++        u32(out, b.len());
++        out.extend_from_slice(b);
++    };
++    out.extend_from_slice(MAGIC);
++    blob(&mut out, &json);
++    blob(&mut out, &cp.mesh);
++    u32(&mut out, cp.resources.len());
++    for (id, r) in &cp.resources {
++        out.extend_from_slice(id.as_bytes());
++        out.push(r.kind);
++        blob(&mut out, r.name.as_bytes());
++        blob(&mut out, &r.bytes);
++    }
++    for (id, images) in &cp.layers {
++        if images.len() > u8::MAX as usize {
++            return Err("A layer has too many paint effects to edit live".into());
++        }
++        out.push(1);
++        out.extend_from_slice(id.as_bytes());
++        out.push(images.len() as u8);
++        for (slot, image) in images {
++            out.push(slot_byte(*slot));
++            if let Slot::Effect(effect) = slot {
++                out.extend_from_slice(effect.as_bytes());
++            }
++            out.push(image.comps);
++            u32(&mut out, image.size as usize);
++            for f in image.fill {
++                u32(&mut out, f as usize);
++            }
++        }
++        let mut tiles: Vec<(u32, u8, &[u8])> = images
++            .values()
++            .enumerate()
++            .flat_map(|(i, image)| image.tiles.iter().map(move |(&t, b)| (t, i as u8, &b[..])))
++            .collect();
++        tiles.sort_unstable_by_key(|&(t, i, _)| (t, i));
++        for (t, i, b) in tiles {
++            u32(&mut out, t as usize);
++            out.push(i);
++            blob(&mut out, b);
++        }
++        u32(&mut out, END as usize);
++    }
++    out.push(0);
++    debug_assert_eq!(out.len(), size);
++    Ok(out)
++}
++
++// ----- texels --------------------------------------------------------------------------------------------------------
++
++fn deflate(raw: &[u8]) -> Vec<u8> {
++    let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
++    e.write_all(raw).expect("in memory");
++    e.finish().expect("in memory")
++}
++
++/// At most `limit` bytes; a stream that would give more is invalid.
++fn inflate(blob: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
++    let mut out = Vec::new();
++    flate2::read::DeflateDecoder::new(blob)
++        .take(limit as u64 + 1)
++        .read_to_end(&mut out)
++        .map_err(invalid)?;
++    if out.len() > limit {
++        return Err(invalid("oversized data"));
++    }
++    Ok(out)
++}
++
++fn tile_blob(tile: &Tile) -> Vec<u8> {
++    let bits = tile.data.iter().map(|v| v.to_bits());
++    let raw: Vec<u8> = bits.clone().map(|b| b as u8).chain(bits.map(|b| (b >> 8) as u8)).collect();
++    deflate(&raw)
++}
++
++fn tile_from(blob: &[u8], comps: u8) -> Result<Tile, Error> {
++    let n = TILE_TEXELS * comps as usize;
++    let raw = inflate(blob, n * 2)?;
++    if raw.len() != n * 2 {
++        return Err(invalid("tile size"));
++    }
++    let (low, high) = raw.split_at(n);
++    let data = low.iter().zip(high).map(|(&l, &h)| subcraft_core::f16::from_bits(l as u16 | (h as u16) << 8)).collect();
++    Ok(Tile { data })
++}
++
++fn mesh_from(blob: &[u8]) -> Result<Mesh, Error> {
++    subcraft_mesh::serialize::decode(&inflate(blob, 1 << 30)?).map_err(invalid)
++}
++
++/// Deflated tiles and mesh by allocation, so a checkpoint compresses only what changed since the last one. A weak
++/// reference keeps each address from being reused while its entry lives.
++#[derive(Default)]
++struct Cache {
++    tiles: HashMap<usize, (Weak<Tile>, Option<Rc<[u8]>>)>,
++    mesh: Option<(Weak<Mesh>, Rc<[u8]>)>,
++}
++
++thread_local! {
++    static CACHE: RefCell<Cache> = RefCell::default();
++}
++
++impl Cache {
++    /// None: the tile holds only the image's fill.
++    fn tile(&mut self, tile: &Arc<Tile>, comps: usize, fill: [f32; 4]) -> Option<Rc<[u8]>> {
++        let key = Arc::as_ptr(tile) as usize;
++        if let Some((weak, blob)) = self.tiles.get(&key)
++            && weak.strong_count() > 0
++        {
++            return blob.clone();
++        }
++        let fill: Vec<u16> = fill[..comps].iter().map(|&f| subcraft_core::f16::from_f32(f).to_bits()).collect();
++        let filled = tile.data.chunks_exact(comps).all(|px| px.iter().zip(&fill).all(|(v, f)| v.to_bits() == *f));
++        let blob: Option<Rc<[u8]>> = (!filled).then(|| tile_blob(tile).into());
++        self.tiles.insert(key, (Arc::downgrade(tile), blob.clone()));
++        blob
++    }
++
++    fn mesh(&mut self, mesh: &Arc<Mesh>) -> Rc<[u8]> {
++        match &self.mesh {
++            Some((weak, blob)) if weak.as_ptr() == Arc::as_ptr(mesh) && weak.strong_count() > 0 => blob.clone(),
++            _ => {
++                let blob: Rc<[u8]> = deflate(&subcraft_mesh::serialize::encode(mesh)).into();
++                self.mesh = Some((Arc::downgrade(mesh), blob.clone()));
++                blob
++            }
++        }
++    }
++}
++
++// ----- the shared projection -----------------------------------------------------------------------------------------
++
++fn channel_index(kind: ChannelKind) -> u8 {
++    ChannelKind::ALL.iter().position(|&k| k == kind).expect("every channel is listed") as u8
++}
++
++/// A layer's rasters by slot.
++fn rasters(l: &Layer) -> Vec<(Slot, &TiledImage)> {
++    let mut out = Vec::new();
++    if let LayerContent::Paint(p) = &l.content {
++        out.extend(p.channels.iter().map(|(&k, image)| (Slot::Channel(channel_index(k)), image)));
++    }
++    if let Some(m) = &l.mask {
++        out.push((Slot::Mask, &m.base));
++        for e in &m.effects {
++            if let MaskEffectKind::Paint { image } = &e.kind {
++                out.push((Slot::Effect(e.id.0), image));
++            }
++        }
++    }
++    out
++}
++
++fn layer_json(l: &Layer) -> LayerV1 {
++    let blend = l.blend.iter().map(|(&channel, b)| BlendV1 { channel, mode: b.mode, opacity: b.opacity }).collect();
++    let mask = l.mask.as_ref().map(|m| MaskV1 {
++        enabled: m.enabled,
++        base: String::new(),
++        effects: m
++            .effects
++            .iter()
++            .map(|e| MaskEffectV1 {
++                id: e.id.0,
++                name: e.name.clone(),
++                visible: e.visible,
++                blend: e.blend,
++                opacity: e.opacity,
++                kind: match &e.kind {
++                    MaskEffectKind::Paint { .. } => MaskEffectKindV1::Paint { raster: String::new() },
++                    MaskEffectKind::Fill { value, procedural, projection } => {
++                        MaskEffectKindV1::Fill { value: *value, procedural: *procedural, projection: *projection }
++                    }
++                    MaskEffectKind::Generator(g) => MaskEffectKindV1::Generator { generator: *g },
++                    MaskEffectKind::Levels(l) => MaskEffectKindV1::Levels { levels: *l },
++                    MaskEffectKind::Invert => MaskEffectKindV1::Invert,
++                    MaskEffectKind::Image { resource, projection, invert } => {
++                        MaskEffectKindV1::Image { resource: resource.0, projection: *projection, invert: *invert }
++                    }
++                },
++            })
++            .collect(),
++    });
++    let content = match &l.content {
++        LayerContent::Paint(p) => ContentV1::Paint {
++            channels: Vec::new(),
++            path: p.path.as_ref().map(|path| PenPathV4 {
++                anchors: path
++                    .anchors
++                    .iter()
++                    .map(|a| PenAnchorV4 {
++                        id: a.id.0,
++                        position: a.position.to_array(),
++                        incoming: a.incoming.to_array(),
++                        outgoing: a.outgoing.to_array(),
++                    })
++                    .collect(),
++                closed: path.closed,
++                radius: path.radius,
++                hardness: path.hardness,
++                opacity: path.opacity,
++                values: path.values.iter().map(|(&channel, value)| PenChannelV4 { channel, value: value.0 }).collect(),
++            }),
++        },
++        LayerContent::Fill(f) => ContentV1::Fill {
++            projection: f.projection,
++            channels: f
++                .channels
++                .iter()
++                .map(|(&channel, c)| FillChannelV1 { channel, enabled: c.enabled, source: c.source.clone(), strength: c.strength })
++                .collect(),
++        },
++        // Open or closed is each person's own view.
++        LayerContent::Group(g) => ContentV1::Folder { expanded: true, children: g.children.iter().map(|c| layer_json(c)).collect() },
++    };
++    let parts = l.parts.as_ref().map(|p| PartsV1 { enabled: p.enabled, kind: p.kind, parts: p.parts.iter().copied().collect() });
++    LayerV1 { id: l.id.0, name: l.name.clone(), visible: l.visible, blend, mask, parts, content }
++}
++
++fn json(doc: &Document) -> Value {
++    let texture_sets = doc
++        .texture_sets
++        .iter()
++        .map(|ts| TextureSetV1 {
++            id: ts.id.0,
++            name: ts.name.clone(),
++            material_slot: ts.material_slot,
++            resolution: ts.resolution,
++            channels: ts.channels.iter().map(|c| ChannelDefV1 { kind: c.kind, format: c.format }).collect(),
++            layers: ts.layers.iter().map(|l| layer_json(l)).collect(),
++            mesh_maps: Vec::new(),
++        })
++        .collect();
++    serde_json::to_value(DocumentV1 { texture_sets, resources: Vec::new() }).expect("schema types serialize")
++}
++
++/// The canonical checkpoint of a project: its document (the committed one, no stroke under way), the images it uses
++/// and its mesh. Baked mesh maps stay local.
++pub(crate) fn encode(doc: &Document, store: &ResourceStore, mesh: &Arc<Mesh>) -> Result<Vec<u8>, Error> {
++    CACHE.with_borrow_mut(|cache| {
++        cache.tiles.retain(|_, (weak, _)| weak.strong_count() > 0);
++        let mut layers = BTreeMap::new();
++        let mut used = Vec::new();
++        for ts in &doc.texture_sets {
++            ts.walk(|l, _| {
++                l.collect_resources(&mut used);
++                let images: Images = rasters(l)
++                    .into_iter()
++                    .map(|(slot, image)| {
++                        let (comps, fill) = (image.comps(), image.fill());
++                        let tiles = (0..image.tile_count())
++                            .filter_map(|i| Some((i as u32, Bytes::Shared(cache.tile(image.tile(i)?, comps, fill)?))))
++                            .collect();
++                        (slot, Image { comps: comps as u8, size: image.width(), fill: fill.map(f32::to_bits), tiles })
++                    })
++                    .collect();
++                if !images.is_empty() {
++                    layers.insert(l.id.0, images);
++                }
++            });
++        }
++        let resources = used
++            .into_iter()
++            .filter_map(|id| {
++                let r = store.get(id)?;
++                let bytes = Bytes::File(r.encoded.clone()?);
++                Some((id.0, Res { kind: kind_byte(r.kind), name: r.name.clone(), bytes }))
++            })
++            .collect();
++        write(&Checkpoint { json: json(doc), mesh: Bytes::Shared(cache.mesh(mesh)), resources, layers })
++    })
++}
++
++// ----- back to a document --------------------------------------------------------------------------------------------
++
++struct Builder<'c, 'a, 'f> {
++    cp: &'c Checkpoint<'a>,
++    left: BTreeSet<(Uuid, Slot)>,
++    ids: HashSet<Uuid>,
++    expanded: &'f dyn Fn(LayerId) -> bool,
++    image: &'f mut dyn FnMut(Uuid, Slot, &Image) -> Result<TiledImage, Error>,
++}
++
++impl Builder<'_, '_, '_> {
++    fn unique(&mut self, id: Uuid) -> Result<(), Error> {
++        if self.ids.insert(id) { Ok(()) } else { Err(invalid(format!("{id} appears twice"))) }
++    }
++
++    fn take(&mut self, layer: Uuid, slot: Slot, resolution: u32, comps: Option<usize>) -> Result<Option<TiledImage>, Error> {
++        let Some(image) = self.cp.layers.get(&layer).and_then(|images| images.get(&slot)) else { return Ok(None) };
++        if image.size != resolution || comps.is_some_and(|c| c != image.comps as usize) {
++            return Err(invalid(format!("raster layout of layer {layer}")));
++        }
++        self.left.remove(&(layer, slot));
++        (self.image)(layer, slot, image).map(Some)
++    }
++
++    fn layer(&mut self, l: &LayerV1, resolution: u32) -> Result<Layer, Error> {
++        self.unique(l.id)?;
++        let mask = match &l.mask {
++            None => None,
++            Some(m) => {
++                let base = self.take(l.id, Slot::Mask, resolution, Some(1))?.ok_or_else(|| invalid("a mask without its base"))?;
++                let mut effects = Vec::new();
++                for e in &m.effects {
++                    self.unique(e.id)?;
++                    let kind = match &e.kind {
++                        MaskEffectKindV1::Paint { .. } => MaskEffectKind::Paint {
++                            image: self.take(l.id, Slot::Effect(e.id), resolution, None)?.ok_or_else(|| invalid("a paint effect without its raster"))?,
++                        },
++                        MaskEffectKindV1::Fill { value, procedural, projection } => {
++                            MaskEffectKind::Fill { value: *value, procedural: *procedural, projection: *projection }
++                        }
++                        MaskEffectKindV1::Generator { generator } => MaskEffectKind::Generator(*generator),
++                        MaskEffectKindV1::Levels { levels } => MaskEffectKind::Levels(*levels),
++                        MaskEffectKindV1::Invert => MaskEffectKind::Invert,
++                        MaskEffectKindV1::Image { resource, projection, invert } => {
++                            MaskEffectKind::Image { resource: ResourceId(*resource), projection: *projection, invert: *invert }
++                        }
++                    };
++                    effects.push(Arc::new(MaskEffect { id: EffectId(e.id), name: e.name.clone(), visible: e.visible, blend: e.blend, opacity: e.opacity, kind }));
++                }
++                Some(Mask { enabled: m.enabled, base, effects })
++            }
++        };
++        let content = match &l.content {
++            ContentV1::Paint { channels, path } => {
++                if !channels.is_empty() {
++                    return Err(invalid("paint channels outside the rasters"));
++                }
++                let mut p = PaintContent::default();
++                if let Some(path) = path {
++                    let source = PenPath {
++                        anchors: path
++                            .anchors
++                            .iter()
++                            .map(|a| PenAnchor { id: AnchorId(a.id), position: a.position.into(), incoming: a.incoming.into(), outgoing: a.outgoing.into() })
++                            .collect(),
++                        closed: path.closed,
++                        radius: path.radius,
++                        hardness: path.hardness,
++                        opacity: path.opacity,
++                        values: path.values.iter().map(|v| (v.channel, ChannelValue(v.value))).collect(),
++                    };
++                    source.validate().map_err(invalid)?;
++                    p.path = Some(source);
++                }
++                for kind in ChannelKind::ALL {
++                    if let Some(image) = self.take(l.id, Slot::Channel(channel_index(kind)), resolution, Some(kind.components() + 1))? {
++                        p.channels.insert(kind, image);
++                    }
++                }
++                LayerContent::Paint(p)
++            }
++            ContentV1::Fill { projection, channels } => LayerContent::Fill(FillContent {
++                projection: *projection,
++                channels: channels.iter().map(|c| (c.channel, FillChannel { enabled: c.enabled, source: c.source.clone(), strength: c.strength })).collect(),
++            }),
++            ContentV1::Folder { children, .. } => LayerContent::Group(GroupContent {
++                expanded: (self.expanded)(LayerId(l.id)),
++                children: children.iter().map(|c| self.layer(c, resolution).map(Arc::new)).collect::<Result<_, _>>()?,
++            }),
++        };
++        Ok(Layer {
++            id: LayerId(l.id),
++            name: l.name.clone(),
++            visible: l.visible,
++            blend: l.blend.iter().map(|b| (b.channel, ChannelBlend { mode: b.mode, opacity: b.opacity })).collect(),
++            mask,
++            parts: l.parts.as_ref().map(|p| PartMask { enabled: p.enabled, kind: p.kind, parts: p.parts.iter().copied().collect() }),
++            content,
++        })
++    }
++}
++
++/// The document a checkpoint describes, `image` making each raster. Fails unless this build would write exactly this
++/// checkpoint for it (every raster belongs to its layer, nothing repeats, lists are in the model's order).
++fn build(
++    cp: &Checkpoint,
++    expanded: &dyn Fn(LayerId) -> bool,
++    image: &mut dyn FnMut(Uuid, Slot, &Image) -> Result<TiledImage, Error>,
++) -> Result<Document, Error> {
++    let file: DocumentV1 = serde_json::from_value(cp.json.clone()).map_err(invalid)?;
++    if file.texture_sets.is_empty() || !file.resources.is_empty() {
++        return Err(invalid("texture sets"));
++    }
++    let left = cp.layers.iter().flat_map(|(&l, images)| images.keys().map(move |&s| (l, s))).collect();
++    let mut b = Builder { cp, left, ids: HashSet::new(), expanded, image };
++    let mut texture_sets = Vec::new();
++    for t in &file.texture_sets {
++        b.unique(t.id)?;
++        if !RESOLUTIONS.contains(&t.resolution) || !t.mesh_maps.is_empty() {
++            return Err(invalid(format!("texture set {}", t.name)));
++        }
++        texture_sets.push(TextureSet {
++            id: TextureSetId(t.id),
++            name: t.name.clone(),
++            material_slot: t.material_slot,
++            resolution: t.resolution,
++            channels: t.channels.iter().map(|c| ChannelDef { kind: c.kind, format: c.format }).collect(),
++            layers: t.layers.iter().map(|l| b.layer(l, t.resolution).map(Arc::new)).collect::<Result<_, _>>()?,
++        });
++    }
++    if !b.left.is_empty() {
++        return Err(invalid("a raster without its layer"));
++    }
++    let doc = Document { texture_sets };
++    if canonical(&json(&doc)) != canonical(&cp.json) {
++        return Err(invalid("not in this build's form"));
++    }
++    Ok(doc)
++}
++
++/// The document's structure, with empty rasters.
++fn skeleton(cp: &Checkpoint) -> Result<Document, Error> {
++    build(cp, &|_| true, &mut |_, _, i| Ok(TiledImage::new(i.size, i.size, i.comps as usize, i.fill.map(f32::from_bits))))
++}
++
++/// Whether every peer can install `cp`: its structure, and whatever differs from `current` (already installed)
++/// decodes. Gives the images the document uses.
++fn check(cp: &Checkpoint, current: &Checkpoint) -> Result<HashSet<Uuid>, Error> {
++    let doc = skeleton(cp)?;
++    if cp.mesh != current.mesh {
++        mesh_from(&cp.mesh)?;
++    }
++    for (id, r) in &cp.resources {
++        if current.resources.get(id) != Some(r) {
++            subcraft_image::io::decode_bitmap(&r.bytes, Some(&r.name)).map_err(invalid)?;
++        }
++    }
++    for (layer, images) in &cp.layers {
++        for (slot, image) in images {
++            let known = current.layers.get(layer).and_then(|i| i.get(slot)).filter(|k| k.comps == image.comps);
++            for (t, blob) in &image.tiles {
++                if known.and_then(|k| k.tiles.get(t)) != Some(blob) {
++                    tile_from(blob, image.comps)?;
++                }
++            }
++        }
++    }
++    let mut used = Vec::new();
++    for ts in &doc.texture_sets {
++        for l in &ts.layers {
++            l.collect_resources(&mut used);
++        }
++    }
++    Ok(used.into_iter().map(|r| r.0).collect())
++}
++
++/// A whole checkpoint `edited` replacing `current`: checked like a merge's result.
++pub(crate) fn check_whole(edited: &Checkpoint, current: &Checkpoint) -> Result<(), Error> {
++    let used = check(edited, current)?;
++    if edited.resources.keys().any(|id| !used.contains(id)) {
++        return Err(invalid("an unused image"));
++    }
++    Ok(())
++}
++
++// ----- merge ---------------------------------------------------------------------------------------------------------
++
++/// Keyed values, three ways: each key takes the side that changed it (strictly: both changing it is a conflict even to
++/// equal values), and `both` merges a key both sides changed and kept.
++fn merge_map<K: Ord + Copy + std::fmt::Debug, V: PartialEq + Clone>(
++    b: &BTreeMap<K, V>,
++    c: &BTreeMap<K, V>,
++    e: &BTreeMap<K, V>,
++    mut both: impl FnMut(K, Option<&V>, &V, &V) -> Result<V, Error>,
++) -> Result<BTreeMap<K, V>, Error> {
++    let keys: BTreeSet<K> = b.keys().chain(c.keys()).chain(e.keys()).copied().collect();
++    let mut out = BTreeMap::new();
++    for k in keys {
++        let (bv, cv, ev) = (b.get(&k), c.get(&k), e.get(&k));
++        let v = if ev == bv {
++            cv.cloned()
++        } else if cv == bv {
++            ev.cloned()
++        } else {
++            match (cv, ev) {
++                (Some(cv), Some(ev)) => Some(both(k, bv, cv, ev)?),
++                _ => return Err(conflict(format!("{k:?}"))),
++            }
++        };
++        if let Some(v) = v {
++            out.insert(k, v);
++        }
++    }
++    Ok(out)
++}
++
++/// Strict three-way merge, then [`check`]: the layer trees and settings per field (layers, effects and anchors by
++/// id), rasters tile by tile, the mesh as one value and the images as a union.
++pub(crate) fn merge<'a>(b: &Checkpoint<'a>, c: &Checkpoint<'a>, e: &Checkpoint<'a>) -> Result<Checkpoint<'a>, Error> {
++    let json = crate::playground_live::merge(&b.json, &c.json, &e.json, &[])?;
++    let mesh = if e.mesh == b.mesh {
++        c.mesh.clone()
++    } else if c.mesh == b.mesh {
++        e.mesh.clone()
++    } else {
++        return Err(conflict("the model"));
++    };
++    let mut resources = BTreeMap::new();
++    for (id, r) in [b, c, e].into_iter().flat_map(|side| &side.resources) {
++        if *resources.entry(*id).or_insert_with(|| r.clone()) != *r {
++            return Err(invalid(format!("two images {id}")));
++        }
++    }
++    let empty = BTreeMap::new();
++    let layers = merge_map(&b.layers, &c.layers, &e.layers, |layer, bl, cl, el| {
++        merge_map(bl.unwrap_or(&empty), cl, el, |slot, bi, ci, ei| {
++            if ci.layout() != ei.layout() || bi.is_some_and(|bi| bi.layout() != ci.layout()) {
++                return Err(conflict(format!("raster {slot:?} of layer {layer}")));
++            }
++            let tiles = merge_map(bi.map_or(&BTreeMap::new(), |bi| &bi.tiles), &ci.tiles, &ei.tiles, |t, _, _, _| {
++                Err(conflict(format!("tile {t} of raster {slot:?} of layer {layer}")))
++            })?;
++            Ok(Image { tiles, ..ci.clone() })
++        })
++    })?;
++    let mut merged = Checkpoint { json, mesh, resources, layers };
++    let used = check(&merged, c)?;
++    merged.resources.retain(|id, _| used.contains(id));
++    Ok(merged)
++}
++
++/// [`merge`] on bytes, for the session's coordinator.
++pub(crate) fn merge_bytes(base: &[u8], current: &[u8], edited: &[u8]) -> Result<Vec<u8>, Error> {
++    write(&merge(&parse(base)?, &parse(current)?, &parse(edited)?)?)
++}
++
++// ----- install -------------------------------------------------------------------------------------------------------
++
++/// What installing a checkpoint takes: the document (local tiles kept where unchanged, folders open as they were),
++/// images new to this store (all of them with a new mesh), and the mesh when it is another one (with its bytes, for
++/// [`known_mesh`]).
++pub(crate) struct Install<'a> {
++    pub doc: Document,
++    pub resources: Vec<Arc<Resource>>,
++    pub mesh: Option<(Mesh, Bytes<'a>)>,
++}
++
++/// `mesh` was installed from `bytes`: its checkpoints reuse them.
++pub(crate) fn known_mesh(mesh: &Arc<Mesh>, bytes: &[u8]) {
++    CACHE.with_borrow_mut(|cache| cache.mesh = Some((Arc::downgrade(mesh), bytes.into())));
++}
++
++pub(crate) fn install<'a>(cp: &Checkpoint<'a>, local: &Document, store: &ResourceStore, mesh: &Arc<Mesh>) -> Result<Install<'a>, Error> {
++    let mut mine: HashMap<(Uuid, Slot), TiledImage> = HashMap::new();
++    let mut folders = HashMap::new();
++    for ts in &local.texture_sets {
++        ts.walk(|l, _| {
++            mine.extend(rasters(l).into_iter().map(|(slot, image)| ((l.id.0, slot), image.clone())));
++            if let LayerContent::Group(g) = &l.content {
++                folders.insert(l.id, g.expanded);
++            }
++        });
++    }
++    CACHE.with_borrow_mut(|cache| {
++        let new_mesh = if cache.mesh(mesh)[..] == cp.mesh[..] { None } else { Some((mesh_from(&cp.mesh)?, cp.mesh.clone())) };
++        let doc = build(cp, &|id| folders.get(&id).copied().unwrap_or(true), &mut |layer, slot, image| {
++            let (comps, fill) = (image.comps as usize, image.fill.map(f32::from_bits));
++            let known = mine.get(&(layer, slot)).filter(|m| m.comps() == comps && m.width() == image.size);
++            let mut out = TiledImage::new(image.size, image.size, comps, fill);
++            for (&t, blob) in &image.tiles {
++                let kept = known
++                    .and_then(|k| k.tile(t as usize))
++                    .filter(|tile| cache.tile(tile, comps, fill).as_deref() == Some(&blob[..]))
++                    .cloned();
++                let tile = match kept {
++                    Some(tile) => tile,
++                    None => {
++                        let tile = Arc::new(tile_from(blob, image.comps)?);
++                        cache.tiles.insert(Arc::as_ptr(&tile) as usize, (Arc::downgrade(&tile), Some(blob.to_vec().into())));
++                        tile
++                    }
++                };
++                out.set_slot(t as usize, Some(tile));
++            }
++            // Unchanged: the very same image, so nothing downstream sees a change.
++            Ok(match known {
++                Some(k) if *k == out => k.clone(),
++                _ => out,
++            })
++        })?;
++        let mut resources = Vec::new();
++        for (&id, r) in &cp.resources {
++            match store.get(ResourceId(id)) {
++                Some(have) if new_mesh.is_some() => resources.push(have.clone()),
++                Some(_) => {}
++                None => {
++                    let bitmap = subcraft_image::io::decode_bitmap(&r.bytes, Some(&r.name)).map_err(invalid)?;
++                    let kind = [ResourceKind::Texture, ResourceKind::Alpha, ResourceKind::Environment][r.kind as usize];
++                    resources.push(Arc::new(Resource {
++                        id: ResourceId(id),
++                        name: r.name.clone(),
++                        kind,
++                        bitmap: Arc::new(bitmap),
++                        source_path: None,
++                        encoded: Some(Arc::new(r.bytes.to_vec())),
++                    }));
++                }
++            }
++        }
++        Ok(Install { doc, resources, mesh: new_mesh })
++    })
++}
+diff --git a/crates/ui/src/app/live/tests.rs b/crates/ui/src/app/live/tests.rs
+new file mode 100644
+index 0000000..5f0d690
+--- /dev/null
++++ b/crates/ui/src/app/live/tests.rs
+@@ -0,0 +1,251 @@
++use std::collections::HashSet;
++use std::sync::Arc;
++
++use glam::Vec2;
++use subcraft_app::{Command, NewLayer, Session};
++use subcraft_core::{ChannelKind, ResourceId};
++use subcraft_doc::{FillChannel, FillSource, LayerContent, Resource, ResourceKind};
++
++use super::checkpoint::{self, encode, install, merge_bytes, parse, write};
++use super::*;
++use crate::app::default_layout;
++use crate::state::UiState;
++
++fn app(session: Session) -> SubcraftApp {
++    SubcraftApp {
++        state: UiState::new(session, None),
++        dock: default_layout(),
++        frames: 0,
++        screenshot: None,
++        screenshot_requested: false,
++        pending_now: None,
++        active_tabs: HashSet::new(),
++        test_crash: false,
++    }
++}
++
++fn cube() -> Session {
++    Session::new(subcraft_mesh::primitives::cube(2.0), 128)
++}
++
++fn bytes(s: &Session) -> Vec<u8> {
++    encode(s.history().current(), s.resources(), &s.scene().mesh).unwrap()
++}
++
++/// A real brush stroke (every channel of the default brush) across the view, `from` and `to` in 0..1.
++fn stroke(s: &mut Session, from: (f32, f32), to: (f32, f32)) {
++    let camera = crate::orbit::OrbitCamera::framing(&s.scene().mesh.bounds).paint_camera([800, 600]);
++    s.begin_stroke().unwrap();
++    for k in 0..=24 {
++        let t = k as f32 / 24.0;
++        let p = Vec2::new(from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t) * Vec2::new(800.0, 600.0);
++        s.stroke_to(&camera, p, false).unwrap();
++    }
++    s.end_stroke();
++}
++
++/// `checkpoint` installed into `s` with no base, as a joining peer does.
++fn adopt(s: &mut Session, checkpoint: &[u8]) {
++    let cp = parse(checkpoint).unwrap();
++    checkpoint::check_whole(&cp, &parse(&bytes(s)).unwrap()).unwrap();
++    let i = install(&cp, s.history().current(), s.resources(), &s.scene().mesh).unwrap();
++    assert!(i.mesh.is_none());
++    s.adopt(i.doc, i.resources, false);
++}
++
++fn png() -> Arc<Resource> {
++    image(None)
++}
++
++/// A small image whose file is `file` (default: its PNG).
++fn image(file: Option<Vec<u8>>) -> Arc<Resource> {
++    let bitmap = subcraft_image::Bitmap::new_u8(2, 2, 3, vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 9, 9, 9]);
++    let encoded = subcraft_image::encode_bitmap(&bitmap).unwrap().0;
++    Arc::new(Resource {
++        id: ResourceId::new(),
++        name: "logo.png".into(),
++        kind: ResourceKind::Texture,
++        bitmap: Arc::new(subcraft_image::io::decode_bitmap(&encoded, None).unwrap()),
++        source_path: None,
++        encoded: Some(Arc::new(file.unwrap_or(encoded))),
++    })
++}
++
++/// A fill layer showing `image`, above the selection.
++fn image_fill(s: &mut Session, image: Arc<Resource>) {
++    let id = image.id;
++    let doc = s.history().current().clone();
++    s.adopt(doc, vec![image], false);
++    s.execute(Command::AddLayer(NewLayer::Fill)).unwrap();
++    let layer = s.selection().layer.unwrap();
++    let fill = FillChannel::new(FillSource::Bitmap { resource: id });
++    s.execute(Command::SetFillChannel { layer, channel: ChannelKind::BaseColor, fill }).unwrap();
++}
++
++#[test]
++fn checkpoints_are_canonical_leave_views_out_and_install_exactly() {
++    let mut a = cube();
++    a.execute(Command::AddLayer(NewLayer::Folder)).unwrap();
++    let folder = a.selection().layer.unwrap();
++    a.execute(Command::AddMask { layer: folder, white: true }).unwrap();
++    let paint = a.selected_texture_set().layers[0].id;
++    a.execute(Command::SelectLayer(Some(paint))).unwrap();
++    stroke(&mut a, (0.4, 0.4), (0.6, 0.55));
++    image_fill(&mut a, png());
++    let shared = bytes(&a);
++    assert_eq!(write(&parse(&shared).unwrap()).unwrap(), shared, "parsing and writing give the same bytes");
++
++    // Views: selection, an open folder, the brush, the tool. The folder's open state is in the document and its
++    // history, but personal.
++    a.execute(Command::SetFolderExpanded { layer: folder, expanded: false }).unwrap();
++    a.execute(Command::SelectLayer(None)).unwrap();
++    a.brush.settings.size *= 2.0;
++    assert_eq!(bytes(&a), shared, "views are not shared");
++
++    // A peer on the same model installs it exactly, keeping its own folder state, and reports the same bytes.
++    let mut b = cube();
++    adopt(&mut b, &shared);
++    assert_eq!(bytes(&b), shared);
++    let (da, db) = (a.history().current(), b.history().current());
++    assert_eq!(da.texture_sets[0].layers[0], db.texture_sets[0].layers[0], "painted tiles arrive exactly");
++    assert!(b.resources().len() == 1 && b.history().entries().len() == 1, "the image arrives; no undo step");
++    let open = |s: &Session| match &s.history().current().texture_sets[0].find(folder).unwrap().content {
++        LayerContent::Group(g) => g.expanded,
++        _ => unreachable!(),
++    };
++    assert!(!open(&a) && open(&b));
++}
++
++#[test]
++fn merges_take_tiles_layers_and_fields_from_whoever_changed_them_and_conflict_when_both_did() {
++    let mut a = cube();
++    let base = bytes(&a);
++    let mut b = cube();
++    adopt(&mut b, &base);
++    // Different tiles of the same layer, and a new layer with an image on each side.
++    stroke(&mut a, (0.3, 0.3), (0.35, 0.32));
++    image_fill(&mut a, png());
++    stroke(&mut b, (0.62, 0.65), (0.68, 0.7));
++    image_fill(&mut b, png());
++    let (ca, cb) = (bytes(&a), bytes(&b));
++    let merged = merge_bytes(&base, &ca, &cb).unwrap();
++    let both = parse(&merged).unwrap();
++    let i = install(&both, a.history().current(), a.resources(), &a.scene().mesh).unwrap();
++    let ts = &i.doc.texture_sets[0];
++    assert_eq!(ts.layers.len(), 3, "both new layers");
++    assert_eq!(i.resources.len(), 1, "the other side's image (union)");
++    let painted = |doc: &subcraft_doc::Document| match &doc.texture_sets[0].layers[0].content {
++        LayerContent::Paint(p) => p.channels[&ChannelKind::BaseColor].allocated_tiles(),
++        _ => unreachable!(),
++    };
++    let (pa, pb) = (painted(a.history().current()), painted(b.history().current()));
++    assert_eq!(painted(&i.doc), pa + pb, "both strokes' tiles");
++    a.adopt(i.doc, i.resources, false);
++    assert_eq!(bytes(&a), merged, "the merge is what the merged project reports");
++
++    // The same tile from both sides conflicts, as does one field both changed (even to the same value).
++    let mut c = cube();
++    adopt(&mut c, &base);
++    stroke(&mut c, (0.31, 0.31), (0.36, 0.33));
++    let err = merge_bytes(&base, &ca, &bytes(&c)).unwrap_err();
++    assert!(err.contains("tile"), "{err}");
++    let layer = a.history().current().texture_sets[0].layers[0].id;
++    let mut d = cube();
++    adopt(&mut d, &base);
++    let mut e = cube();
++    adopt(&mut e, &base);
++    for s in [&mut d, &mut e] {
++        s.execute(Command::Rename { layer, name: "Same".into() }).unwrap();
++    }
++    assert!(merge_bytes(&base, &bytes(&d), &bytes(&e)).unwrap_err().contains("Conflict"));
++
++    // Not this build's form, or not a checkpoint: refused before anyone records it.
++    let mut extra: serde_json::Value = serde_json::from_slice(json_of(&cb)).unwrap();
++    extra["texture_sets"][0]["layers"][0]["note"] = "x".into();
++    assert!(merge_bytes(&base, &base, &with_json(&cb, &extra)).unwrap_err().contains("this build's form"));
++    assert!(merge_bytes(&base, &base, b"SCLIVE01").is_err());
++}
++
++fn json_of(checkpoint: &[u8]) -> &[u8] {
++    let n = u32::from_le_bytes(checkpoint[8..12].try_into().unwrap()) as usize;
++    &checkpoint[12..12 + n]
++}
++
++fn with_json(checkpoint: &[u8], json: &serde_json::Value) -> Vec<u8> {
++    let json = serde_json::to_vec(json).unwrap();
++    let rest = &checkpoint[12 + json_of(checkpoint).len()..];
++    [&checkpoint[..8], &(json.len() as u32).to_le_bytes(), &json, rest].concat()
++}
++
++#[test]
++fn remote_changes_wait_for_quiet_install_without_an_undo_step_and_keep_views() {
++    let mut owner = app(cube());
++    let mut peer = cube();
++    let base = owner.live_encode().unwrap();
++    adopt(&mut peer, &base);
++    stroke(&mut peer, (0.4, 0.4), (0.6, 0.5));
++    let edited = bytes(&peer);
++    // The owner's own views and history.
++    owner.state.session.execute(Command::AddLayer(NewLayer::Folder)).unwrap();
++    owner.state.camera.orbit(30.0, 10.0);
++    let (camera, selection, history) =
++        (owner.state.camera.paint_camera([8, 8]).view, owner.state.session.selection(), owner.state.session.history().entries().len());
++
++    connect();
++    assert!(connected());
++    let done = std::rc::Rc::new(std::cell::RefCell::new(None));
++    let to = done.clone();
++    queue(Some(base), edited, Box::new(move |r| *to.borrow_mut() = Some(r)));
++    owner.state.painting = true;
++    let ctx = egui::Context::default();
++    owner.live_frame(&ctx);
++    assert!(done.borrow().is_none(), "a stroke under way waits");
++    assert_eq!(owner.live_checkpoint().unwrap_err(), "busy");
++    owner.state.painting = false;
++    owner.live_frame(&ctx);
++    assert_eq!(*done.borrow(), Some(Ok(None)));
++    let s = &owner.state.session;
++    assert_eq!(s.history().entries().len(), history, "no undo step");
++    assert_eq!((s.selection(), owner.state.camera.paint_camera([8, 8]).view), (selection, camera), "views stay");
++    assert_eq!(s.selected_texture_set().layers.len(), 2, "the owner's folder stays");
++    assert_eq!(s.document(), s.history().current());
++    assert!(undo(true) && LIVE.with_borrow(|l| l.undos.clone()) == [true], "Undo goes to the session");
++    let changes = LIVE.with_borrow(|l| l.changes);
++    owner.live_frame(&ctx);
++    assert_eq!(LIVE.with_borrow(|l| l.changes), changes, "no change: nothing to report");
++
++    disconnect();
++    owner.live_disconnected();
++    assert!(!undo(false));
++    assert_eq!(owner.state.session.history().entries().len(), 1, "native Undo starts over");
++}
++
++#[test]
++fn a_stroke_changes_a_small_span_and_oversized_projects_fail_clearly() {
++    let mut s = Session::sample();
++    let before = bytes(&s);
++    let mut spans = Vec::new();
++    for (from, to) in [((0.45, 0.35), (0.6, 0.45)), ((0.5, 0.5), (0.55, 0.6)), ((0.4, 0.6), (0.48, 0.62))] {
++        let (was, layer) = (bytes(&s), s.selected_layer().unwrap().clone());
++        stroke(&mut s, from, to);
++        let now = bytes(&s);
++        let prefix = was.iter().zip(&now).take_while(|(a, b)| a == b).count();
++        let suffix = was.iter().rev().zip(now.iter().rev()).take_while(|(a, b)| a == b).count();
++        let span = now.len() - prefix - suffix.min(was.len().min(now.len()) - prefix);
++        let (LayerContent::Paint(a), LayerContent::Paint(b)) = (&layer.content, &s.selected_layer().unwrap().content) else { unreachable!() };
++        let tiles: usize = b.channels.iter().map(|(k, i)| a.channels.get(k).map_or(i.allocated_tiles(), |was| i.changed_tiles(was).len())).sum();
++        spans.push((now.len(), span, tiles));
++    }
++    eprintln!(
++        "sample crate at 1024²: empty {} bytes; after 3 strokes {} bytes ({} bytes of raw texels); per stroke (checkpoint, changed span, tiles touched): {spans:?}",
++        before.len(),
++        bytes(&s).len(),
++        s.history().current().raster_bytes()
++    );
++    assert!(spans.iter().skip(1).all(|&(size, span, _)| span < size / 2), "{spans:?}");
++
++    image_fill(&mut s, image(Some(vec![0; checkpoint::MAX_BYTES])));
++    let err = encode(s.history().current(), s.resources(), &s.scene().mesh).unwrap_err();
++    assert!(err.contains("too large to edit live") && err.contains("128 MiB"), "{err}");
++    assert!(parse(&vec![0; checkpoint::MAX_BYTES + 1]).unwrap_err().contains("too large"));
++}
+diff --git a/crates/ui/src/lib.rs b/crates/ui/src/lib.rs
+index 6d36477..79ffb1b 100644
+--- a/crates/ui/src/lib.rs
++++ b/crates/ui/src/lib.rs
+@@ -20,6 +20,11 @@ pub mod welcome;
+ 
+ pub mod updates;
+ 
++// Playground live editing (web only): the template's JSON merge and canonical form.
++#[cfg(any(target_arch = "wasm32", test))]
++#[allow(dead_code)]
++mod playground_live;
++
+ pub use app::{LaunchOptions, SubcraftApp, Tab};
+ 
+ /// Open the main window.
+@@ -56,9 +61,9 @@ pub async fn start_web(canvas_id: &str) -> Result<(), wasm_bindgen::JsValue> {
+         .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+         .ok_or_else(|| wasm_bindgen::JsValue::from_str("canvas not found"))?;
+     let options = eframe::WebOptions { wgpu_options: wgpu_options(), ..Default::default() };
+-    eframe::WebRunner::new()
+-        .start(canvas, options, Box::new(|cc| Ok(Box::new(SubcraftApp::new(cc, LaunchOptions::default())))))
+-        .await
++    let runner = eframe::WebRunner::new();
++    runner.start(canvas, options, Box::new(|cc| Ok(Box::new(SubcraftApp::new(cc, LaunchOptions::default()))))).await?;
++    app::live::web::attach(&runner)
+ }
+ 
+ #[cfg(target_arch = "wasm32")]
+diff --git a/crates/ui/src/panels/history.rs b/crates/ui/src/panels/history.rs
+index c816360..124ac23 100644
+--- a/crates/ui/src/panels/history.rs
++++ b/crates/ui/src/panels/history.rs
+@@ -25,7 +25,7 @@ pub fn show(state: &mut UiState, ui: &mut Ui) {
+                 }
+                 ui.add(egui::Label::new(text).truncate().selectable(false));
+             });
+-            if resp.clicked() && i != cursor {
++            if resp.clicked() && i != cursor && !crate::app::live_session() {
+                 cmds.push(Command::JumpToHistory(i));
+             }
+         }
