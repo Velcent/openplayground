@@ -211,14 +211,14 @@ groups:
         alternative: Fusion 360
         blurb: Parametric 3D modeling with sketches, constraints and solids.
         # Designs, and STEP/IGES/STL/3MF/OBJ (each opens as a new design, or joins one that has features).
-        opens: [solvecraft, step, stp, iges, igs, stl, 3mf, obj]
+        opens: [solidcraft, solvecraft, step, stp, iges, igs, stl, 3mf, obj]
         imports: []
         repo: bherbruck/solvecraft
         # Its web zip is solvecraft-<tag>-web.zip; its 0.x releases are pre-releases.
         asset: '-web\.zip$'
         # The web app and what it compiles (dependency changes show up in Cargo.lock; the root Cargo.toml holds
         # the release profile and the vendored truck patches): CI, docs and desktop-only commits don't rebuild it.
-        paths: [apps/solvecraft-web, crates, vendor, Cargo.lock, Cargo.toml]
+        paths: [apps/solidcraft-web, crates, vendor, Cargo.lock, Cargo.toml]
         icon: icons/solidcraft.svg
         theme: themes/fusion-360.js
         patches: patches/fusion-360.yaml
