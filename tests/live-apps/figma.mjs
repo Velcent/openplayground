@@ -25,12 +25,15 @@ export default {
   viewport: { width: 1280, height: 800 },
   ready: async (page) => {
     await until(async () => !(await checkpoint(page)).startsWith('error'), 120000, 'FigCraft to run')
-    // A first click gives the canvas the keyboard.
-    await page.mouse.click(640, 600)
-    await draw(page, LEFT)
-    await until(async () => await rectangles(page) === 1, 10000, 'the first rectangle')
-    await draw(page, RIGHT)
-    await until(async () => await rectangles(page) === 2, 10000, 'the second rectangle')
+    // A first click gives the canvas the keyboard. A busy machine can drop the first keys: draw again until it shows.
+    for (const [at, count] of [[LEFT, 1], [RIGHT, 2]]) {
+      for (let tries = 0; await rectangles(page) < count; tries++) {
+        if (tries === 4) throw new Error(`no rectangle ${count} after ${tries} tries`)
+        await page.mouse.click(640, 600)
+        await draw(page, at)
+        await until(async () => await rectangles(page) >= count, 5000, `rectangle ${count}`).catch(() => {})
+      }
+    }
   },
   editA: (page) => nudge(page, LEFT),
   editB: (page) => nudge(page, RIGHT),
