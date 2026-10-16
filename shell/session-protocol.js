@@ -43,8 +43,11 @@ function validInvite(value) {
   decode(value.token); decode(value.secret)
   return { room: value.room, token: value.token, secret: value.secret, app: value.app }
 }
+// The secret stays in the fragment, which browsers never send. The room ID (no secret; the server knows it) also goes
+// in the query, so an app that keeps a personal library can open the session in a store of its own (`?pg-session=`).
 export function inviteURL(url, invite) {
   const out = new URL(url)
+  out.searchParams.set('pg-session', validInvite(invite).room)
   const fragment = new URLSearchParams(out.hash.slice(1))
   fragment.set('pg-session', encode(text.encode(JSON.stringify(validInvite(invite)))))
   out.hash = fragment.toString()

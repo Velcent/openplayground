@@ -22,7 +22,7 @@ test('invite stays in the fragment and preserves the app URL', () => {
   assert.equal(typeof p.inviteURL, 'function')
   const invite = { room: 'b98ea707-95fd-486d-9749-542939cd7c5d', token: p.randomToken(), secret: p.randomToken(), app: '/honeydew/' }
   const url = p.inviteURL('https://example.test/honeydew/?mode=dark#page=2', invite)
-  assert.equal(new URL(url).search, '?mode=dark')
+  assert.equal(new URL(url).search, `?mode=dark&pg-session=${invite.room}`, 'only the room ID, never the secret, is in the query')
   assert.equal(new URLSearchParams(new URL(url).hash.slice(1)).get('page'), '2')
   assert.deepEqual(p.readInvite(url), invite)
   assert.equal(p.readInvite('https://example.test/honeydew/#page=2'), null)
