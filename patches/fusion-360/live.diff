@@ -14,34 +14,53 @@ index 4c615fb..fa1544e 100644
  wasm-bindgen = "0.2"
 diff --git a/apps/solidcraft-web/src/live.rs b/apps/solidcraft-web/src/live.rs
 new file mode 100644
-index 0000000..87f713c
+index 0000000..a6ea97e
 --- /dev/null
 +++ b/apps/solidcraft-web/src/live.rs
-@@ -0,0 +1,298 @@
-+//! Live editing in a Playground session (`playground_live` drives it). The shared document is the open design's
-+//! parametric feature tree (`Session::doc`); every peer evaluates the bodies from it. This person's own state stays out:
-+//! the camera, selection and tools (outside the document anyway), what is hidden, each sketch's Sketch Palette options
-+//! and the timeline position Edit Sketch rolled to. New features, components and occurrences get ids unique across the
+@@ -0,0 +1,439 @@
++//! Live editing in a Playground session (`playground_live` drives it). The shared document is a design's parametric
++//! feature tree (`Session::doc`); every peer evaluates the bodies from it. The shared design is the one active when the
++//! session started, followed by its `Session::uid` wherever its tab goes; while another design is active, or after it
++//! closed, the session keeps its last state and remote changes wait for it. This person's own state stays out: the
++//! camera, selection and tools (outside the document anyway), what is hidden, each sketch's Sketch Palette options and
++//! the timeline position Edit Sketch rolled to. New features, components and occurrences get ids unique across the
 +//! peers (`fresh_id`), and each peer keeps its own `next_id`.
 +
-+use std::cell::{Cell, OnceCell};
++use std::cell::{Cell, OnceCell, RefCell};
 +use std::collections::{BTreeMap, BTreeSet};
 +use std::sync::Arc;
 +
 +use serde_json::{Map, Value};
++use solidcraft_engine::Session;
 +use solidcraft_engine::doc::{Document, FeatureKind};
-+use solidcraft_ui_egui::SolveApp;
++use solidcraft_ui_egui::{SolveApp, documents};
 +
-+use crate::playground_live::{self, Live};
++use crate::playground_live::{self, Live, canonical};
 +
 +thread_local! {
 +    /// This frame's pointer is down or text is being typed (`live_quiet` has no context to ask).
 +    static INPUT_BUSY: Cell<bool> = const { Cell::new(false) };
-+    /// The design tab the session follows: the active one when it started.
-+    static TAB: Cell<Option<usize>> = const { Cell::new(None) };
-+    /// Another design tab is active: its Undo is its own.
-+    static OTHER_TAB: Cell<bool> = const { Cell::new(false) };
++    /// The shared design (`Session::uid`).
++    static SHARED: Cell<Option<u64>> = const { Cell::new(None) };
++    /// The active design is the shared one (or none is yet): Undo and Redo go to the session.
++    static ON_SHARED: Cell<bool> = const { Cell::new(true) };
++    /// The shared document as last reported or adopted: what is reported while the shared design is not active.
++    static LAST: RefCell<Option<Value>> = const { RefCell::new(None) };
++    /// Remote changes that came while the shared design was not active: it takes them when it is again.
++    static PENDING: RefCell<Option<(u64, Value)>> = const { RefCell::new(None) };
++    /// Remote changes kept for later, counted (the generation).
++    static KEPT: Cell<u64> = const { Cell::new(0) };
++    /// The session ended while the shared design was not active: its Undo history goes when it is.
++    static FORGET: Cell<Option<u64>> = const { Cell::new(None) };
 +    static CTX: OnceCell<egui::Context> = const { OnceCell::new() };
++}
++
++fn on_shared(app: &SolveApp) -> bool {
++    SHARED.get().is_none_or(|uid| uid == app.session.uid)
++}
++
++fn pending_for(app: &SolveApp) -> bool {
++    PENDING.with_borrow(|p| p.as_ref().is_some_and(|(uid, _)| *uid == app.session.uid))
 +}
 +
 +/// The end of each frame.
@@ -50,14 +69,25 @@ index 0000000..87f713c
 +        c.get_or_init(|| ctx.clone());
 +    });
 +    INPUT_BUSY.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
-+    OTHER_TAB.set(TAB.get().is_some_and(|tab| tab != app.docs.active));
++    if FORGET.get() == Some(app.session.uid) {
++        FORGET.set(None);
++        app.session.undo.clear();
++        app.session.redo.clear();
++    }
++    if pending_for(app)
++        && app.live_quiet()
++        && let Some((_, document)) = PENDING.take()
++        && let Err(e) = install(app, document)
++    {
++        log::warn!("live editing: {e}");
++    }
++    ON_SHARED.set(on_shared(app));
 +    playground_live::frame(app);
 +}
 +
-+/// Undo and Redo of the session's design go to the session.
-+#[cfg(target_arch = "wasm32")]
++/// Undo and Redo of the shared design go to the session.
 +fn undo(redo: bool) -> bool {
-+    !OTHER_TAB.get() && playground_live::undo(redo)
++    ON_SHARED.get() && playground_live::undo(redo)
 +}
 +
 +/// Offers live editing to the Playground shell once the app runs; `app` finds the design in the runner's app.
@@ -76,48 +106,43 @@ index 0000000..87f713c
 +
 +impl Live for SolveApp {
 +    fn live_document(&self) -> Value {
-+        let mut v = serde_json::to_value(&*self.session.doc).unwrap_or_default();
-+        let Some(o) = v.as_object_mut() else { return v };
-+        // Each peer has its own next id (`fresh_id` keeps the ids apart); what is hidden is this person's.
-+        o.remove("next_id");
-+        o.remove("visibility");
++        if (!on_shared(self) || pending_for(self))
++            && let Some(last) = LAST.with_borrow(Clone::clone)
++        {
++            return last;
++        }
++        let mut v = project(&self.session.doc);
 +        // Edit Sketch rolls the timeline for the person editing only.
-+        match self.pre_sketch_marker {
-+            Some(Some(m)) => drop(o.insert("marker".into(), m.into())),
-+            Some(None) => drop(o.remove("marker")),
-+            None => {}
-+        }
-+        // Parameters merge one by one, by name.
-+        for p in items(&mut v, "params") {
-+            if let Some(name) = p.get("name").cloned() {
-+                p["id"] = name;
++        if let (Some(marker), Some(o)) = (self.pre_sketch_marker, v.as_object_mut()) {
++            match marker {
++                Some(m) => drop(o.insert("marker".into(), m.into())),
++                None => drop(o.remove("marker")),
 +            }
 +        }
-+        for f in items(&mut v, "features") {
-+            if let Some(s) = f.get_mut("sketch").and_then(Value::as_object_mut) {
-+                s.remove("view");
-+            }
++        if SHARED.get().is_some() {
++            LAST.set(Some(v.clone()));
 +        }
 +        v
 +    }
 +
 +    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
-+        let mut doc = design(document)?;
-+        let local = &self.session.doc;
-+        doc.next_id = doc.next_id.max(local.next_id);
-+        for f in &mut doc.features {
-+            if let FeatureKind::Sketch { sketch, .. } = &mut f.kind {
-+                sketch.view = local.sketch(f.id).map(|s| s.view.clone()).unwrap_or_default();
++        if SHARED.get().is_none() {
++            // A joiner's own design stays theirs: the session's opens in a tab of its own, unless the active design
++            // is blank or is the session's already (the owner's).
++            if !documents::active_is_blank(self) && canonical(&self.live_document()) != canonical(&document) {
++                documents::open_tab(self, Session::default())?;
 +            }
++            SHARED.set(Some(self.session.uid));
 +        }
-+        if let Some(marker) = &mut self.pre_sketch_marker {
-+            *marker = std::mem::replace(&mut doc.marker, local.marker);
++        if on_shared(self) {
++            PENDING.take();
++            install(self, document.clone())?;
++        } else {
++            design(document.clone())?;
++            PENDING.set(SHARED.get().map(|uid| (uid, document.clone())));
++            KEPT.set(KEPT.get() + 1);
 +        }
-+        if TAB.get().is_none() {
-+            TAB.set(Some(self.docs.active));
-+        }
-+        self.session.doc = Arc::new(doc);
-+        self.session.refresh();
++        LAST.set(Some(document));
 +        Ok(())
 +    }
 +
@@ -131,20 +156,27 @@ index 0000000..87f713c
 +            && !self.file_load.busy()
 +            && !self.file_picker_busy()
 +            && !self.session.model.is_stale()
-+            && TAB.get().is_none_or(|tab| tab == self.docs.active)
 +    }
 +
 +    fn live_generation(&self) -> Option<u64> {
 +        use std::hash::{Hash, Hasher};
 +        let mut h = std::hash::DefaultHasher::new();
-+        (self.session.revision, Arc::as_ptr(&self.session.doc) as usize, self.pre_sketch_marker).hash(&mut h);
++        let s = &self.session;
++        (s.uid, s.revision, Arc::as_ptr(&s.doc) as usize, self.pre_sketch_marker, KEPT.get()).hash(&mut h);
 +        Some(h.finish())
 +    }
 +
 +    fn live_disconnected(&mut self) {
-+        TAB.set(None);
-+        self.session.undo.clear();
-+        self.session.redo.clear();
++        if let Some(uid) = SHARED.take() {
++            if uid == self.session.uid {
++                self.session.undo.clear();
++                self.session.redo.clear();
++            } else {
++                FORGET.set(Some(uid));
++            }
++        }
++        LAST.set(None);
++        ON_SHARED.set(true);
 +    }
 +
 +    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
@@ -172,9 +204,56 @@ index 0000000..87f713c
 +        if let Some(name) = named_twice(&merged).difference(&before).next() {
 +            return Err(format!("Conflict: two {name}"));
 +        }
-+        design(merged.clone())?;
 +        Ok(merged)
 +    }
++
++    /// The design opens, and as it is: one that reading repairs (a component left without an occurrence gets one,
++    /// with a new id) would come out differently on every peer.
++    fn live_check(document: &Value) -> Result<(), String> {
++        if canonical(&project(&design(document.clone())?)) != canonical(document) {
++            return Err("Conflict: the merged design needs repairs".into());
++        }
++        Ok(())
++    }
++}
++
++/// Installs the shared document in the active design, keeping this person's views; no undo step.
++fn install(app: &mut SolveApp, document: Value) -> Result<(), String> {
++    let mut doc = design(document)?;
++    let local = &app.session.doc;
++    doc.next_id = doc.next_id.max(local.next_id);
++    for f in &mut doc.features {
++        if let FeatureKind::Sketch { sketch, .. } = &mut f.kind {
++            sketch.view = local.sketch(f.id).map(|s| s.view.clone()).unwrap_or_default();
++        }
++    }
++    if let Some(marker) = &mut app.pre_sketch_marker {
++        *marker = std::mem::replace(&mut doc.marker, local.marker);
++    }
++    app.session.doc = Arc::new(doc);
++    app.session.refresh();
++    Ok(())
++}
++
++/// A design as shared: without each peer's next id and what is hidden, sketches without their display options, and
++/// parameters keyed by name (so they merge one by one).
++fn project(doc: &Document) -> Value {
++    let mut v = serde_json::to_value(doc).unwrap_or_default();
++    if let Some(o) = v.as_object_mut() {
++        o.remove("next_id");
++        o.remove("visibility");
++    }
++    for p in items(&mut v, "params") {
++        if let Some(name) = p.get("name").cloned() {
++            p["id"] = name;
++        }
++    }
++    for f in items(&mut v, "features") {
++        if let Some(s) = f.get_mut("sketch").and_then(Value::as_object_mut) {
++            s.remove("view");
++        }
++    }
++    v
 +}
 +
 +fn items<'a>(v: &'a mut Value, key: &'static str) -> impl Iterator<Item = &'a mut Value> {
@@ -217,9 +296,8 @@ index 0000000..87f713c
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
-+    use crate::playground_live::{canonical, checkpoint, connect, queue};
++    use crate::playground_live::{checkpoint, connect, queue};
 +    use serde_json::json;
-+    use solidcraft_engine::Session;
 +    use solidcraft_ui_egui::Services;
 +
 +    fn app() -> SolveApp {
@@ -230,13 +308,31 @@ index 0000000..87f713c
 +        app
 +    }
 +
++    /// The app under test, its active design shared (as the owner's is).
++    fn bound() -> SolveApp {
++        let mut a = app();
++        let doc = a.live_document();
++        a.live_adopt(doc).unwrap();
++        a
++    }
++
++    /// Another peer: a design holding `document`, changed by `cmd`.
++    fn peer(document: &[u8], cmd: &str, p: Value) -> Vec<u8> {
++        let mut x = app();
++        install(&mut x, serde_json::from_slice(document).unwrap()).unwrap();
++        x.run(cmd, p).unwrap();
++        canonical(&project(&x.session.doc))
++    }
++
 +    fn shared(app: &SolveApp) -> Vec<u8> {
 +        canonical(&app.live_document())
 +    }
 +
++    const BOX: (&str, fn() -> Value) = ("solid.box", || json!({"length": "10", "width": "10", "height": "10"}));
++
 +    #[test]
 +    fn the_shared_design_leaves_out_views_and_adopting_one_keeps_them_without_an_undo_step() {
-+        let mut a = app();
++        let mut a = bound();
 +        let before = shared(&a);
 +        let doc = a.live_document();
 +        assert!(doc.get("next_id").is_none() && doc["features"][0]["sketch"].get("view").is_none());
@@ -245,7 +341,7 @@ index 0000000..87f713c
 +        let sketch = a.session.doc.features[0].id;
 +        a.session.doc_mut().sketch_mut(sketch).unwrap().view.hide_grid = true;
 +        assert_eq!(shared(&a), before);
-+        a.run("solid.box", json!({"length": "10", "width": "10", "height": "10"})).unwrap();
++        a.run(BOX.0, BOX.1()).unwrap();
 +        a.edit_sketch(sketch);
 +        assert_ne!(a.session.doc.marker, None, "Edit Sketch rolled the timeline");
 +        let with_box = shared(&a);
@@ -254,31 +350,23 @@ index 0000000..87f713c
 +        assert_eq!(shared(&a), with_box);
 +        assert_ne!(with_box, before);
 +
-+        // Someone else's design: a cylinder added; adopting it keeps a's views and is no undo step.
-+        let mut b = app();
-+        b.live_adopt(serde_json::from_slice(&with_box).unwrap()).unwrap();
-+        b.run("solid.cylinder", json!({"radius": "5", "height": "10"})).unwrap();
++        // Someone else's design: a cylinder added; adopting it keeps a's views, is no undo step and reads back the same.
++        let theirs = peer(&with_box, "solid.cylinder", json!({"radius": "5", "height": "10"}));
 +        let undo = a.session.undo.len();
-+        a.live_adopt(b.live_document()).unwrap();
++        a.live_adopt(serde_json::from_slice(&theirs).unwrap()).unwrap();
 +        assert_eq!(a.session.undo.len(), undo);
 +        assert!(a.session.doc.sketch(sketch).unwrap().view.hide_grid);
 +        assert_eq!(a.session.doc.features.len(), 3);
 +        assert!(a.session.doc.next_id > a.session.doc.features.iter().map(|f| f.id).max().unwrap());
-+        assert_eq!(shared(&a), shared(&b));
++        assert_eq!(shared(&a), theirs);
 +    }
 +
 +    #[test]
-+    fn concurrent_boxes_conflict_on_their_names_and_sketch_counters_take_the_larger() {
-+        let a = app();
-+        let base = a.live_document();
-+        let with = |cmd: &str, p: Value| {
-+            let mut x = app();
-+            x.live_adopt(base.clone()).unwrap();
-+            x.run(cmd, p).unwrap();
-+            x.live_document()
-+        };
-+        let one = with("solid.box", json!({"length": "10", "width": "10", "height": "10"}));
-+        let mut two = with("solid.box", json!({"length": "20", "width": "20", "height": "20"}));
++    fn merges_refuse_twice_given_names_and_designs_that_need_repairs_and_sketch_counters_take_the_larger() {
++        let base = canonical(&project(&app().session.doc));
++        let one: Value = serde_json::from_slice(&peer(&base, BOX.0, BOX.1())).unwrap();
++        let mut two: Value = serde_json::from_slice(&peer(&base, BOX.0, json!({"length": "20", "width": "20", "height": "20"}))).unwrap();
++        let base: Value = serde_json::from_slice(&base).unwrap();
 +        // Peer-unique ids, as `fresh_id` gives them while connected.
 +        two["features"][1]["id"] = json!(1u64 << 52 | 99);
 +        let error = SolveApp::live_merge(&base, &one, &two).unwrap_err();
@@ -291,21 +379,29 @@ index 0000000..87f713c
 +        };
 +        let merged = SolveApp::live_merge(&line(1), &line(3), &line(2)).unwrap();
 +        assert_eq!(merged["features"][0]["sketch"]["counters"]["l"], 3);
++        // A component left without an occurrence would get a new random one on each peer that reads it.
++        let mut x = app();
++        x.run("component.create", json!({})).unwrap();
++        let with: Value = project(&x.session.doc);
++        let mut without = with.clone();
++        without.as_object_mut().unwrap().remove("occurrences");
++        assert!(SolveApp::live_check(&with).is_ok());
++        let error = SolveApp::live_check(&without).unwrap_err();
++        assert!(error.contains("repairs"), "{error}");
++        assert!(SolveApp::live_check(&Value::Null).is_err());
 +    }
 +
 +    #[test]
 +    fn a_remote_change_waits_while_a_dialog_is_open() {
-+        let mut a = app();
-+        let mut b = app();
-+        b.live_adopt(a.live_document()).unwrap();
++        let mut a = bound();
 +        connect();
 +        let ctx = egui::Context::default();
 +        frame(&mut a, &ctx);
 +        let base = shared(&a);
-+        b.run("solid.box", json!({"length": "10", "width": "10", "height": "10"})).unwrap();
++        let theirs = peer(&base, BOX.0, BOX.1());
 +        let done = std::rc::Rc::new(Cell::new(false));
 +        let to = done.clone();
-+        queue(Some(base), shared(&b), Box::new(move |r| to.set(r.is_ok())));
++        queue(Some(base), theirs.clone(), Box::new(move |r| to.set(r.is_ok())));
 +        a.start("solid.sphere");
 +        assert!(a.dialog.is_some());
 +        frame(&mut a, &ctx);
@@ -313,11 +409,56 @@ index 0000000..87f713c
 +        a.dialog = None;
 +        frame(&mut a, &ctx);
 +        assert!(done.get());
-+        assert_eq!(shared(&a), shared(&b));
++        assert_eq!(shared(&a), theirs);
++    }
++
++    #[test]
++    fn the_shared_design_is_followed_wherever_its_tab_goes_and_outlives_it() {
++        let mut a = app();
++        // The session starts on the second of two designs.
++        documents::new_design(&mut a);
++        let doc = a.live_document();
++        a.live_adopt(doc).unwrap();
++        connect();
++        let ctx = egui::Context::default();
++        frame(&mut a, &ctx);
++        let base = shared(&a);
++        // On the other design: the session keeps the shared one, and Undo there is that design's own.
++        documents::switch(&mut a, 0);
++        frame(&mut a, &ctx);
++        assert_eq!(shared(&a), base);
++        assert!(!undo(false));
++        // A remote change waits for the shared design, not the open one.
++        let theirs = peer(&base, BOX.0, BOX.1());
++        let done = std::rc::Rc::new(Cell::new(false));
++        let to = done.clone();
++        queue(Some(base), theirs.clone(), Box::new(move |r| to.set(r.is_ok())));
++        frame(&mut a, &ctx);
++        assert!(done.get());
++        assert_eq!(shared(&a), theirs);
++        assert_eq!(a.session.doc.features.len(), 1, "the open design keeps its sketch alone");
++        // The other design closes, so the shared one's tab moves from 1 to 0; it takes the change.
++        documents::close(&mut a, 0, true);
++        assert_eq!(a.docs.active, 0);
++        frame(&mut a, &ctx);
++        assert_eq!(canonical(&project(&a.session.doc)), theirs);
++        assert!(undo(false));
++        // A new design opens next to it, then it closes, then the last one does (a blank design takes its place):
++        // the session keeps the shared design as it was, never another one.
++        documents::new_design(&mut a);
++        frame(&mut a, &ctx);
++        assert_eq!(shared(&a), theirs);
++        documents::switch(&mut a, 0);
++        for _ in 0..2 {
++            documents::close(&mut a, 0, true);
++            frame(&mut a, &ctx);
++            assert_eq!(shared(&a), theirs);
++        }
++        assert!(a.session.doc.features.is_empty() && !undo(false));
 +    }
 +}
 diff --git a/apps/solidcraft-web/src/main.rs b/apps/solidcraft-web/src/main.rs
-index 555fe38..6f7b71c 100644
+index 555fe38..76e845c 100644
 --- a/apps/solidcraft-web/src/main.rs
 +++ b/apps/solidcraft-web/src/main.rs
 @@ -10,6 +10,11 @@
@@ -353,11 +494,13 @@ index 555fe38..6f7b71c 100644
                  .start(
                      canvas,
                      options,
-@@ -528,6 +538,7 @@ mod web {
+@@ -528,6 +538,9 @@ mod web {
                      }),
                  )
                  .await;
-+            crate::live::attach(&runner, |shell: &mut Shell| &mut shell.app);
++            if result.is_ok() {
++                crate::live::attach(&runner, |shell: &mut Shell| &mut shell.app);
++            }
              if let Some(el) = document.get_element_by_id(LOADING_ID) {
                  match result {
                      Ok(()) => el.remove(),
@@ -376,13 +519,17 @@ index aeda6e2..1d3ed66 100644
          let k = self.occurrences.iter().filter(|o| o.component == component).count() + 1;
          self.occurrences.push(crate::Occurrence { id, component, parent, name: format!("{cname}:{k}"), transform, grounded: false });
 diff --git a/crates/doc/src/document.rs b/crates/doc/src/document.rs
-index 0463746..450f51e 100644
+index 0463746..ff68585 100644
 --- a/crates/doc/src/document.rs
 +++ b/crates/doc/src/document.rs
-@@ -12,6 +12,10 @@ pub const MAX_PARAMS: usize = 10_000;
+@@ -10,8 +10,12 @@ use crate::{DocError, Result};
+ pub const MAX_FEATURES: usize = 10_000;
+ pub const MAX_PARAMS: usize = 10_000;
  /// Largest feature id a replayed feature may keep (`Document::insert_feature`): exact in JSON
- /// numbers, and far from overflowing the next id.
- pub const MAX_FEATURE_ID: u64 = 1 << 52;
+-/// numbers, and far from overflowing the next id.
+-pub const MAX_FEATURE_ID: u64 = 1 << 52;
++/// numbers (live editing's ids are 2^52 and up), and far from overflowing the next id.
++pub const MAX_FEATURE_ID: u64 = (1 << 53) - 1;
 +/// The host's allocator for new feature, component and occurrence ids, if any: given the next id, the id to use (the
 +/// web app's live editing makes them unique across the people editing).
 +#[cfg(target_arch = "wasm32")]
@@ -428,6 +575,47 @@ index 0463746..450f51e 100644
          let name = match name {
              Some(n) if !n.trim().is_empty() => n.trim().to_string(),
              _ => self.unique_name(kind.base_name()),
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 8fc7f21..2a94046 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -193,6 +193,8 @@ impl WorldCache {
+ 
+ /// An editing session on one design.
+ pub struct Session {
++    /// Names this design while it is open, wherever its tab moves (unique in this process).
++    pub uid: u64,
+     pub doc: Arc<Document>,
+     pub model: Model,
+     pub undo: Vec<Snapshot>,
+@@ -295,6 +297,11 @@ const MAX_UNDO: usize = 200;
+ const MAX_CHECKPOINTS: usize = 16;
+ const MAX_LOG: usize = 2000;
+ 
++fn next_uid() -> u64 {
++    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
++    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
++}
++
+ impl Default for Session {
+     fn default() -> Self {
+         Session::new(Document::new("Untitled"))
+@@ -309,6 +316,7 @@ impl Session {
+         let mut model = Model::new();
+         model.evaluate(&doc);
+         Session {
++            uid: next_uid(),
+             saved: doc.clone(),
+             doc,
+             model,
+@@ -776,6 +784,7 @@ impl Session {
+     /// commands on without touching this one.
+     pub fn scratch(&self) -> Session {
+         Session {
++            uid: next_uid(),
+             doc: self.doc.clone(),
+             model: self.model.clone(),
+             undo: Vec::new(),
 diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
 index e90c6e1..419fd7f 100644
 --- a/crates/ui-egui/src/lib.rs
