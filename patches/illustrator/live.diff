@@ -46,7 +46,7 @@ index cfe8458..083b8c7 100644
  
  fn services(inbox: Inbox, place_inbox: PlaceInbox, ctx: egui::Context, locks: Option<WebLocks>) -> Services {
 diff --git a/crates/doc/src/lib.rs b/crates/doc/src/lib.rs
-index cc4f1c7..1731018 100644
+index cc4f1c7..30c4b53 100644
 --- a/crates/doc/src/lib.rs
 +++ b/crates/doc/src/lib.rs
 @@ -737,6 +737,11 @@ pub struct Document {
@@ -61,13 +61,16 @@ index cc4f1c7..1731018 100644
  fn ppi72() -> f64 {
      72.0
  }
-@@ -829,6 +834,10 @@ impl Document {
+@@ -829,6 +834,13 @@ impl Document {
  
      /// Allocate a fresh node id.
      pub fn alloc_id(&mut self) -> NodeId {
 +        #[cfg(target_arch = "wasm32")]
 +        if let Some(fresh) = FRESH_ID.get().filter(|_| self.next_id < MAX_NEXT_ID) {
-+            return NodeId(fresh(&mut self.next_id));
++            let id = fresh(&mut self.next_id);
++            // The counter stays above every id, as without it ("from the counter on" is new).
++            self.next_id = self.next_id.max(id.saturating_add(1));
++            return NodeId(id);
 +        }
          let id = NodeId(self.next_id);
          // Never reached from a counter [`Self::fix_next_id`] has seen (it stays under
@@ -101,10 +104,10 @@ index 193832b..3fed07e 100644
  egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
 diff --git a/crates/ui-egui/live/live.rs b/crates/ui-egui/live/live.rs
 new file mode 100644
-index 0000000..63687cf
+index 0000000..2fdf0f9
 --- /dev/null
 +++ b/crates/ui-egui/live/live.rs
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,299 @@
 +//! Live editing in a Playground session (web only): [`crate::playground_live`] is what the page drives.
 +//!
 +//! The shared document is the open document the session started on, as its JSON with the images' bytes and without
@@ -113,6 +116,7 @@ index 0000000..63687cf
 +//! step. New ids come from `playground_live::fresh_id` while connected, so additions at once don't collide.
 +
 +use std::cell::{Cell, RefCell};
++use std::collections::{BTreeMap, HashSet};
 +use std::sync::Arc;
 +
 +use serde_json::Value;
@@ -125,10 +129,17 @@ index 0000000..63687cf
 +/// Document fields that are this person's, or written at save only: not shared.
 +const LOCAL: [&str; 5] = ["next_id", "last_view", "layers_open", "export_settings", "print_setup"];
 +
++/// What [`BOUND`] holds once the session's document is none (shared before a document was open): no
++/// [`DocState::uid`] is 0.
++const NO_DOCUMENT: u64 = 0;
++
++/// Image bytes by key, and whether they are a linked image's preview.
++type Images = BTreeMap<String, (Vec<u8>, bool)>;
++
 +thread_local! {
 +    /// The shared document ([`DocState::uid`]), from the session's first look at it.
 +    static BOUND: Cell<Option<u64>> = const { Cell::new(None) };
-+    /// A pointer button was down in the last frame.
++    /// A pointer button was down, or a text field had the keyboard, in the last frame.
 +    static POINTER: Cell<bool> = const { Cell::new(false) };
 +    /// The document last compared: held, so that any change to it makes a new one.
 +    static SEEN: RefCell<Option<Arc<Document>>> = const { RefCell::new(None) };
@@ -136,7 +147,8 @@ index 0000000..63687cf
 +
 +/// The end of each frame: applies the remote changes waiting and reports this person's, once quiet.
 +pub fn frame(app: &mut VectorcraftApp, ctx: &egui::Context) {
-+    POINTER.set(ctx.input(|i| i.pointer.any_down()));
++    let typing = ctx.memory(|m| m.focused()).is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
++    POINTER.set(typing || ctx.input(|i| i.pointer.any_down()));
 +    playground_live::frame(app);
 +}
 +
@@ -167,7 +179,34 @@ index 0000000..63687cf
 +    }
 +}
 +
++/// A shared document as a [`Document`] whose id counter is `next_id`, and its images' bytes (which the document keeps
++/// outside its JSON).
++fn decode(mut document: Value, next_id: u64) -> Result<(Document, Images), String> {
++    let o = document.as_object_mut().ok_or("The shared document is not a VectorCraft document")?;
++    let mut bytes = Images::new();
++    if let Some(Value::Object(images)) = o.get_mut("images") {
++        for (k, image) in images.iter_mut() {
++            let data = image.as_object_mut().and_then(|i| i.remove("data"));
++            let data = data.as_ref().and_then(Value::as_str).and_then(vectorcraft_format::base64_decode);
++            let proxy = image.get("proxy") == Some(&Value::Bool(true));
++            bytes.insert(k.clone(), (data.ok_or_else(|| format!("Invalid image data for `{k}`"))?, proxy));
++        }
++    }
++    o.insert("next_id".into(), next_id.into());
++    let doc = serde_json::from_value(document).map_err(|e| format!("Invalid shared document: {e}"))?;
++    Ok((doc, bytes))
++}
++
 +impl Live for VectorcraftApp {
++    /// A merged document installs: it reads as a document, with no object in two places (moved into different groups
++    /// by both sides).
++    fn live_check(document: &Value) -> Result<(), String> {
++        let (doc, _) = decode(document.clone(), 1)?;
++        let (mut ids, mut unique) = (HashSet::new(), true);
++        doc.walk(|n| unique &= ids.insert(n.id));
++        if unique { Ok(()) } else { Err("Conflict: an object would be in two places".into()) }
++    }
++
 +    fn live_document(&self) -> Value {
 +        // Once the shared document is closed here, the last one seen: a change from the others opens it again.
 +        let Some(doc) = shared(self, true).map(|st| st.doc.clone()).or_else(|| SEEN.with_borrow(Clone::clone)) else {
@@ -193,20 +232,18 @@ index 0000000..63687cf
 +        v
 +    }
 +
-+    fn live_adopt(&mut self, mut document: Value) -> Result<(), String> {
-+        let current = shared(self, true).map(|st| st.doc.clone());
-+        let o = document.as_object_mut().ok_or("The shared document is not a VectorCraft document")?;
-+        let mut bytes = std::collections::BTreeMap::new();
-+        if let Some(Value::Object(images)) = o.get_mut("images") {
-+            for (k, image) in images.iter_mut() {
-+                let data = image.as_object_mut().and_then(|i| i.remove("data"));
-+                let data = data.as_ref().and_then(Value::as_str).and_then(vectorcraft_format::base64_decode);
-+                let proxy = image.get("proxy") == Some(&Value::Bool(true));
-+                bytes.insert(k.clone(), (data.ok_or_else(|| format!("Invalid image data for `{k}`"))?, proxy));
++    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
++        // A session shared before a document was open has none: this person's own document isn't shared (the first
++        // one opened is, without one).
++        if document.is_null() {
++            SEEN.set(None);
++            if BOUND.get().is_some() || self.session.active().is_some() {
++                BOUND.set(Some(NO_DOCUMENT));
 +            }
++            return Ok(());
 +        }
-+        o.insert("next_id".into(), current.as_ref().map_or(1, |d| d.peek_next_id()).into());
-+        let mut doc: Document = serde_json::from_value(document).map_err(|e| format!("Invalid shared document: {e}"))?;
++        let current = shared(self, true).map(|st| st.doc.clone());
++        let (mut doc, mut bytes) = decode(document, current.as_ref().map_or(1, |d| d.peek_next_id()))?;
 +        for (k, blob) in &mut doc.images {
 +            let Some((data, proxy)) = bytes.remove(k) else { continue };
 +            *blob = match current.as_ref().and_then(|d| d.images.get(k)) {
@@ -222,6 +259,8 @@ index 0000000..63687cf
 +        if let Some(d) = &current {
 +            (doc.last_view, doc.layers_open) = (d.last_view.clone(), d.layers_open.clone());
 +            (doc.export_settings, doc.print_setup) = (d.export_settings.clone(), d.print_setup.clone());
++            // Puppet Warp's pins (the tool's working state).
++            doc.puppet.clone_from(&d.puppet);
 +        }
 +        doc.fix_next_id();
 +        doc.limit_depth();
@@ -316,6 +355,30 @@ index 0000000..63687cf
 +        assert!(st.transparency_grid && st.doc.export_settings.contains_key("scale"), "views and settings stay");
 +        assert_eq!(*st.doc.images["pic"].bytes, [1, 2, 3]);
 +        assert!(st.doc.peek_next_id() > 1 << 52, "new ids come after the remote ones");
++    }
++
++    #[test]
++    fn a_session_without_a_document_shares_none_until_one_comes_and_merges_must_give_documents() {
++        let mut owner = VectorcraftApp::new(Session::new(), crate::Services::default());
++        owner.live_adopt(Value::Null).unwrap();
++        owner.run("file.new", json!({})).unwrap();
++        assert!(!owner.live_document().is_null(), "the first document opened is shared");
++        BOUND.set(None);
++        let mut app = app_with_rect();
++        let doc = app.live_document();
++        // A session shared before its owner opened a document: joining adopts nothing.
++        BOUND.set(None);
++        app.live_adopt(Value::Null).unwrap();
++        assert!(app.live_document().is_null(), "this person's own document isn't shared");
++        assert!(VectorcraftApp::live_check(&Value::Null).is_err());
++        let mut twice = doc.clone();
++        let layer = twice["layers"][0].clone();
++        twice["layers"].as_array_mut().unwrap().push(json!({"id": 9, "kind": {"type": "layer", "color": {"Preset": 1}, "children": [layer]}}));
++        assert!(VectorcraftApp::live_check(&twice).unwrap_err().contains("two places"));
++        // The owner opens one: it opens here too.
++        app.live_adopt(VectorcraftApp::live_merge(&Value::Null, &Value::Null, &doc).unwrap()).unwrap();
++        assert_eq!(app.session.documents().len(), 2);
++        assert_eq!(canonical(&app.live_document()), canonical(&doc));
 +    }
 +
 +    #[test]
