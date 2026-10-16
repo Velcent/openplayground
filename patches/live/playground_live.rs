@@ -505,7 +505,8 @@ pub mod web {
 
     /// Offers the adapter as `globalThis.playgroundLiveAdapter`, and to `globalThis.playgroundLive.attach` when the
     /// shell is there already. `with_app` runs a closure on the running app (false: not running); `repaint` asks for a
-    /// frame. A page without the shell never connects.
+    /// frame. A page without the shell never connects. An app whose media live in asynchronous storage may replace
+    /// `readAsset`/`writeAsset` on that object right after this returns with functions returning promises.
     pub fn attach<A: Live + 'static>(
         format: &str,
         with_app: impl Fn(&mut dyn FnMut(&mut A)) -> bool + 'static,
