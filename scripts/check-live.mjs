@@ -1,6 +1,8 @@
 // Checks that each live-editing tool's diffs (and patch rules) still apply to what build.mjs would build now, on
 // both channels: the same refs as `build.mjs facts`, the live template copied in first, then applyDiffs and the rules.
-// No compile. Sources are cached under $LIVE_CHECK_DIR (default ~/.cache/live-check).
+// No compile. Sources are cached under $LIVE_CHECK_DIR (default ~/.cache/live-check). Also names the existing
+// upstream files the diffs edit: each such hunk breaks as soon as upstream edits its context, so they should be none
+// (new files only, upstream edits as yaml rules anchored on stable lines).
 //   node scripts/check-live.mjs [slug...]
 import { execFileSync } from 'node:child_process'
 import { cpSync, existsSync, globSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
@@ -34,7 +36,9 @@ for (const t of tools.filter((t) => (t.live || t.slug === 'fl-studio-mobile') &&
         if (!globSync(rule.file, { cwd: src }).some((f) => re.test(readFileSync(join(src, f), 'utf8')))) bad++
       }
       if (bad) throw new Error(`${bad} patch rule(s) no longer match`)
-      console.log(`${t.slug} ${channel} (${ref}): ok${merged.length ? ` (upstream has ${merged.length})` : ''}`)
+      const hunked = globSync(join(t.patches.replace(/\.yaml$/, ''), '*.diff')).flatMap((f) => readFileSync(f, 'utf8').split(/^diff --git /m).slice(1))
+        .filter((d) => !/^new file mode/m.test(d.split('@@')[0])).map((d) => d.split('\n')[0].split(' b/')[1])
+      console.log(`${t.slug} ${channel} (${ref}): ok${merged.length ? ` (upstream has ${merged.length})` : ''}${hunked.length ? `; diffs edit upstream files: ${[...new Set(hunked)].join(', ')}` : ''}`)
     } catch (e) {
       failed++
       console.log(`${t.slug} ${channel} (${ref}): FAILS — ${e.message.split('\n')[0]}`)
