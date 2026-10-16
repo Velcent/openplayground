@@ -46,10 +46,10 @@ index 58966e6..81b37e6 100644
  #[cfg(target_arch = "wasm32")]
 diff --git a/apps/lightcraft-web/src/live.rs b/apps/lightcraft-web/src/live.rs
 new file mode 100644
-index 0000000..a285567
+index 0000000..2f0f6ca
 --- /dev/null
 +++ b/apps/lightcraft-web/src/live.rs
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,196 @@
 +//! Playground live editing (`playground_live`): the shared document is the library's catalog as JSON (every photo's
 +//! develop settings, History, Versions, rating, flag, label and metadata; albums, stacks, the keyword list), without
 +//! this browser's own browsing records (when it browsed Local folders and the photos seen there) and without views
@@ -73,6 +73,10 @@ index 0000000..a285567
 +/// The end of a frame.
 +pub fn frame(app: &mut LightcraftApp, pointer_down: bool) {
 +    POINTER_DOWN.set(pointer_down);
++    // while live, automatic versions are for the photos this person edited (others' are theirs to keep)
++    if playground_live::connected() != app.session.own_edits.is_some() {
++        app.session.own_edits = playground_live::connected().then(Default::default);
++    }
 +    playground_live::frame(app);
 +}
 +
@@ -91,8 +95,14 @@ index 0000000..a285567
 +    photo.get("local") == Some(&Value::Bool(true))
 +}
 +
-+fn invalid(e: impl std::fmt::Display) -> String {
-+    format!("Invalid shared document: {e}")
++/// The catalog a shared document holds, refusing one that does not hold together (concurrent stacks sharing a photo,
++/// folders moved into each other): every peer would repair it, each proposing the same fix.
++fn catalog(document: &Value) -> Result<Catalog, String> {
++    let catalog = Catalog::deserialize(document).map_err(|e| format!("Conflict: {e}"))?;
++    match catalog.clone().repair().first() {
++        Some(problem) => Err(format!("Conflict: {problem}")),
++        None => Ok(catalog),
++    }
 +}
 +
 +impl Live for LightcraftApp {
@@ -110,7 +120,7 @@ index 0000000..a285567
 +    }
 +
 +    fn live_adopt(&mut self, mut document: Value) -> Result<(), String> {
-+        let mine = serde_json::to_value(&self.session.catalog).map_err(invalid)?;
++        let mine = serde_json::to_value(&self.session.catalog).map_err(|e| e.to_string())?;
 +        if let (Some(doc), Some(mine)) = (document.as_object_mut(), mine.as_object()) {
 +            if let Some(browsed) = mine.get("browsed") {
 +                doc.insert("browsed".into(), browsed.clone());
@@ -121,9 +131,7 @@ index 0000000..a285567
 +                }
 +            }
 +        }
-+        let mut catalog = Catalog::deserialize(&document).map_err(invalid)?;
-+        catalog.repair();
-+        self.session.adopt_catalog(catalog);
++        self.session.adopt_catalog(catalog(&document)?);
 +        Ok(())
 +    }
 +
@@ -146,11 +154,8 @@ index 0000000..a285567
 +        self.session.redo.clear();
 +    }
 +
-+    /// The JSON merge, refusing a result that is no catalog.
-+    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
-+        let merged = playground_live::merge(base, current, edited, Self::COUNTERS)?;
-+        Catalog::deserialize(&merged).map_err(|e| format!("Conflict: {e}"))?;
-+        Ok(merged)
++    fn live_check(document: &Value) -> Result<(), String> {
++        catalog(document).map(drop)
 +    }
 +}
 +
@@ -183,6 +188,10 @@ index 0000000..a285567
 +        a.run("library.next", json!({}))?;
 +        assert_eq!(canonical(&a.live_document()), start, "views are not shared");
 +        let (selected, undo_steps) = (a.session.selection.clone(), a.session.undo.len());
++        // A merge that no longer holds together (two stacks sharing a photo) is refused, not repaired by every peer.
++        let mut stacked = playground_live::parse(&start)?;
++        stacked["stacks"] = json!({"1": {"id": 1, "photos": [1, 2]}, "2": {"id": 2, "photos": [2, 3]}});
++        assert!(LightcraftApp::live_check(&playground_live::parse(&start)?).is_ok() && LightcraftApp::live_check(&stacked).is_err());
 +
 +        // B joins with the whole library, then rates a photo A is not on; A merges it at a quiet frame, keeping its
 +        // selection, its Local record and its undo history.
@@ -208,6 +217,32 @@ index 0000000..a285567
 +        // New ids are this peer's own; the counter goes past them, so the catalog needs no repair.
 +        assert!(seen.id.0 >> 52 == 1 && a.session.catalog.alloc_album_id().0 >> 52 == 1 && a.session.catalog.repair().is_empty());
 +        playground_live::disconnect();
++        Ok(())
++    }
++
++    #[test]
++    fn while_live_leaving_a_photo_versions_only_this_persons_edits() -> Result<(), String> {
++        let (mut a, mut b) = (demo(), demo());
++        playground_live::connect();
++        frame(&mut a, false);
++        let versions = |app: &LightcraftApp, id| app.session.catalog.photo(id).map_or(0, |p| p.versions.len());
++        // B edits the photo A is on; A steps away from it: no automatic version of B's edit from A.
++        let x = a.session.active().ok_or("no active photo")?;
++        b.run("library.select", json!({"ids": [x.0]}))?;
++        b.run("develop.set", json!({"values": {"light.exposure": 0.5}}))?;
++        a.live_adopt(b.live_document())?;
++        let before = versions(&a, x);
++        a.run("library.next", json!({}))?;
++        assert_eq!(versions(&a, x), before, "someone else's edit is theirs to version");
++        // A's own edit is versioned when A leaves the photo, as before.
++        let y = a.session.active().ok_or("no active photo")?;
++        a.run("develop.set", json!({"values": {"light.exposure": 0.25}}))?;
++        let before = versions(&a, y);
++        a.run("library.next", json!({}))?;
++        assert_eq!(versions(&a, y), before + 1);
++        playground_live::disconnect();
++        frame(&mut a, false);
++        assert!(a.session.own_edits.is_none(), "not live: every edited photo again");
 +        Ok(())
 +    }
 +}
@@ -347,10 +382,45 @@ index 1776c89..43aa475 100644
  
      // ---- reads
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 8a282ce..dc5f565 100644
+index 8a282ce..727dbb1 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
-@@ -663,6 +663,24 @@ impl Session {
+@@ -228,6 +228,9 @@ pub struct Session {
+     /// Photos in the current source with no filter on (cached like `visible`).
+     total: Option<((u64, String), usize)>,
+     pub undo: Vec<UndoEntry>,
++    /// Live editing: the photos whose develop settings this person committed since their last automatic version.
++    /// `None` (not live): every edited photo gets one when left. While live, others' edits are theirs to keep.
++    pub own_edits: Option<std::collections::BTreeSet<PhotoId>>,
+     /// Undo steps committed in this session, ever (the history drops its oldest past 1000, so
+     /// its length can't tell how many steps a command just made; see [`Session::commits`]).
+     commits: u64,
+@@ -423,6 +426,7 @@ impl Session {
+             visible_gen: 0,
+             total: None,
+             undo: Vec::new(),
++            own_edits: None,
+             commits: 0,
+             redo: Vec::new(),
+             pending_sidecar_repairs: Vec::new(),
+@@ -587,6 +591,16 @@ impl Session {
+     pub fn commit(&mut self, label: &str, op: Op) -> Result<()> {
+         let fwd = op.clone();
+         let inv = self.apply_catalog(op)?;
++        if let Some(own) = &mut self.own_edits {
++            let mut ops = vec![&fwd];
++            while let Some(op) = ops.pop() {
++                match op {
++                    Op::SetDevelop { id, .. } => _ = own.insert(*id),
++                    Op::Batch { ops: inner } => ops.extend(inner),
++                    _ => {}
++                }
++            }
++        }
+         self.pending_log.push(fwd);
+         self.undo.push(UndoEntry { label: label.to_string(), op: inv, folder: None, retry_inverse: Vec::new(), retry_sidecars: Vec::new() });
+         self.commits = self.commits.wrapping_add(1);
+@@ -663,6 +677,24 @@ impl Session {
          Ok(())
      }
  
@@ -375,49 +445,126 @@ index 8a282ce..dc5f565 100644
      /// Leaving photo `id` after editing it: keep its settings as an automatic version (when they
      /// differ from its latest version; at most [`AUTO_VERSIONS`] auto versions, oldest dropped).
      /// Saved with the library but not an undo step.
+@@ -671,6 +703,9 @@ impl Session {
+         if !p.is_edited() || p.versions.last().is_some_and(|v| *v.settings == *p.develop) || self.interaction.is_some() {
+             return;
+         }
++        if self.own_edits.as_mut().is_some_and(|own| !own.remove(&id)) {
++            return;
++        }
+         let mut versions = p.versions.clone();
+         let created = (self.clock)();
+         let name = lightcraft_catalog::dates::display_time(&created);
 diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index bb290bd..ee64927 100644
+index bb290bd..50f6cb5 100644
 --- a/crates/ui-egui/src/lib.rs
 +++ b/crates/ui-egui/src/lib.rs
-@@ -228,6 +228,9 @@ pub type HostAction = Box<dyn FnMut(&mut Session) -> Result<Value, String>>;
+@@ -228,6 +228,10 @@ pub type HostAction = Box<dyn FnMut(&mut Session) -> Result<Value, String>>;
  /// last heard and wakes the UI itself when that changes; it is never polled for changes.
  pub type SystemThemeFn = Box<dyn Fn(&egui::Context) -> Option<egui::Theme>>;
  
-+/// Set by a host that takes Undo and Redo over while it returns true (the web build's live editing).
++/// Set by a host that takes Undo and Redo over while it returns true (the web build's live editing); not those run with
++/// `{"native": true}` (the Presets panel's Amount, which replaces the step it made).
 +pub static UNDO: std::sync::OnceLock<fn(bool) -> bool> = std::sync::OnceLock::new();
 +
  /// Platform services injected by the host app (desktop or web).
  #[derive(Default)]
  pub struct Services {
-@@ -599,6 +602,9 @@ impl LightcraftApp {
+@@ -599,6 +603,9 @@ impl LightcraftApp {
      /// [`LightcraftApp::run`], keeping what kind of error a refusal is: for code that decides on it
      /// (offer a model's download, treat a cancel as one) instead of reading the message.
      pub fn run_typed(&mut self, id: &str, params: Value) -> Result<Value, CommandError> {
-+        if matches!(id, "edit.undo" | "edit.redo") && UNDO.get().is_some_and(|undo| undo(id == "edit.redo")) {
++        if matches!(id, "edit.undo" | "edit.redo") && params["native"] != true && UNDO.get().is_some_and(|undo| undo(id == "edit.redo")) {
 +            return Ok(Value::Null);
 +        }
          if let Some(result) = model_setup::intercept(self, id, &params) {
              return result.map_err(CommandError::from);
          }
 diff --git a/crates/ui-egui/src/panels/presets.rs b/crates/ui-egui/src/panels/presets.rs
-index ca0243c..4820aa8 100644
+index ca0243c..d144ba3 100644
 --- a/crates/ui-egui/src/panels/presets.rs
 +++ b/crates/ui-egui/src/panels/presets.rs
-@@ -101,14 +101,15 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
-                 track: Track::Plain,
+@@ -27,17 +27,24 @@ struct AppliedPreset {
+     selected: Vec<lightcraft_catalog::PhotoId>,
+     active: Option<lightcraft_catalog::PhotoId>,
+     commits: u64,
++    /// The photos' settings it left: a change that came from elsewhere (live editing) is no undo step of this session.
++    develop: Vec<Option<Arc<lightcraft_develop::DevelopSettings>>>,
+ }
+ 
+ impl AppliedPreset {
+     fn new(session: &lightcraft_engine::Session, id: String, amount: f64) -> Self {
+-        Self { id, amount, selected: session.selection.ids.clone(), active: session.active(), commits: session.commits() }
++        let develop = develop_of(session, &session.selection.ids, session.active());
++        Self { id, amount, selected: session.selection.ids.clone(), active: session.active(), commits: session.commits(), develop }
+     }
+ 
+     fn is_current(&self, session: &lightcraft_engine::Session) -> bool {
+         self.selected == session.selection.ids
+             && self.active == session.active()
+             && self.commits == session.commits()
++            && develop_of(session, &self.selected, self.active).iter().zip(&self.develop).all(|(now, then)| match (now, then) {
++                (Some(now), Some(then)) => Arc::ptr_eq(now, then) || now == then,
++                (now, then) => now.is_none() && then.is_none(),
++            })
+             && session.interaction.is_none()
+             && session.redo.is_empty()
+             && session
+@@ -47,6 +54,14 @@ impl AppliedPreset {
+     }
+ }
+ 
++fn develop_of(
++    session: &lightcraft_engine::Session,
++    selected: &[lightcraft_catalog::PhotoId],
++    active: Option<lightcraft_catalog::PhotoId>,
++) -> Vec<Option<Arc<lightcraft_develop::DevelopSettings>>> {
++    selected.iter().chain(&active).map(|id| session.develop_of(*id)).collect()
++}
++
+ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
+     let t = Tokens::get(ui.ctx());
+     egui::Frame::NONE.fill(t.chrome).stroke(egui::Stroke::new(1.0, t.divider)).show(ui, |ui| {
+@@ -102,13 +117,13 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
              };
              let out = slider(ui, &spec, last.amount, true, None);
-+            // the history's own Undo and Redo, never a host's (`crate::UNDO`)
              if let Some(v) = out.value
 -                && app.run("edit.undo", json!({})).is_ok()
-+                && app.session.execute("edit.undo", &json!({})).is_ok()
++                && app.run("edit.undo", json!({"native": true})).is_ok()
              {
                  // Only replace the most recent preset; never undo intervening edits.
                  if app.run("preset.apply", json!({"id": &last.id, "amount": v})).is_ok() {
                      ui.data_mut(|d| d.insert_temp(amt_id, AppliedPreset::new(&app.session, last.id, v)));
                  } else {
 -                    let _ = app.run("edit.redo", json!({}));
-+                    let _ = app.session.execute("edit.redo", &json!({}));
++                    let _ = app.run("edit.redo", json!({"native": true}));
                      ui.data_mut(|d| d.remove::<AppliedPreset>(amt_id));
                  }
              }
+@@ -413,4 +428,26 @@ mod tests {
+         session.execute("library.select", &json!({"ids": [other.0]})).unwrap();
+         assert!(!state.is_current(&session), "the preset belongs to the earlier selection");
+     }
++
++    #[test]
++    fn amount_slider_does_not_undo_a_change_from_elsewhere() {
++        let mut session = lightcraft_engine::Session::with_demo();
++        let pid = "lc.golden-hour";
++        session.execute("preset.apply", &json!({"id": pid})).unwrap();
++        let state = AppliedPreset::new(&session, pid.into(), 100.0);
++        // live editing installs other people's changes without a commit here
++        let exposure = |session: &lightcraft_engine::Session, id| {
++            let mut shared = session.catalog.clone();
++            let mut d = (*session.develop_of(id).unwrap()).clone();
++            d.light.exposure = 0.5;
++            shared.apply(lightcraft_catalog::Op::SetDevelop { id, settings: Arc::new(d), label: "Exposure".into(), edited: None }).unwrap();
++            shared
++        };
++        let active = session.active().unwrap();
++        let other = session.visible().iter().copied().find(|id| *id != active).unwrap();
++        session.adopt_catalog(exposure(&session, other));
++        assert!(state.is_current(&session), "another photo's change leaves the preset's step alone");
++        session.adopt_catalog(exposure(&session, active));
++        assert!(!state.is_current(&session), "undoing the preset now would drop someone else's change");
++    }
+ }
