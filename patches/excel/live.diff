@@ -1,135 +1,117 @@
-diff --git a/apps/gridcraft-web/src/web.rs b/apps/gridcraft-web/src/web.rs
-index c0fcb22..6ac245d 100644
---- a/apps/gridcraft-web/src/web.rs
-+++ b/apps/gridcraft-web/src/web.rs
-@@ -29,11 +29,15 @@ pub fn start() {
-         // workbooks in it and stores what it saves (`host`).
-         let bridge = if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new() } else { None };
-         let app_bridge = bridge.clone();
--        let result = eframe::WebRunner::new()
-+        let runner = eframe::WebRunner::new();
-+        let repaint = std::rc::Rc::new(std::cell::OnceCell::<egui::Context>::new());
-+        let created = repaint.clone();
-+        let result = runner
-             .start(
-                 canvas,
-                 options,
-                 Box::new(move |cc| {
-+                    let _ = created.set(cc.egui_ctx.clone());
-                     let inbox: Inbox = Inbox::default();
-                     let mut session = Session::new();
-                     // In host mode the parent sends the workbook to edit; no sample meanwhile.
-@@ -69,6 +73,21 @@ pub fn start() {
-                 }),
-             )
-             .await;
-+        if result.is_ok() {
-+            // Live editing in a Playground session.
-+            let attached = gridcraft_ui_egui::playground_live::web::attach::<SheetApp>(
-+                concat!("excel:1:", env!("CARGO_PKG_VERSION")),
-+                move |with| runner.app_mut::<WebShell>().map(|mut shell| with(&mut shell.app)).is_some(),
-+                move || {
-+                    if let Some(ctx) = repaint.get() {
-+                        ctx.request_repaint();
-+                    }
-+                },
-+            );
-+            if let Err(e) = attached {
-+                log::error!("live editing: {e:?}");
-+            }
-+        }
-         if let (Err(e), Some(bridge)) = (&result, &bridge) {
-             bridge.post_failed(&format!("{e:?}"));
-         }
-@@ -124,6 +143,11 @@ impl eframe::App for WebShell {
-         if let Some(bridge) = &self.bridge {
-             bridge.sync(&mut self.app);
-         }
-+        gridcraft_ui_egui::live::frame(&mut self.app, ui.ctx());
+diff --git a/apps/gridcraft-web/src/web/live.rs b/apps/gridcraft-web/src/web/live.rs
+new file mode 100644
+index 0000000..9a1013d
+--- /dev/null
++++ b/apps/gridcraft-web/src/web/live.rs
+@@ -0,0 +1,77 @@
++//! Live editing in a Playground session: the page's runner, kept for the session to reach the app, and the shell
++//! around [`WebShell`] that ends each frame with the session's frame hook.
++
++use super::WebShell;
++use gridcraft_ui_egui::SheetApp;
++use gridcraft_ui_egui::live::{self, playground_live};
++use std::cell::OnceCell;
++
++thread_local! {
++    static RUNNER: OnceCell<eframe::WebRunner> = const { OnceCell::new() };
++    static CONTEXT: OnceCell<egui::Context> = const { OnceCell::new() };
++}
++
++/// A new web runner, kept for [`wrap`].
++pub(super) fn runner() -> eframe::WebRunner {
++    let runner = eframe::WebRunner::new();
++    RUNNER.with(|kept| kept.get_or_init(|| runner.clone()).clone())
++}
++
++/// The app eframe runs: `shell`, offered to the page for live editing.
++pub(super) fn wrap(shell: WebShell) -> Box<dyn eframe::App> {
++    let attached = playground_live::web::attach::<SheetApp>(
++        concat!("excel:1:", env!("CARGO_PKG_VERSION")),
++        |with| RUNNER.with(|runner| runner.get().and_then(|r| r.app_mut::<Live>().map(|mut live| with(&mut live.0.app))).is_some()),
++        || {
++            CONTEXT.with(|ctx| {
++                if let Some(ctx) = ctx.get() {
++                    ctx.request_repaint();
++                }
++            });
++        },
++    );
++    if let Err(e) = attached {
++        log::error!("live editing: {e:?}");
++    }
++    Box::new(Live(shell))
++}
++
++struct Live(WebShell);
++
++impl eframe::App for Live {
++    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
++        CONTEXT.with(|kept| {
++            kept.get_or_init(|| ctx.clone());
++        });
++        self.0.logic(ctx, frame);
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        self.0.ui(ui, frame);
++        live::frame(&mut self.0.app, ui.ctx());
 +    }
 +
 +    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
 +        Some(self)
-     }
- }
- 
-diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
-index 85a24dd..1a0d592 100644
---- a/crates/ui-egui/Cargo.toml
-+++ b/crates/ui-egui/Cargo.toml
-@@ -37,6 +37,9 @@ sys-locale = { workspace = true }
- [target.'cfg(target_arch = "wasm32")'.dependencies]
- # Read the browser's preferred language for the first-run web interface language.
- web-sys = { version = "0.3", features = ["Window", "Navigator"] }
-+# Playground live editing's adapter (`playground_live`).
-+wasm-bindgen = "0.2"
-+js-sys = "0.3"
- 
- [build-dependencies]
- serde_json = { workspace = true }
-diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index f96cdac..05c1fbc 100644
---- a/crates/ui-egui/src/lib.rs
-+++ b/crates/ui-egui/src/lib.rs
-@@ -22,10 +22,15 @@ pub mod i18n;
- pub mod icons;
- pub mod keymap;
- pub mod keytips;
-+// Live editing in a Playground session (web only).
-+#[cfg(any(target_arch = "wasm32", test))]
-+pub mod live;
- pub mod outline;
- pub mod panes;
- pub mod paper_view;
- pub mod pivot_pane;
-+#[cfg(any(target_arch = "wasm32", test))]
-+pub mod playground_live;
- pub mod printing;
- pub mod ribbon;
- pub mod selection_glide;
-@@ -377,6 +382,17 @@ impl SheetApp {
-         {
-             self.commit_text_box_edit()?;
-         }
-+        // Live editing (web): in the workbook a session shares, the session undoes or redoes this person's last operations.
-+        #[cfg(target_arch = "wasm32")]
-+        if let Some(redo) = match id {
-+            "edit.undo" => Some(false),
-+            "edit.redo" => Some(true),
-+            _ => None,
-+        } && live::shared_active(&self.session)
-+            && (0..params.get("steps").and_then(Json::as_u64).unwrap_or(1).max(1)).all(|_| playground_live::undo(redo))
-+        {
-+            return Ok(Json::Null);
-+        }
-         if let Some(r) = self.run_ui_command(id, &params) {
-             return r;
-         }
++    }
++
++    fn save(&mut self, storage: &mut dyn eframe::Storage) {
++        self.0.save(storage);
++    }
++
++    fn auto_save_interval(&self) -> std::time::Duration {
++        self.0.auto_save_interval()
++    }
++
++    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
++        self.0.clear_color(visuals)
++    }
++
++    fn persist_egui_memory(&self) -> bool {
++        self.0.persist_egui_memory()
++    }
++
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
++        self.0.raw_input_hook(ctx, raw_input);
++    }
++}
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..5bfc807
+index 0000000..e6c7e80
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,390 @@
+@@ -0,0 +1,534 @@
 +//! Live editing in a Playground session (web only): the shared document is the workbook open when the session started
 +//! (pinned by uid; if its window closes the session goes on with it as it was), as JSON. Sheets are keyed by name,
 +//! cells by address with their style inline (style ids are positions in a table each copy grows on its own), objects
 +//! by id. Formula results are recalculated where the workbook is, not shared. This person's active sheet, zoom, sheet
 +//! view mode, gridlines, headings and Show Formulas, scroll position and active cell, Watch Window, selection and the
-+//! file data GridCraft does not model stay local.
++//! file data GridCraft does not model stay local. Presence: the sheet each person is on, the cell under their pointer
++//! and their selection, drawn over the others' grids in their color.
++
++// The adapter template (patches/live/playground_live.rs), copied next to this file.
++#[path = "playground_live.rs"]
++pub mod playground_live;
 +
 +use std::cell::{Cell as Flag, RefCell};
 +use std::sync::Arc;
 +
-+use gridcraft_engine::core::{CellRef, Value as CellValue};
++use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, pos2, vec2};
++use gridcraft_engine::core::{CellRef, RangeRef, Value as CellValue};
 +use gridcraft_engine::model::{Cell, CellStore, Formula, Sheet, Style, StyleId, StyleTable, Workbook};
 +use gridcraft_engine::{DocState, Mode, Session};
 +use serde::{Deserialize, Serialize};
 +use serde_json::{Map, Value, json};
 +
 +use crate::SheetApp;
-+use crate::grid::Drag;
-+use crate::playground_live::{self, Live};
++use crate::grid::{Drag, Geo, outline_bands};
++use playground_live::{Live, Presence};
 +
 +/// Sheet fields that are this person's view.
 +const VIEW: [&str; 7] = ["zoom", "view", "view_active", "view_top_left", "show_gridlines", "show_headings", "show_formulas"];
@@ -143,12 +125,110 @@ index 0000000..5bfc807
 +    static LAST: RefCell<Option<Arc<Workbook>>> = const { RefCell::new(None) };
 +    /// A pointer is down or a text field has the keyboard (as of the last frame).
 +    static GESTURE: Flag<bool> = const { Flag::new(false) };
++    /// Where the pointer is on screen (as of the last frame).
++    static POINTER: Flag<Option<Pos2>> = const { Flag::new(None) };
++    /// The others in the session, as they last showed themselves.
++    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
 +}
 +
 +/// The end of each frame (web): [`playground_live::frame`], told whether a pointer or the keyboard is busy.
 +pub fn frame(app: &mut SheetApp, ctx: &egui::Context) {
 +    GESTURE.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
++    POINTER.set(ctx.input(|i| i.pointer.hover_pos()));
 +    playground_live::frame(app);
++}
++
++/// The first step of [`SheetApp::run`] (web): in the workbook a session shares, Undo and Redo undo or redo this
++/// person's last operations through the session (`Some`, the command's result).
++pub(crate) fn undo(app: &mut SheetApp, id: &str, params: &Value) -> Option<Result<Value, String>> {
++    let redo = match id {
++        "edit.undo" => false,
++        "edit.redo" => true,
++        _ => return None,
++    };
++    if !shared_active(&app.session) {
++        return None;
++    }
++    if let Err(e) = app.commit_text_box_edit() {
++        return Some(Err(e));
++    }
++    let steps = params.get("steps").and_then(Value::as_u64).unwrap_or(1).max(1);
++    (0..steps).all(|_| playground_live::undo(redo)).then_some(Ok(Value::Null))
++}
++
++/// The cell under this person's pointer in the grid, and where in it (fractions of its width and height).
++fn pointer(app: &SheetApp, sh: &Sheet) -> Option<(CellRef, f32, f32)> {
++    let geo = app.grid.geo.as_ref().filter(|_| app.backstage.is_none())?;
++    let p = geo.mirror_pos(POINTER.get()?);
++    if !geo.in_cells(p) {
++        return None;
++    }
++    let at = geo.cell_at(sh, p);
++    let r = geo.cell_rect(sh, at);
++    Some((at, (p.x - r.left()) / r.width().max(1.0), (p.y - r.top()) / r.height().max(1.0)))
++}
++
++/// One of the others' ranges: a faint fill and a `width` outline in `color`, in each pane that shows it.
++fn outline(p: &Painter, geo: &Geo, sh: &Sheet, range: RangeRef, width: f32, fill: bool, color: Color32) {
++    let rect = geo.range_rect(sh, range);
++    for pane in geo.range_panes(range) {
++        let clip = pane.intersect(p.clip_rect());
++        let p = p.with_clip_rect(clip);
++        if fill {
++            p.rect_filled(rect.intersect(clip.expand(4.0)), 0.0, color.gamma_multiply(0.1));
++        }
++        for side in outline_bands(rect, width, clip) {
++            p.rect_filled(side, 0.0, color);
++        }
++    }
++}
++
++/// A name in a tag of `color`, its top left at `at`.
++fn tag(p: &Painter, at: Pos2, name: &str, color: Color32) {
++    let name = p.layout_no_wrap(name.to_owned(), crate::theme::ui_font(11.0), Color32::WHITE);
++    let tag = Rect::from_min_size(at, name.size() + vec2(8.0, 4.0));
++    p.rect_filled(tag, 2.0, color);
++    p.galley(tag.min + vec2(4.0, 2.0), name, Color32::WHITE);
++}
++
++/// The others on this person's sheet of the shared workbook: their selections, their active cells with their names
++/// and their pointers, in their colors. The grid's overlays call it first: `p` paints over the cells of `sh`, the
++/// active sheet, laid out by `geo`, left to right.
++pub(crate) fn draw_presence(app: &SheetApp, p: &Painter, geo: &Geo, sh: &Sheet) {
++    OTHERS.with_borrow(|others| {
++        if others.is_empty() || !shared_active(&app.session) {
++            return;
++        }
++        let cell = |v: &Value| v.as_str().and_then(CellRef::parse).filter(CellRef::is_valid);
++        for o in others.iter().filter(|o| o.state["sheet"].as_str() == Some(sh.name.as_str())) {
++            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
++            let ranges = o.state["selection"].as_array().into_iter().flatten().take(50).filter_map(Value::as_str);
++            for range in ranges.filter_map(RangeRef::parse).filter(|r| r.start.is_valid() && r.end.is_valid()) {
++                outline(p, geo, sh, range, 1.0, true, color);
++            }
++            if let Some(active) = cell(&o.state["active"]) {
++                let range = sh.merge_at(active).unwrap_or(RangeRef::cell(active));
++                outline(p, geo, sh, range, 2.0, false, color);
++                if !geo.hidden_under_frozen(sh, active) {
++                    let r = geo.range_rect(sh, range);
++                    // Above the cell, or inside it at the top of the grid.
++                    let top = if r.top() - 16.0 >= geo.cells.top() { r.top() - 16.0 } else { r.top() + 1.0 };
++                    tag(p, pos2(r.left(), top), &o.name, color);
++                }
++            }
++            let at = &o.state["pointer"];
++            let fraction = |i: usize| at[i].as_f64().filter(|f| f.is_finite()).map(|f| f.clamp(0.0, 1.0) as f32);
++            if let (Some(c), Some(fx), Some(fy)) = (cell(&at[0]), fraction(1), fraction(2))
++                && !geo.hidden_under_frozen(sh, c)
++            {
++                let r = geo.cell_rect(sh, c);
++                let at = r.min + vec2(r.width() * fx, r.height() * fy);
++                let arrow = vec![at, at + vec2(0.0, 15.0), at + vec2(10.0, 10.5)];
++                p.add(Shape::convex_polygon(arrow, color, Stroke::new(1.0, Color32::WHITE)));
++                tag(p, at + vec2(10.0, 12.0), &o.name, color);
++            }
++        }
++    });
 +}
 +
 +/// Whether the active workbook is the one the session shares (its Undo and Redo go to the session).
@@ -356,6 +436,27 @@ index 0000000..5bfc807
 +        Some(h.finish())
 +    }
 +
++    /// `{ sheet, active, selection: [ranges], pointer?: [cell, x, y] }` (see [`pointer`]), on the shared workbook only.
++    fn live_presence(&self) -> Value {
++        let Some(d) = self.session.active().filter(|_| shared_active(&self.session)) else { return Value::Null };
++        let Some(sh) = d.wb.active() else { return Value::Null };
++        let sel = &d.selection;
++        let mut state = json!({
++            "sheet": sh.name,
++            "active": sel.active.a1(),
++            "selection": sel.ranges.iter().take(50).map(RangeRef::a1).collect::<Vec<_>>(),
++        });
++        if let Some((at, x, y)) = pointer(self, sh) {
++            let round = |f: f32| (f64::from(f) * 100.0).round() / 100.0;
++            state["pointer"] = json!([at.a1(), round(x), round(y)]);
++        }
++        state
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        OTHERS.set(others);
++    }
++
 +    fn live_disconnected(&mut self) {
 +        let s = &mut self.session;
 +        if let Some(i) = s.documents().iter().position(|d| d.uid == SHARED.get()) {
@@ -373,7 +474,7 @@ index 0000000..5bfc807
 +mod tests {
 +    use super::*;
 +    use crate::Services;
-+    use crate::playground_live::{self as live, canonical};
++    use super::playground_live::{self as live, canonical};
 +
 +    /// Another person's app, its workbook not shared yet (each page pins its own).
 +    fn app() -> SheetApp {
@@ -481,6 +582,25 @@ index 0000000..5bfc807
 +        edited["sheets"][0]["cells"]["B2"] = json!({"value": {"t": "Number", "v": 7.0}});
 +        a.live_adopt(edited.clone()).unwrap();
 +        assert_eq!(canonical(&a.live_document()), canonical(&edited), "remote changes go on in it");
++    }
++
++    #[test]
++    fn presence_names_the_sheet_the_selection_and_the_cell_under_the_pointer_in_the_shared_workbook_only() {
++        let mut a = app();
++        run(&mut a, "home.insertSheet", json!({"name": "Notes"}));
++        a.live_document();
++        run(&mut a, "selection.set", json!({"range": "A1:B2,D4", "active": "D4"}));
++        let d = a.session.active().unwrap();
++        let sh = d.wb.active().unwrap();
++        let geo = Geo::new(sh, Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)), egui::Vec2::ZERO);
++        let c3 = geo.cell_rect(sh, CellRef::parse("C3").unwrap());
++        POINTER.set(Some(c3.min + vec2(c3.width() / 4.0, c3.height() / 2.0)));
++        a.grid.geo = Some(geo);
++        assert_eq!(a.live_presence(), json!({"sheet": "Notes", "active": "D4", "selection": ["A1:B2", "D4"], "pointer": ["C3", 0.25, 0.5]}));
++        POINTER.set(None);
++        assert!(a.live_presence().get("pointer").is_none(), "no pointer off the grid");
++        a.session.new_workbook();
++        assert_eq!(a.live_presence(), Value::Null, "nothing from another workbook");
 +    }
 +
 +    #[test]

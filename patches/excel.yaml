@@ -317,3 +317,49 @@
   replace: |-
     $&
             playground::report_unsaved(self.app.session.documents().iter().any(|d| d.is_dirty()));
+
+# Live editing in Playground sessions (patches/excel/live.diff + patches/live/playground_live.rs)
+# What it's for: people in a Playground session edit one workbook together and see each other's sheet, selection,
+#   active cell and pointer, in each person's color.
+# How: the adapter lives in new files: crates/ui-egui/src/live.rs (the shared document, merge, adopt, Undo, presence;
+#   it declares the template, copied next to it) and apps/gridcraft-web/src/web/live.rs (the kept runner and the shell
+#   that ends each frame with the session's frame hook). These rules only declare them and call in, each one line at
+#   the end of a file or right after a function's signature.
+# Verify: node scripts/build.mjs check excel head|release, then the e2e (tests/live-apps/excel.mjs).
+# If upstream changes: if a function named below is renamed, anchor on its new signature; if WebShell or its `app`
+#   field is renamed, follow it in web/live.rs.
+#
+# The frontend's module (web, and its native tests), and the template's wasm dependencies under a target spelling
+# nobody else uses.
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web only).\n#[cfg(any(target_arch = \"wasm32\", test))]\npub mod live;\n"
+- live: true
+  file: crates/ui-egui/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\njs-sys = \"0.3\"\nwasm-bindgen = \"0.2\"\n"
+# SheetApp::run, which every command goes through: Undo and Redo in the shared workbook go to the session.
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\b[^{]*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if let Some(r) = crate::live::undo(self, id, &params) { return r; }"
+# The grid's overlays: the others' selections, active cells and pointers, painted first (under this person's own).
+- live: true
+  file: crates/ui-egui/src/grid.rs
+  find: '\bfn\s+paint_overlays\s*\([^{]*\{'
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] crate::live::draw_presence(app, p, geo, sh);"
+# The web entry keeps its runner for the adapter and wraps its app (web/live.rs, a child module so it reaches
+# WebShell's fields).
+- live: true
+  file: apps/gridcraft-web/src/web.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session.\nmod live;\n"
+- live: true
+  file: apps/gridcraft-web/src/web.rs
+  find: 'eframe::WebRunner::new\(\)'
+  replace: 'live::runner()'
+- live: true
+  file: apps/gridcraft-web/src/web.rs
+  find: 'Ok\(Box::new\((?=\s*WebShell\b)'
+  replace: 'Ok(live::wrap('
