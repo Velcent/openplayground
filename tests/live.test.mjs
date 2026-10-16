@@ -24,7 +24,8 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 class App {
   constructor(values = [0, 0, 0], format = 'honeydew:1:test') { this.doc = Uint8Array.from(values); this.busy = null; this.gesture = false; this.format = format }
   checkpoint() { if (this.gesture) throw 'busy'; return this.doc.slice() }
-  merge(base, current, edited) { return merge(base, current, edited) }
+  // 9 in the first field stands for "no document": the app's own merge refuses it, as a real app's validation would.
+  merge(base, current, edited) { if ([base, current, edited].some((d) => d[0] === 9)) throw 'not a document'; return merge(base, current, edited) }
   async apply(base, edited) {
     while (this.busy || this.gesture) await (this.busy ?? sleep(5))
     const replaced = this.doc.slice()
@@ -251,4 +252,13 @@ test('proposals reach the journal as they arrive, so its pending bound rejects a
     rejects.splice(0, rejects.length, ...hub.sent.filter((m) => m.from === o && m.type === 'reject'))
     assert.ok(rejects.length >= 80 - 64 - 1)
   })
+})
+
+test('the owner shares nothing until it has a document every peer can install', async () => {
+  const hub = new Hub(), [o, e] = ids(), app = new App([9, 0, 0])
+  const starting = hub.join(o, 'owner', app)
+  await sleep(100)
+  app.doc = Uint8Array.from([1, 2, 3])
+  const owner = await starting, editor = await hub.join(e, 'editor')
+  await converge([owner, editor], [1, 2, 3])
 })

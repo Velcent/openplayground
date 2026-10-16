@@ -92,11 +92,21 @@ export class LiveDocument extends EventTarget {
     } catch {
       // Another build's or an unreadable journal: its document carries over when this build can open it.
       if (record?.bytes) await this.adapter.apply(null, record.bytes).catch(() => this.store.draft(record.bytes))
-      this.history = await DocumentHistory.create({ document: crypto.randomUUID(), format: this.adapter.format, bytes: await this.quietCheckpoint(), ...options })
+      this.history = await DocumentHistory.create({ document: crypto.randomUUID(), format: this.adapter.format, bytes: await this.shareable(), ...options })
     }
     const snapshot = this.history.snapshot()
     this.broadcasted = snapshot.revision
     this.work = this.work.then(() => this.adopt(snapshot)).catch((e) => this.report(e))
+  }
+  // A document every peer can install (the app's own merge validates it), or nothing is shared yet: a journal that
+  // starts from no document would fail every joiner.
+  async shareable() {
+    for (;;) {
+      const bytes = await this.quietCheckpoint()
+      try { this.adapter.merge(bytes, bytes, bytes); this.error = null; return bytes }
+      catch { this.report(new Error('Open a document to share it live.')) }
+      await sleep(500)
+    }
   }
   async quietCheckpoint() {
     for (;;) {
