@@ -1,0 +1,354 @@
+diff --git a/apps/figcraft-web/src/web.rs b/apps/figcraft-web/src/web.rs
+index 8cadb01..ef7d9b6 100644
+--- a/apps/figcraft-web/src/web.rs
++++ b/apps/figcraft-web/src/web.rs
+@@ -26,11 +26,16 @@ pub fn start() {
+         {
+             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
+         }
+-        let result = eframe::WebRunner::new()
++        // Kept for Playground live editing, which reaches the app through it once it runs.
++        let runner = eframe::WebRunner::new();
++        let live_ctx = std::rc::Rc::new(std::cell::OnceCell::new());
++        let app_ctx = live_ctx.clone();
++        let result = runner
+             .start(
+                 canvas,
+                 options,
+-                Box::new(|cc| {
++                Box::new(move |cc| {
++                    let _ = app_ctx.set(cc.egui_ctx.clone());
+                     if let Some(rs) = &cc.wgpu_render_state {
+                         log::info!("figcraft-web: wgpu backend {:?}", rs.adapter.get_info().backend);
+                     }
+@@ -45,6 +50,9 @@ pub fn start() {
+                 }),
+             )
+             .await;
++        if result.is_ok() {
++            attach_live(runner, live_ctx);
++        }
+         if let Some(el) = document.get_element_by_id(LOADING_ID) {
+             match result {
+                 Ok(()) => el.remove(),
+@@ -54,6 +62,22 @@ pub fn start() {
+     });
+ }
+ 
++/// Offers Playground live editing of the document in front to the page (`figcraft_engine::playground_live`).
++fn attach_live(runner: eframe::WebRunner, ctx: std::rc::Rc<std::cell::OnceCell<egui::Context>>) {
++    let attached = figcraft_engine::playground_live::web::attach::<Session>(
++        concat!("figma:1:", env!("CARGO_PKG_VERSION")),
++        move |f| runner.app_mut::<WebShell>().map(|mut shell| f(&mut shell.fig.session)).is_some(),
++        move || {
++            if let Some(ctx) = ctx.get() {
++                ctx.request_repaint();
++            }
++        },
++    );
++    if let Err(e) = attached {
++        log::error!("figcraft-web: no live editing: {e:?}");
++    }
++}
++
+ fn query() -> String {
+     web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
+ }
+@@ -66,6 +90,16 @@ impl eframe::App for WebShell {
+     // `FigApp::ui` runs its own per-frame logic first (fonts, theme), like the desktop app.
+     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+         self.fig.ui(ui);
++        // Playground live editing: this frame's edits go out, others' come in and show next frame.
++        let revision = self.fig.session.ds().map(|d| d.revision).ok();
++        figcraft_engine::playground_live::frame(&mut self.fig.session);
++        if self.fig.session.ds().map(|d| d.revision).ok() != revision {
++            ui.ctx().request_repaint();
++        }
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
+     }
+ }
+ 
+diff --git a/crates/engine/Cargo.toml b/crates/engine/Cargo.toml
+index f610c38..14bcc5c 100644
+--- a/crates/engine/Cargo.toml
++++ b/crates/engine/Cargo.toml
+@@ -29,6 +29,11 @@ base64 = { workspace = true }
+ regex = { workspace = true }
+ web-time = "1.1.0"
+ 
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++# Playground live editing (src/playground_live.rs).
++wasm-bindgen = "0.2"
++js-sys = "0.3"
++
+ [dev-dependencies]
+ wat = { workspace = true }
+ image = { workspace = true }
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 34653bd..ecf50cd 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -34,6 +34,11 @@ pub mod library;
+ pub mod library_server;
+ pub mod library_swap;
+ pub mod live;
++// Playground live editing (the web build).
++#[cfg(any(target_arch = "wasm32", test))]
++mod live_playground;
++#[cfg(any(target_arch = "wasm32", test))]
++pub mod playground_live;
+ pub mod measure;
+ pub mod online;
+ pub mod params;
+@@ -1063,6 +1068,10 @@ impl Session {
+     }
+ 
+     pub fn undo(&mut self) -> Result<bool> {
++        #[cfg(any(target_arch = "wasm32", test))]
++        if live_playground::undo(self, false) {
++            return Ok(true);
++        }
+         textpreview::end(self);
+         let live = self.ds().is_ok_and(|d| self.live_doc(d.uid));
+         let ds = self.ds_mut()?;
+@@ -1093,6 +1102,10 @@ impl Session {
+     }
+ 
+     pub fn redo(&mut self) -> Result<bool> {
++        #[cfg(any(target_arch = "wasm32", test))]
++        if live_playground::undo(self, true) {
++            return Ok(true);
++        }
+         textpreview::end(self);
+         let live = self.ds().is_ok_and(|d| self.live_doc(d.uid));
+         let ds = self.ds_mut()?;
+diff --git a/crates/engine/src/live_playground.rs b/crates/engine/src/live_playground.rs
+new file mode 100644
+index 0000000..e913fdd
+--- /dev/null
++++ b/crates/engine/src/live_playground.rs
+@@ -0,0 +1,221 @@
++//! Playground live editing of one open document (the web build; [`playground_live`] is the adapter the Playground shell
++//! drives). The shared document is the collaboration core's snapshot of the file ([`Replica::snapshot`]: layers with
++//! their properties, styles, variables, comments, images) without its name and opening page, which stay this person's
++//! like the selection, page and view. Merges are the core's three-way branch merge ([`merge::plan`]), strict: a
++//! property both sides wrote is a conflict, even when they wrote the same value. Derived data (auto layout, instances)
++//! is recomputed after a merge.
++//!
++//! The session edits the document in front when it connects. A document in a native live session (`collab.*`) belongs
++//! to that one: Playground live editing waits while it does.
++
++use std::cell::Cell;
++use std::collections::BTreeSet;
++use std::sync::Arc;
++
++use figcraft_collab::merge::{self, Key, Side};
++use figcraft_collab::{Change, DocProp, Entry, Prop, Recompute as _, Replica};
++use figcraft_doc::Document;
++use serde::Deserialize as _;
++use serde_json::Value;
++
++use crate::collab::EngineRecompute;
++use crate::playground_live::{self, Error, Live};
++use crate::{DocState, Session};
++
++thread_local! {
++    /// The document the connected session edits (`None`: none yet, the one in front).
++    static BOUND: Cell<Option<u64>> = const { Cell::new(None) };
++}
++
++/// The session's document, unless a native live session has it.
++fn bound(s: &Session) -> Option<&DocState> {
++    let uid = BOUND.get().or_else(|| s.ds().ok().map(|d| d.uid))?;
++    s.docs.iter().find(|d| d.uid == uid).filter(|_| !s.live.iter().any(|l| l.doc_uid == Some(uid)))
++}
++
++/// Undo or Redo (`redo`) of the document in front goes to the Playground session while it edits that document.
++pub(crate) fn undo(s: &Session, redo: bool) -> bool {
++    bound(s).is_some_and(|d| s.ds().is_ok_and(|a| a.uid == d.uid)) && playground_live::undo(redo)
++}
++
++/// `doc` as shared: its snapshot without the file name and opening page.
++fn shared(doc: &Document) -> Result<Value, Error> {
++    let mut changes = Replica::new(doc.clone()).snapshot().map_err(|e| e.to_string())?;
++    changes.retain(|c| !matches!(c, Change::SetDoc { prop: DocProp::Name | DocProp::CurrentPage, .. }));
++    serde_json::to_value(changes).map_err(|e| e.to_string())
++}
++
++fn document(shared: &Value) -> Result<Document, Error> {
++    let invalid = |e: String| format!("Invalid shared document: {e}");
++    let changes = Vec::<Change>::deserialize(shared).map_err(|e| invalid(e.to_string()))?;
++    Ok(Replica::from_snapshot(&changes).map_err(|e| invalid(e.to_string()))?.document().clone())
++}
++
++/// What a change writes, as the core's merge names conflicts (creations write nothing another side can: ids are per
++/// client; images are content-addressed).
++fn written(c: &Change) -> Option<Key> {
++    Some(match c {
++        Change::Set { id, prop: Prop::Position, .. } => Key::Node(*id, Prop::Parent),
++        Change::Set { id, prop, .. } => Key::Node(*id, *prop),
++        Change::Delete { id } => Key::Layer(*id),
++        Change::SetDoc { prop, .. } => Key::Doc(*prop),
++        Change::Create { .. } | Change::Put { entry: Entry::Image(_), .. } | Change::Remove { entry: Entry::Image(_) } => return None,
++        Change::Put { entry, .. } | Change::Remove { entry } => Key::Entry(entry.clone()),
++    })
++}
++
++impl Live for Session {
++    fn live_document(&self) -> Value {
++        let Some(ds) = bound(self) else { return Value::Null };
++        BOUND.set(Some(ds.uid));
++        shared(&ds.doc).unwrap_or(Value::Null)
++    }
++
++    /// Installs the shared document as others' edits are ([`Session::apply_remote`]): no undo step, the page,
++    /// selection and view stay. New ids come from this person's own space ([`Document::set_client_id`]).
++    fn live_adopt(&mut self, shared: Value) -> Result<(), Error> {
++        let mut doc = document(&shared)?;
++        let ds = bound(self).ok_or("No document to edit live")?;
++        BOUND.set(Some(ds.uid));
++        doc.name.clone_from(&ds.doc.name);
++        doc.current_page = ds.doc.current_page;
++        doc.published.clone_from(&ds.doc.published);
++        // 32 of the session's random bits.
++        let client = match ds.doc.client_id() {
++            0 => (playground_live::fresh_id(&mut 0) as u32).max(1),
++            c => c,
++        };
++        doc.set_client_id(client);
++        let uid = ds.uid;
++        self.apply_remote(uid, Arc::new(doc));
++        Ok(())
++    }
++
++    fn live_quiet(&self) -> bool {
++        bound(self).is_some_and(|ds| ds.interaction.is_none() && ds.preview.is_none() && ds.text_preview.is_none())
++    }
++
++    fn live_generation(&self) -> Option<u64> {
++        bound(self).map(|ds| ds.revision ^ (Arc::as_ptr(&ds.doc) as usize as u64).rotate_left(32))
++    }
++
++    /// Native undo steps from the session would take back others' edits.
++    fn live_disconnected(&mut self) {
++        let Some(uid) = BOUND.take() else { return };
++        if let Some(ds) = self.docs.iter_mut().find(|d| d.uid == uid) {
++            ds.history.undo.clear();
++            ds.history.redo.clear();
++        }
++    }
++
++    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
++        if edited == base {
++            return Ok(current.clone());
++        }
++        if current == base {
++            return Ok(edited.clone());
++        }
++        let (base, current, edited) = (document(base)?, document(current)?, document(edited)?);
++        let plan = merge::plan(&base, &edited, &current).map_err(|e| e.to_string())?;
++        let theirs: BTreeSet<Key> = plan.main.iter().filter_map(written).collect();
++        let both = plan.branch.iter().filter_map(written).find(|k| theirs.contains(k));
++        if let Some(key) = plan.conflicts.first().map(|c| c.key.clone()).or(both) {
++            return Err(format!("Conflict at {key}"));
++        }
++        let (mut doc, touched) = plan.merge(&current, Side::Branch, &|_| None).map_err(|e| e.to_string())?;
++        EngineRecompute.recompute(&mut doc, &current, &touched);
++        shared(&doc)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::playground_live::{activity, canonical, connect, disconnect, frame, queue};
++    use figcraft_doc::NodeId;
++    use serde_json::json;
++    use std::cell::RefCell;
++    use std::rc::Rc;
++
++    fn rect(s: &mut Session, x: f64) -> NodeId {
++        let made = s.execute("node.create", &json!({"type": "rectangle", "x": x, "y": 0, "width": 50, "height": 50})).unwrap();
++        NodeId(made["id"].as_u64().unwrap())
++    }
++
++    fn rename(s: &mut Session, id: NodeId, name: &str) {
++        s.execute("node.set", &json!({"id": id, "props": {"name": name}})).unwrap();
++    }
++
++    /// Another person's document (the binding is per thread: one session per page).
++    fn theirs(s: &Session) -> Value {
++        let mine = BOUND.take();
++        let shared = s.live_document();
++        BOUND.set(mine);
++        shared
++    }
++
++    fn name(s: &Session, id: NodeId) -> String {
++        s.doc().unwrap().node(id).unwrap().name.clone()
++    }
++
++    #[test]
++    fn the_shared_document_leaves_out_the_name_page_and_views() {
++        let mut s = Session::new();
++        let r = rect(&mut s, 0.0);
++        let shared = canonical(&s.live_document());
++        let ds = s.ds_mut().unwrap();
++        ds.view.zoom = 4.0;
++        ds.selection = vec![r];
++        let doc = Arc::make_mut(&mut ds.doc);
++        doc.name = "Mine".into();
++        doc.current_page = None;
++        assert_eq!(canonical(&s.live_document()), shared);
++        rename(&mut s, r, "Card");
++        assert_ne!(canonical(&s.live_document()), shared);
++    }
++
++    #[test]
++    fn adopting_keeps_this_persons_views_and_adds_no_undo_step() {
++        let mut a = Session::new();
++        rect(&mut a, 0.0);
++        let mut b = Session::new();
++        b.ds_mut().unwrap().view.zoom = 2.0;
++        let page = b.ds().unwrap().page;
++        b.live_adopt(theirs(&a)).unwrap();
++        assert_eq!(canonical(&b.live_document()), canonical(&theirs(&a)));
++        let ds = b.ds().unwrap();
++        assert_eq!((ds.view.zoom, ds.page, ds.history.undo.len(), ds.doc.name.as_str()), (2.0, page, 0, "Untitled"));
++        assert_ne!(ds.doc.client_id(), 0, "new ids come from this person's space");
++    }
++
++    #[test]
++    fn remote_changes_wait_for_gestures_merge_by_layer_and_undo_goes_to_the_session() {
++        let mut a = Session::new();
++        let (r1, r2) = (rect(&mut a, 0.0), rect(&mut a, 100.0));
++        let base = theirs(&a);
++        let mut b = Session::new();
++        b.live_adopt(base.clone()).unwrap();
++        rename(&mut a, r1, "A");
++        connect();
++        rename(&mut b, r2, "B");
++        b.begin_interaction("Move").unwrap();
++        let done = Rc::new(RefCell::new(None));
++        let to = done.clone();
++        queue(Some(canonical(&base)), canonical(&theirs(&a)), Box::new(move |r| *to.borrow_mut() = Some(r)));
++        frame(&mut b);
++        assert!(done.borrow().is_none(), "a gesture holds others' changes back");
++        b.commit_interaction().unwrap();
++        frame(&mut b);
++        assert_eq!(*done.borrow(), Some(Ok(None)));
++        assert_eq!((name(&b, r1), name(&b, r2)), ("A".into(), "B".into()));
++        // Both sides writing one property conflict, even with the same value.
++        let renamed = theirs(&a);
++        assert!(Session::live_merge(&base, &renamed, &renamed).unwrap_err().contains("Conflict"));
++        assert!(b.undo().unwrap());
++        assert_eq!(name(&b, r2), "B", "Undo is the session's");
++        assert_eq!(activity().1, [false]);
++        disconnect();
++        b.live_disconnected();
++        assert!(!b.undo().unwrap(), "native Undo starts again from the session's document");
++    }
++}

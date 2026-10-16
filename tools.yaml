@@ -299,5 +299,6 @@ groups:
         icon: icons/figcraft.png
         theme: themes/figma.js
         patches: patches/figma.yaml
+        live: crates/engine/src
         accent: "#02DA96"
         base: "#062E22"
