@@ -46,33 +46,43 @@ index 58966e6e..81b37e63 100644
  #[cfg(target_arch = "wasm32")]
 diff --git a/apps/lightcraft-web/src/live.rs b/apps/lightcraft-web/src/live.rs
 new file mode 100644
-index 00000000..933276fd
+index 00000000..ccdad929
 --- /dev/null
 +++ b/apps/lightcraft-web/src/live.rs
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,316 @@
 +//! Playground live editing (`playground_live`): the shared document is the library's catalog as JSON (every photo's
 +//! develop settings, History, Versions, rating, flag, label and metadata; albums, stacks, the keyword list), without
 +//! this browser's own browsing records (when it browsed Local folders and the photos seen there) and without views
-+//! (selection, filter, sort, panels live outside the catalog). The photos' original files are not shared: a photo
-+//! imported by someone else shows as missing here. Native undo history stays local; while connected Undo and Redo go
-+//! to the session.
++//! (selection, filter, sort, panels live outside the catalog). The originals of imported photos travel as session files
++//! named by their content hash, and land in this browser's storage as if imported here. Native undo history stays
++//! local; while connected Undo and Redo go to the session.
 +
 +use crate::playground_live::{self, Live};
-+use lightcraft_engine::catalog::Catalog;
++use crate::store::{self, Originals};
++use lightcraft_engine::catalog::{Catalog, Source};
 +use lightcraft_ui_egui::LightcraftApp;
 +use serde::Deserialize as _;
 +use serde_json::Value;
-+use std::cell::Cell;
++use std::cell::{Cell, RefCell};
++use std::collections::{BTreeMap, BTreeSet, HashSet};
 +
 +pub const FORMAT: &str = concat!("lightroom:1:", env!("CARGO_PKG_VERSION"));
 +
 +thread_local! {
 +    static POINTER_DOWN: Cell<bool> = const { Cell::new(false) };
++    /// This browser's originals: the ones in memory, and the hashes known to be in its storage (never removed).
++    static MEDIA: RefCell<(Originals, HashSet<String>)> = RefCell::default();
++    /// An original arrived from the session since the last frame.
++    static ARRIVED: Cell<bool> = const { Cell::new(false) };
 +}
 +
 +/// The end of a frame.
 +pub fn frame(app: &mut LightcraftApp, pointer_down: bool) {
 +    POINTER_DOWN.set(pointer_down);
++    if ARRIVED.take() {
++        // failed renders are retried once the catalog changes (as after a relink); the document itself stays as it is
++        app.session.catalog.revision = app.session.catalog.revision.wrapping_add(1);
++    }
 +    // while live, automatic versions are for the photos this person edited (others' are theirs to keep)
 +    if playground_live::connected() != app.session.own_edits.is_some() {
 +        app.session.own_edits = playground_live::connected().then(Default::default);
@@ -82,13 +92,75 @@ index 00000000..933276fd
 +
 +/// Offers live editing to the Playground shell (nothing happens until it connects).
 +#[cfg(target_arch = "wasm32")]
-+pub fn attach(with_app: impl Fn(&mut dyn FnMut(&mut LightcraftApp)) -> bool + 'static, repaint: impl Fn() + 'static) {
++pub async fn attach(
++    with_app: impl Fn(&mut dyn FnMut(&mut LightcraftApp)) -> bool + 'static,
++    repaint: impl Fn() + 'static,
++    (originals, backend): (Originals, Option<crate::backend::Backend>),
++) {
++    let stored = match &backend {
++        Some(b) => b.list("originals").await.unwrap_or_else(|e| {
++            log::warn!("listing the stored originals: {e}");
++            Vec::new()
++        }),
++        None => Vec::new(),
++    };
++    MEDIA.set((originals.clone(), stored.into_iter().collect()));
 +    let _ = lightcraft_engine::catalog::FRESH_ID.set(playground_live::fresh_id);
 +    let _ = lightcraft_ui_egui::UNDO.set(playground_live::undo);
 +    let _ = lightcraft_ui_egui::LIVE.set(playground_live::connected);
-+    if let Err(e) = playground_live::web::attach::<LightcraftApp>(FORMAT, with_app, repaint) {
++    if let Err(e) = playground_live::web::attach::<LightcraftApp>(FORMAT, with_app, repaint).and_then(|()| media(originals, backend)) {
 +        log::error!("live editing unavailable: {e:?}");
 +    }
++}
++
++/// The bytes of original `id`, refused unless they are the file the hash names.
++#[cfg(target_arch = "wasm32")]
++fn checked<'a>(id: &str, bytes: Option<&'a [u8]>) -> Result<&'a [u8], wasm_bindgen::JsValue> {
++    bytes.filter(|b| store::content_hash(b) == id).ok_or_else(|| format!("Missing media: the original {id}").into())
++}
++
++/// Originals live in asynchronous browser storage: the adapter's `readAsset` and `writeAsset` return promises. One that
++/// arrives is stored and kept in memory as the import does, without touching the catalog or the undo history.
++#[cfg(target_arch = "wasm32")]
++fn media(originals: Originals, backend: Option<crate::backend::Backend>) -> Result<(), wasm_bindgen::JsValue> {
++    use js_sys::{Reflect, Uint8Array};
++    use wasm_bindgen::prelude::*;
++    use wasm_bindgen_futures::future_to_promise;
++    let adapter = Reflect::get(&js_sys::global(), &"playgroundLiveAdapter".into())?;
++    let (o, b) = (originals.clone(), backend.clone());
++    let read = move |id: String| {
++        let (originals, backend) = (o.clone(), b.clone());
++        future_to_promise(async move {
++            let path = store::original_path(&id, "original");
++            if let Some(bytes) = originals.contains(&path).then(|| originals.get(&path)).flatten() {
++                return checked(&id, Some(&bytes)).map(|b| Uint8Array::from(b).into());
++            }
++            let bytes = match &backend {
++                Some(b) => b.read(&store::storage_key(&id)).await?,
++                None => None,
++            };
++            checked(&id, bytes.as_deref()).map(|b| Uint8Array::from(b).into())
++        })
++    };
++    Reflect::set(&adapter, &"readAsset".into(), &Closure::<dyn Fn(String) -> js_sys::Promise>::new(read).into_js_value())?;
++    let write = move |id: String, _name: String, bytes: Uint8Array| {
++        let (originals, backend) = (originals.clone(), backend.clone());
++        future_to_promise(async move {
++            let bytes = bytes.to_vec();
++            checked(&id, Some(&bytes))?;
++            if let Some(b) = &backend {
++                b.write(&store::storage_key(&id), &bytes).await?;
++            }
++            originals.insert(&id, bytes.into());
++            MEDIA.with_borrow_mut(|(_, stored)| stored.insert(id));
++            ARRIVED.set(true);
++            crate::web::request_repaint();
++            Ok(JsValue::UNDEFINED)
++        })
++    };
++    let write = Closure::<dyn Fn(String, String, Uint8Array) -> js_sys::Promise>::new(write);
++    Reflect::set(&adapter, &"writeAsset".into(), &write.into_js_value())?;
++    Ok(())
 +}
 +
 +/// A photo record only this browser has: seen while browsing a Local folder, not in the library.
@@ -157,6 +229,28 @@ index 00000000..933276fd
 +
 +    fn live_check(document: &Value) -> Result<(), String> {
 +        catalog(document).map(drop)
++    }
++
++    /// The originals the shared photos were imported from, by content hash (demo photos have none).
++    fn live_assets(&self) -> Vec<(String, String, bool)> {
++        MEDIA.with_borrow(|(originals, stored)| {
++            let files: BTreeMap<_, _> = (self.session.catalog.photos().filter(|p| !p.local))
++                .filter_map(|p| match &p.source {
++                    Source::File { path } => {
++                        let hash = store::hash_of_path(path)?;
++                        Some((hash.to_string(), (p.file_name.clone(), stored.contains(hash) || originals.contains(path))))
++                    }
++                    _ => None,
++                })
++                .collect();
++            files.into_iter().map(|(hash, (name, have))| (hash, name, have)).collect()
++        })
++    }
++
++    fn live_assets_of(document: &Value) -> Vec<String> {
++        let photos = document.get("photos").and_then(Value::as_object).into_iter().flat_map(|p| p.values());
++        let ids: BTreeSet<_> = photos.filter(|p| !own(p)).filter_map(|p| store::hash_of_path(p.get("source")?.get("path")?.as_str()?)).collect();
++        ids.into_iter().map(str::to_string).collect()
 +    }
 +}
 +
@@ -250,9 +344,30 @@ index 00000000..933276fd
 +        assert!(a.session.own_edits.is_none(), "not live: every edited photo again");
 +        Ok(())
 +    }
++
++    #[test]
++    fn lists_the_shared_photos_originals_once_by_content_hash() -> Result<(), String> {
++        let mut a = demo();
++        let hash = store::content_hash(b"photo");
++        let mut add = |path: String, local: bool| {
++            let mut p = Photo::new(a.session.catalog.alloc_photo_id(), Source::File { path }, "IMG 1.jpg", "JPEG", 9, 9, "2026-01-01T00:00:00");
++            p.local = local;
++            a.session.catalog.apply(Op::AddPhoto { photo: Box::new(p) }).map(drop).map_err(|e| e.to_string())
++        };
++        // a virtual copy shares its original; a Local folder's photo and a file on disk are not the session's
++        add(store::original_path(&hash, "IMG 1.jpg"), false)?;
++        add(store::original_path(&hash, "IMG 1.jpg"), false)?;
++        add(store::original_path("123", "seen.jpg"), true)?;
++        add("/home/me/x.jpg".into(), false)?;
++        assert_eq!(a.live_assets(), [(hash.clone(), "IMG 1.jpg".to_string(), false)], "demo photos have no original");
++        assert_eq!(LightcraftApp::live_assets_of(&a.live_document()), [hash.clone()], "the same from the shared document");
++        MEDIA.with_borrow(|(originals, _)| originals.insert(&hash, b"photo".as_slice().into()));
++        assert_eq!(a.live_assets(), [(hash, "IMG 1.jpg".to_string(), true)]);
++        Ok(())
++    }
 +}
 diff --git a/apps/lightcraft-web/src/web.rs b/apps/lightcraft-web/src/web.rs
-index 18c89636..114c2263 100644
+index 18c89636..9771ff44 100644
 --- a/apps/lightcraft-web/src/web.rs
 +++ b/apps/lightcraft-web/src/web.rs
 @@ -15,7 +15,7 @@ use wasm_bindgen::JsCast;
@@ -329,15 +444,17 @@ index 18c89636..114c2263 100644
  }
  
  /// Start the app with the separately fetched Simplified Chinese font (empty in font-free builds).
-@@ -697,6 +711,11 @@ pub fn start(chinese_font: Vec<u8>) {
+@@ -697,6 +711,13 @@ pub fn start(chinese_font: Vec<u8>) {
          let r = runner.start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(WebApp::new(cc, boot, chinese_font))))).await;
          match r {
              Ok(()) => {
 +                let live = runner.clone();
-+                crate::live::attach(
++                let media = runner.app_mut::<WebApp>().map(|w| (w.originals.clone(), w.backend.clone())).unwrap_or_default();
++                wasm_bindgen_futures::spawn_local(crate::live::attach(
 +                    move |f| live.app_mut::<WebApp>().map(|mut w| f(&mut w.app)).is_some(),
 +                    || _ = CTX.with(|c| c.borrow().as_ref().map(egui::Context::request_repaint)),
-+                );
++                    media,
++                ));
                  if let Some(el) = window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("lightcraft_loading")) {
                      el.remove();
                  }
