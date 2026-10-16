@@ -22,9 +22,10 @@ async function eventually(check, ms = 10000) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 class App {
-  constructor(values = [0, 0, 0], format = 'honeydew:1:test') { this.doc = Uint8Array.from(values); this.busy = null; this.gesture = false; this.format = format; this.refs = []; this.media = new Map() }
-  // Media the document refers to but keeps outside it, as a photo or audio app does.
-  assets() { return this.refs.map((id) => ({ id, name: `${id}.bin`, have: this.media.has(id) })) }
+  constructor(values = [0, 0, 0], format = 'honeydew:1:test') { this.doc = Uint8Array.from(values); this.busy = null; this.gesture = false; this.format = format; this.media = new Map() }
+  // Media the document refers to but keeps outside it, as a photo or audio app does: field i set refers to photo-i.
+  assetsOf(doc) { return [...doc].flatMap((v, i) => v ? [`photo-${i}`] : []) }
+  assets() { return this.assetsOf(this.doc).map((id) => ({ id, name: `${id}.bin`, have: this.media.has(id) })) }
   async readAsset(id) { return this.media.get(id) }
   async writeAsset(id, name, bytes) { this.media.set(id, new Blob([bytes])) }
   checkpoint() { if (this.gesture) throw 'busy'; return this.doc.slice() }
@@ -279,17 +280,19 @@ test('the owner shares nothing until it has a document every peer can install', 
   await converge([owner, editor], [1, 2, 3])
 })
 
-test('media the document refers to reaches the people who lack it, and only them', async () => {
-  const hub = new Hub(), [o, e] = ids(), ownerApp = new App(), editorApp = new App()
-  ownerApp.refs = editorApp.refs = ['photo-1']
+test('media reach the people who lack them, shared only by whoever added them to the document', async () => {
+  const hub = new Hub(), [o, e] = ids(), ownerApp = new App([0, 1, 0]), editorApp = new App()
+  const bytes = async (app, id) => [...new Uint8Array(await app.media.get(id)?.arrayBuffer() ?? new ArrayBuffer(0))]
   ownerApp.media.set('photo-1', new Blob([Uint8Array.of(1, 2, 3)]))
+  // A file the owner has from elsewhere: someone else referring to it must not make the owner share it.
+  ownerApp.media.set('photo-0', new Blob([Uint8Array.of(7)]))
   const owner = await hub.join(o, 'owner', ownerApp), editor = await hub.join(e, 'editor', editorApp)
   await live(owner, editor)
-  await eventually(async () => assert.deepEqual([...new Uint8Array(await editorApp.media.get('photo-1')?.arrayBuffer() ?? new ArrayBuffer(0))], [1, 2, 3]))
-  // A photo the editor adds later reaches the owner the same way.
-  editorApp.media.set('photo-2', new Blob([Uint8Array.of(9)]))
-  ownerApp.refs = editorApp.refs = ['photo-1', 'photo-2']
+  await eventually(async () => assert.deepEqual(await bytes(editorApp, 'photo-1'), [1, 2, 3]))
   editorApp.edit(0, 1)
-  await eventually(async () => assert.deepEqual([...new Uint8Array(await ownerApp.media.get('photo-2')?.arrayBuffer() ?? new ArrayBuffer(0))], [9]))
+  editorApp.media.set('photo-2', new Blob([Uint8Array.of(9)]))
+  editorApp.edit(2, 1)
+  await eventually(async () => assert.deepEqual(await bytes(ownerApp, 'photo-2'), [9]))
   assert.equal(owner.session.files.length, 2)
+  assert.equal(editorApp.media.has('photo-0'), false)
 })

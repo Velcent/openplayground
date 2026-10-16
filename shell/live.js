@@ -8,8 +8,8 @@
 // checkpoint(), which throws 'busy' while a gesture is under way; merge(base, current, edited); apply(base, edited) and
 // apply(null, document), promises settled at the next quiet frame, the second resolving to the document it replaced;
 // connect({ changed, undo }) and disconnect(). Apps that keep media outside the document (photos, audio) also offer
-// assets() → [{ id, name, have }], readAsset(id) → bytes or Blob, and writeAsset(id, name, bytes), each of which may
-// throw 'busy'; those travel as session files.
+// assets() → [{ id, name, have }] for the live document, assetsOf(document) → the same IDs for a document, readAsset(id)
+// → bytes or Blob, and writeAsset(id, name, bytes), any of which may throw 'busy'; those media travel as session files.
 import { DocumentHistory, stacks } from './document-history.js'
 import { applyDelta, delta } from './document-delta.js'
 
@@ -63,7 +63,9 @@ export class LiveDocument extends EventTarget {
   }
   constructor(session, adapter, store) {
     super()
-    Object.assign(this, { session, adapter, store, acked: null, entries: [], inflight: null, wanted: [], error: null, unsaved: [] })
+    // `mine`: the media this browser may share, those its own document or edits brought in. Someone else referring to
+    // a file this browser happens to have never makes it share that file.
+    Object.assign(this, { session, adapter, store, acked: null, entries: [], inflight: null, wanted: [], error: null, unsaved: [], mine: new Set() })
     this.work = this.coordinating = this.assetWork = Promise.resolve()
     this.handlers = {
       document: (e) => this.receive(e.peer, e.value),
@@ -105,7 +107,9 @@ export class LiveDocument extends EventTarget {
     } catch {
       // Another build's or an unreadable journal: its document carries over when this build can open it.
       if (record?.bytes) await this.adapter.apply(null, record.bytes).catch(() => this.store.draft(record.bytes))
-      this.history = await DocumentHistory.create({ document: crypto.randomUUID(), format: this.adapter.format, bytes: await this.shareable(), ...options })
+      const bytes = await this.shareable()
+      this.history = await DocumentHistory.create({ document: crypto.randomUUID(), format: this.adapter.format, bytes, ...options })
+      await this.introduced(null, bytes)
     }
     const snapshot = this.history.snapshot()
     this.broadcasted = snapshot.revision
@@ -230,7 +234,15 @@ export class LiveDocument extends EventTarget {
     this.acked = { ...this.acked, revision: entry.revision, bytes: after }
     this.entries = [...this.entries, entry].slice(-RETAINED)
     if (own) this.inflight = null
+    if (entry.author === this.session.id && entry.kind === 'edit') await this.introduced(before, after)
     this.changed()
+  }
+  async introduced(before, after) {
+    if (!this.adapter.assetsOf) return
+    try {
+      const old = new Set(before ? await this.adapter.assetsOf(before) : [])
+      for (const id of await this.adapter.assetsOf(after)) if (!old.has(id)) this.mine.add(id)
+    } catch (e) { this.report(e) }
   }
   async merge(before, after) {
     try { await this.adapter.apply(before, after) }
@@ -264,7 +276,7 @@ export class LiveDocument extends EventTarget {
     const files = new Map(this.session.files.map((f) => [f.id, f])), share = [], ids = []
     for (const { id, name, have } of await this.adapter.assets()) {
       const file = files.get(await fileId(id))
-      if (have && !file && this.editable) { share.push(new File([await this.adapter.readAsset(id)], fileName(name))); ids.push(await fileId(id)) }
+      if (have && !file && this.editable && this.mine.has(id)) { share.push(new File([await this.adapter.readAsset(id)], fileName(name))); ids.push(await fileId(id)) }
       else if (!have && file) {
         if (!this.session.accepted) await this.session.receive()
         if (this.session.available.has(file.asset)) await this.adapter.writeAsset(id, file.name, new Uint8Array(await (await this.session.store.file(file.asset)).arrayBuffer()))

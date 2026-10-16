@@ -33,6 +33,14 @@ pub trait Live {
     fn live_assets(&self) -> Vec<(String, String, bool)> {
         Vec::new()
     }
+    /// The ids [`Self::live_assets`] would list for `document`. A browser shares only media its own edits added, so
+    /// another person referring to a file this browser has does not make it share that file.
+    fn live_assets_of(_document: &Value) -> Vec<String>
+    where
+        Self: Sized,
+    {
+        Vec::new()
+    }
     /// The bytes of an asset [`Self::live_assets`] lists as present.
     fn live_read_asset(&self, _id: &str) -> Option<Vec<u8>> {
         None
@@ -482,8 +490,8 @@ fn adopt<A: Live>(
 /// The adapter object the Playground shell drives (`shell/live.js`): `format`, `checkpoint()` (throws `busy` while a
 /// gesture is under way), `merge(base, current, edited)`, `apply(base | null, edited)` (a promise, settled at the next
 /// quiet frame; a whole adopted document resolves to the one it replaced), `connect({ changed, undo })`,
-/// `disconnect()`, and `assets()`, `readAsset(id)`, `writeAsset(id, name, bytes)` (all three throw `busy` while the app
-/// is not running). The hooks are called from inside a frame: the shell defers its calls back.
+/// `disconnect()`, `assets()`, `assetsOf(document)`, `readAsset(id)` and `writeAsset(id, name, bytes)` (the ones that
+/// read the app throw `busy` while it is not running). The hooks are called from inside a frame: the shell defers its calls back.
 #[cfg(target_arch = "wasm32")]
 pub mod web {
     use super::{Live, SESSION};
@@ -620,6 +628,17 @@ pub mod web {
         set(
             "assets",
             Closure::<dyn Fn() -> _>::new(assets).into_js_value(),
+        )?;
+        let assets_of = |bytes: Uint8Array| -> Result<js_sys::Array, JsValue> {
+            let document = super::parse(&bytes.to_vec()).map_err(|e| JsValue::from_str(&e))?;
+            Ok(A::live_assets_of(&document)
+                .into_iter()
+                .map(JsValue::from)
+                .collect())
+        };
+        set(
+            "assetsOf",
+            Closure::<dyn Fn(_) -> _>::new(assets_of).into_js_value(),
         )?;
         let app = with_app.clone();
         let read_asset = move |id: String| -> Result<Uint8Array, JsValue> {
