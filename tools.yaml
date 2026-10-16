@@ -160,6 +160,7 @@ groups:
         icon: icons/gridcraft.svg
         theme: themes/excel.js
         patches: patches/excel.yaml
+        live: crates/ui-egui/src
         accent: "#33C481"
         base: "#062E19"
 

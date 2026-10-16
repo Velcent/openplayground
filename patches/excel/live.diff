@@ -1,0 +1,423 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 6d618a0..278478f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1643,12 +1643,14 @@ dependencies = [
+  "gridcraft-engine",
+  "gridcraft-xlsx",
+  "image",
++ "js-sys",
+  "log",
+  "serde",
+  "serde_json",
+  "skrifa",
+  "sys-locale",
+  "toml",
++ "wasm-bindgen",
+  "web-sys",
+  "zbus",
+ ]
+diff --git a/apps/gridcraft-web/src/web.rs b/apps/gridcraft-web/src/web.rs
+index c0fcb22..b29ba60 100644
+--- a/apps/gridcraft-web/src/web.rs
++++ b/apps/gridcraft-web/src/web.rs
+@@ -29,11 +29,15 @@ pub fn start() {
+         // workbooks in it and stores what it saves (`host`).
+         let bridge = if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new() } else { None };
+         let app_bridge = bridge.clone();
+-        let result = eframe::WebRunner::new()
++        let runner = eframe::WebRunner::new();
++        let repaint = std::rc::Rc::new(std::cell::OnceCell::<egui::Context>::new());
++        let created = repaint.clone();
++        let result = runner
+             .start(
+                 canvas,
+                 options,
+                 Box::new(move |cc| {
++                    let _ = created.set(cc.egui_ctx.clone());
+                     let inbox: Inbox = Inbox::default();
+                     let mut session = Session::new();
+                     // In host mode the parent sends the workbook to edit; no sample meanwhile.
+@@ -69,6 +73,21 @@ pub fn start() {
+                 }),
+             )
+             .await;
++        if result.is_ok() {
++            // Live editing in a Playground session.
++            let attached = gridcraft_ui_egui::playground_live::web::attach::<SheetApp>(
++                concat!("excel:1:", env!("CARGO_PKG_VERSION")),
++                move |with| runner.app_mut::<WebShell>().map(|mut shell| with(&mut shell.app)).is_some(),
++                move || {
++                    if let Some(ctx) = repaint.get() {
++                        ctx.request_repaint();
++                    }
++                },
++            );
++            if let Err(e) = attached {
++                log::error!("live editing: {e:?}");
++            }
++        }
+         if let (Err(e), Some(bridge)) = (&result, &bridge) {
+             bridge.post_failed(&format!("{e:?}"));
+         }
+@@ -124,6 +143,11 @@ impl eframe::App for WebShell {
+         if let Some(bridge) = &self.bridge {
+             bridge.sync(&mut self.app);
+         }
++        gridcraft_ui_egui::playground_live::frame(&mut self.app);
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
+     }
+ }
+ 
+diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
+index 85a24dd..1a0d592 100644
+--- a/crates/ui-egui/Cargo.toml
++++ b/crates/ui-egui/Cargo.toml
+@@ -37,6 +37,9 @@ sys-locale = { workspace = true }
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+ # Read the browser's preferred language for the first-run web interface language.
+ web-sys = { version = "0.3", features = ["Window", "Navigator"] }
++# Playground live editing's adapter (`playground_live`).
++wasm-bindgen = "0.2"
++js-sys = "0.3"
+ 
+ [build-dependencies]
+ serde_json = { workspace = true }
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index f96cdac..79f9f28 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -22,10 +22,15 @@ pub mod i18n;
+ pub mod icons;
+ pub mod keymap;
+ pub mod keytips;
++// Live editing in a Playground session (web only).
++#[cfg(any(target_arch = "wasm32", test))]
++mod live;
+ pub mod outline;
+ pub mod panes;
+ pub mod paper_view;
+ pub mod pivot_pane;
++#[cfg(any(target_arch = "wasm32", test))]
++pub mod playground_live;
+ pub mod printing;
+ pub mod ribbon;
+ pub mod selection_glide;
+@@ -377,6 +382,16 @@ impl SheetApp {
+         {
+             self.commit_text_box_edit()?;
+         }
++        // Live editing (web): the session undoes or redoes this person's last operations.
++        #[cfg(target_arch = "wasm32")]
++        if let Some(redo) = match id {
++            "edit.undo" => Some(false),
++            "edit.redo" => Some(true),
++            _ => None,
++        } && (0..params.get("steps").and_then(Json::as_u64).unwrap_or(1).max(1)).all(|_| playground_live::undo(redo))
++        {
++            return Ok(Json::Null);
++        }
+         if let Some(r) = self.run_ui_command(id, &params) {
+             return r;
+         }
+diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
+new file mode 100644
+index 0000000..2f0d8fa
+--- /dev/null
++++ b/crates/ui-egui/src/live.rs
+@@ -0,0 +1,292 @@
++//! Live editing in a Playground session (web only): the shared document is the workbook open when the session started,
++//! as JSON. Sheets are keyed by name, cells by address with their style inline (style ids are positions in a table
++//! each copy grows on its own), objects by id. Formula results are recalculated where the workbook is, not shared.
++//! This person's active sheet, zoom, sheet view mode, scroll position and active cell, Watch Window, selection and the
++//! file data GridCraft does not model stay local.
++
++use std::sync::Arc;
++
++use gridcraft_engine::core::{CellRef, Value as CellValue};
++use gridcraft_engine::model::{Cell, CellStore, Formula, Sheet, Style, StyleId, StyleTable, Workbook};
++use gridcraft_engine::{DocState, Mode, Session};
++use serde::{Deserialize, Serialize};
++use serde_json::{Map, Value, json};
++
++use crate::SheetApp;
++use crate::grid::Drag;
++use crate::playground_live::Live;
++
++/// Sheet fields that are this person's view.
++const VIEW: [&str; 4] = ["zoom", "view", "view_active", "view_top_left"];
++/// The defined name holding the Watch Window's list, which the app keeps through Undo as view state.
++const WATCH: &str = "_sc_watch";
++
++thread_local! {
++    /// The shared workbook's `DocState::uid` (0: none yet).
++    static SHARED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++}
++
++/// The shared workbook's index: the one the session started with, else (closed) the active one.
++fn shared(s: &Session) -> Option<usize> {
++    let i = s.documents().iter().position(|d| d.uid == SHARED.get()).or_else(|| s.active().map(|_| s.active_index()))?;
++    SHARED.set(s.documents().get(i)?.uid);
++    Some(i)
++}
++
++/// Runs `f` on document `i` (the session lends out only the active one).
++fn with_doc<R>(s: &mut Session, i: usize, f: impl FnOnce(&mut DocState) -> R) -> Option<R> {
++    let active = s.active_index();
++    s.set_active(i);
++    let r = s.active_mut().map(f);
++    s.set_active(active);
++    r
++}
++
++/// A cell as shared: its formula or value, and its style unless that is Normal.
++#[derive(Serialize, Deserialize)]
++struct SharedCell {
++    #[serde(default, skip_serializing_if = "CellValue::is_empty")]
++    value: CellValue,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    formula: Option<Arc<Formula>>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    style: Option<Style>,
++}
++
++fn document(wb: &Workbook) -> serde_json::Result<Value> {
++    let normal = wb.styles.get(StyleId::DEFAULT);
++    let mut sheets = Vec::new();
++    for sh in &wb.sheets {
++        let mut v = serde_json::to_value(Sheet { cells: CellStore::new(), ..(**sh).clone() })?;
++        if let Some(m) = v.as_object_mut() {
++            for k in VIEW {
++                m.remove(k);
++            }
++        }
++        v["id"] = sh.name.clone().into();
++        let mut cells = Map::new();
++        for (at, cell) in sh.cells.iter() {
++            let style = wb.styles.get(cell.style);
++            let shared = SharedCell {
++                // A formula's result is recalculated where the workbook is.
++                value: if cell.formula.is_some() { CellValue::Empty } else { cell.value.clone() },
++                formula: cell.formula.clone(),
++                style: (style != normal).then(|| style.clone()),
++            };
++            if !shared.value.is_empty() || shared.formula.is_some() || shared.style.is_some() {
++                cells.insert(at.a1(), serde_json::to_value(shared)?);
++            }
++        }
++        v["cells"] = Value::Object(cells);
++        for (key, lines) in [("rows", &sh.rows), ("cols", &sh.cols)] {
++            for (i, line) in lines {
++                if let Some(id) = line.style {
++                    v[key][i.to_string()]["style"] = serde_json::to_value(wb.styles.get(id))?;
++                }
++            }
++        }
++        sheets.push(v);
++    }
++    let mut v = serde_json::to_value(Workbook { sheets: vec![], ..wb.clone() })?;
++    if let Some(m) = v.as_object_mut() {
++        m.remove("active_sheet");
++        m.insert("styles".into(), serde_json::to_value(normal)?);
++        m.insert("sheets".into(), Value::Array(sheets));
++    }
++    if let Some(names) = v["names"].as_array_mut() {
++        names.retain(|n| n["name"] != WATCH);
++    }
++    Ok(v)
++}
++
++/// The shared `document` as a workbook, with this person's views, Watch Window and unmodelled file data from `local`.
++fn install(local: &Workbook, document: Value) -> Result<Workbook, String> {
++    let json = |e: serde_json::Error| e.to_string();
++    let mut m: Map<String, Value> = serde_json::from_value(document).map_err(json)?;
++    let normal: Style = serde_json::from_value(m.remove("styles").unwrap_or_default()).map_err(json)?;
++    let incoming: Vec<Map<String, Value>> = serde_json::from_value(m.remove("sheets").unwrap_or_default()).map_err(json)?;
++    m.extend([("active_sheet".into(), json!(0)), ("styles".into(), json!({"styles": []})), ("sheets".into(), json!([]))]);
++    let mut wb: Workbook = serde_json::from_value(Value::Object(m)).map_err(json)?;
++    // Styles this copy has keep their ids.
++    wb.styles = if *local.styles.get(StyleId::DEFAULT) == normal { local.styles.clone() } else { StyleTable::with_default(normal) };
++    let blank = serde_json::to_value(Sheet::new("")).map_err(json)?;
++    for mut s in incoming {
++        let cells = s.insert("cells".into(), blank["cells"].clone()).unwrap_or_else(|| json!({}));
++        for k in VIEW {
++            s.insert(k.into(), blank[k].clone());
++        }
++        for key in ["rows", "cols"] {
++            for line in s.get_mut(key).and_then(Value::as_object_mut).into_iter().flat_map(|m| m.values_mut()) {
++                if let Some(style) = line.get_mut("style").filter(|v| v.is_object()) {
++                    *style = wb.styles.intern(serde_json::from_value(style.take()).map_err(json)?).0.into();
++                }
++            }
++        }
++        let mut sh: Sheet = serde_json::from_value(Value::Object(s)).map_err(json)?;
++        for (a1, cell) in serde_json::from_value::<Map<String, Value>>(cells).map_err(json)? {
++            let at = CellRef::parse(&a1).ok_or_else(|| format!("invalid cell `{a1}`"))?;
++            let c: SharedCell = serde_json::from_value(cell).map_err(json)?;
++            let style = c.style.map_or(StyleId::DEFAULT, |s| wb.styles.intern(s));
++            sh.cells.set(at, Cell { value: c.value, formula: c.formula, style });
++        }
++        if let Some(old) = local.sheets.iter().find(|old| old.name == sh.name) {
++            (sh.zoom, sh.view, sh.view_active, sh.view_top_left) = (old.zoom, old.view, old.view_active, old.view_top_left);
++            sh.preserved = old.preserved.clone();
++        }
++        wb.sheets.push(Arc::new(sh));
++    }
++    if wb.sheets.is_empty() {
++        return Err("a workbook without sheets".into());
++    }
++    let active = local.active().map(|sh| &sh.name);
++    wb.active_sheet = wb.sheets.iter().position(|sh| Some(&sh.name) == active).unwrap_or(local.active_sheet.min(wb.sheets.len() - 1));
++    wb.names.extend(local.names.iter().filter(|n| n.name == WATCH).cloned());
++    (wb.preserved, wb.source_dir) = (local.preserved.clone(), local.source_dir.clone());
++    Ok(wb)
++}
++
++impl Live for SheetApp {
++    fn live_document(&self) -> Value {
++        let s = &self.session;
++        shared(s).and_then(|i| s.documents().get(i)).and_then(|d| document(&d.wb).ok()).unwrap_or_default()
++    }
++
++    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
++        let s = &mut self.session;
++        let i = match shared(s) {
++            Some(i) => i,
++            None => {
++                s.new_workbook();
++                shared(s).ok_or("No workbook")?
++            }
++        };
++        with_doc(s, i, |d| {
++            if self::document(&d.wb).ok().as_ref() == Some(&document) {
++                return Ok(());
++            }
++            let mut wb = install(&d.wb, document).map_err(|e| format!("Invalid shared workbook: {e}"))?;
++            d.calc.recalc_all(&mut wb);
++            d.wb = Arc::new(wb);
++            d.revision += 1;
++            Ok(())
++        })
++        .ok_or("No workbook")?
++    }
++
++    fn live_quiet(&self) -> bool {
++        let g = &self.grid;
++        self.editor.is_none()
++            && self.text_box_editor.is_none()
++            && self.session.mode == Mode::Ready
++            && g.drag == Drag::None
++            && !g.drag_select
++            && g.ink.is_empty()
++            && g.hf_edit.is_none()
++            && g.ruler_drag.is_none()
++            && g.renaming_tab.is_none()
++    }
++
++    fn live_generation(&self) -> Option<u64> {
++        use std::hash::{Hash, Hasher};
++        let s = &self.session;
++        let d = s.documents().get(shared(s)?)?;
++        let mut h = std::hash::DefaultHasher::new();
++        (d.uid, d.revision, Arc::as_ptr(&d.wb) as usize).hash(&mut h);
++        Some(h.finish())
++    }
++
++    fn live_disconnected(&mut self) {
++        let s = &mut self.session;
++        if let Some(i) = shared(s) {
++            // Its steps hold other people's edits.
++            with_doc(s, i, |d| {
++                d.undo.clear();
++                d.redo.clear();
++            });
++        }
++        SHARED.set(0);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::playground_live::{self as live, canonical};
++    use crate::Services;
++
++    fn app() -> SheetApp {
++        let mut s = Session::new();
++        s.new_workbook();
++        SheetApp::new(s, Services::default())
++    }
++
++    fn run(app: &mut SheetApp, id: &str, params: Value) {
++        app.session.execute(id, params).unwrap();
++    }
++
++    fn input(app: &SheetApp, a1: &str) -> String {
++        let d = app.session.active().unwrap();
++        d.wb.sheet(0).unwrap().cell(CellRef::parse(a1).unwrap()).map(|c| c.input_text()).unwrap_or_default()
++    }
++
++    #[test]
++    fn the_workbook_round_trips_without_views_or_results_and_adopting_it_keeps_this_persons_views() {
++        let mut a = app();
++        run(&mut a, "cell.set", json!({"cell": "A1", "input": "2"}));
++        run(&mut a, "cell.set", json!({"cell": "B1", "input": "=A1*3"}));
++        run(&mut a, "home.bold", json!({"range": "B1", "on": true}));
++        run(&mut a, "home.insertSheet", json!({"name": "Notes"}));
++        let doc = a.live_document();
++        assert_eq!(doc["sheets"][0]["cells"]["B1"]["formula"]["text"], "A1*3");
++        assert!(doc["sheets"][0]["cells"]["B1"].get("value").is_none(), "formula results are not shared");
++        assert_eq!(doc["sheets"][0]["cells"]["B1"]["style"]["font"]["bold"], true, "styles are inline");
++        assert_eq!(doc["sheets"][1]["id"], "Notes");
++
++        // Views are not shared.
++        run(&mut a, "view.zoom", json!({"percent": 150}));
++        run(&mut a, "sheet.activate", json!({"sheet": 0}));
++        a.store_view_state();
++        assert_eq!(canonical(&a.live_document()), canonical(&doc));
++
++        let mut b = app();
++        run(&mut b, "home.insertSheet", json!({"name": "Notes"}));
++        run(&mut b, "view.zoom", json!({"percent": 70}));
++        let undo = b.session.active().unwrap().undo.len();
++        b.live_adopt(doc.clone()).unwrap();
++        assert_eq!(canonical(&b.live_document()), canonical(&doc), "the workbook arrives whole");
++        let d = b.session.active().unwrap();
++        assert_eq!(d.wb.sheets[d.wb.active_sheet].name, "Notes", "this person's active sheet");
++        assert_eq!(d.wb.sheets[1].zoom, 70, "and zoom stay");
++        assert_eq!(d.wb.sheets[0].value(CellRef::parse("B1").unwrap()), CellValue::Number(6.0), "results are recalculated");
++        assert_eq!(d.undo.len(), undo, "no native undo step");
++    }
++
++    #[test]
++    fn edits_and_styles_in_different_cells_merge_and_a_remote_change_waits_for_the_cell_editor() {
++        let mut a = app();
++        live::connect();
++        let base = a.live_document();
++        let mut b = app();
++        b.live_adopt(base.clone()).unwrap();
++        // Both add a new style: each copy gives it the next id in its own table.
++        run(&mut a, "cell.set", json!({"cell": "A1", "input": "1"}));
++        run(&mut a, "home.italic", json!({"range": "A1", "on": true}));
++        run(&mut b, "cell.set", json!({"cell": "C3", "input": "x"}));
++        run(&mut b, "home.bold", json!({"range": "C3", "on": true}));
++        let edited = b.live_document();
++        let merged = SheetApp::live_merge(&base, &a.live_document(), &edited).unwrap();
++        assert_eq!(merged["sheets"][0]["cells"]["A1"]["style"]["font"]["italic"], true);
++        assert_eq!(merged["sheets"][0]["cells"]["C3"]["style"]["font"]["bold"], true);
++
++        a.begin_edit(Some("5".into()), false);
++        assert!(!a.live_quiet());
++        live::queue(Some(canonical(&base)), canonical(&edited), Box::new(|r| assert_eq!(r, Ok(None))));
++        live::frame(&mut a);
++        assert_eq!(input(&a, "C3"), "", "a remote change waits while a cell is being typed");
++        a.editor = None;
++        a.session.mode = Mode::Ready;
++        live::frame(&mut a);
++        assert_eq!((input(&a, "A1"), input(&a, "C3")), ("1".into(), "x".into()));
++        live::disconnect();
++    }
++}
