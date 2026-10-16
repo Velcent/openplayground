@@ -1,9 +1,9 @@
 diff --git a/apps/wordcraft-web/src/live.rs b/apps/wordcraft-web/src/live.rs
 new file mode 100644
-index 0000000..8d94520
+index 0000000..791fb78
 --- /dev/null
 +++ b/apps/wordcraft-web/src/live.rs
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,441 @@
 +//! Playground live editing (`playground_live`): the shared document is the open document's model as JSON (as the
 +//! app's own JSON format writes it, with pictures and kept parts as base64) without what is personal or stamped on
 +//! save: the zoom saved with it, the save times, author and count, and field-code toggles. Text merges character by
@@ -14,7 +14,7 @@ index 0000000..8d94520
 +use std::sync::Arc;
 +
 +use serde_json::{Map, Value};
-+use wordcraft_doc::{Block, Blocks, Document, Pos, StoryRef};
++use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph, Pos, StoryRef};
 +use wordcraft_engine::cmd::insert::{base64_decode, base64_encode};
 +use wordcraft_ui_egui::WordApp;
 +
@@ -45,9 +45,12 @@ index 0000000..8d94520
 +    CTX.with_borrow(|c| c.iter().for_each(egui::Context::request_repaint));
 +}
 +
-+/// `wordcraft_engine::LIVE_UNDO`: Undo and Redo of the shared document go to the session while connected.
-+pub fn undo(document: u64, redo: bool) -> bool {
-+    SHARED.get() == Some(document) && playground_live::undo(redo)
++/// `wordcraft_engine::LIVE_UNDO`: while connected, the shared document's Undo and Redo are the session's.
++pub fn undo(document: u64) -> Option<fn(bool)> {
++    fn session(redo: bool) {
++        playground_live::undo(redo);
++    }
++    (SHARED.get() == Some(document) && playground_live::connected()).then_some(session as fn(bool))
 +}
 +
 +/// Whether the open document is the shared one; the first document open becomes it.
@@ -110,6 +113,63 @@ index 0000000..8d94520
 +    let mut doc: Document = serde_json::from_value(document).map_err(|e| invalid(&e))?;
 +    (doc.media, doc.passthrough) = (files(media)?, files(passthrough)?);
 +    Ok(doc)
++}
++
++/// The body's and the parts' blocks.
++fn stories(doc: &Document) -> impl Iterator<Item = &Blocks> {
++    std::iter::once(&doc.body).chain(doc.parts.values().map(|p| &p.blocks))
++}
++
++fn paragraphs<'a>(blocks: &'a Blocks, f: &mut dyn FnMut(&'a Paragraph)) {
++    for block in blocks {
++        match &**block {
++            Block::Para(p) => f(p),
++            Block::Table(t) => t.rows.iter().flat_map(|r| &r.cells).for_each(|c| paragraphs(&c.blocks, f)),
++        }
++    }
++}
++
++fn paragraphs_mut(blocks: &mut Blocks, f: &mut dyn FnMut(&mut Paragraph)) {
++    for block in blocks {
++        match Arc::make_mut(block) {
++            Block::Para(p) => f(p),
++            Block::Table(t) => t.rows.iter_mut().flat_map(|r| &mut r.cells).for_each(|c| paragraphs_mut(&mut c.blocks, f)),
++        }
++    }
++}
++
++/// Shift+F9's per-field code view stays this person's: fields pair up by their codes in reading order. (`new` was just
++/// read, so its blocks are its own and nothing is copied.)
++fn keep_field_codes(new: &mut Document, old: &Document) {
++    let fields = |doc: &Document| {
++        let mut out = Vec::new();
++        for blocks in stories(doc) {
++            paragraphs(blocks, &mut |p| {
++                out.extend(p.objects.iter().filter_map(|o| match o {
++                    InlineObject::Field { instr, code, .. } => Some((instr.clone(), *code)),
++                    _ => None,
++                }))
++            });
++        }
++        out
++    };
++    let was = fields(old);
++    if !was.iter().any(|(_, code)| *code) {
++        return;
++    }
++    let pairs = text_merge::matches(&fields(new), &was, |a, b| a.0 == b.0);
++    let mut codes = pairs.into_iter().map(|j| j.and_then(|j| was.get(j)).is_some_and(|(_, code)| *code));
++    let mut set = |p: &mut Paragraph| {
++        for o in &mut p.objects {
++            if let InlineObject::Field { code, .. } = o {
++                *code = codes.next().unwrap_or(false);
++            }
++        }
++    };
++    paragraphs_mut(&mut new.body, &mut set);
++    for part in new.parts.values_mut() {
++        paragraphs_mut(&mut part.blocks, &mut set);
++    }
 +}
 +
 +/// Keeps `old`'s blocks (and so their layout) where `new` has them unchanged: for each old block, its new index.
@@ -180,11 +240,9 @@ index 0000000..8d94520
 +        let core = &s.doc.core;
 +        (doc.core.created, doc.core.modified, doc.core.last_modified_by, doc.core.revision) =
 +            (core.created.clone(), core.modified.clone(), core.last_modified_by.clone(), core.revision);
-+        doc.ensure_nonempty();
-+        if doc == s.doc {
-+            return Ok(());
-+        }
-+        // Unchanged blocks and files keep their Arcs (and their layout); the selection moves with the text.
++        keep_field_codes(&mut doc, &s.doc);
++        // Unchanged blocks and files keep their Arcs (and their layout); the selection and an equation being edited
++        // move with the text.
 +        let body = reuse(&mut doc.body, &s.doc.body);
 +        let mut parts = BTreeMap::new();
 +        for (id, part) in doc.parts.iter_mut() {
@@ -199,7 +257,10 @@ index 0000000..8d94520
 +                }
 +            }
 +        }
-+        for pos in [&mut s.sel.anchor, &mut s.sel.focus] {
++        if doc == s.doc {
++            return Ok(());
++        }
++        for pos in [&mut s.sel.anchor, &mut s.sel.focus].into_iter().chain(s.math.as_mut().map(|m| &mut m.at)) {
 +            let story = match pos.story {
 +                StoryRef::Body => Some((&body, &s.doc.body, &doc.body)),
 +                StoryRef::Part(id) => parts.get(&id).zip(s.doc.parts.get(&id)).zip(doc.parts.get(&id)).map(|((p, o), n)| (p, &o.blocks, &n.blocks)),
@@ -233,9 +294,27 @@ index 0000000..8d94520
 +    }
 +
 +    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
-+        let merged = text_merge::merge(base, current, edited)?;
-+        from_shared(merged.clone())?;
-+        Ok(merged)
++        text_merge::merge(base, current, edited)
++    }
++
++    /// What every page can open: a document whose paragraphs' runs cover their text on character boundaries, with one
++    /// object per U+FFFC, and every story and cell holding a paragraph.
++    fn live_check(document: &Value) -> Result<(), Error> {
++        let doc = from_shared(document.clone())?;
++        let mut whole = doc.clone();
++        whole.ensure_nonempty();
++        let mut valid = whole == doc;
++        for blocks in stories(&doc) {
++            paragraphs(blocks, &mut |p| {
++                let mut end = 0usize;
++                valid &= p.runs.iter().all(|r| {
++                    end = end.saturating_add(r.len);
++                    p.text.is_char_boundary(end)
++                }) && end == p.text.len()
++                    && p.text.matches(wordcraft_doc::para::OBJ).count() == p.objects.len();
++            });
++        }
++        if valid { Ok(()) } else { Err("Conflict: the merged document is not valid".into()) }
 +    }
 +}
 +
@@ -259,10 +338,25 @@ index 0000000..8d94520
 +        caret(app, block, off);
 +        app.session.run("text.insert", &json!({"text": text})).unwrap();
 +    }
++    /// Whether each of the body's fields shows its code (Shift+F9).
++    fn codes(doc: &Document) -> Vec<bool> {
++        let mut out = Vec::new();
++        paragraphs(&doc.body, &mut |p| {
++            out.extend(p.objects.iter().filter_map(|o| match o {
++                InlineObject::Field { code, .. } => Some(*code),
++                _ => None,
++            }))
++        });
++        out
++    }
 +
 +    #[test]
 +    fn shares_the_document_without_views_merges_text_in_without_an_undo_step_and_waits_for_a_gesture() {
 +        let mut a = app(&["Hello world", "Second", "Third"]);
++        for at in [(0, 11), (1, 6)] {
++            caret(&mut a, at.0, at.1);
++            a.session.run("insert.field", &json!({"instr": "PAGE"})).unwrap();
++        }
 +        let _ = wordcraft_engine::LIVE_UNDO.set(undo);
 +        playground_live::connect();
 +        let start = canonical(&a.live_document());
@@ -270,6 +364,13 @@ index 0000000..8d94520
 +        caret(&mut a, 2, 3);
 +        a.session.view.zoom = 2.0;
 +        a.session.stamp_save();
++        paragraphs_mut(&mut a.session.doc.body, &mut |p| {
++            p.objects.iter_mut().for_each(|o| {
++                if let InlineObject::Field { code, .. } = o {
++                    *code = true;
++                }
++            })
++        });
 +        assert_eq!(canonical(&a.live_document()), start, "views are not shared");
 +
 +        // B (another page: the adapter's state is per thread) joins from the Start screen and adopts it whole, types in
@@ -293,8 +394,9 @@ index 0000000..8d94520
 +        // A, typing in the same first paragraph further on, merges B's edits at a quiet frame, keeping its own, its
 +        // caret, its undo history and unchanged blocks.
 +        typed(&mut a, 0, 11, "!");
++        let second = a.session.doc.body[1].clone();
 +        caret(&mut a, 2, 3);
-+        let (undo_steps, second) = (a.session.undo_depth(), a.session.doc.body[1].clone());
++        let undo_steps = a.session.undo_depth();
 +        let done = std::rc::Rc::new(Cell::new(false));
 +        let to = done.clone();
 +        playground_live::queue(Some(start.clone()), edited, Box::new(move |r| to.set(r.is_ok())));
@@ -305,7 +407,8 @@ index 0000000..8d94520
 +        playground_live::frame(&mut a);
 +        assert!(done.get());
 +        let text: Vec<&str> = a.session.doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.text.as_str()).collect();
-+        assert_eq!(text[0], "Oh, Hello world!");
++        assert_eq!(text[0], "Oh, Hello world!\u{FFFC}");
++        assert_eq!(codes(&a.session.doc), [true, true], "field-code views stay");
 +        assert_eq!(text.last(), Some(&"Third"));
 +        assert_eq!(a.session.undo_depth(), undo_steps, "no undo step");
 +        assert!(Arc::ptr_eq(&a.session.doc.body[1], &second), "an unchanged paragraph keeps its Arc");
@@ -326,11 +429,20 @@ index 0000000..8d94520
 +    }
 +
 +    #[test]
-+    fn a_merge_that_would_not_open_is_refused() {
-+        let base = json!({"body": [{"kind": "para", "text": "a", "runs": [{"len": 1}]}]});
-+        let bad = json!({"body": [{"kind": "para", "text": "a", "runs": "?"}]});
-+        assert!(WordApp::live_merge(&base, &base, &bad).is_err());
-+        assert!(WordApp::live_merge(&base, &base, &Value::Null).is_err());
++    fn only_documents_every_page_can_open_pass_the_check() {
++        let doc = |text: &str, runs: Value| json!({"body": [{"kind": "para", "text": text, "runs": runs}]});
++        assert!(WordApp::live_check(&project(&Document::new())).is_ok());
++        let bad = [
++            doc("ab", json!([{"len": 1}])),
++            doc("é", json!([{"len": 1}, {"len": 1}])),
++            doc("\u{FFFC}", json!([{"len": 3}])),
++            doc("a", json!("?")),
++            json!({"body": []}),
++            Value::Null,
++        ];
++        for bad in bad {
++            assert!(WordApp::live_check(&bad).is_err(), "{bad}");
++        }
 +    }
 +}
 diff --git a/apps/wordcraft-web/src/main.rs b/apps/wordcraft-web/src/main.rs
@@ -355,10 +467,10 @@ index 2f4283d..9f074ff 100644
      web::start();
 diff --git a/apps/wordcraft-web/src/text_merge.rs b/apps/wordcraft-web/src/text_merge.rs
 new file mode 100644
-index 0000000..a58eafa
+index 0000000..8292802
 --- /dev/null
 +++ b/apps/wordcraft-web/src/text_merge.rs
-@@ -0,0 +1,402 @@
+@@ -0,0 +1,440 @@
 +//! Playground live editing: the three-way merge of WordCraft's shared document (JSON). Stories (the body, parts, note
 +//! separators, table cells) are lists of blocks without ids and a paragraph is one string with byte-length runs and
 +//! positional inline objects, so they merge as text does (diff3, as git merges lines): blocks that neither side
@@ -450,34 +562,60 @@ index 0000000..a58eafa
 +        |x, y| x == y,
 +        |b, _, _| Ok(b.clone()),
 +        |b, c, e| {
-+            // Both sides changed these blocks: merge them character by character.
++            // Both sides changed these blocks: merge them character by character. Paragraph ends and tables pair up
++            // by position when all three stretches have as many of them, else only when equal: a table typed into
++            // must not pair with one the other side added.
++            let paras = |x: &[Value]| x.iter().filter(|b| b.get("kind").and_then(Value::as_str) == Some("para")).count();
++            let (ends, tables) = ([b, c, e].map(paras), [b, c, e].map(|x| x.len() - paras(x)));
++            let by_position = (ends[0] == ends[1] && ends[1] == ends[2], tables[0] == tables[1] && tables[1] == tables[2]);
++            let same = move |x: &Atom, y: &Atom| match (x, y) {
++                (Atom::Char(a, ..), Atom::Char(b, ..)) => a == b,
++                (Atom::End(i, a), Atom::End(j, b)) => {
++                    if by_position.0 {
++                        i == j
++                    } else {
++                        a == b
++                    }
++                }
++                (Atom::Table(i, a), Atom::Table(j, b)) => {
++                    if by_position.1 {
++                        i == j
++                    } else {
++                        a == b
++                    }
++                }
++                _ => false,
++            };
 +            let (b, c, e) = (atoms(b)?, atoms(c)?, atoms(e)?);
-+            let merged = diff3(&b, &c, &e, Atom::same, Atom::merge, |_, _, _| Err(conflict("text")))?;
++            let merged = diff3(&b, &c, &e, same, Atom::merge, |_, _, _| Err(conflict("text")))?;
 +            paragraphs(merged)
 +        },
 +    )
 +}
 +
 +/// A story's content in reading order: characters, paragraph ends and tables.
-+#[derive(Clone, Debug, PartialEq)]
++#[derive(Clone, Debug)]
 +enum Atom<'a> {
 +    /// A character with its run's `props` (`{}` for none) and, for U+FFFC, its inline object.
 +    Char(char, Cow<'a, Value>, Option<Cow<'a, Value>>),
-+    /// A paragraph's end: the paragraph without its text, runs and objects.
-+    End(Cow<'a, Value>),
-+    Table(Cow<'a, Value>),
++    /// A paragraph's end (the how-manyth in its stretch): the paragraph without its text, runs and objects.
++    End(usize, Cow<'a, Value>),
++    /// A table (the how-manyth in its stretch).
++    Table(usize, Cow<'a, Value>),
 +}
 +
-+impl<'a> Atom<'a> {
-+    /// The same character, paragraph end or table, whatever its formatting or contents.
-+    fn same(x: &Self, y: &Self) -> bool {
-+        match (x, y) {
-+            (Atom::Char(a, ..), Atom::Char(b, ..)) => a == b,
-+            (Atom::End(_), Atom::End(_)) | (Atom::Table(_), Atom::Table(_)) => true,
++/// The same content; where it stands in its stretch does not count.
++impl PartialEq for Atom<'_> {
++    fn eq(&self, other: &Self) -> bool {
++        match (self, other) {
++            (Atom::Char(a, ap, ao), Atom::Char(b, bp, bo)) => a == b && ap == bp && ao == bo,
++            (Atom::End(_, a), Atom::End(_, b)) | (Atom::Table(_, a), Atom::Table(_, b)) => a == b,
 +            _ => false,
 +        }
 +    }
++}
 +
++impl<'a> Atom<'a> {
 +    /// One that neither side removed: formatting, objects and paragraph or table properties merge.
 +    fn merge(b: &Self, c: &Self, e: &Self) -> Result<Self, Error> {
 +        fn three<'a>(b: &Cow<'a, Value>, c: &Cow<'a, Value>, e: &Cow<'a, Value>, key: &str) -> Result<Cow<'a, Value>, Error> {
@@ -497,18 +635,19 @@ index 0000000..a58eafa
 +                };
 +                Atom::Char(*ch, three(bp, cp, ep, "props")?, object)
 +            }
-+            (Atom::End(b), Atom::End(c), Atom::End(e)) => Atom::End(three(b, c, e, "paragraph")?),
-+            (Atom::Table(b), Atom::Table(c), Atom::Table(e)) => Atom::Table(three(b, c, e, "table")?),
++            (Atom::End(i, b), Atom::End(_, c), Atom::End(_, e)) => Atom::End(*i, three(b, c, e, "paragraph")?),
++            (Atom::Table(i, b), Atom::Table(_, c), Atom::Table(_, e)) => Atom::Table(*i, three(b, c, e, "table")?),
 +            _ => return Err(conflict("text")),
 +        })
 +    }
 +}
 +
 +fn atoms(blocks: &[Value]) -> Result<Vec<Atom<'_>>, Error> {
-+    let mut out = Vec::new();
++    let (mut out, mut ends, mut tables) = (Vec::new(), 0, 0);
 +    for block in blocks {
 +        if block.get("kind").and_then(Value::as_str) != Some("para") {
-+            out.push(Atom::Table(Cow::Borrowed(block)));
++            out.push(Atom::Table(tables, Cow::Borrowed(block)));
++            tables += 1;
 +            continue;
 +        }
 +        let text = block.get("text").and_then(Value::as_str).unwrap_or_default();
@@ -526,7 +665,8 @@ index 0000000..a58eafa
 +            out.push(Atom::Char(ch, props, object));
 +        }
 +        let rest = block.as_object().into_iter().flatten().filter(|(k, _)| !matches!(k.as_str(), "text" | "runs" | "objects"));
-+        out.push(Atom::End(Cow::Owned(Value::Object(rest.map(|(k, v)| (k.clone(), v.clone())).collect()))));
++        out.push(Atom::End(ends, Cow::Owned(Value::Object(rest.map(|(k, v)| (k.clone(), v.clone())).collect()))));
++        ends += 1;
 +    }
 +    Ok(out)
 +}
@@ -545,7 +685,7 @@ index 0000000..a58eafa
 +                text.push(ch);
 +                objects.extend(object.map(Cow::into_owned));
 +            }
-+            Atom::End(rest) => {
++            Atom::End(_, rest) => {
 +                let mut p = match rest.into_owned() {
 +                    Value::Object(p) => p,
 +                    _ => Map::new(),
@@ -565,8 +705,8 @@ index 0000000..a58eafa
 +                out.push(Value::Object(p));
 +            }
 +            // Text left without its paragraph end (one side joined paragraphs where the other put a table).
-+            Atom::Table(_) if !text.is_empty() => return Err(conflict("text")),
-+            Atom::Table(table) => out.push(table.into_owned()),
++            Atom::Table(..) if !text.is_empty() => return Err(conflict("text")),
++            Atom::Table(_, table) => out.push(table.into_owned()),
 +        }
 +    }
 +    if !text.is_empty() {
@@ -747,6 +887,16 @@ index 0000000..a58eafa
 +        assert_eq!(merge(&base, &c, &e).unwrap(), doc(vec![table(&[["a1", "b"], ["c", "d2"]]), plain("after")]));
 +        let sorted = doc(vec![table(&[["c", "d"], ["a", "b"]]), plain("after")]);
 +        assert!(merge(&base, &sorted, &e).is_err());
++        // Typing into a table while the other side adds one above it never lands in the new table.
++        let base = doc(vec![plain("Intro"), table(&[["", ""]]), plain("")]);
++        let added = doc(vec![plain("Intro"), table(&[["", "x"]]), plain(""), table(&[["", ""]]), plain("")]);
++        let typed = doc(vec![plain("Intro"), table(&[["Alice", ""]]), plain("")]);
++        let want = doc(vec![plain("Intro"), table(&[["", "x"]]), plain(""), table(&[["Alice", ""]]), plain("")]);
++        for (c, e) in [(&added, &typed), (&typed, &added)] {
++            if let Ok(merged) = merge(&base, c, e) {
++                assert_eq!(merged, want);
++            }
++        }
 +    }
 +
 +    #[test]
@@ -803,7 +953,7 @@ index 0e40099..683b454 100644
  }
  
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 0158a60..0ac8fca 100644
+index 0158a60..8b6067c 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
 @@ -31,6 +31,10 @@ pub use session::{
@@ -811,26 +961,46 @@ index 0158a60..0ac8fca 100644
  };
  pub use wordcraft_doc as doc;
 +
-+/// Set by the web app for live editing: takes Undo (false) or Redo (true) of document `id` from the native history
-+/// when it returns true.
-+pub static LIVE_UNDO: std::sync::OnceLock<fn(u64, bool) -> bool> = std::sync::OnceLock::new();
++/// Set by the web app for live editing: the Undo (false) and Redo (true) that take document `id`'s place of its native
++/// history while a live session holds it.
++pub static LIVE_UNDO: std::sync::OnceLock<fn(u64) -> Option<fn(bool)>> = std::sync::OnceLock::new();
  pub use wordcraft_geom::Region;
  pub use wordcraft_layout as layout;
  pub use wordcraft_proof as proof;
 diff --git a/crates/engine/src/session.rs b/crates/engine/src/session.rs
-index 4f16aea..ed7c1b6 100644
+index 4f16aea..896470a 100644
 --- a/crates/engine/src/session.rs
 +++ b/crates/engine/src/session.rs
-@@ -1165,6 +1165,12 @@ impl Session {
+@@ -1165,6 +1165,14 @@ impl Session {
      /// control channel). Mutating commands are undoable; a failed command leaves the document as
      /// it was; a panic inside a command becomes an error.
      pub fn run(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
-+        if let Some(undo) = crate::LIVE_UNDO.get()
-+            && matches!(id, "edit.undo" | "edit.undoTo" | "edit.redo")
-+            && (0..params.get("count").and_then(Value::as_u64).unwrap_or(1).max(1)).all(|_| undo(self.document_id, id == "edit.redo"))
++        if matches!(id, "edit.undo" | "edit.undoTo" | "edit.redo")
++            && let Some(undo) = crate::LIVE_UNDO.get().and_then(|live| live(self.document_id))
 +        {
++            for _ in 0..params.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 64) {
++                undo(id == "edit.redo");
++            }
 +            return Ok(Value::Null);
 +        }
          let join = std::mem::take(&mut self.join_next);
          let reg = self.registry.clone();
          let Some(spec) = reg.get(id) else { return Err(CmdError::Unknown(id.to_string())) };
+diff --git a/crates/ui-egui/src/chrome.rs b/crates/ui-egui/src/chrome.rs
+index c057992..8502ffe 100644
+--- a/crates/ui-egui/src/chrome.rs
++++ b/crates/ui-egui/src/chrome.rs
+@@ -29,9 +29,11 @@ const QAT_MENU: [&str; 10] =
+ 
+ /// Match the toolbar's enabled state for keyboard activation too.
+ pub(crate) fn qat_enabled(app: &WordApp, id: &str) -> bool {
++    // While live editing, the session holds the shared document's Undo and Redo.
++    let live = || wordcraft_engine::LIVE_UNDO.get().is_some_and(|live| live(app.session.document_id()).is_some());
+     match id {
+-        "edit.undo" => app.session.can_undo(),
+-        "edit.redo" => app.session.can_redo(),
++        "edit.undo" => app.session.can_undo() || live(),
++        "edit.redo" => app.session.can_redo() || live(),
+         "file.save" => app.has_document(),
+         _ => crate::widgets::enabled(app, id),
+     }
