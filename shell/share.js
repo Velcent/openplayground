@@ -1,4 +1,5 @@
 import { PeerSession } from './session.js'
+import { follow, liveAdapter, unfollow } from './live.js'
 import { SessionStore } from './session-store.js'
 import { readInvite } from './session-protocol.js'
 import * as store from './store.js'
@@ -8,6 +9,7 @@ import { h, icon, modal, toast, download, confirmIn } from './ui.js'
 const button = (label, run, primary = false) => h('button', { type:'button', class:`pg-btn${primary ? ' pg-primary' : ''}`, onclick:run }, label)
 const color = id => `hsl(${parseInt(id.slice(0, 6), 16) % 360} 65% 60%)`
 const total = files => [...new Map(files.map(f => [f.asset, f])).values()].reduce((n,f)=>n+f.size,0)
+const LIVE = { live:'Live editing', 'read-only':'Viewing live edits', paused:'Paused: the owner is offline. Your edits stay here until they return.', 'catching up':'Catching up on edits' }
 
 export async function mountShare(bar, app, here) {
   if (app.slug === 'outlook') return
@@ -30,7 +32,11 @@ export async function mountShare(bar, app, here) {
     progress.hidden = !states.length || states.every(p=>p.status==='ready')
     progress.value = states.length ? Math.min(...states.map(p=>p.total ? p.received/p.total : p.status==='ready'?1:0)) : 0
   }
-  const use = next => { session?.removeEventListener('change',update); session=next; session.addEventListener('change',update); update() }
+  const use = next => {
+    session?.removeEventListener('change',update); session=next; session.addEventListener('change',update); update()
+    follow(next).then(live => live?.addEventListener('change', () => next.changed())).catch(e => { next.error = e.message; next.changed() })
+  }
+  const end = () => { unfollow(session); session.leave() }
   const clearLink = () => {
     const url = new URL(location.href), hash = new URLSearchParams(url.hash.slice(1)); hash.delete('pg-session'); url.hash=hash.toString(); history.replaceState(history.state,'',url)
   }
@@ -58,8 +64,8 @@ export async function mountShare(bar, app, here) {
         }))
         const body = h('div', {class:'pg-share-body'})
         const view = h('div', {class:'pg-choice pg-sharing'},
-          h('div', {class:'pg-share-heading'}, h('h2', {class:'pg-title'}, 'File sharing'), button('Close',()=>done())),
-          h('p', {class:'pg-hint'}, `${app.name} · Files are copied between participants. Live edits are not shared in this build.`),
+          h('div', {class:'pg-share-heading'}, h('h2', {class:'pg-title'}, liveAdapter() ? 'Live session' : 'File sharing'), button('Close',()=>done())),
+          h('p', {class:'pg-hint'}, liveAdapter() ? `${app.name} · Edits to this project are shared live. Added samples are not shared yet; Undo reverts only your own edits.` : `${app.name} · Files are copied between participants. Live edits are not shared in this build.`),
           h('label',{},'Your name',name), body, error)
         function live() {
           body.replaceChildren()
@@ -67,15 +73,15 @@ export async function mountShare(bar, app, here) {
           const rows=new Map(), fileRows=new Map()
           const receive=button('Receive files',()=>attempt(()=>session.receive()),true)
           const reconnect=button('Reconnect',()=>attempt(async()=>{ session.leave(); await session.connect() }))
-          const leave=button('Leave session',()=>{ session.leave(); invite=null; clearLink(); done() })
+          const leave=button('Leave session',()=>{ end(); invite=null; clearLink(); done() })
           const forget=button('Remove local copy',()=>attempt(async()=>{
             if (!await confirmIn(view,'Remove this session’s files from this browser? Other participants keep their copies.','Remove',{danger:true})) return
-            session.leave(); await session.store.remove(); session=null; invite=null; clearLink(); update(); done()
+            end(); await session.store.remove(); session=null; invite=null; clearLink(); update(); done()
           }))
           const warning=h('p',{class:'pg-hint'})
           let link, lock
           if (session.config.owner) {
-            const role=h('select',{class:'pg-input','aria-label':'Invitation access'},h('option',{value:'editor'},'Can share files'),h('option',{value:'viewer'},'Can receive files'))
+            const role=h('select',{class:'pg-input','aria-label':'Invitation access'},h('option',{value:'editor'},liveAdapter()?'Can edit':'Can share files'),h('option',{value:'viewer'},liveAdapter()?'Can view':'Can receive files'))
             link=h('input',{class:'pg-input',readonly:true,'aria-label':'Invitation link'})
             const refreshLink=()=>{link.value=session.invite(role.value)}; role.onchange=refreshLink; refreshLink()
             lock=button('Lock invitations',()=>attempt(async()=>{await session.admin({lock:!session.locked})}))
@@ -86,8 +92,8 @@ export async function mountShare(bar, app, here) {
           add.onchange=()=>attempt(async()=>{await session.share([...add.files]);add.value=''})
           body.append(status,warning,members,files,receive,addLabel,h('div',{class:'pg-actions'},forget,reconnect,leave))
           renderSession = () => {
-            status.textContent=`${session.files.length} ${session.files.length===1?'file':'files'} · ${formatSize(total(session.files))}`
-            warning.textContent=session.error || session.relayWarning || (session.peers.size ? '' : 'Waiting for another participant. A person with a local copy must be online to send files.')
+            status.textContent=`${session.live ? `${LIVE[session.live.status]} · ` : ''}${session.files.length} ${session.files.length===1?'file':'files'} · ${formatSize(total(session.files))}`
+            warning.textContent=session.live?.error || session.error || session.relayWarning || (session.peers.size ? '' : 'Waiting for another participant. A person with a local copy must be online to send files.')
             addLabel.hidden=session.role==='viewer' || session.stopped
             receive.hidden=session.accepted; receive.disabled=!session.files.length
             reconnect.hidden=!['failed','reconnecting','left','displaced'].includes(session.status)
@@ -146,7 +152,7 @@ export async function mountShare(bar, app, here) {
           body.append(h('p',{},'Choose the saved project and its assets. Your other files stay private.'),selection,computer,button('Create session',()=>attempt(async()=>{
             const files=[...computer.files]
             for(const {entry,checkbox} of picks)if(checkbox.checked)files.push(await store.file(entry.path))
-            if(!files.length)throw new Error('Choose at least one file')
+            if(!files.length && !liveAdapter())throw new Error('Choose at least one file')
             use(await PeerSession.create({app:here.path,name:name.value,files}));live()
           }),true))
           for(const room of await SessionStore.list(here.path)) {

@@ -12,6 +12,22 @@ import { applyDelta, delta } from './document-delta.js'
 const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i])
 const RETAINED = 100
 
+// The app's adapter: set before the shell loads (globalThis.playgroundLiveAdapter) or offered through attach.
+let adapter = globalThis.playgroundLiveAdapter ?? null
+const waiting = new Set(), followed = new WeakMap()
+globalThis.playgroundLive = { attach(next) { adapter = next; for (const resolve of waiting) resolve(next); waiting.clear() } }
+export const liveAdapter = () => adapter
+// Live editing for a session once this page's app offers an adapter; apps without one only share files.
+export function follow(session) {
+  if (!followed.has(session)) followed.set(session, (adapter ? Promise.resolve(adapter) : new Promise((resolve) => waiting.add(resolve)))
+    .then(async (found) => session.unfollowed ? null : (session.live = await LiveDocument.start({ session, adapter: found }))))
+  return followed.get(session)
+}
+export function unfollow(session) {
+  session.unfollowed = true
+  session.live?.stop()
+}
+
 export class LiveDocument extends EventTarget {
   static async start({ session, adapter, store = session.store }) {
     const live = new LiveDocument(session, adapter, store)
