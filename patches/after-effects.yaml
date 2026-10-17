@@ -11,7 +11,7 @@
 # project's binding, Undo/Redo/History hand-off), crates/ui-egui/src/playground.rs (the shared document, merge
 # checks, media, presence, the kept runner and the web wrapper that ends each frame) and
 # crates/ui-egui/src/panels/viewer_playground.rs (the viewer's Pen path and rubber band, for presence). These rules only
-# declare them and call in, at signatures, long-standing mod lines and file ends. Verify: node scripts/build.mjs check after-effects
+# declare them and call in, at signatures, long-standing mod lines, file ends and the Timeline's CTI. Verify: node scripts/build.mjs check after-effects
 # head|release (and LIVE=0), then the e2e (tests/live-apps/after-effects.mjs).
 #
 # A session (`?pg-session=<room>`) opens in a browser store of its own, so this person's last session, auto-saves,
@@ -68,9 +68,21 @@
   file: crates/ui-egui/src/panels/viewer.rs
   find: '(?![\s\S])'
   after: "\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))] #[path = \"viewer_playground.rs\"] pub(crate) mod playground;\n"
-# The Timeline's first step records that it is on screen (its layer): the end-of-frame hook draws the others' dragged
-# keyframes and scrubbed current times over it, where its rows and ruler are (their automation ids).
+# The Timeline, right before it draws this person's CTI: the others' dragged keyframes and scrubbed current times (a
+# line with a name flag on the ruler), where its rows and ruler are this frame (their automation ids), so this
+# person's CTI stays on top. If the CTI's `let cx = tm.x(time.seconds());` changes, call it anywhere in
+# timeline::show after the rows are drawn and before the CTI.
 - live: true
   file: crates/ui-egui/src/panels/timeline.rs
-  find: 'pub\s+fn\s+show\s*\([^{]*\{'
-  after: "\n    #[cfg(any(target_arch = \"wasm32\", debug_assertions))] crate::playground::timeline(ui);"
+  find: '^\s*let\s+cx\s*=\s*tm\.x\(time\.seconds\(\)\)\s*;'
+  before: "    #[cfg(any(target_arch = \"wasm32\", debug_assertions))] crate::playground::timeline(app, ui);\n"
+# Every press's hit test in the viewer (layers_at: Selection, Rotate, Pan Behind, drops, Puppet, Object Matte) takes
+# the frontend's selectable_layers, which leaves out a layer someone else's Pen is still drawing a path in (the
+# document has it from their first click, on top; a one-vertex path's box is a point, which point_in_quad finds every
+# press inside, and later the box spans the path so far). A `use` in the function shadows the viewer's own
+# selectable_layers there. If layers_at stops calling selectable_layers, put the `use` in whatever
+# function now lists the layers a press can hit.
+- live: true
+  file: crates/ui-egui/src/panels/viewer.rs
+  find: '(?:pub(?:\([^)]*\))?\s+)?fn\s+layers_at\b[^{]*\{'
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", debug_assertions))] use crate::playground::selectable_layers;"

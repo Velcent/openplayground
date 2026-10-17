@@ -93,10 +93,10 @@ index 0000000..9927650
 +}
 diff --git a/crates/ui-egui/src/playground.rs b/crates/ui-egui/src/playground.rs
 new file mode 100644
-index 0000000..2edcc98
+index 0000000..0b8ccd4
 --- /dev/null
 +++ b/crates/ui-egui/src/playground.rs
-@@ -0,0 +1,1022 @@
+@@ -0,0 +1,1094 @@
 +//! Live editing in a Playground session (web only). The shared document is the project open when the session started
 +//! (`Project`), minus what is this person's: the id counter, each comp's Resolution, Draft 3D and Hide Shy Layers
 +//! switches (viewer and Timeline toggles), which footage is missing in this browser, and the Render Queue (its jobs,
@@ -107,7 +107,8 @@ index 0000000..2edcc98
 +//! (by path, in the page's file table) reach everyone through the session ([`media`]). Opening another project leaves
 +//! the session's document as it was, still merging remote changes. Presence: each person shares the comp they show,
 +//! their pointer over its viewer in comp pixels and their selected layers, and what a gesture under way has done so
-+//! far (the document gets it only when the gesture ends): the others' are drawn over the viewer and the Timeline.
++//! far (the document gets it only when the gesture ends): the others' are drawn over the viewer and the Timeline. A
++//! layer someone else's Pen is drawing a path in takes no presses here until they finish it ([`selectable_layers`]).
 +
 +use std::cell::{Cell, RefCell};
 +use std::collections::{BTreeMap, BTreeSet};
@@ -120,7 +121,8 @@ index 0000000..2edcc98
 +use effectcraft_engine::playground::playground_live::{self, Live, Presence};
 +use effectcraft_engine::render::EvalCtx;
 +use effectcraft_engine::time::Tick;
-+use effectcraft_project::{Footage, ItemId, ItemKind, Layer, LayerId, LayerSource, Project};
++use effectcraft_project::{Comp, Footage, ItemId, ItemKind, Layer, LayerId, LayerSource, Project};
++use egui::emath::GuiRounding as _;
 +use egui::{Color32, Pos2, Rect, Shape, Stroke, pos2, vec2};
 +use serde_json::{Value, json};
 +
@@ -145,8 +147,6 @@ index 0000000..2edcc98
 +    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
 +    /// The last frame had a pointer button down or a text field focused.
 +    static INPUT: Cell<bool> = const { Cell::new(false) };
-+    /// The Timeline as shown last ([`timeline`]): the pass and its layer.
-+    static TIMELINE: Cell<Option<(u64, egui::LayerId)>> = const { Cell::new(None) };
 +    /// The last frame had a pointer button down: a gesture may be under way.
 +    static DOWN: Cell<bool> = const { Cell::new(false) };
 +    /// The project and the current time as of the last frame without a button down: what the others have.
@@ -231,7 +231,7 @@ index 0000000..2edcc98
 +}
 +
 +/// The end of a frame: [`playground_live::frame`], with what egui knows of the pointer and the keyboard; then this
-+/// person's gestures for their presence and the others' over the comp viewer and the Timeline.
++/// person's gestures for their presence and the others' over the comp viewer (the Timeline draws theirs: [`timeline`]).
 +pub fn frame(app: &mut EffectcraftApp, ctx: &egui::Context) {
 +    let down = ctx.input(|i| i.pointer.any_down());
 +    INPUT.set(down || ctx.text_edit_focused());
@@ -259,20 +259,18 @@ index 0000000..2edcc98
 +        }
 +        None => Drawing { zoom: 1.0, pen: None, band: None },
 +    });
-+    // How far the others' marks go this frame toward their latest presence.
-+    let k = 1.0 - (-f64::from(ctx.input(|i| i.stable_dt).clamp(0.0, 0.1)) / EASE).exp();
-+    let mut moving = false;
-+    OTHERS.with_borrow(|others| {
-+        if let Some(((_, layer, clip), map)) = shown {
-+            moving |= draw_viewer(app, &ctx.layer_painter(layer).with_clip_rect(map.area.intersect(clip)), &map, others, k);
-+        }
-+        if let Some((_, layer)) = TIMELINE.get().filter(|(p, _)| *p == pass) {
-+            moving |= draw_timeline(app, &ctx.layer_painter(layer), others, k);
-+        }
++    let moving = OTHERS.with_borrow(|others| match shown {
++        Some(((_, layer, clip), map)) => draw_viewer(app, &ctx.layer_painter(layer).with_clip_rect(map.area.intersect(clip)), &map, others, pace(ctx)),
++        None => false,
 +    });
 +    if moving {
 +        ctx.request_repaint();
 +    }
++}
++
++/// How far the others' marks go this frame toward their latest presence.
++fn pace(ctx: &egui::Context) -> f64 {
++    1.0 - (-f64::from(ctx.input(|i| i.stable_dt).clamp(0.0, 0.1)) / EASE).exp()
 +}
 +
 +/// The comp viewer's first step (`panels::viewer::show`): it is on screen this frame, on this layer.
@@ -280,9 +278,22 @@ index 0000000..2edcc98
 +    VIEWER.set(Some((ui.ctx().cumulative_pass_nr(), ui.layer_id(), ui.clip_rect())));
 +}
 +
-+/// The Timeline's first step (`panels::timeline::show`): it is on screen this frame, on this layer.
-+pub fn timeline(ui: &egui::Ui) {
-+    TIMELINE.set(Some((ui.ctx().cumulative_pass_nr(), ui.layer_id())));
++/// The Timeline, right before it draws this person's CTI (`panels::timeline::show`): the others' marks on it
++/// ([`draw_timeline`]), so this person's CTI stays on top.
++pub fn timeline(app: &EffectcraftApp, ui: &egui::Ui) {
++    if OTHERS.with_borrow(|others| draw_timeline(app, ui.painter(), others, pace(ui.ctx()))) {
++        ui.ctx().request_repaint();
++    }
++}
++
++/// The layers eligible for viewer hit tests (`panels::viewer::selectable_layers`) but those someone else's Pen is
++/// drawing a path in. The document has such a layer from the first click, on top; with one vertex its box is a point,
++/// and the hit test (`point_in_quad`) finds every press inside a box collapsed to a point, then the box spans the path
++/// so far: either way it would take presses meant for the layers under it. `panels::viewer::layers_at` (every press's
++/// hit test) calls this one while it is compiled.
++pub(crate) fn selectable_layers(comp: &Comp, time: Tick) -> impl Iterator<Item = &Layer> {
++    let drawn: Vec<u64> = OTHERS.with_borrow(|others| others.iter().filter_map(|p| p.state["pen"].as_u64()).collect());
++    crate::panels::viewer::selectable_layers(comp, time).filter(move |l| !drawn.contains(&l.id.0))
 +}
 +
 +/// What the comp viewer was drawing in a frame: its magnification (points per comp pixel), the Pen's path in progress
@@ -435,7 +446,8 @@ index 0000000..2edcc98
 +
 +/// The others who show this comp, over the Timeline's time graph, eased toward their latest presence: the keyframes
 +/// they drag where the drag has them so far (on the property's row, or the layer's while its properties are folded)
-+/// and the current time they scrub, a line, in their colors. Whether a mark is still on its way.
++/// and the current time they scrub, a line with a flag of their name on the ruler ([`cti`]), in their colors. Whether a
++/// mark is still on its way.
 +fn draw_timeline(app: &EffectcraftApp, painter: &egui::Painter, others: &[Presence], k: f64) -> bool {
 +    let Some((cid, comp)) = app.session.active_comp_id().and_then(|c| Some((c, app.session.project.comp(c)?))) else { return false };
 +    // Where the Timeline put its ruler, rows and keys this frame (its automation ids) and its time mapping.
@@ -477,7 +489,7 @@ index 0000000..2edcc98
 +            }
 +        }
 +        if let Some(&[t]) = mark(&marks, "time") {
-+            lines.push(Shape::line_segment([pos2(x(t), ruler.min.y + 12.0), pos2(x(t), rows.max.y)], Stroke::new(1.5, color)));
++            cti(&painter, &mut lines, painter.round_to_pixel_center(x(t)), [ruler.min.y + 1.0, rows.max.y], ruler.max.x, color, &p.name);
 +        }
 +    }
 +    painter.extend(keys);
@@ -497,12 +509,37 @@ index 0000000..2edcc98
 +    if name.is_empty() {
 +        return;
 +    }
++    let text = tag_text(painter, name, color);
++    let tag = Rect::from_min_size(tip + vec2(12.0, 15.0), text.size() + 2.0 * PAD);
++    shapes.push(Shape::rect_filled(tag, 6.0, color));
++    shapes.push(Shape::galley(tag.min + PAD, text, color));
++}
++
++/// The space around a name tag's text.
++const PAD: egui::Vec2 = vec2(7.0, 3.0);
++
++/// A name tag's text: the name cut to 24 characters, 12 px semibold, white or (on a light `color`) near-black.
++fn tag_text(painter: &egui::Painter, name: &str, color: Color32) -> Arc<egui::Galley> {
 +    let name: String = if name.chars().count() > 24 { name.chars().take(23).chain(['…']).collect() } else { name.into() };
 +    let ink = if luminance(color) > 0.55 { Color32::from_rgb(0x11, 0x11, 0x11) } else { Color32::WHITE };
-+    let text = painter.layout_no_wrap(name, Tokens::semibold(12.0), ink);
-+    let tag = Rect::from_min_size(tip + vec2(12.0, 15.0), text.size() + vec2(14.0, 6.0));
-+    shapes.push(Shape::rect_filled(tag, 6.0, color));
-+    shapes.push(Shape::galley(tag.min + vec2(7.0, 3.0), text, ink));
++    painter.layout_no_wrap(name, Tokens::semibold(12.0), ink)
++}
++
++/// Another person's current time at `x` (a pixel centre), from `top` to `bottom`: a line 1.5 px wide in 85% of their
++/// color, and at its top a flag with their name in the tag's look, hanging right of the line (flush with its left edge)
++/// or, where it would pass `right`, left of it; square where it meets the line.
++fn cti(painter: &egui::Painter, shapes: &mut Vec<Shape>, x: f32, [top, bottom]: [f32; 2], right: f32, color: Color32, name: &str) {
++    shapes.push(Shape::line_segment([pos2(x, top), pos2(x, bottom)], Stroke::new(1.5, color.gamma_multiply(0.85))));
++    if name.is_empty() {
++        return;
++    }
++    let text = tag_text(painter, name, color);
++    let size = text.size() + 2.0 * PAD;
++    let left = x + size.x > right;
++    let flag = Rect::from_min_size(pos2(if left { x + 0.75 - size.x } else { x - 0.75 }, top), size).round_to_pixels(painter.pixels_per_point());
++    let corners = if left { egui::CornerRadius { ne: 0, ..egui::CornerRadius::same(6) } } else { egui::CornerRadius { nw: 0, ..egui::CornerRadius::same(6) } };
++    shapes.push(Shape::rect_filled(flag, corners, color));
++    shapes.push(Shape::galley(flag.min + PAD, text, color));
 +}
 +
 +/// A color's relative luminance (sRGB, 0 black to 1 white).
@@ -546,8 +583,9 @@ index 0000000..2edcc98
 +/// What this person is doing that the document gets only when the gesture ends, measured against the project and time
 +/// the others have ([`REST`]), in comp `cid`: the outlines of selected layers a drag has moved, scaled or turned so far
 +/// (`ghosts`: [layer id, x, y, …] in comp pixels), the Pen's path and the selected layers' paths being edited
-+/// (`strokes`: [x, y, …]), a shape tool drag's rubber band (`band`: [kind, centre x, y, width, height]), the keyframes
-+/// a drag has moved (`keys`: [layer id, property uid, comp seconds]) and the current time being scrubbed (`time`).
++/// (`strokes`: [x, y, …]) and the Pen's layer (`pen`: its id), a shape tool drag's rubber band (`band`: [kind, centre x,
++/// y, width, height]), the keyframes a drag has moved (`keys`: [layer id, property uid, comp seconds]) and the current
++/// time being scrubbed (`time`).
 +fn gestures(app: &EffectcraftApp, cid: ItemId, state: &mut Value) {
 +    let s = &app.session;
 +    let Some(comp) = s.project.comp(cid) else { return };
@@ -556,6 +594,9 @@ index 0000000..2edcc98
 +    let line = |p: PathInfo| polyline(&flatten(&p.sp, &p.m, &ViewerMap { origin: Pos2::ZERO, zoom: 1.0, comp: [0.0; 2], area: Rect::NOTHING }), drawing.zoom);
 +    let pen = drawing.pen.filter(|(l, _)| comp.layer(*l).is_some());
 +    let mut strokes: Vec<Vec<f64>> = pen.and_then(|(l, uid)| path_of(&now, l, uid)).map(line).into_iter().collect();
++    if let Some((l, _)) = pen {
++        state["pen"] = json!(l.0);
++    }
 +    if let Some((kind, b)) = drawing.band {
 +        state["band"] = json!([kind, tenth(b[0]), tenth(b[1]), tenth(b[2]), tenth(b[3])]);
 +    }
@@ -1091,6 +1132,37 @@ index 0000000..2edcc98
 +        assert!(a.session.project.items.values().all(|i| !matches!(&i.kind, ItemKind::Footage(f) if f.missing)), "no longer Missing");
 +        assert_eq!((canonical(&a.live_document()), a.session.history.undo.len(), a.session.is_dirty()), (doc, steps, false));
 +        assert!(a.session.drain_events().contains(&effectcraft_engine::Event::PurgeCaches));
++    }
++
++    #[test]
++    fn a_layer_someone_else_draws_a_path_in_with_the_pen_takes_no_presses() {
++        let (mut a, mut b) = (demo(), demo());
++        let c = comp(&a);
++        let hit = |a: &EffectcraftApp, at: [f64; 2]| {
++            let s = &a.session;
++            let cc = s.project.comp(c).unwrap();
++            let ectx = EvalCtx { project: &s.project, comp_id: c, comp: cc, time: s.time(), expr: s.expr.as_deref(), footage: None };
++            crate::panels::viewer::layer_at(&ectx, at).map(|l| l.id.0)
++        };
++        let (title, at) = (a.session.active_comp().unwrap().layers[1].id.0, [700.0, 500.0]);
++        assert_eq!(hit(&a, at), Some(title));
++        // B's first Pen click, in a corner: a new shape layer on top, its path one vertex, its box a point (the
++        // document gets it at once). The viewer's hit test finds every point inside a box collapsed to a point.
++        b.session.state.selected_layers.clear();
++        let v = b.session.execute("shape.newPath", json!({"vertices": [[100, 100]], "space": "comp"})).unwrap();
++        let (pen, path) = (v["layer"].as_u64().unwrap(), v["path"].as_u64().unwrap());
++        DRAWING.set(Drawing { zoom: 1.0, pen: Some((LayerId(pen), path)), band: None });
++        let bob = b.live_presence();
++        DRAWING.set(Drawing { zoom: 1.0, pen: None, band: None });
++        assert_eq!(bob["pen"], json!(pen), "the Pen's layer is in its person's presence");
++        a.live_adopt(b.live_document()).unwrap();
++        assert_eq!(hit(&a, at), Some(pen), "on top, it takes a press anywhere");
++        let person = |state| vec![Presence { id: "b".into(), name: "Bob".into(), color: [245, 130, 48], state }];
++        a.live_show_presence(person(bob));
++        assert_eq!(hit(&a, at), Some(title), "while B draws it, a press goes to the layers under it");
++        a.live_show_presence(person(json!({"page": c.0})));
++        assert_eq!(hit(&a, at), Some(pen), "B's path done, the layer is like any other");
++        a.live_show_presence(vec![]);
 +    }
 +
 +    #[test]

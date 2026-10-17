@@ -380,9 +380,10 @@
   after: "\n        #[cfg(any(target_arch = \"wasm32\", debug_assertions))] if filmcraft_project::playground_live::undo(true) { return None; }"
 
 # Rule 19: the UI crate's live module (wasm, and the crate's own tests).
-# Rule 20: the others' pointers, playheads, selected clips and drags, drawn on the Timeline in their colors: in
-#   timeline::show right before its interaction pass (the clips are drawn; `layout` is this frame's). If that call
-#   moves, call it anywhere in timeline::show after the clips are painted, with the frame's Layout.
+# Rule 20: the others' pointers, playheads (with name flags on the ruler), selected clips and drags, drawn on the
+#   Timeline in their colors: in timeline::show right before it paints this person's own playhead (the clips and the
+#   ruler are drawn; `layout` is this frame's), so that playhead stays on top. If that line moves, call it anywhere in
+#   timeline::show after the ruler (draw_top) and before the own playhead, with the frame's Layout.
 # Rule 20a: the Timeline's own drag preview (preview_drag) opened to the crate, so a person's presence carries a drag
 #   under way exactly where their Timeline shows its clips. Verify: hold a clip drag in one browser, the other shows a
 #   ghost there. If upstream renames it, open whatever fills the clips' (start, duration, track) preview.
@@ -392,7 +393,7 @@
   after: "\n// Live editing in a Playground session (web only).\n#[cfg(any(target_arch = \"wasm32\", test))]\npub mod live;\n"
 - live: true
   file: crates/ui-egui/src/panels/timeline.rs
-  find: '^\s*interact\(app,'
+  find: '^\s*let\s+ph\s*=\s*app\.session\.playhead\(\)\s*;'
   before: "    #[cfg(any(target_arch = \"wasm32\", test))] crate::live::paint_timeline(app, ui, &layout);\n"
 - live: true
   file: crates/ui-egui/src/panels/timeline.rs

@@ -103,17 +103,18 @@ index 0000000..44f1a8c
 +}
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..14eb55b
+index 0000000..896f44a
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,665 @@
+@@ -0,0 +1,707 @@
 +//! Live editing in a Playground session (web only). The shared document is the open project (`Project`). What each
 +//! person sees for themselves (selection, playheads, open sequences, Timeline zoom and scroll, panels, the Source
 +//! monitor) already lives outside it, in the engine's `EditorState` and the UI; so does what belongs to this machine:
 +//! the renderer, the scratch disks and record-armed tracks. Imported media (files the project refers to by path,
 +//! `/files/<name>` on the web) travel as session files: the web host reads and installs their bytes.
 +//! Presence: each person's sequence, Timeline pointer (track and time), playhead, selected clips and the clip or
-+//! transition drag under way, drawn on the others' Timeline in that person's color and eased toward where it last was.
++//! transition drag under way, drawn on the others' Timeline in that person's color and eased toward where it last was;
++//! a playhead flies a flag with its person's name at the top of the ruler.
 +
 +use std::cell::{Cell, RefCell};
 +use std::collections::{BTreeSet, HashMap};
@@ -243,7 +244,8 @@ index 0000000..14eb55b
 +
 +/// The others on this person's Timeline, in their colors, when they show the same sequence: their playheads and the
 +/// ghosts of their drags, then outlines around their selected clips (where the clips are in this person's project),
-+/// then their pointers. Called after the Timeline drew its clips and playhead (`layout` is this frame's).
++/// then their pointers. Called after the Timeline drew its clips and ruler, before its own playhead (`layout` is this
++/// frame's), so this person's playhead stays on top.
 +pub fn paint_timeline(app: &FilmcraftApp, ui: &egui::Ui, layout: &Layout) {
 +    SHOWN.set(true);
 +    let (Some(id), Some(seq)) = (app.session.state.active_sequence, app.session.active_sequence()) else { return };
@@ -280,8 +282,7 @@ index 0000000..14eb55b
 +            moving |= shown.step(targets(&o.state, row), dt, px, far);
 +            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
 +            if let Some(at) = shown.playhead.map(|[s]| layout.x_of(Tick::from_seconds_f64(s))).filter(|x| content.x_range().contains(*x)) {
-+                let at = tall.round_to_pixel_center(at);
-+                tall.line_segment([pos2(at, ruler.min.y), pos2(at, content.max.y)], Stroke::new(1.0, color));
++                playhead(&tall, tall.round_to_pixel_center(at), [ruler.min.y + 1.0, content.max.y], content.max.x, color, &o.name);
 +            }
 +            for &(transition, [s, v, d]) in &shown.ghosts {
 +                let Some(r) = band(v) else { continue };
@@ -326,6 +327,17 @@ index 0000000..14eb55b
 +    if name.is_empty() {
 +        return;
 +    }
++    let text = tag_text(painter, name, color);
++    let tag = Rect::from_min_size((tip + vec2(12.0, 15.0)).round_to_pixels(painter.pixels_per_point()), text.size() + 2.0 * PAD);
++    painter.rect_filled(tag, 6.0, color);
++    painter.galley(tag.min + PAD, text, color);
++}
++
++/// The space around a name tag's text.
++const PAD: Vec2 = vec2(7.0, 3.0);
++
++/// A name tag's text: the name cut to [`MAX_NAME`] characters, 12 px semibold, white or (on a light `color`) near-black.
++fn tag_text(painter: &egui::Painter, name: &str, color: Color32) -> Arc<egui::Galley> {
 +    let name: String = match name.chars().count() > MAX_NAME {
 +        true => name.chars().take(MAX_NAME - 1).chain(['…']).collect(),
 +        false => name.to_owned(),
@@ -335,11 +347,34 @@ index 0000000..14eb55b
 +        true => Color32::from_gray(0x11),
 +        false => Color32::WHITE,
 +    };
-+    let text = painter.layout_no_wrap(name, Tokens::semibold(12.0), ink);
-+    let pad = vec2(7.0, 3.0);
-+    let tag = Rect::from_min_size((tip + vec2(12.0, 15.0)).round_to_pixels(painter.pixels_per_point()), text.size() + 2.0 * pad);
-+    painter.rect_filled(tag, 6.0, color);
-+    painter.galley(tag.min + pad, text, ink);
++    painter.layout_no_wrap(name, Tokens::semibold(12.0), ink)
++}
++
++/// Another person's playhead at `x` (a pixel centre), from `top` to `bottom`: a line 1.5 px wide in 85% of their
++/// color, and at its top a flag with their name, in the shared tag look ([`flag`]).
++fn playhead(painter: &egui::Painter, x: f32, [top, bottom]: [f32; 2], right: f32, color: Color32, name: &str) {
++    painter.line_segment([pos2(x, top), pos2(x, bottom)], Stroke::new(1.5, color.gamma_multiply(0.85)));
++    if name.is_empty() {
++        return;
++    }
++    let text = tag_text(painter, name, color);
++    let (rect, left) = flag(x, top, text.size() + 2.0 * PAD, right);
++    let rect = rect.round_to_pixels(painter.pixels_per_point());
++    // Square where it meets the line.
++    let corners = match left {
++        true => egui::CornerRadius { ne: 0, ..egui::CornerRadius::same(6) },
++        false => egui::CornerRadius { nw: 0, ..egui::CornerRadius::same(6) },
++    };
++    painter.rect_filled(rect, corners, color);
++    painter.galley(rect.min + PAD, text, color);
++}
++
++/// Where a playhead's flag of `size` goes on its line at `x` from `top`: hanging right of the line, flush with its left
++/// edge, or left of it (`true`) where it would pass `right`.
++fn flag(x: f32, top: f32, size: Vec2, right: f32) -> (Rect, bool) {
++    let left = x + size.x > right;
++    let x = if left { x + 0.75 - size.x } else { x - 0.75 };
++    (Rect::from_min_size(pos2(x, top), size), left)
 +}
 +
 +/// The clips a drag under way has elsewhere so far ([`preview_drag`], what this person's Timeline shows), each as
@@ -745,6 +780,13 @@ index 0000000..14eb55b
 +        let second = Tick::from_seconds_f64(1.0);
 +        app.tl.drag = Some(Drag::Move { clips: vec![item.id], grab_tick: item.start, start_track: v1, offset: second, track_delta: 0, new_track: None, copy: false });
 +        assert_eq!(app.live_presence()["ghosts"], json!([[v1.0, (item.start + second).0, item.duration.0]]), "a second later, as the Timeline shows it");
++    }
++
++    #[test]
++    fn a_playhead_flag_hangs_from_its_line_and_stays_in_the_timeline() {
++        let size = vec2(60.0, 21.0);
++        assert_eq!(flag(100.5, 31.0, size, 1100.0), (Rect::from_min_size(pos2(99.75, 31.0), size), false));
++        assert_eq!(flag(1080.5, 31.0, size, 1100.0), (Rect::from_min_size(pos2(1021.25, 31.0), size), true), "near the end it hangs left");
 +    }
 +
 +    #[test]
