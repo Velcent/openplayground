@@ -100,17 +100,20 @@
     }
 
 # Live editing in Playground sessions (patches/photoshop/live.diff + patches/live/playground_live.rs)
-# What it's for: people in a Playground session edit one document together (layers and settings merged per layer and
-#   field, pixels per 256×256 tile) and see each other's pointer, active layer and selection on the canvas in their
-#   color.
+# What it's for: people in a Playground session edit the open documents together (each tab one document of the
+#   session's set: one opened while connected reaches the others as a tab in the background, closing a tab is
+#   personal; layers and settings merged per layer and field, pixels per 256×256 tile; typing on the canvas reaches the
+#   others keystroke by keystroke) and see each other's pointer, selection and gestures under way (strokes, marquees
+#   and lassos, Move drags, Free Transform) on the canvas in their color, with dots on the tabs saying who is where.
 # How: the adapter lives in new files: apps/photocraft-web/src/live.rs (the binary checkpoint, merge, adoption, Undo,
 #   presence; it declares the template, copied next to it), apps/photocraft-web/src/web/live_shell.rs (the kept runner
 #   and the shell that ends each frame with the session's frame hook and draws the others), crates/engine/src/live.rs
 #   (Session::install_remote: a shared document taken in with no history step), crates/format/src/store/live.rs (loads
-#   that reuse the tiles decoded before) and crates/ui-egui/src/live.rs (the Undo hook). These rules only declare them
-#   and call in, each one line at the end of a file or right after a function's signature, except the two in web.rs
-#   that keep the runner and wrap the app. Native builds behave as before: the hooks compile on wasm, and in debug
-#   builds (the native tests) where nothing connects.
+#   that reuse the tiles decoded before), crates/ui-egui/src/live.rs (the Undo hook, and the gesture under way read from
+#   the app's own state) and apps/photocraft-web/src/live/peers.rs (the others drawn on the canvas and the tabs). These
+#   rules only declare them and call in, each one line at the end of a file or right after a function's signature,
+#   except the two in web.rs that keep the runner and wrap the app. Native builds behave as before: the hooks compile
+#   on wasm, and in debug builds (the native tests) where nothing connects.
 # Verify: node scripts/build.mjs check photoshop head|release, then the e2e (tests/live-apps/photoshop.mjs) and
 #   `cargo test -p photocraft-web live::`.
 # If upstream changes: if a function named below is renamed, anchor on its new signature; if WebShell or its `app`

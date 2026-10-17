@@ -3,6 +3,10 @@
 // right: different 256×256 tiles of the same layer, which merge tile by tile. Ctrl+Z is the owner's Undo.
 // point(): the owner drags a marquee around where editA paints (M; the stroke stays inside it) and rests the pointer on
 // the canvas: the editor is shown their pointer, active layer and selection bounds.
+// drag(): the owner draws a Lasso loop right of that selection and keeps the mouse down: the editor is shown the path so
+// far (presence `lasso`). Releasing makes a selection, which stays the owner's own: the document doesn't change.
+// openTab(): the owner opens a second document (Home, "New document…", Create): it joins the session's set of documents
+// and reaches the editor as a tab in the background.
 //
 // PhotoCraft's checkpoint is binary (canonical JSON, then the tiles): `ready` defines liveTestDocument(), which gives
 // the harness that JSON with each surface's tiles as {"tx,ty": hash}.
@@ -70,6 +74,23 @@ export default {
       const p = playgroundLiveAdapter.presence()
       return !!(p?.pointer && p.selection)
     }), 10000, 'the pointer and a selection on the canvas')
+  },
+  drag: async (page) => {
+    await page.keyboard.press('l')
+    await page.mouse.move(560, 300)
+    await page.mouse.down()
+    for (const [x, y] of [[700, 290], [760, 380], [690, 470], [580, 430]]) await page.mouse.move(x, y, { steps: 6 })
+  },
+  openTab: async (page) => {
+    const documents = () => page.evaluate(() => { try { return JSON.parse(liveTestDocument()).documents.length } catch { return 0 } })
+    const before = await documents()
+    await page.mouse.click(23, 85)
+    await page.waitForTimeout(500)
+    await page.mouse.click(397, 391)
+    await page.waitForTimeout(500)
+    await page.keyboard.press('Enter')
+    // Done once the dialog has gone and the new document is in the set (a dialog open is a gesture under way).
+    await until(async () => await documents() > before, 10000, 'the new document')
   },
   editA: (page) => stroke(page, 220, 300),
   editB: (page) => stroke(page, 850, 520),

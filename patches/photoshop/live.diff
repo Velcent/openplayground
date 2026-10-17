@@ -1,22 +1,24 @@
 diff --git a/apps/photocraft-web/src/live.rs b/apps/photocraft-web/src/live.rs
 new file mode 100644
-index 0000000..1a11d0a
+index 0000000..ae31d04
 --- /dev/null
 +++ b/apps/photocraft-web/src/live.rs
-@@ -0,0 +1,1004 @@
+@@ -0,0 +1,1176 @@
 +//! Live editing in a Playground session (web only). Playground's `shell/live.js` drives it through [`web::attach`];
-+//! nothing here runs until it connects. The shared document is one open document as a checkpoint ([`encode`]): its
-+//! `.pcraft` manifest as canonical JSON without personal views, then every surface's tiles in a fixed order, so a
-+//! brush stroke changes only the bytes of the tiles it touched. A remote change merges into the open document at the
-+//! end of a quiet frame ([`frame`]), keeping this person's views, and is no step of the native history. While
-+//! connected, Undo and Redo of that document go to the session ([`undo`]), which reverts only this person's edits.
-+//! Each person's pointer, active layers and selection bounds go to the others ([`presence`]), who see them on the
-+//! canvas ([`draw_presence`]).
++//! nothing here runs until it connects. The shared document is the set of documents open in the session (the tabs), as
++//! a checkpoint ([`shared`]): each one's `.pcraft` manifest as canonical JSON without personal views ([`entry`]), then
++//! every surface's tiles in a fixed order, so a brush stroke changes only the bytes of the tiles it touched. A document
++//! opened here while connected joins the set; one someone else opened arrives as a tab in the background; closing a
++//! tab only hides that document here. A remote change merges into the open documents at the end of a quiet frame
++//! ([`frame`]), keeping this person's views, and is no step of the native history. While connected, Undo and Redo of
++//! those documents go to the session ([`undo`]), which reverts only this person's edits. Each person's document,
++//! pointer, active layers, selection bounds and the gesture under way go to the others ([`presence`]), who see them on
++//! the canvas and as dots on its tab (`peers`).
 +//!
 +//! Checkpoint layout (integers little-endian):
-+//! - `photocraft-live 1\n`;
-+//! - u32 n, n bytes: the document (the manifest's `document`, keys sorted, without [`VIEWS`]), each surface's
-+//!   `tiles` empty;
++//! - `photocraft-live 2\n`;
++//! - u32 n, n bytes: `{"documents": [...]}`, keys sorted, each document the manifest's `document` without [`VIEWS`],
++//!   with `id`: its id in the set (in increasing order), each surface's `tiles` empty;
 +//! - per surface, in the order a walk of that JSON meets them (keys sorted): u32 count, then per tile in row order:
 +//!   i32 tx, i32 ty, the BLAKE3 hash of its pixels (32 bytes), u32 n, n bytes of its `.pcraft` zstd frame (0: that
 +//!   tile came earlier);
@@ -38,10 +40,10 @@ index 0000000..1a11d0a
 +
 +/// The shell's document limit (`shell/document-delta.js`).
 +pub const MAX_BYTES: usize = 128 << 20;
-+const MAGIC: &[u8] = b"photocraft-live 1\n";
++const MAGIC: &[u8] = b"photocraft-live 2\n";
 +/// The manifest document's personal views; `Session::install_remote` keeps the local ones (and groups' `expanded`
-+/// and the measurement's `ruler` and `active_count_group`).
-+const VIEWS: &[&str] = &["id", "name", "file_encoding", "selection", "quick_mask", "quick_mask_unselected", "work_path"];
++/// and the measurement's `ruler` and `active_count_group`). Its `id` is replaced by the one in the set.
++const VIEWS: &[&str] = &["id", "file_encoding", "selection", "quick_mask", "quick_mask_unselected", "work_path"];
 +
 +fn invalid(e: impl std::fmt::Display) -> String {
 +    format!("Invalid shared document: {e}")
@@ -100,7 +102,7 @@ index 0000000..1a11d0a
 +    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 +}
 +
-+/// The hashes `v` names: its blobs (tiles are out of the JSON when this runs).
++/// The hashes `v` names: its blobs, and its tiles while they are maps of hashes.
 +fn hashes(v: &Value, out: &mut HashSet<String>) {
 +    match v {
 +        Value::String(s) if is_hash(s) => {
@@ -123,8 +125,8 @@ index 0000000..1a11d0a
 +    (0..32).map(|i| u8::from_str_radix(&hash[2 * i..2 * i + 2], 16).map_err(invalid)).collect()
 +}
 +
-+/// The shared part of `doc` as a checkpoint. `writer` keeps the tiles it hashed and compressed before.
-+fn encode(writer: &mut PcraftWriter, doc: &Document) -> Result<Vec<u8>, String> {
++/// The shared part of `doc` as the set's document `uid`. `writer` keeps the tiles it hashed and compressed before.
++fn entry(writer: &mut PcraftWriter, doc: &Document, uid: u64) -> Result<Parts, String> {
 +    let (zip, _) = writer.save_zip(doc, &SaveOptions::default()).map_err(|e| e.to_string())?;
 +    let zip = photocraft_format::zip::ZipReader::new(&zip).map_err(|e| e.to_string())?;
 +    let mut objects = HashMap::new();
@@ -141,6 +143,7 @@ index 0000000..1a11d0a
 +            m.remove("ruler");
 +            m.remove("active_count_group");
 +        }
++        m.insert("id".into(), uid.into());
 +    }
 +    groups(&mut doc, false);
 +    let mut parts = Parts::default();
@@ -161,7 +164,27 @@ index 0000000..1a11d0a
 +            parts.blobs.insert(hash.into(), bytes);
 +        }
 +    }
-+    write(&parts)
++    let size = parts.tiles.values().chain(parts.blobs.values()).map(|b| b.len()).sum();
++    if size > MAX_BYTES { Err(too_large(size)) } else { Ok(parts) }
++}
++
++/// The set of `entries` as one: `{"documents": [...]}` in id order, with all their tiles and blobs.
++fn set<'a>(entries: impl Iterator<Item = &'a Parts>) -> Parts {
++    let mut set = Parts::default();
++    let mut docs = Vec::new();
++    for e in entries {
++        docs.push(e.doc.clone());
++        set.tiles.extend(e.tiles.iter().map(|(h, b)| (h.clone(), b.clone())));
++        set.blobs.extend(e.blobs.iter().map(|(h, b)| (h.clone(), b.clone())));
++    }
++    docs.sort_by_key(|d| d["id"].as_u64());
++    set.doc = json!({ "documents": docs });
++    set
++}
++
++/// The documents of a set, by id.
++fn documents(set: &Value) -> impl Iterator<Item = (u64, &Value)> {
++    set["documents"].as_array().into_iter().flatten().filter_map(|d| Some((d["id"].as_u64()?, d)))
 +}
 +
 +/// The canonical bytes of `parts` (see the module's layout).
@@ -245,6 +268,11 @@ index 0000000..1a11d0a
 +    let mut doc = template::parse(json)?;
 +    if template::canonical(&doc) != json {
 +        return Err(invalid("noncanonical document"));
++    }
++    let ids: Option<Vec<u64>> =
++        doc.as_object().filter(|m| m.len() == 1).and_then(|m| m["documents"].as_array()).and_then(|d| d.iter().map(|d| d["id"].as_u64()).collect());
++    if !ids.is_some_and(|ids| ids.windows(2).all(|w| w[0] < w[1])) {
++        return Err(invalid("not a set of documents in id order"));
 +    }
 +    let mut named = HashSet::new();
 +    hashes(&doc, &mut named);
@@ -333,11 +361,11 @@ index 0000000..1a11d0a
 +    static DECODED: std::cell::RefCell<(photocraft_format::Tiles, HashMap<String, Rc<[u8]>>)> = Default::default();
 +}
 +
-+/// The document `parts` describe, through the `.pcraft` loader (which checks every tile against its hash). Tiles the
-+/// last load decoded from the same bytes are reused, not decoded again. Views get placeholders:
-+/// `Session::install_remote` puts the local ones back.
-+fn document(parts: &Parts) -> Result<Document, String> {
-+    let mut doc = parts.doc.clone();
++/// The set's document `entry` (with its tiles and blobs in `parts`), through the `.pcraft` loader (which checks every
++/// tile against its hash). Tiles a load decoded before from the same bytes are reused, not decoded again. Views get
++/// placeholders: `Session::install_remote` puts the local ones back.
++fn document(entry: &Value, parts: &Parts) -> Result<Document, String> {
++    let mut doc = entry.clone();
 +    surfaces(&mut doc, &mut |tiles| {
 +        let mut list = Vec::new();
 +        for (key, hash) in tiles.as_object().ok_or_else(|| invalid("tiles"))? {
@@ -349,7 +377,6 @@ index 0000000..1a11d0a
 +    })?;
 +    let Value::Object(m) = &mut doc else { return Err(invalid("not a document")) };
 +    m.insert("id".into(), 0.into());
-+    m.insert("name".into(), "".into());
 +    m.insert("selection".into(), Value::Null);
 +    groups(&mut doc, true);
 +    raise_ids(max_id(&doc));
@@ -392,20 +419,28 @@ index 0000000..1a11d0a
 +    }
 +}
 +
-+/// The three-way merge of checkpoints: the document merges per field and per layer (by id), the pixels per surface
-+/// tile (by hash), a derived cache as a whole; a value or tile both sides changed is a conflict, even to the same
-+/// thing. `current` is the side not yet accepted, `edited` the accepted change. The result is checked by loading it,
-+/// and comes with its document.
-+fn merge(base: &[u8], current: &[u8], edited: &[u8]) -> Result<(Vec<u8>, Document), String> {
++/// The three-way merge of checkpoints: the set merges per document (by id: two opened at once are two), each document
++/// per field and per layer (by id), the pixels per surface tile (by hash), a derived cache as a whole; a value or tile
++/// both sides changed is a conflict, even to the same thing. `current` is the side not yet accepted, `edited` the
++/// accepted change. Each document that is neither side's is checked by loading it.
++fn merge(base: &[u8], current: &[u8], edited: &[u8]) -> Result<(Vec<u8>, Parts), String> {
 +    let (mut base, mut current, mut edited) = (decode(base)?, decode(current)?, decode(edited)?);
 +    [&mut base, &mut current, &mut edited].into_iter().for_each(|parts| whole_caches(&mut parts.doc, true));
 +    let mut doc = template::merge(&base.doc, &current.doc, &edited.doc, &[])?;
 +    whole_caches(&mut doc, false);
++    [&mut current, &mut edited].into_iter().for_each(|parts| whole_caches(&mut parts.doc, false));
++    if let Some(docs) = doc["documents"].as_array_mut() {
++        docs.sort_by_key(|d| d["id"].as_u64());
++    }
 +    let mut parts = Parts { doc, tiles: current.tiles, blobs: current.blobs };
 +    parts.tiles.extend(edited.tiles);
 +    parts.blobs.extend(edited.blobs);
 +    let bytes = write(&parts)?;
-+    Ok((bytes, document(&parts)?))
++    let sides: HashSet<Vec<u8>> = [&current.doc, &edited.doc].into_iter().flat_map(|d| documents(d).map(|(_, d)| template::canonical(d))).collect();
++    for (_, d) in documents(&parts.doc).filter(|(_, d)| !sides.contains(&template::canonical(d))) {
++        document(d, &parts)?;
++    }
++    Ok((bytes, parts))
 +}
 +
 +/// A remote change waiting for a quiet frame: `edited` relative to `base`, or with no base the whole document.
@@ -420,16 +455,32 @@ index 0000000..1a11d0a
 +
 +type Checkpoint = Result<Rc<Vec<u8>>, String>;
 +
++/// A document of the session's set.
++struct Shared {
++    /// Its id in the set, the same for everyone.
++    uid: u64,
++    /// The open document showing it here; none once this person closed its tab (the others keep it).
++    local: Option<DocId>,
++    /// The document last encoded, and its part of the set ([`entry`]).
++    seen: Option<Arc<Document>>,
++    entry: Result<Rc<Parts>, String>,
++}
++
++/// A new document id for the set: random, so two people opening documents at once practically never pick the same one
++/// (52 bits, exact in JavaScript).
++fn uid() -> u64 {
++    ((gap() << 20) ^ gap()) & ((1 << 52) - 1)
++}
++
 +#[derive(Default)]
 +struct Live {
 +    connected: bool,
 +    /// The last frame was not quiet: a checkpoint now would catch a gesture half done.
 +    busy: bool,
-+    /// The shared document: the one active when the session first needed one.
-+    bound: Option<DocId>,
++    /// The session's documents.
++    docs: Vec<Shared>,
 +    writer: PcraftWriter,
-+    /// The shared document as last encoded and its checkpoint, kept when it closes.
-+    seen: Option<Arc<Document>>,
++    /// The set's checkpoint as last written.
 +    encoded: Option<Checkpoint>,
 +    /// The checkpoint last reported as changed.
 +    reported: Option<Checkpoint>,
@@ -459,22 +510,72 @@ index 0000000..1a11d0a
 +    }
 +}
 +
-+/// The shared document's checkpoint; `None` while no document is open to share.
-+fn shared(live: &mut Live, app: &PhotocraftApp) -> Option<Checkpoint> {
-+    if live.bound.is_none() {
-+        live.bound = app.session.active().map(|st| st.doc.id);
-+    }
-+    let bound = live.bound?;
-+    if let Some(doc) = app.session.documents().iter().find(|st| st.doc.id == bound).map(|st| &st.doc)
-+        && live.seen.as_ref().is_none_or(|seen| !Arc::ptr_eq(seen, doc))
-+    {
-+        // A new selection or the like (personal views) shares nothing: no need to encode.
-+        if live.seen.as_ref().is_none_or(|seen| !views_only(seen, doc)) {
-+            live.encoded = Some(encode(&mut live.writer, doc).map(Rc::new));
++/// The set's checkpoint: the documents open here (one opened since joins it), and those closed here as last known;
++/// `busy` until there is one. One that can't be shared (too large) makes it an error until it closes.
++fn shared(live: &mut Live, app: &PhotocraftApp) -> Checkpoint {
++    let open = app.session.documents();
++    let mut changed = live.encoded.is_none();
++    live.docs.retain_mut(|s| {
++        if s.local.is_some_and(|id| !open.iter().any(|st| st.doc.id == id)) {
++            s.local = None;
++            changed |= s.entry.is_err();
 +        }
-+        live.seen = Some(doc.clone());
++        s.local.is_some() || s.entry.is_ok()
++    });
++    for st in open {
++        let i = match live.docs.iter().position(|s| s.local == Some(st.doc.id)) {
++            Some(i) => i,
++            None => {
++                live.docs.push(Shared { uid: uid(), local: Some(st.doc.id), seen: None, entry: Err(String::new()) });
++                live.docs.len() - 1
++            }
++        };
++        let s = &mut live.docs[i];
++        if s.seen.as_ref().is_some_and(|seen| Arc::ptr_eq(seen, &st.doc)) {
++            continue;
++        }
++        // A new selection or the like (personal views) shares nothing: no need to encode.
++        if s.seen.as_ref().is_none_or(|seen| !views_only(seen, &st.doc)) {
++            s.entry = entry(&mut live.writer, &st.doc, s.uid).map(Rc::new);
++            changed = true;
++        }
++        s.seen = Some(st.doc.clone());
 +    }
-+    live.encoded.clone()
++    if changed {
++        let entries: Result<Vec<_>, _> = live.docs.iter().map(|s| s.entry.clone()).collect();
++        live.encoded = Some(entries.and_then(|e| write(&set(e.iter().map(|e| &**e)))).map(Rc::new));
++    }
++    live.encoded.clone().filter(|_| !live.docs.is_empty()).unwrap_or_else(|| Err("busy".into()))
++}
++
++/// The set's documents closed here: their ids and names, for the Home screen's "In this session" (`peers`).
++#[cfg(target_arch = "wasm32")]
++fn closed(live: &Live) -> Vec<(u64, String)> {
++    let name = |s: &Shared| Some(s.entry.as_ref().ok()?.doc["name"].as_str()?.to_owned());
++    live.docs.iter().filter(|s| s.local.is_none()).filter_map(|s| Some((s.uid, name(s)?))).collect()
++}
++
++/// Opens the set's document `uid`, closed here, again as the document shown.
++#[cfg(target_arch = "wasm32")]
++fn reopen(app: &mut PhotocraftApp, uid: u64) {
++    let Some(entry) = LIVE.with_borrow(|live| live.docs.iter().find(|s| s.uid == uid && s.local.is_none())?.entry.clone().ok()) else { return };
++    let mut doc = match document(&entry.doc, &entry) {
++        Ok(doc) => doc,
++        Err(e) => return log::warn!("live editing: {e}"),
++    };
++    doc.id = DocId::fresh();
++    let i = app.session.add_document(doc, None);
++    let st = &app.session.documents()[i];
++    LIVE.with_borrow_mut(|live| {
++        if let Some(s) = live.docs.iter_mut().find(|s| s.uid == uid) {
++            (s.local, s.seen) = (Some(st.doc.id), Some(st.doc.clone()));
++        }
++    });
++}
++
++/// The set's id of open document `id`, while connected.
++fn uid_of(live: &Live, id: DocId) -> Option<u64> {
++    live.docs.iter().find(|s| s.local == Some(id)).map(|s| s.uid).filter(|_| live.connected)
 +}
 +
 +/// Whether `a` and `b` differ in personal views only (tiles compare by pointer first).
@@ -487,7 +588,7 @@ index 0000000..1a11d0a
 +pub fn connect() {
 +    LIVE.with_borrow_mut(|live| {
 +        live.connected = true;
-+        (live.bound, live.seen, live.encoded, live.reported) = (None, None, None, None);
++        (live.docs, live.encoded, live.reported) = (Vec::new(), None, None);
 +        if let Some(ctx) = &live.ctx {
 +            ctx.request_repaint();
 +        }
@@ -500,7 +601,7 @@ index 0000000..1a11d0a
 +pub fn disconnect() {
 +    let waiting = LIVE.with_borrow_mut(|live| {
 +        live.connected = false;
-+        (live.bound, live.seen, live.encoded, live.reported) = (None, None, None, None);
++        (live.docs, live.encoded, live.reported) = (Vec::new(), None, None);
 +        (live.presence, live.others) = (Value::Null, Vec::new());
 +        #[cfg(target_arch = "wasm32")]
 +        {
@@ -529,23 +630,23 @@ index 0000000..1a11d0a
 +    }
 +}
 +
-+/// The canonical shared document, unless the last frame was busy (or no document is open yet): then the next quiet
-+/// frame reports it.
++/// The canonical set of documents, unless the last frame was busy: then the next quiet frame reports it.
 +fn checkpoint(app: &PhotocraftApp) -> Checkpoint {
 +    LIVE.with_borrow_mut(|live| {
 +        if live.busy {
 +            live.reported = None;
 +            return Err("busy".into());
 +        }
-+        shared(live, app).unwrap_or_else(|| Err("busy".into()))
++        shared(live, app)
 +    })
 +}
 +
-+/// The Undo hook (`photocraft_ui_egui::live`): while connected, Undo and Redo of the shared document go to the session. Selection steps
-+/// are personal, no session edits: Undo after one reverts this person's last shared edit and keeps the selection.
++/// The Undo hook (`photocraft_ui_egui::live`): while connected, Undo and Redo of the session's documents go to the
++/// session. Selection steps are personal, no session edits: Undo after one reverts this person's last shared edit and
++/// keeps the selection.
 +pub fn undo(active: Option<DocId>, redo: Option<bool>) -> bool {
 +    let taken = LIVE.with_borrow_mut(|live| {
-+        let taken = live.connected && live.bound.is_some() && live.bound == active;
++        let taken = active.and_then(|id| uid_of(live, id)).is_some();
 +        #[cfg(test)]
 +        if let (true, Some(redo)) = (taken, redo) {
 +            live.undos.push(redo);
@@ -560,13 +661,16 @@ index 0000000..1a11d0a
 +}
 +
 +/// Nothing under way that a remote change would cut short or a checkpoint would catch half done: no pointer down
-+/// (strokes, drags), text field, live adjustment, type edit, Free Transform, pen path, dialog or floating selection.
++/// (strokes, drags), text field, live adjustment, IME composition or Type Mask, Free Transform, pen path, dialog or
++/// floating selection. Typing on the canvas is quiet between keystrokes: each one is an edit of the type layer, which
++/// the others then see as it is typed.
 +fn quiet(app: &PhotocraftApp, ctx: &egui::Context) -> bool {
 +    let ui = &app.ui;
 +    !ctx.input(|i| i.pointer.any_down())
 +        && !ctx.text_edit_focused()
 +        && app.live_adjust.is_none()
-+        && (ui.text_edit.is_none() && ui.type_transform.is_none() && ui.transform.is_none() && ui.cam_transform.is_none())
++        && ui.text_edit.as_ref().is_none_or(|ed| !ed.mask && ed.preedit.is_none())
++        && (ui.type_transform.is_none() && ui.transform.is_none() && ui.cam_transform.is_none())
 +        && (ui.pen.is_none() && ui.dialogs.is_empty())
 +        && app.session.documents().iter().all(|st| st.floating.is_none())
 +}
@@ -585,13 +689,12 @@ index 0000000..1a11d0a
 +        ctx.request_repaint();
 +    }
 +    let changed = LIVE.with_borrow_mut(|live| {
-+        if live.connected {
-+            live.presence = presence(live, app, ctx);
-+        }
-+        if !live.connected || !quiet {
++        if !live.connected {
 +            return false;
 +        }
-+        let now = shared(live, app);
++        // The set first, so a document opened this frame is in it for the presence.
++        let now = quiet.then(|| shared(live, app));
++        live.presence = presence(live, app, ctx);
 +        if now.is_none() || same(&now, &live.reported) {
 +            return false;
 +        }
@@ -610,13 +713,16 @@ index 0000000..1a11d0a
 +    let _ = changed;
 +}
 +
-+/// This person's presence: `{ "pointer": [x, y] }` in image pixels while it is over the canvas, `"layers"`: the targeted
-+/// layers' ids (the active one first) and `"selection": [x0, y0, x1, y1]`, the selection's bounds, when there is one.
-+/// Null unless the shared document is the one shown.
++/// This person's presence: `{ "doc": <the document shown, by its id in the set>, "pointer": [x, y] }` in image pixels
++/// while it is over the canvas, `"layers"`: the targeted layers' ids (the active one first), `"selection": [x0, y0, x1,
++/// y1]`, the selection's bounds, when there is one, and the gesture under way ([`photocraft_ui_egui::live::gesture`]).
++/// Null while no document of the set is shown.
 +fn presence(live: &mut Live, app: &PhotocraftApp, ctx: &egui::Context) -> Value {
-+    let Some(st) = app.session.active().filter(|st| live.bound == Some(st.doc.id)) else { return Value::Null };
-+    let mut state = Map::new();
-+    if let Some([x, y]) = ctx.pointer_hover_pos().and_then(|p| photocraft_ui_egui::canvas::doc_point_at(app, p)) {
++    let Some((st, uid)) = app.session.active().and_then(|st| Some((st, uid_of(live, st.doc.id)?))) else { return Value::Null };
++    let pointer = ctx.pointer_hover_pos().and_then(|p| photocraft_ui_egui::canvas::doc_point_at(app, p));
++    let mut state = photocraft_ui_egui::live::gesture(app, pointer);
++    state.insert("doc".into(), uid.into());
++    if let Some([x, y]) = pointer {
 +        state.insert("pointer".into(), json!([(x * 10.0).round() / 10.0, (y * 10.0).round() / 10.0]));
 +    }
 +    let layers = st.active_layer.into_iter().chain(st.selected_layers.iter().copied().filter(|l| Some(*l) != st.active_layer));
@@ -633,77 +739,86 @@ index 0000000..1a11d0a
 +    Value::Object(state)
 +}
 +
-+/// The others on the shared document, drawn over its canvas in their color (after the app's own frame): their
-+/// selection bounds, and their pointer with their name and active layer. Their states come from other people:
-+/// anything that doesn't read as numbers in range is skipped.
++// The others on the shared document, drawn over its canvas.
 +#[cfg(target_arch = "wasm32")]
-+pub fn draw_presence(app: &PhotocraftApp, ui: &egui::Ui) {
-+    use egui::{Color32, FontId, Pos2, Rect, Shape, Stroke, pos2, vec2};
-+    LIVE.with_borrow(|live| {
-+        let Some(st) = app.session.active().filter(|st| !live.others.is_empty() && live.bound == Some(st.doc.id)) else { return };
-+        let Some(xf) = photocraft_ui_egui::canvas::ViewXform::active(app) else { return };
-+        let painter = ui.painter().with_clip_rect(xf.rect);
-+        fn numbers<const N: usize>(v: &Value) -> Option<[f32; N]> {
-+            let v: Vec<f32> = v.as_array()?.iter().map(|n| n.as_f64().filter(|n| n.abs() < 1e7).map(|n| n as f32)).collect::<Option<_>>()?;
-+            v.try_into().ok()
-+        }
-+        for p in &live.others {
-+            let color = Color32::from_rgb(p.color[0], p.color[1], p.color[2]);
-+            if let Some([x0, y0, x1, y1]) = numbers(&p.state["selection"]) {
-+                let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| xf.to_screen(x, y));
-+                painter.add(Shape::closed_line(corners.to_vec(), Stroke::new(1.5, color)));
-+            }
-+            let Some([x, y]) = numbers(&p.state["pointer"]) else { continue };
-+            let at = xf.to_screen(x, y);
-+            let arrow = [pos2(0.0, 0.0), pos2(0.0, 16.0), pos2(4.5, 12.5), pos2(11.0, 12.0)].map(|q| at + q.to_vec2());
-+            painter.add(Shape::convex_polygon(arrow.to_vec(), color, Stroke::new(1.0, Color32::WHITE)));
-+            let layer = p.state["layers"][0].as_u64().and_then(|id| st.doc.layer(LayerId(id)));
-+            let tag = match layer {
-+                Some(l) => format!("{} · {}", p.name, l.name),
-+                None => p.name.clone(),
-+            };
-+            let galley = painter.layout_no_wrap(tag, FontId::proportional(11.0), Color32::WHITE);
-+            let min: Pos2 = at + vec2(10.0, 15.0);
-+            painter.rect_filled(Rect::from_min_size(min, galley.size() + vec2(8.0, 4.0)), 3.0, color);
-+            painter.galley(min + vec2(4.0, 2.0), galley, Color32::WHITE);
-+        }
-+    });
-+}
++mod peers;
++#[cfg(target_arch = "wasm32")]
++pub use peers::draw as draw_presence;
 +
-+/// Merges `edited` (relative to `base`; without one, adopts it whole) into the shared document, with no native undo
-+/// step. Without an open document to share it opens one; when the shared one was closed, only its checkpoint moves.
++/// Merges `edited` (relative to `base`; without one, adopts it whole) into the session's documents, with no native undo
++/// step ([`install`]).
 +fn apply(app: &mut PhotocraftApp, base: Option<&[u8]>, edited: &[u8]) -> Result<Option<Vec<u8>>, String> {
 +    let current = LIVE.with_borrow_mut(|live| shared(live, app));
-+    let (bytes, doc) = match (base, &current) {
-+        (base, Some(Ok(current))) if current.as_slice() == edited => return Ok(base.is_none().then(|| edited.to_vec())),
-+        (Some(base), Some(current)) => merge(base, current.as_ref()?, edited)?,
-+        (Some(_), None) => return Err("No document is shared yet".into()),
-+        // What it replaces goes to the shell's drafts when it has a checkpoint (one too large to share has none).
-+        (None, _) => (edited.to_vec(), document(&decode(edited)?)?),
-+    };
-+    let replaced = if base.is_none() { current.and_then(Result::ok).map(|c| c.to_vec()) } else { None };
-+    let bound = LIVE.with_borrow(|live| live.bound);
-+    match bound {
-+        Some(id) => {
-+            app.session.install_remote(id, doc);
-+        }
-+        None => {
-+            let mut doc = doc;
-+            doc.id = DocId::fresh();
-+            doc.name = "Live document".into();
-+            let i = app.session.add_document(doc, None);
-+            LIVE.with_borrow_mut(|live| live.bound = app.session.documents().get(i).map(|st| st.doc.id));
-+        }
++    if current.as_ref().is_ok_and(|c| c.as_slice() == edited) {
++        return Ok(base.is_none().then(|| edited.to_vec()));
 +    }
++    let (bytes, parts) = match base {
++        Some(base) => merge(base, current.as_ref()?, edited)?,
++        None => (edited.to_vec(), decode(edited)?),
++    };
++    install(app, &parts)?;
 +    LIVE.with_borrow_mut(|live| {
-+        let open = app.session.documents().iter().find(|st| Some(st.doc.id) == live.bound);
-+        if let Some(st) = open {
-+            live.seen = Some(st.doc.clone());
-+        }
 +        live.encoded = Some(Ok(Rc::new(bytes)));
 +        live.reported = live.encoded.clone();
 +    });
-+    Ok(replaced)
++    // What a whole document replaces goes to the shell's drafts when it has a checkpoint (one too large has none).
++    Ok(if base.is_none() { current.ok().map(|c| c.to_vec()) } else { None })
++}
++
++/// Makes the session's documents those of `set`: each open one takes its new content (keeping this person's views), one
++/// someone else opened opens as a tab in the background, one closed here stays closed, and one no longer in the set
++/// (an open undone, another whole set adopted) closes. When the document shown closes, the set's first one shows.
++fn install(app: &mut PhotocraftApp, set: &Parts) -> Result<(), String> {
++    let shown = app.session.active().map(|st| st.doc.id);
++    // Every document that changed loads first: one that doesn't changes nothing.
++    let mut changed = Vec::new();
++    for (uid, doc) in documents(&set.doc) {
++        let known = LIVE.with_borrow(|live| live.docs.iter().find(|s| s.uid == uid).map(|s| (s.local, s.entry.as_ref().is_ok_and(|e| e.doc == *doc))));
++        let load = match known {
++            Some((_, true)) => continue,
++            Some((None, false)) => None,
++            Some((Some(id), false)) => Some((Some(id), document(doc, set)?)),
++            None => Some((None, document(doc, set)?)),
++        };
++        let mut named = HashSet::new();
++        hashes(doc, &mut named);
++        let only = |from: &HashMap<String, Rc<[u8]>>| from.iter().filter(|(h, _)| named.contains(*h)).map(|(h, b)| (h.clone(), b.clone())).collect();
++        changed.push((uid, Rc::new(Parts { doc: doc.clone(), tiles: only(&set.tiles), blobs: only(&set.blobs) }), load));
++    }
++    let gone: Vec<DocId> = LIVE.with_borrow_mut(|live| {
++        let kept = |s: &Shared| documents(&set.doc).any(|(uid, _)| uid == s.uid);
++        let gone = live.docs.iter().filter(|s| !kept(s)).filter_map(|s| s.local).collect();
++        live.docs.retain(kept);
++        gone
++    });
++    for (uid, entry, load) in changed {
++        let local = match load {
++            None => None,
++            Some((Some(id), doc)) => app.session.install_remote(id, doc).then_some(id),
++            Some((None, mut doc)) => {
++                doc.id = DocId::fresh();
++                let i = app.session.add_document(doc, None);
++                Some(app.session.documents()[i].doc.id)
++            }
++        };
++        let seen = local.and_then(|id| app.session.documents().iter().find(|st| st.doc.id == id)).map(|st| st.doc.clone());
++        LIVE.with_borrow_mut(|live| match live.docs.iter_mut().find(|s| s.uid == uid) {
++            Some(s) => (s.seen, s.entry) = (seen.or(s.seen.take()), Ok(entry)),
++            None => live.docs.push(Shared { uid, local, seen, entry: Ok(entry) }),
++        });
++    }
++    for id in gone {
++        if let Some(i) = app.session.documents().iter().position(|st| st.doc.id == id) {
++            app.session.close(i);
++        }
++    }
++    // No focus stolen: the document shown stays, unless it went.
++    let first = LIVE.with_borrow(|live| live.docs.iter().filter(|s| s.local.is_some()).min_by_key(|s| s.uid).and_then(|s| s.local));
++    let show = shown.filter(|id| app.session.documents().iter().any(|st| st.doc.id == *id)).or(first);
++    if let Some(i) = show.and_then(|id| app.session.documents().iter().position(|st| st.doc.id == id)) {
++        app.session.set_active(i);
++    }
++    Ok(())
 +}
 +
 +/// The adapter object the Playground shell drives (`shell/live.js`): `format`, `checkpoint()` (throws `busy` while a
@@ -826,8 +941,19 @@ index 0000000..1a11d0a
 +        Some(selection)
 +    }
 +
++    /// The checkpoint of a set of `d` as document 1.
 +    fn bytes(d: &Document) -> Vec<u8> {
-+        encode(&mut PcraftWriter::new(), d).unwrap()
++        set_of(&[(1, d)])
++    }
++
++    fn set_of(docs: &[(u64, &Document)]) -> Vec<u8> {
++        let entries: Vec<_> = docs.iter().map(|(uid, d)| entry(&mut PcraftWriter::new(), d, *uid).unwrap()).collect();
++        write(&set(entries.iter())).unwrap()
++    }
++
++    /// The first document of a set.
++    fn first_doc(set: &Parts) -> Document {
++        document(&set.doc["documents"][0], set).unwrap()
 +    }
 +
 +    /// The bytes two checkpoints differ in, as the shell's delta sees them (between their common prefix and suffix).
@@ -843,11 +969,10 @@ index 0000000..1a11d0a
 +        let a = bytes(&d);
 +        let mut viewed = d.clone();
 +        viewed.id = DocId::fresh();
-+        viewed.name = "renamed.pcraft".into();
 +        viewed.selection = selection();
 +        viewed.measurement.ruler = Some(photocraft_doc::Ruler { start: [0.0, 0.0], end: [5.0, 5.0], protractor: None });
 +        assert_eq!(bytes(&viewed), a, "views are not shared");
-+        let loaded = document(&decode(&a).unwrap()).unwrap();
++        let loaded = first_doc(&decode(&a).unwrap());
 +        assert_eq!(bytes(&loaded), a, "a loaded checkpoint encodes to the same bytes");
 +        assert_eq!(loaded.layers[1].surface().unwrap().pixel(5, 5), d.layers[1].surface().unwrap().pixel(5, 5));
 +        // A stroke within one tile of the top layer changes about that tile's bytes only.
@@ -869,15 +994,16 @@ index 0000000..1a11d0a
 +        paint(&mut right.layers[0], Rect::from_xywh(900, 300, 20, 20), [0.0, 0.0, 1.0, 1.0]);
 +        right.layers[1].opacity = 0.5;
 +        let (merged, out) = merge(&bytes(&base), &bytes(&left), &bytes(&right)).unwrap();
++        let out = first_doc(&out);
 +        assert_eq!(out.layers[1].surface().unwrap().pixel(15, 15), vec![1.0, 0.0, 0.0, 1.0]);
 +        assert_eq!(out.layers[0].surface().unwrap().pixel(905, 305), vec![0.0, 0.0, 1.0, 1.0]);
 +        assert_eq!(out.layers[1].opacity, 0.5);
 +        assert_eq!(bytes(&out), merged);
-+        let (_, again) = merge(&bytes(&base), &bytes(&left), &bytes(&right)).unwrap();
++        let again = first_doc(&merge(&bytes(&base), &bytes(&left), &bytes(&right)).unwrap().1);
 +        let tile = |d: &Document| d.layers[0].surface().unwrap().tiles().next().unwrap().1.clone();
 +        assert!(Arc::ptr_eq(&tile(&out), &tile(&again)), "tiles decoded before are reused");
 +        // The same tile changed on both sides is a conflict, even to the same pixels.
-+        assert!(merge(&bytes(&base), &bytes(&left), &bytes(&left)).unwrap_err().contains("Conflict"));
++        assert!(merge(&bytes(&base), &bytes(&left), &bytes(&left)).err().unwrap().contains("Conflict"));
 +    }
 +
 +    #[test]
@@ -896,8 +1022,8 @@ index 0000000..1a11d0a
 +        render(&mut typed, Rect::from_xywh(0, 300, 100, 40));
 +        render(&mut larger, Rect::from_xywh(0, 0, 400, 80));
 +        faded.layers[2].opacity = 0.5;
-+        assert!(merge(&bytes(&base), &bytes(&typed), &bytes(&larger)).unwrap_err().contains("/cache"));
-+        let (_, out) = merge(&bytes(&base), &bytes(&typed), &bytes(&faded)).unwrap();
++        assert!(merge(&bytes(&base), &bytes(&typed), &bytes(&larger)).err().unwrap().contains("/cache"));
++        let out = first_doc(&merge(&bytes(&base), &bytes(&typed), &bytes(&faded)).unwrap().1);
 +        assert_eq!((out.layers[2].opacity, out.layers[2].content.clone()), (0.5, typed.layers[2].content.clone()));
 +    }
 +
@@ -915,7 +1041,7 @@ index 0000000..1a11d0a
 +        let second_author = merge(&base, &second, &first).unwrap().0;
 +        let first_author = merge(&first, &first, &coordinator).unwrap().0;
 +        assert_eq!((&coordinator, &first_author), (&second_author, &second_author));
-+        let names: Vec<_> = document(&decode(&coordinator).unwrap()).unwrap().layers.iter().map(|l| l.name.clone()).collect();
++        let names: Vec<_> = first_doc(&decode(&coordinator).unwrap()).layers.iter().map(|l| l.name.clone()).collect();
 +        assert_eq!(names, ["Background", "Layer 1", "second", "first"]);
 +    }
 +
@@ -938,7 +1064,7 @@ index 0000000..1a11d0a
 +        session.execute("history.newSnapshot", Value::Null).unwrap();
 +        assert!(session.install_remote(id, remote));
 +        let st = session.active().unwrap();
-+        assert_eq!((st.doc.layers[0].opacity, st.doc.name.as_str(), st.active_layer), (0.25, "Untitled-1", active));
++        assert_eq!((st.doc.layers[0].opacity, st.doc.name.as_str(), st.active_layer), (0.25, "theirs", active));
 +        assert!(st.doc.selection.is_some(), "the selection is this person's");
 +        assert!(!st.history.can_undo(), "no native step to undo it, nor older ones without it");
 +        assert!(st.snapshots.is_empty(), "nor a snapshot without it");
@@ -959,10 +1085,21 @@ index 0000000..1a11d0a
 +        frame(&mut app, &ctx);
 +        frame(&mut app, &ctx);
 +        let active = app.session.active().unwrap().active_layer.unwrap().0;
-+        assert_eq!(LIVE.with_borrow(|live| live.presence.clone()), json!({"layers": [active], "selection": [10, 10, 60, 60]}));
-+        app.session.add_document(doc(), None);
++        let uid = LIVE.with_borrow(|live| live.docs[0].uid);
++        assert_eq!(LIVE.with_borrow(|live| live.presence.clone()), json!({"doc": uid, "layers": [active], "selection": [10, 10, 60, 60]}));
++        // A brush stroke under way: the others are shown it so far, at the brush's size.
++        use photocraft_ui_egui::canvas::{ToolEvent, tool_event};
++        app.ui.tool = photocraft_ui_egui::state::Tool::Brush;
++        tool_event(&mut app, ToolEvent::Down { x: 20.0, y: 20.0, pressure: 1.0 }, egui::Modifiers::NONE);
++        tool_event(&mut app, ToolEvent::Move { x: 40.5, y: 30.0, pressure: 1.0 }, egui::Modifiers::NONE);
 +        frame(&mut app, &ctx);
-+        assert_eq!(LIVE.with_borrow(|live| live.presence.clone()), Value::Null, "another document shown: nothing to share");
++        let stroke = LIVE.with_borrow(|live| live.presence["stroke"].clone());
++        assert_eq!((stroke["size"].as_f64(), &stroke["points"]), (Some(f64::from(app.session.tools.brush.size)), &json!([20, 20, 40.5, 30])));
++        tool_event(&mut app, ToolEvent::Up { x: 40.5, y: 30.0 }, egui::Modifiers::NONE);
++        app.session.add_document(Document::new("Untitled-2", Size::new(64, 64), ColorMode::Rgb, SampleType::U8), None);
++        frame(&mut app, &ctx);
++        let other = LIVE.with_borrow(|live| live.docs[1].uid);
++        assert_eq!(LIVE.with_borrow(|live| live.presence["doc"].clone()), json!(other), "another document shown");
 +        disconnect();
 +    }
 +
@@ -979,7 +1116,8 @@ index 0000000..1a11d0a
 +        theirs.layers[0].visible = false;
 +        let done = Rc::new(std::cell::RefCell::new(None));
 +        let to = done.clone();
-+        queue(Some(base.to_vec()), bytes(&theirs), Box::new(move |r| *to.borrow_mut() = Some(r)));
++        let uid = LIVE.with_borrow(|live| live.docs[0].uid);
++        queue(Some(base.to_vec()), set_of(&[(uid, &theirs)]), Box::new(move |r| *to.borrow_mut() = Some(r)));
 +        app.live_adjust = Some((app.session.active().unwrap().doc.layers[1].id, Value::Null));
 +        frame(&mut app, &ctx);
 +        assert!(done.borrow().is_none(), "a busy app waits");
@@ -1002,21 +1140,466 @@ index 0000000..1a11d0a
 +        assert!(LIVE.with_borrow(|live| Rc::ptr_eq(live.encoded.as_ref().unwrap().as_ref().unwrap(), &encoded)), "a selection is not encoded");
 +        assert_eq!(LIVE.with_borrow(|live| live.changes), changes);
 +        assert!(app.run("edit.undo", Value::Null).is_ok());
-+        app.session.add_document(doc(), None);
-+        assert!(!undo(app.session.active().map(|st| st.doc.id), None), "another document keeps its own Undo");
 +        assert_eq!(LIVE.with_borrow(|live| live.undos.clone()), [false]);
++        disconnect();
++        assert!(!undo(app.session.active().map(|st| st.doc.id), None), "native Undo once disconnected");
++    }
++
++    #[test]
++    fn opened_documents_join_the_set_theirs_open_in_the_background_and_closed_ones_stay_closed() {
++        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
++        app.session.add_document(doc(), None);
++        let ctx = egui::Context::default();
++        connect();
++        frame(&mut app, &ctx);
++        app.session.add_document(Document::new("Untitled-2", Size::new(64, 64), ColorMode::Rgb, SampleType::U8), None);
++        frame(&mut app, &ctx);
++        let two = checkpoint(&app).unwrap();
++        let mut set = decode(&two).unwrap();
++        assert_eq!(documents(&set.doc).count(), 2, "a document opened while connected joins the set");
++        // Someone else opens a third: it arrives as a tab, the document shown stays.
++        let mut third = set.doc["documents"][1].clone();
++        third["id"] = json!(1u64 << 52);
++        third["name"] = "theirs".into();
++        set.doc["documents"].as_array_mut().unwrap().push(third.clone());
++        let theirs = write(&set).unwrap();
++        queue(Some(two.to_vec()), theirs.clone(), Box::new(|r| assert!(r.is_ok(), "{r:?}")));
++        frame(&mut app, &ctx);
++        let names = |app: &PhotocraftApp| app.session.documents().iter().map(|st| st.doc.name.clone()).collect::<Vec<_>>();
++        assert_eq!((names(&app), app.session.active_index()), (vec!["Untitled-1".into(), "Untitled-2".into(), "theirs".into()], Some(1)));
++        // Closing it hides it here only: the set keeps it, and a change to it doesn't open it again.
++        app.session.close(2);
++        frame(&mut app, &ctx);
++        assert_eq!(checkpoint(&app).unwrap().as_slice(), theirs.as_slice());
++        third["name"] = "renamed".into();
++        *set.doc["documents"].as_array_mut().unwrap().last_mut().unwrap() = third;
++        queue(Some(theirs), write(&set).unwrap(), Box::new(|r| assert!(r.is_ok(), "{r:?}")));
++        frame(&mut app, &ctx);
++        assert_eq!(names(&app).len(), 2);
++        assert_eq!(documents(&decode(&checkpoint(&app).unwrap()).unwrap().doc).last().unwrap().1["name"], "renamed");
 +        disconnect();
 +    }
 +}
+diff --git a/apps/photocraft-web/src/live/peers.rs b/apps/photocraft-web/src/live/peers.rs
+new file mode 100644
+index 0000000..a17120d
+--- /dev/null
++++ b/apps/photocraft-web/src/live/peers.rs
+@@ -0,0 +1,405 @@
++//! The others in a live session, drawn over the canvas of the document they are on in their colour after the app's own
++//! frame (`web/live_shell.rs`), so menus, dialogs and popups stay above them, and as dots on that document's tab. First
++//! the gestures they have under way ([`photocraft_ui_egui::live::gesture`]: a stroke at its brush width, a marquee's or
++//! lasso's rubber band, a ghost of what a Move drag or Free Transform has so far), then their selection bounds, then
++//! their pointers with a name tag. Presence arrives about ten times a second: each mark eases toward its person's latest
++//! state in document pixels, so this person's own scrolling and zooming never lags them. Their states come from other
++//! people: what doesn't read as numbers in range is skipped.
++
++use super::LIVE;
++use egui::{Color32, FontFamily, FontId, Pos2, Rect, Shape, Stroke, Vec2, pos2, vec2};
++use photocraft_ui_egui::canvas::ViewXform;
++use serde_json::Value;
++use std::cell::RefCell;
++use std::collections::HashMap;
++
++/// A point in document pixels.
++type P = [f32; 2];
++
++/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
++const EASE: f32 = 0.08;
++/// The most points of a remote path (twice what a presence carries).
++const MAX_POINTS: usize = 400;
++
++/// A person's moving marks as last drawn, in document pixels: their pointer, a ghost's or rubber band's corners, and how
++/// far (along the path) the drawn end of a stroke or lasso trails its newest point.
++#[derive(Default)]
++struct Shown {
++    pointer: Vec<P>,
++    ghost: Vec<P>,
++    band: Vec<P>,
++    tip: Option<P>,
++    behind: f32,
++}
++
++thread_local! {
++    static SHOWN: RefCell<HashMap<String, Shown>> = RefCell::default();
++}
++
++fn numbers<const N: usize>(v: &Value) -> Option<[f32; N]> {
++    points(v, N)?.as_flattened().try_into().ok()
++}
++
++/// `[x, y, …]` with at most `max` points, all in range.
++fn points(v: &Value, max: usize) -> Option<Vec<P>> {
++    let v = v.as_array().filter(|v| v.len() % 2 == 0 && v.len() <= 2 * max)?;
++    let n: Vec<f32> = v.iter().map(|n| n.as_f64().filter(|n| n.abs() < 1e7).map(|n| n as f32)).collect::<Option<_>>()?;
++    Some(n.chunks_exact(2).map(|p| [p[0], p[1]]).collect())
++}
++
++/// The four corners of the rectangle between `a` and `b`, clockwise from `a`.
++fn rect(a: P, b: P) -> [P; 4] {
++    [a, [b[0], a[1]], b, [a[0], b[1]]]
++}
++
++/// What a person's state shows, in document pixels: the ghost's corners, a rubber band's two corners (and whether it is
++/// an ellipse), a path (a stroke's with its width, or a lasso's) and the pointer.
++struct Targets {
++    ghost: Vec<P>,
++    band: Vec<P>,
++    ellipse: bool,
++    path: Vec<P>,
++    width: Option<f32>,
++    pointer: Vec<P>,
++}
++
++fn targets(state: &Value) -> Targets {
++    let stroke = &state["stroke"];
++    let width = stroke["size"].as_f64().filter(|s| (0.0..1e5).contains(s)).map(|s| s as f32);
++    let path = match width {
++        Some(_) => points(&stroke["points"], MAX_POINTS),
++        None => points(&state["lasso"], MAX_POINTS),
++    };
++    Targets {
++        ghost: points(&state["ghost"], 4).filter(|g| g.len() == 4).unwrap_or_default(),
++        band: numbers::<4>(&state["band"]).map(|[x0, y0, x1, y1]| vec![[x0, y0], [x1, y1]]).unwrap_or_default(),
++        ellipse: state["ellipse"] == true,
++        path: path.unwrap_or_default(),
++        width,
++        pointer: numbers::<2>(&state["pointer"]).map(|p| vec![p]).unwrap_or_default(),
++    }
++}
++
++impl Shown {
++    /// `k` of the way on toward `t`; a first sight, another kind of mark or a jump of more than `far` (screen points
++    /// on `xf`) goes at once. Whether a mark is still on its way.
++    fn step(&mut self, t: &Targets, k: f32, far: f32, xf: &ViewXform) -> bool {
++        let screen = |p: P| xf.to_screen(p[0], p[1]);
++        let ease = |s: &mut Vec<P>, t: &[P]| {
++            if s.len() != t.len() || s.iter().zip(t).any(|(a, b)| (screen(*a) - screen(*b)).length() > far) {
++                *s = t.to_vec();
++                return false;
++            }
++            let mut moving = false;
++            for (a, b) in s.iter_mut().zip(t) {
++                *a = [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k];
++                match (screen(*a) - screen(*b)).length() < 0.5 {
++                    true => *a = *b,
++                    false => moving = true,
++                }
++            }
++            moving
++        };
++        let mut moving = ease(&mut self.pointer, &t.pointer);
++        moving |= ease(&mut self.ghost, &t.ghost);
++        moving |= ease(&mut self.band, &t.band);
++        // A path's newest end: what came since the newest point drawn is drawn as it comes.
++        let tip = t.path.last().copied();
++        if tip != self.tip {
++            let since = self.tip.zip(tip).and_then(|(old, _)| from_end(&t.path, old, 4.0 / xf.zoom.max(1e-3)));
++            self.behind = since.map_or(0.0, |d| self.behind + d);
++            self.tip = tip;
++        }
++        self.behind *= 1.0 - k;
++        if self.behind * xf.zoom < 0.5 || self.behind * xf.zoom > far {
++            self.behind = 0.0;
++        }
++        moving || self.behind > 0.0
++    }
++}
++
++fn dist(a: P, b: P) -> f32 {
++    (a[0] - b[0]).hypot(a[1] - b[1])
++}
++
++/// How far along `path` from `q` (within `tol` of it) to its newest end, searched from that end.
++fn from_end(path: &[P], q: P, tol: f32) -> Option<f32> {
++    let mut d = 0.0;
++    for w in path.windows(2).rev() {
++        let (a, b) = (w[0], w[1]);
++        let len = dist(a, b);
++        let t = if len > 0.0 { (((q[0] - a[0]) * (b[0] - a[0]) + (q[1] - a[1]) * (b[1] - a[1])) / (len * len)).clamp(0.0, 1.0) } else { 0.0 };
++        let on = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
++        if dist(on, q) <= tol {
++            return Some(d + len * (1.0 - t));
++        }
++        d += len;
++    }
++    None
++}
++
++/// `path` without its last `behind` pixels.
++fn cut(path: &[P], mut behind: f32) -> Vec<P> {
++    let mut end = path.len();
++    while behind > 0.0 && end > 1 {
++        let (a, b) = (path[end - 2], path[end - 1]);
++        let len = dist(a, b);
++        if behind < len {
++            let t = behind / len;
++            let mut kept = path[..end - 1].to_vec();
++            kept.push([b[0] + (a[0] - b[0]) * t, b[1] + (a[1] - b[1]) * t]);
++            return kept;
++        }
++        behind -= len;
++        end -= 1;
++    }
++    path[..end].to_vec()
++}
++
++/// A translucent stroke `w` wide along `path` (screen points), as one mesh so that no part of it covers another: round
++/// caps, mitred joins (at most twice as long), its edges feathered over `aa` points as egui feathers its own shapes.
++fn stroke(path: &[Pos2], w: f32, ink: Color32, aa: f32) -> Shape {
++    let mut pts: Vec<Pos2> = Vec::with_capacity(path.len());
++    for &p in path {
++        if pts.last().is_none_or(|q| q.distance(p) > 0.01) {
++            pts.push(p);
++        }
++    }
++    let n = pts.len();
++    let (inner, outer) = ((w - aa).max(0.0) / 2.0, (w + aa) / 2.0);
++    let clear = Color32::TRANSPARENT;
++    let dir = |i: usize| (pts[i + 1] - pts[i]).normalized();
++    let mut mesh = egui::Mesh::default();
++    // Per point, along its normal: the left edge's feather and inside, the right edge's inside and feather.
++    let normals: Vec<Vec2> = (0..n)
++        .map(|i| match i {
++            _ if n == 1 => Vec2::Y,
++            0 => dir(0).rot90(),
++            _ if i == n - 1 => dir(n - 2).rot90(),
++            _ => {
++                let (a, b) = (dir(i - 1).rot90(), dir(i).rot90());
++                let m = (a + b).normalized();
++                m / m.dot(a).max(0.5)
++            }
++        })
++        .collect();
++    for (p, normal) in pts.iter().zip(&normals) {
++        for (off, c) in [(outer, clear), (inner, ink), (-inner, ink), (-outer, clear)] {
++            mesh.colored_vertex(*p + *normal * off, c);
++        }
++    }
++    for a in (0..n.saturating_sub(1) as u32).map(|i| 4 * i) {
++        for k in 0..3 {
++            mesh.add_triangle(a + k, a + k + 1, a + 4 + k);
++            mesh.add_triangle(a + k + 1, a + 5 + k, a + 4 + k);
++        }
++    }
++    // Half a disc out of each end (a whole one around a single point), from the end's left edge to its right.
++    let mut cap = |i: usize, out: Vec2| {
++        let (p, left) = (pts[i], normals[i]);
++        let at = 4 * i as u32;
++        let centre = mesh.vertices.len() as u32;
++        mesh.colored_vertex(p, ink);
++        let (mut last_in, mut last_out) = (at + 1, at);
++        for k in 1..=12 {
++            let (sin, cos) = (std::f32::consts::PI * k as f32 / 12.0).sin_cos();
++            let (inside, edge) = match k {
++                12 => (at + 2, at + 3),
++                _ => {
++                    let u = left * cos + out * sin;
++                    let v = mesh.vertices.len() as u32;
++                    mesh.colored_vertex(p + u * inner, ink);
++                    mesh.colored_vertex(p + u * outer, clear);
++                    (v, v + 1)
++                }
++            };
++            mesh.add_triangle(centre, last_in, inside);
++            mesh.add_triangle(last_in, last_out, inside);
++            mesh.add_triangle(last_out, edge, inside);
++            (last_in, last_out) = (inside, edge);
++        }
++    };
++    match n {
++        0 => {}
++        1 => {
++            cap(0, Vec2::X);
++            cap(0, -Vec2::X);
++        }
++        _ => {
++            cap(0, -dir(0));
++            cap(n - 1, dir(n - 2));
++        }
++    }
++    Shape::mesh(mesh)
++}
++
++/// Relative luminance (sRGB) of `c`.
++fn luminance(c: Color32) -> f32 {
++    let lin = |v: u8| {
++        let v = f32::from(v) / 255.0;
++        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
++    };
++    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
++}
++
++/// `name` cut to 24 characters, with "…" when cut.
++fn tag(name: &str) -> String {
++    match name.chars().nth(24) {
++        Some(_) => name.chars().take(23).chain(['…']).collect(),
++        None => name.to_owned(),
++    }
++}
++
++/// The pointer arrow, tip at (0, 0), in points.
++const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
++
++/// `points` filled with `fill` as a fan from the first (the arrow is star-shaped around its tip).
++fn fan(points: &[Pos2], fill: Color32) -> Shape {
++    let mut mesh = egui::Mesh::default();
++    for p in points {
++        mesh.colored_vertex(*p, fill);
++    }
++    for i in 1..points.len() as u32 - 1 {
++        mesh.add_triangle(0, i, i + 1);
++    }
++    Shape::mesh(mesh)
++}
++
++/// A person's pointer: the arrow in their colour with a white outline and a soft shadow, and their name tag.
++fn pointer(painter: &egui::Painter, tip: Pos2, color: Color32, name: &str) {
++    let ppp = painter.pixels_per_point();
++    let tip = (tip.to_vec2() * ppp).round().to_pos2() / ppp;
++    let arrow = |off: Vec2| ARROW.map(|[x, y]| tip + off + vec2(x, y));
++    painter.add(fan(&arrow(vec2(0.0, 1.0)), Color32::from_black_alpha(64)));
++    painter.add(fan(&arrow(Vec2::ZERO), color));
++    painter.add(Shape::closed_line(arrow(Vec2::ZERO).to_vec(), Stroke::new(1.5, Color32::WHITE)));
++    if name.is_empty() {
++        return;
++    }
++    let ink = if luminance(color) > 0.55 { Color32::from_rgb(0x11, 0x11, 0x11) } else { Color32::WHITE };
++    let semibold = FontFamily::Name("semibold".into());
++    let font = match painter.fonts(|f| f.families().contains(&semibold)) {
++        true => FontId::new(12.0, semibold),
++        false => FontId::proportional(12.0),
++    };
++    let text = painter.layout_no_wrap(tag(name), font, ink);
++    let pad = vec2(7.0, 3.0);
++    let at = tip + vec2(12.0, 15.0);
++    painter.rect_filled(Rect::from_min_size(at, text.size() + 2.0 * pad), 6.0, color);
++    painter.galley(at + pad, text, ink);
++}
++
++fn color(p: &super::template::Presence) -> Color32 {
++    Color32::from_rgb(p.color[0], p.color[1], p.color[2])
++}
++
++/// The others on each document tab: a dot each in their colour, stacked in the padding before its title (three at
++/// most).
++fn dots(app: &photocraft_ui_egui::PhotocraftApp, ui: &egui::Ui, live: &super::Live) {
++    let edge = Stroke::new(1.0, Color32::from_black_alpha(90));
++    for (id, tab) in photocraft_ui_egui::live::tabs(app) {
++        let Some(uid) = super::uid_of(live, id) else { continue };
++        let on: Vec<_> = live.others.iter().filter(|p| p.state["doc"].as_u64() == Some(uid)).take(3).collect();
++        let painter = ui.painter().with_clip_rect(tab);
++        for (i, p) in on.iter().enumerate() {
++            let y = (i as f32 - (on.len() - 1) as f32 / 2.0) * 7.0;
++            painter.circle(pos2(tab.left() + 8.0, tab.center().y + y), 2.5, color(p), edge);
++        }
++    }
++}
++
++/// The Home screen lists the session's documents closed here ("In this session"), one row each; a click opens it again.
++fn home(app: &mut photocraft_ui_egui::PhotocraftApp, ui: &egui::Ui) {
++    let n = app.session.documents().len();
++    let home = (n == 0 && app.session.prefs().general.auto_show_home_screen) || app.ui.chrome.home == Some(n);
++    let closed = LIVE.with_borrow(super::closed);
++    if !home || closed.is_empty() {
++        return;
++    }
++    let mut open = None;
++    // Under the Home screen's card, which is centred where the canvas was.
++    let at = app.last_canvas_rect.center() + vec2(0.0, 165.0);
++    egui::Area::new(egui::Id::new("live-session-documents")).fixed_pos(at).pivot(egui::Align2::CENTER_TOP).show(ui.ctx(), |ui| {
++        egui::Frame::popup(ui.style()).show(ui, |ui| {
++            ui.set_min_width(300.0);
++            ui.label(egui::RichText::new("In this session").strong());
++            for (uid, name) in &closed {
++                if ui.selectable_label(false, name).clicked() {
++                    open = Some(*uid);
++                }
++            }
++        });
++    });
++    if let Some(uid) = open {
++        super::reopen(app, uid);
++    }
++}
++
++/// Draws the others on the canvas of the document shown (those on it) and on the tabs, lists the session's documents
++/// closed here on the Home screen, and asks for another frame while a mark is still on its way.
++pub fn draw(app: &mut photocraft_ui_egui::PhotocraftApp, ui: &egui::Ui) {
++    home(app, ui);
++    let app = &*app;
++    LIVE.with_borrow(|live| {
++        dots(app, ui, live);
++        SHOWN.with_borrow_mut(|shown| {
++            let here = app.session.active().and_then(|st| super::uid_of(live, st.doc.id));
++            let others: Vec<_> = live.others.iter().filter(|p| here.is_some() && p.state["doc"].as_u64() == here).collect();
++            shown.retain(|id, _| others.iter().any(|p| p.id == *id));
++            let Some(xf) = ViewXform::active(app).filter(|_| !others.is_empty()) else { return };
++            let painter = ui.painter().with_clip_rect(xf.rect);
++            let k = 1.0 - (-ui.input(|i| i.stable_dt).clamp(0.0, 0.1) / EASE).exp();
++            let far = xf.rect.width().max(xf.rect.height()) / 4.0;
++            let screen = |p: &P| xf.to_screen(p[0], p[1]);
++            let mut moving = false;
++            let wanted: Vec<_> = others.iter().map(|p| targets(&p.state)).collect();
++            for (p, t) in others.iter().zip(&wanted) {
++                moving |= shown.entry(p.id.clone()).or_default().step(t, k, far, &xf);
++            }
++            let peers: Vec<_> = others.iter().zip(&wanted).filter_map(|(p, t)| Some((*p, t, shown.get(&p.id)?))).collect();
++            for (p, t, s) in &peers {
++                let color = color(p);
++                if s.ghost.len() == 4 {
++                    let fill = color.gamma_multiply(0.28);
++                    painter.add(Shape::convex_polygon(s.ghost.iter().map(screen).collect(), fill, Stroke::new(1.5, color.gamma_multiply(0.85))));
++                }
++                let band = match s.band[..] {
++                    [a, b] if t.ellipse => (0..=64)
++                        .map(|i| {
++                            let r = std::f32::consts::TAU * i as f32 / 64.0;
++                            let c = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
++                            screen(&[c[0] + (b[0] - a[0]) / 2.0 * r.cos(), c[1] + (b[1] - a[1]) / 2.0 * r.sin()])
++                        })
++                        .collect(),
++                    [a, b] => rect(a, b).iter().chain([&a]).map(screen).collect(),
++                    _ => Vec::new(),
++                };
++                let path: Vec<Pos2> = cut(&t.path, s.behind).iter().map(screen).collect();
++                match t.width {
++                    Some(w) if !path.is_empty() => {
++                        let aa = 1.0 / painter.pixels_per_point();
++                        painter.add(stroke(&path, (w * xf.zoom).max(2.0), color.gamma_multiply(0.7), aa));
++                    }
++                    _ => painter.extend(Shape::dashed_line(&path, Stroke::new(1.5, color), 4.0, 3.0)),
++                }
++                painter.extend(Shape::dashed_line(&band, Stroke::new(1.5, color), 4.0, 3.0));
++            }
++            for (p, ..) in &peers {
++                if let Some([x0, y0, x1, y1]) = numbers::<4>(&p.state["selection"]) {
++                    // On pixel edges: a 2-point line there stays crisp.
++                    let ppp = painter.pixels_per_point();
++                    let corners = rect([x0, y0], [x1, y1]).iter().map(|p| (screen(p).to_vec2() * ppp).round().to_pos2() / ppp).collect();
++                    painter.add(Shape::closed_line(corners, Stroke::new(2.0, color(p))));
++                }
++            }
++            for (p, _, s) in &peers {
++                if let Some(at) = s.pointer.first().map(screen).filter(|at| xf.rect.contains(*at)) {
++                    pointer(&painter, at, color(p), &p.name);
++                }
++            }
++            if moving {
++                ui.ctx().request_repaint();
++            }
++        });
++    });
++}
 diff --git a/apps/photocraft-web/src/web/live_shell.rs b/apps/photocraft-web/src/web/live_shell.rs
 new file mode 100644
-index 0000000..c88ce53
+index 0000000..95c767d
 --- /dev/null
 +++ b/apps/photocraft-web/src/web/live_shell.rs
 @@ -0,0 +1,65 @@
 +//! Live editing in a Playground session (patches/photoshop/live.diff): the page's runner, kept for the session to
 +//! reach the app, and the shell around [`WebShell`] that ends each frame with the session's frame hook and draws the
-+//! others' pointers. The adapter itself is `crate::live`.
++//! others (their pointers, selections and gestures). The adapter itself is `crate::live`.
 +
 +use super::WebShell;
 +use std::cell::OnceCell;
@@ -1052,7 +1635,7 @@ index 0000000..c88ce53
 +    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
 +        self.0.ui(ui, frame);
 +        crate::live::frame(&mut self.0.app, ui.ctx());
-+        crate::live::draw_presence(&self.0.app, ui);
++        crate::live::draw_presence(&mut self.0.app, ui);
 +    }
 +
 +    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -1081,10 +1664,10 @@ index 0000000..c88ce53
 +}
 diff --git a/crates/engine/src/live.rs b/crates/engine/src/live.rs
 new file mode 100644
-index 0000000..24c4b7a
+index 0000000..cff21cc
 --- /dev/null
 +++ b/crates/engine/src/live.rs
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,45 @@
 +//! Live editing in a Playground session (web; patches/photoshop/live.diff): a shared document installed as a change
 +//! made elsewhere. A child of the crate root so it reaches the open documents and `fix_active`.
 +
@@ -1111,12 +1694,11 @@ index 0000000..24c4b7a
 +    }
 +
 +    /// Copies `local`'s personal views into `doc`, the parts of a document a live editing session doesn't share: the
-+    /// selection, Quick Mask, work path, groups' disclosure, Ruler tool line and active count group, the id, name and
-+    /// file settings.
++    /// selection, Quick Mask, work path, groups' disclosure, Ruler tool line and active count group, the id and file
++    /// settings.
 +    pub fn keep_views(doc: &mut Document, local: &Document) {
 +        use photocraft_doc::{Layer, LayerContent::Group};
 +        doc.id = local.id;
-+        doc.name.clone_from(&local.name);
 +        doc.file_encoding.clone_from(&local.file_encoding);
 +        doc.selection.clone_from(&local.selection);
 +        doc.quick_mask.clone_from(&local.quick_mask);
@@ -1173,17 +1755,21 @@ index 0000000..6fd4823
 +}
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..8e20964
+index 0000000..0d0a866
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,171 @@
 +//! Live editing in a Playground session (web; patches/photoshop/live.diff): while the web crate's adapter
 +//! (apps/photocraft-web/src/live.rs) is connected, Undo and Redo of the shared document go to the session, which
-+//! reverts only this person's edits. Nothing here does anything until the adapter installs its hook.
++//! reverts only this person's edits. Nothing here does anything until the adapter installs its hook. [`gesture`] reads
++//! the gesture under way for the adapter to show the others.
 +
 +use crate::PhotocraftApp;
-+use photocraft_doc::DocId;
-+use std::cell::Cell;
++use crate::state::Tool;
++use photocraft_doc::{DocId, Document, LayerId, Rect};
++use serde_json::{Map, Value, json};
++use std::cell::{Cell, RefCell};
++use std::sync::{Arc, Weak};
 +
 +/// Whether the session takes Undo or Redo of the active document `active`; with `Some(redo)` it takes one.
 +pub type UndoHook = fn(active: Option<DocId>, take: Option<bool>) -> bool;
@@ -1209,4 +1795,138 @@ index 0000000..8e20964
 +        return false;
 +    }
 +    UNDO.get().is_some_and(|hook| hook(app.session.active().map(|st| st.doc.id), take.then_some(redo)))
++}
++
++/// The document tabs shown this frame: each one's document and rectangle.
++pub fn tabs(app: &PhotocraftApp) -> Vec<(DocId, egui::Rect)> {
++    let docs = app.session.documents();
++    let strip = app.tab_strip.as_ref().map(|s| s.tabs.as_slice()).unwrap_or_default();
++    strip.iter().filter_map(|&(i, r)| Some((docs.get(i)?.doc.id, r))).collect()
++}
++
++/// About this many characters of numbers at most in a stroke's or lasso's path, so a presence stays well under the
++/// shell's 4 KiB.
++const PATH_CHARS: usize = 2800;
++/// The most points of a path.
++const MAX_POINTS: usize = 200;
++
++/// `x` in tenths, short in JSON.
++fn num(x: f64) -> Value {
++    let x = (x.clamp(-1e7, 1e7) * 10.0).round() / 10.0;
++    if x.fract() == 0.0 { json!(x as i64) } else { json!(x) }
++}
++
++fn flat(points: &[[f64; 2]]) -> Value {
++    points.iter().flat_map(|p| [num(p[0]), num(p[1])]).collect()
++}
++
++/// `points` as `[x, y, …]`: none closer than `min` to the one kept before it (the last always kept), at most the newest
++/// [`MAX_POINTS`] and [`PATH_CHARS`].
++fn path(points: impl Iterator<Item = [f64; 2]>, min: f64) -> Value {
++    let mut kept: Vec<[f64; 2]> = Vec::new();
++    let mut last = None;
++    for p in points.filter(|p| p[0].is_finite() && p[1].is_finite()) {
++        if kept.last().is_none_or(|q| (p[0] - q[0]).hypot(p[1] - q[1]) >= min) {
++            kept.push(p);
++        }
++        last = Some(p);
++    }
++    if let Some(p) = last.filter(|p| kept.last() != Some(p)) {
++        kept.push(p);
++    }
++    let mut chars = 0;
++    let newest = kept.iter().rev().take(MAX_POINTS).take_while(|p| {
++        chars += num(p[0]).to_string().len() + num(p[1]).to_string().len() + 2;
++        chars <= PATH_CHARS
++    });
++    let from = kept.len() - newest.count();
++    flat(&kept[from..])
++}
++
++/// The four corners of `r` moved by `by`, clockwise from the top left.
++fn corners(r: Rect, by: (i32, i32)) -> Option<[[f64; 2]; 4]> {
++    let r = r.translate(by.0, by.1);
++    let [x0, y0, x1, y1] = [r.x0, r.y0, r.x1, r.y1].map(f64::from);
++    (!r.is_empty()).then_some([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
++}
++
++thread_local! {
++    /// The bounds a ghost last measured: in which document, of what (the moved layers; none: the selection).
++    static BOUNDS: RefCell<Option<(Weak<Document>, Vec<LayerId>, Option<Rect>)>> = const { RefCell::new(None) };
++}
++
++/// The bounds of `layers` in `doc` (none: of its selection), measured once per document and layers.
++fn bounds(doc: &Arc<Document>, layers: Vec<LayerId>) -> Option<Rect> {
++    BOUNDS.with_borrow_mut(|memo| {
++        if let Some((seen, of, b)) = memo.as_ref()
++            && seen.ptr_eq(&Arc::downgrade(doc))
++            && *of == layers
++        {
++            return *b;
++        }
++        let b = match layers.is_empty() {
++            true => doc.selection.as_ref().map(|s| s.content_bounds()),
++            false => (layers.iter().filter_map(|id| doc.layer(*id)))
++                .map(|l| photocraft_engine::transform_cmds::transform_bounds(doc, l))
++                .filter(|b| !b.is_empty())
++                .reduce(|a, b| a.union(&b)),
++        };
++        *memo = Some((Arc::downgrade(doc), layers, b));
++        b
++    })
++}
++
++/// The gesture under way on the active document, in its pixels, for the others to see as it happens:
++/// - `"stroke": {"size": diameter, "points": [x, y, …]}`: a painting stroke so far ([`path`]);
++/// - `"lasso": [x, y, …]`: a Lasso's or Polygonal Lasso's path, to the pointer (`pointer`);
++/// - `"band": [x0, y0, x1, y1]`, with `"ellipse": true` for the Elliptical Marquee: a marquee as it would select;
++/// - `"ghost": [x, y, …]`: where a Move drag (or a floating selection) has the layers or the selection so far, or the
++///   Free Transform box: four corners clockwise from the top left.
++///
++/// Read from the app's own gesture state; empty while nothing is under way.
++pub fn gesture(app: &PhotocraftApp, pointer: Option<[f64; 2]>) -> Map<String, Value> {
++    let mut out = Map::new();
++    let Some(st) = app.session.active() else { return out };
++    // The drawer's screen point, in document pixels: finer than that shows nothing.
++    let min = 1.0 / f64::from(app.point_zoom()).max(1e-3);
++    let selection = || crate::move_ui::floating_offset(app).or_else(|| crate::canvas::selection_drag_delta(app));
++    if let Some(t) = &app.ui.transform {
++        out.insert("ghost".into(), flat(&t.quad));
++    } else if !app.ui.polygon.is_empty() {
++        out.insert("lasso".into(), path(app.ui.polygon.iter().copied().chain(pointer), min));
++    } else if let Some(by) = selection() {
++        if let Some(c) = bounds(&st.doc, Vec::new()).and_then(|b| corners(b, by)) {
++            out.insert("ghost".into(), flat(&c));
++        }
++    } else if let Some(d) = &app.drag {
++        let end = d.points.last().map_or(d.start, |p| [p[0], p[1]]);
++        match d.tool {
++            t if t.is_brushlike() || crate::canvas::strokes_live(t) => {
++                let points = path(d.points.iter().map(|p| [p[0], p[1]]), min);
++                out.insert("stroke".into(), json!({"size": num(f64::from(app.session.tools.brush.size)), "points": points}));
++            }
++            Tool::Lasso => {
++                let to = d.lasso.as_ref().map(|l| l.cursor);
++                out.insert("lasso".into(), path(d.points.iter().map(|p| [p[0], p[1]]).chain(to), min));
++            }
++            Tool::RectMarquee | Tool::EllipseMarquee => {
++                if let Some(r) = crate::canvas::marquee_preview_px(&app.ui.tool_options, d, app.point_zoom()) {
++                    out.insert("band".into(), r.iter().map(|x| num(*x)).collect());
++                    if d.tool == Tool::EllipseMarquee {
++                        out.insert("ellipse".into(), true.into());
++                    }
++                }
++            }
++            Tool::Move => {
++                // Whole pixels, as the layers move (`move_ui`).
++                let by = ((end[0] - d.start[0]).round().clamp(-1e7, 1e7) as i32, (end[1] - d.start[1]).round().clamp(-1e7, 1e7) as i32);
++                let moved = photocraft_engine::layer_multi_cmds::move_targets(&st.doc, &st.selected_layers());
++                if let Some(c) = (!moved.is_empty()).then(|| bounds(&st.doc, moved)).flatten().and_then(|b| corners(b, by)) {
++                    out.insert("ghost".into(), flat(&c));
++                }
++            }
++            _ => {}
++        }
++    }
++    out
 +}
