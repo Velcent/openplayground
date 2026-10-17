@@ -183,3 +183,11 @@ test('a proposal is rebased entry by entry, exactly as its author rebases it, so
   const local = append(bytes(1, 2), append(bytes(1), proposal, bytes(1, 2)), bytes(1, 2, 3))
   assert.deepEqual(state(j), [...local])
 })
+
+test('an edit that changes nothing is refused, so a browser stuck on one cannot record entries forever', async () => {
+  const j = await setup()
+  await assert.rejects(j.submit(alice, await edit(0, [0, 0, 0], [0, 0, 0])), /No change/)
+  await j.submit(bob, await edit(0, [0, 0, 0], [1, 0, 0]))
+  await assert.rejects(j.submit(alice, await edit(1, [1, 0, 0], [1, 0, 0])), /No change/)
+  assert.equal(j.snapshot().revision, 1)
+})

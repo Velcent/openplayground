@@ -135,6 +135,9 @@ export class DocumentHistory {
         state = await applyDelta(state, entry.change)
         next = await this.#check(before, next, state)
       }
+      // An edit the merge reduces to nothing would be an empty entry its author's browser, still differing, proposes
+      // again and again; refused, that browser takes the shared document back (keeping its own as a draft).
+      if (next.length === this.#bytes.length && next.every((v, i) => v === this.#bytes[i])) throw new Error('No change')
     } else {
       if (p.target <= this.#oldest) throw new Error('Undo or Redo target expired')
       const { undo, redo } = stacks(this.#entries, author)
