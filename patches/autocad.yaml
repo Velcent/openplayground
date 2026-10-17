@@ -1,13 +1,16 @@
 # Live editing in Playground sessions (patches/autocad/live.diff + patches/live/playground_live.rs)
-# What it's for: people in a Playground session edit one drawing together and see each other's space, pointer and
-#   selection, in each person's color.
-# How: the adapter lives in new files: crates/ui-egui/src/live.rs (the shared document, merge, adopt, presence),
-#   crates/doc/src/live.rs (handles and anonymous block names no one else picks), crates/engine/src/live.rs (the shared
-#   drawing's Undo and Redo) and apps/cadcraft-web/src/web/live.rs (the kept runner and the shell that ends each frame
-#   with the session's frame hook). The template goes into crates/doc/src (tools.yaml live:). These rules only declare
-#   them and call in, each one line at the end of a file or right after a function's signature, except rule 9 (after
-#   one statement) and rules 11 and 12 (an expression replaced). Native builds behave as before: the hooks compile on
-#   wasm, and in debug builds (the native tests) where nothing connects.
+# What it's for: people in a Playground session edit the session's drawings together (every drawing opened, created
+#   or imported reaches the others as a tab behind theirs; closing a tab is personal) and see each other's drawing,
+#   space, pointer, selection and the gesture under way (ghosts of moved or grip-edited objects, rubber bands, selection
+#   windows) in each person's color, with dots on the tabs for who is where.
+# How: the adapter lives in new files: crates/ui-egui/src/live.rs (the shared drawings, merge, adopt, presence, tab
+#   dots, the Start page's list), crates/doc/src/live.rs (handles and anonymous block names no one else picks),
+#   crates/engine/src/live.rs (the shared drawings' Undo and Redo) and apps/cadcraft-web/src/web/live.rs (the kept
+#   runner and the shell that ends each frame with the session's frame hook). The template goes into crates/doc/src
+#   (tools.yaml live:). These rules only declare them and call in, each one line at the end of a file or right after a
+#   function's signature, except rules 9, 13 and 14 (after one statement) and rules 11 and 12 (an expression
+#   replaced). Native builds behave as before: the hooks compile on wasm, and in debug builds (the native tests) where
+#   nothing connects.
 # Verify all: node scripts/build.mjs check autocad head|release, LIVE=0 the same, the e2e (tests/live-apps/autocad.mjs)
 #   and `cargo test -p cadcraft-ui-egui --lib live::`.
 # If upstream changes: if a function named below is renamed, anchor on its new signature; if Shell or its fields
@@ -53,9 +56,9 @@
   after: "\n        #[cfg(target_arch = \"wasm32\")] if let Some(r) = self.live_undo(true) { return r; }"
 
 # Rule 8: the UI crate's live module (wasm, and the crate's own tests).
-# Rule 9: the others' pointers and selections, drawn on the canvas in their colors: in canvas::show right after the
-#   drawing and its selection highlights are painted (where it times them), with the sheet's transform `xf_paper`. If
-#   that line moves, call draw_presence anywhere in canvas::show after the highlights.
+# Rule 9: the others' pointers, selections and gestures, drawn on the canvas in their colors: in canvas::show right
+#   after the drawing and its selection highlights are painted (where it times them), with the sheet's transform
+#   `xf_paper`. If that line moves, call draw_presence anywhere in canvas::show after the highlights.
 - live: true
   file: crates/ui-egui/src/lib.rs
   find: '(?![\s\S])'
@@ -80,3 +83,18 @@
   file: apps/cadcraft-web/src/main.rs
   find: 'Ok\(Box::new\((?=\s*Shell\b)'
   replace: 'Ok(live::wrap('
+
+# Rules 13 and 14: shared tabs. Each drawing tab shows dots in the colors of the others on that drawing (in
+#   chrome::file_tabs, right after the statement that draws the tab, anchored on its widget id); the Start page lists
+#   the session's drawings ("In this session", under its buttons) to go to or open again (in CadApp::ui, right after
+#   the call that draws the Start page). Verify: the e2e's openTab step, and the screenshots. If the tab's id changes,
+#   anchor on the statement that draws a drawing tab and follow the id in live::tab_dots; if the Start page call moves,
+#   call session_list right after it.
+- live: true
+  file: crates/ui-egui/src/chrome.rs
+  find: 'with\(\(\s*"tab",\s*i\s*\)\)\)\s*;'
+  after: "\n            #[cfg(any(target_arch = \"wasm32\", test))] crate::live::tab_dots(app, ui, i);"
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: 'chrome::start_page\(\s*self,\s*ui\s*\)\s*;'
+  after: "\n                #[cfg(any(target_arch = \"wasm32\", test))] crate::live::session_list(self, ui);"
