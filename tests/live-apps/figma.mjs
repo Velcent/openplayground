@@ -3,7 +3,8 @@
 // editor the right one; Ctrl+Z is the owner's Undo. Nudges change one layer's transform: no array shifts.
 // The tool key gets a frame of its own: in a frame that has both, the canvas takes the press before the shortcut
 // switches the tool (a drag then selects instead of drawing, and a later click with the tool left on would draw a
-// stray 100×100 rectangle).
+// stray 100×100 rectangle). Before the edits the owner selects the left one with a click and leaves the pointer on it:
+// the editor is shown that page, pointer (page coordinates) and selection.
 import { until } from '../helpers.mjs'
 
 const LEFT = { x: 500, y: 330 }, RIGHT = { x: 760, y: 330 }
@@ -44,6 +45,14 @@ export default {
         await until(async () => await rectangles(page) >= count, 5000, `rectangle ${count}`).catch(() => {})
       }
     }
+  },
+  point: async (page) => {
+    await page.mouse.click(LEFT.x, LEFT.y)
+    await frames(page)
+    await until(() => page.evaluate(() => {
+      const mine = playgroundLiveAdapter.presence()
+      return !!mine?.pointer && mine.selection.length === 1
+    }), 10000, 'the pointer and selection')
   },
   editA: (page) => nudge(page, LEFT),
   editB: (page) => nudge(page, RIGHT),

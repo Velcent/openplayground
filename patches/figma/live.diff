@@ -1,155 +1,101 @@
-diff --git a/apps/figcraft-web/src/web.rs b/apps/figcraft-web/src/web.rs
-index 8cadb01..77812c9 100644
---- a/apps/figcraft-web/src/web.rs
-+++ b/apps/figcraft-web/src/web.rs
-@@ -26,11 +26,16 @@ pub fn start() {
-         {
-             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
-         }
--        let result = eframe::WebRunner::new()
-+        // Kept for Playground live editing, which reaches the app through it once it runs.
-+        let runner = eframe::WebRunner::new();
-+        let live_ctx = std::rc::Rc::new(std::cell::OnceCell::new());
-+        let app_ctx = live_ctx.clone();
-+        let result = runner
-             .start(
-                 canvas,
-                 options,
--                Box::new(|cc| {
-+                Box::new(move |cc| {
-+                    let _ = app_ctx.set(cc.egui_ctx.clone());
-                     if let Some(rs) = &cc.wgpu_render_state {
-                         log::info!("figcraft-web: wgpu backend {:?}", rs.adapter.get_info().backend);
-                     }
-@@ -45,6 +50,9 @@ pub fn start() {
-                 }),
-             )
-             .await;
-+        if result.is_ok() {
-+            attach_live(runner, live_ctx);
-+        }
-         if let Some(el) = document.get_element_by_id(LOADING_ID) {
-             match result {
-                 Ok(()) => el.remove(),
-@@ -54,6 +62,22 @@ pub fn start() {
-     });
- }
- 
-+/// Offers Playground live editing of the document in front to the page (`figcraft_engine::playground_live`).
-+fn attach_live(runner: eframe::WebRunner, ctx: std::rc::Rc<std::cell::OnceCell<egui::Context>>) {
-+    let attached = figcraft_engine::playground_live::web::attach::<Session>(
+diff --git a/apps/figcraft-web/src/web/playground.rs b/apps/figcraft-web/src/web/playground.rs
+new file mode 100644
+index 0000000..8b1acdc
+--- /dev/null
++++ b/apps/figcraft-web/src/web/playground.rs
+@@ -0,0 +1,86 @@
++//! Live editing in a Playground session (`figcraft_engine::live_playground`): the page's runner, kept for the session
++//! to reach the app, and the app eframe runs: [`WebShell`], then the session's end-of-frame hook.
++
++use super::WebShell;
++use figcraft_engine::Session;
++use figcraft_engine::live_playground::{self as live, playground_live};
++use std::cell::OnceCell;
++
++thread_local! {
++    static RUNNER: OnceCell<eframe::WebRunner> = const { OnceCell::new() };
++    static CONTEXT: OnceCell<egui::Context> = const { OnceCell::new() };
++}
++
++/// A new web runner, kept for [`wrap`].
++pub(super) fn runner() -> eframe::WebRunner {
++    let runner = eframe::WebRunner::new();
++    RUNNER.with(|kept| kept.get_or_init(|| runner.clone()).clone())
++}
++
++/// The app eframe runs: `shell`, offered to the page for live editing of the document in front.
++pub(super) fn wrap(shell: WebShell) -> Box<dyn eframe::App> {
++    let attached = playground_live::web::attach::<Session>(
 +        concat!("figma:1:", env!("CARGO_PKG_VERSION")),
-+        move |f| runner.app_mut::<WebShell>().map(|mut shell| f(&mut shell.fig.session)).is_some(),
-+        move || {
-+            if let Some(ctx) = ctx.get() {
-+                ctx.request_repaint();
-+            }
++        |with| RUNNER.with(|runner| runner.get().and_then(|r| r.app_mut::<WebShell>()).map(|mut shell| with(&mut shell.fig.session)).is_some()),
++        || {
++            CONTEXT.with(|ctx| {
++                if let Some(ctx) = ctx.get() {
++                    ctx.request_repaint();
++                }
++            });
 +        },
 +    );
 +    if let Err(e) = attached {
 +        log::error!("figcraft-web: no live editing: {e:?}");
 +    }
++    Box::new(Live(shell))
 +}
 +
- fn query() -> String {
-     web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
- }
-@@ -66,6 +90,18 @@ impl eframe::App for WebShell {
-     // `FigApp::ui` runs its own per-frame logic first (fonts, theme), like the desktop app.
-     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-         self.fig.ui(ui);
-+        // Playground live editing: this frame's edits go out, others' come in and show next frame.
-+        let revision = self.fig.session.ds().map(|d| d.revision).ok();
++struct Live(WebShell);
++
++impl eframe::App for Live {
++    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
++        self.0.logic(ctx, frame);
++    }
++
++    /// The shell's frame, then this frame's edits go out and others' come in (they show next frame).
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        self.0.ui(ui, frame);
 +        let ctx = ui.ctx();
++        CONTEXT.with(|kept| {
++            kept.get_or_init(|| ctx.clone());
++        });
++        let session = &mut self.0.fig.session;
++        let revision = session.ds().map(|d| d.revision).ok();
 +        let typing = ctx.memory(|m| m.focused()).is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
-+        figcraft_engine::live_playground::frame(&mut self.fig.session, typing || ctx.input(|i| i.pointer.any_down()));
-+        if self.fig.session.ds().map(|d| d.revision).ok() != revision {
++        live::frame(session, typing || ctx.input(|i| i.pointer.any_down()));
++        if session.ds().map(|d| d.revision).ok() != revision {
 +            ctx.request_repaint();
 +        }
 +    }
 +
++    /// The shell itself, which the session reaches through the runner.
 +    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-+        Some(self)
-     }
- }
- 
-diff --git a/crates/engine/Cargo.toml b/crates/engine/Cargo.toml
-index f610c38..14bcc5c 100644
---- a/crates/engine/Cargo.toml
-+++ b/crates/engine/Cargo.toml
-@@ -29,6 +29,11 @@ base64 = { workspace = true }
- regex = { workspace = true }
- web-time = "1.1.0"
- 
-+[target.'cfg(target_arch = "wasm32")'.dependencies]
-+# Playground live editing (src/playground_live.rs).
-+wasm-bindgen = "0.2"
-+js-sys = "0.3"
++        Some(&mut self.0)
++    }
 +
- [dev-dependencies]
- wat = { workspace = true }
- image = { workspace = true }
-diff --git a/crates/engine/src/branches.rs b/crates/engine/src/branches.rs
-index 8bff056..92280d9 100644
---- a/crates/engine/src/branches.rs
-+++ b/crates/engine/src/branches.rs
-@@ -223,7 +223,11 @@ fn disabled(cmd: &str, why: impl Into<String>) -> EngineError {
- /// aren't known here, so a branch's id space could clash); allow them once the server hands out
- /// branch id spaces.
- fn refuse_live(s: &Session, cmd: &str, uid: u64) -> Result<()> {
--    if s.live_doc(uid) { Err(disabled(cmd, "branches aren't available in a live session")) } else { Ok(()) }
-+    #[cfg(any(target_arch = "wasm32", test))]
-+    let shared = crate::live_playground::shares(s, uid);
-+    #[cfg(not(any(target_arch = "wasm32", test)))]
-+    let shared = false;
-+    if s.live_doc(uid) || shared { Err(disabled(cmd, "branches aren't available in a live session")) } else { Ok(()) }
- }
- 
- fn create(s: &mut Session, p: &Value) -> Result<Value> {
-diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 34653bd..279c015 100644
---- a/crates/engine/src/lib.rs
-+++ b/crates/engine/src/lib.rs
-@@ -34,6 +34,11 @@ pub mod library;
- pub mod library_server;
- pub mod library_swap;
- pub mod live;
-+// Playground live editing (the web build).
-+#[cfg(any(target_arch = "wasm32", test))]
-+pub mod live_playground;
-+#[cfg(any(target_arch = "wasm32", test))]
-+pub mod playground_live;
- pub mod measure;
- pub mod online;
- pub mod params;
-@@ -1063,6 +1068,10 @@ impl Session {
-     }
- 
-     pub fn undo(&mut self) -> Result<bool> {
-+        #[cfg(any(target_arch = "wasm32", test))]
-+        if live_playground::undo(self, false) {
-+            return Ok(true);
-+        }
-         textpreview::end(self);
-         let live = self.ds().is_ok_and(|d| self.live_doc(d.uid));
-         let ds = self.ds_mut()?;
-@@ -1093,6 +1102,10 @@ impl Session {
-     }
- 
-     pub fn redo(&mut self) -> Result<bool> {
-+        #[cfg(any(target_arch = "wasm32", test))]
-+        if live_playground::undo(self, true) {
-+            return Ok(true);
-+        }
-         textpreview::end(self);
-         let live = self.ds().is_ok_and(|d| self.live_doc(d.uid));
-         let ds = self.ds_mut()?;
++    fn save(&mut self, storage: &mut dyn eframe::Storage) {
++        self.0.save(storage);
++    }
++
++    fn auto_save_interval(&self) -> std::time::Duration {
++        self.0.auto_save_interval()
++    }
++
++    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
++        self.0.clear_color(visuals)
++    }
++
++    fn persist_egui_memory(&self) -> bool {
++        self.0.persist_egui_memory()
++    }
++
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
++        self.0.raw_input_hook(ctx, raw_input);
++    }
++}
 diff --git a/crates/engine/src/live_playground.rs b/crates/engine/src/live_playground.rs
 new file mode 100644
-index 0000000..c327dcb
+index 0000000..eee840c
 --- /dev/null
 +++ b/crates/engine/src/live_playground.rs
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,412 @@
 +//! Playground live editing of one open document (the web build; [`playground_live`] is the adapter the Playground shell
 +//! drives). The shared document is the collaboration core's snapshot of the file ([`Replica::snapshot`]: layers with
 +//! their properties, styles, variables, comments, images) without its name and opening page, which stay this person's
@@ -159,6 +105,10 @@ index 0000000..c327dcb
 +//!
 +//! The session edits the document in front when it connects. Once its tab is closed, or a native live session
 +//! (`collab.*`) has the document, the session keeps the last one it saw, and the others' next change opens it in a tab.
++//!
++//! Presence: each person shares the page they look at, their pointer on it (page coordinates) and their selection
++//! (ids as strings: JavaScript numbers lose the low bits of client-space ids); the canvas draws the others'
++//! (`figcraft_ui_egui::live::playground`).
 +
 +use std::cell::{Cell, RefCell};
 +use std::collections::BTreeSet;
@@ -166,13 +116,20 @@ index 0000000..c327dcb
 +
 +use figcraft_collab::merge::{self, Key, Side};
 +use figcraft_collab::{Change, DocProp, Entry, Prop, Recompute as _, Replica};
-+use figcraft_doc::Document;
++use figcraft_doc::{Document, NodeId};
 +use serde::Deserialize as _;
 +use serde_json::Value;
 +
 +use crate::collab::EngineRecompute;
-+use crate::playground_live::{self, Error, Live};
-+use crate::{DocState, Session};
++use crate::{DocState, EngineError, Result as EngineResult, Session};
++use playground_live::{Error, Live, Presence};
++
++/// The Playground adapter (patches/live/playground_live.rs, copied next to this file).
++#[path = "playground_live.rs"]
++pub mod playground_live;
++
++/// Most selected ids a presence carries.
++const MAX_SELECTION: usize = 50;
 +
 +thread_local! {
 +    /// The document the connected session edits (`None`: none yet, the one in front).
@@ -181,12 +138,57 @@ index 0000000..c327dcb
 +    static HELD: Cell<bool> = const { Cell::new(false) };
 +    /// The shared document last seen in its tab.
 +    static SEEN: RefCell<Option<Arc<Document>>> = const { RefCell::new(None) };
++    /// The pointer over the canvas this frame, and in the last frame (page coordinates).
++    static POINTED: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
++    static POINTER: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
++    /// The others, as the shell last showed them.
++    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
 +}
 +
 +/// The end of each frame (`held`: a pointer button is down or a text field has the keyboard).
 +pub fn frame(s: &mut Session, held: bool) {
 +    HELD.set(held);
++    POINTER.set(POINTED.take());
 +    playground_live::frame(s);
++}
++
++/// The pointer over the canvas in this frame (page coordinates; the canvas tells, while it shows).
++pub fn point(at: Option<(f64, f64)>) {
++    POINTED.set(at);
++}
++
++/// Someone else on the page in front of the session's document: their pointer and the selected layers there.
++pub struct Other {
++    pub name: String,
++    pub color: [u8; 3],
++    pub pointer: Option<(f64, f64)>,
++    pub selection: Vec<NodeId>,
++}
++
++/// The others on the page in front, when it is the session's document (what does not resolve is left out).
++pub fn others(s: &Session) -> Vec<Other> {
++    let Some(ds) = in_front(s) else { return Vec::new() };
++    let id = |v: &Value| v.as_str()?.parse().ok().map(NodeId);
++    let coordinate = |v: &Value| v.as_f64().filter(|c| c.abs() < 1e9);
++    OTHERS.with_borrow(|others| {
++        others
++            .iter()
++            .filter(|p| id(&p.state["page"]) == Some(ds.page))
++            .map(|p| Other {
++                name: p.name.clone(),
++                color: p.color,
++                pointer: coordinate(&p.state["pointer"][0]).zip(coordinate(&p.state["pointer"][1])),
++                selection: p.state["selection"]
++                    .as_array()
++                    .into_iter()
++                    .flatten()
++                    .take(MAX_SELECTION)
++                    .filter_map(id)
++                    .filter(|n| ds.doc.page_of(*n) == Some(ds.page))
++                    .collect(),
++            })
++            .collect()
++    })
 +}
 +
 +/// The session's document in its tab, unless a native live session has it.
@@ -207,12 +209,20 @@ index 0000000..c327dcb
 +
 +/// Undo or Redo (`redo`) of the document in front goes to the Playground session while it edits that document.
 +pub(crate) fn undo(s: &Session, redo: bool) -> bool {
-+    bound(s).is_some_and(|d| s.ds().is_ok_and(|a| a.uid == d.uid)) && playground_live::undo(redo)
++    in_front(s).is_some() && playground_live::undo(redo)
++}
++
++/// The session's document, when its tab is the one in front.
++fn in_front(s: &Session) -> Option<&DocState> {
++    bound(s).filter(|d| s.ds().is_ok_and(|a| a.uid == d.uid))
 +}
 +
 +/// Document `uid` is the session's: it takes no branches (their id spaces are per file, the same on every peer).
-+pub(crate) fn shares(s: &Session, uid: u64) -> bool {
-+    playground_live::connected() && bound(s).is_some_and(|d| d.uid == uid)
++pub(crate) fn refuse_branches(s: &Session, cmd: &str, uid: u64) -> EngineResult<()> {
++    if playground_live::connected() && bound(s).is_some_and(|d| d.uid == uid) {
++        return Err(EngineError::Disabled(cmd.into(), "branches aren't available in a live session".into()));
++    }
++    Ok(())
 +}
 +
 +/// `doc` as shared: its snapshot without the file name and opening page.
@@ -299,6 +309,21 @@ index 0000000..c327dcb
 +        document(shared).map(drop)
 +    }
 +
++    /// The page in front, the pointer on it and the selection, while the session's document is in front.
++    fn live_presence(&self) -> Value {
++        let Some(ds) = in_front(self) else { return Value::Null };
++        let selection: Vec<String> = ds.selection.iter().take(MAX_SELECTION).map(|n| n.0.to_string()).collect();
++        let mut state = serde_json::json!({ "page": ds.page.0.to_string(), "selection": selection });
++        if let Some((x, y)) = POINTER.get().filter(|(x, y)| x.is_finite() && y.is_finite()) {
++            state["pointer"] = serde_json::json!([x, y]);
++        }
++        state
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        OTHERS.set(others);
++    }
++
 +    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
 +        if edited == base {
 +            return Ok(current.clone());
@@ -321,9 +346,8 @@ index 0000000..c327dcb
 +
 +#[cfg(test)]
 +mod tests {
++    use super::playground_live::{activity, canonical, connect, disconnect, frame, queue};
 +    use super::*;
-+    use crate::playground_live::{activity, canonical, connect, disconnect, frame, queue};
-+    use figcraft_doc::NodeId;
 +    use serde_json::json;
 +    use std::cell::RefCell;
 +    use std::rc::Rc;
@@ -433,6 +457,30 @@ index 0000000..c327dcb
 +    }
 +
 +    #[test]
++    fn presence_is_the_page_pointer_and_selection_and_shows_only_what_resolves_here() {
++        let mut a = Session::new();
++        let r = rect(&mut a, 0.0);
++        a.ds_mut().unwrap().selection = vec![r];
++        point(Some((12.5, -3.0)));
++        super::frame(&mut a, false);
++        let mine = Live::live_presence(&a);
++        assert_eq!(mine["selection"], json!([r.0.to_string()]));
++        let mut b = Session::new();
++        b.live_adopt(theirs(&a)).unwrap();
++        let ann = |state: Value| Presence::list(&json!([{"id": "a", "name": "Ann", "color": "#e6194b", "state": state}]));
++        b.live_show_presence(ann(mine.clone()));
++        let shown = others(&b);
++        assert_eq!((shown[0].name.as_str(), shown[0].pointer, shown[0].selection.clone()), ("Ann", Some((12.5, -3.0)), vec![r]));
++        b.live_show_presence(ann(json!({"page": mine["page"], "pointer": [1e300, 1], "selection": ["999", 7, "x", null]})));
++        let shown = others(&b);
++        assert_eq!((shown[0].pointer, shown[0].selection.len()), (None, 0));
++        b.live_show_presence(ann(json!({"page": "424242", "pointer": [1, 2]})));
++        assert!(others(&b).is_empty(), "another page");
++        b.live_show_presence(Vec::new());
++        assert!(others(&b).is_empty());
++    }
++
++    #[test]
 +    fn a_closed_tab_keeps_its_document_and_the_others_next_change_reopens_it() {
 +        let mut a = Session::new();
 +        let r = rect(&mut a, 0.0);
@@ -458,5 +506,41 @@ index 0000000..c327dcb
 +        assert_eq!((b.docs.len(), name(&b, r), b.ds().unwrap().doc.name.as_str()), (1, "A".into(), "Untitled"));
 +        assert_ne!(b.ds().unwrap().uid, uid);
 +        disconnect();
++    }
++}
+diff --git a/crates/ui-egui/src/live/playground.rs b/crates/ui-egui/src/live/playground.rs
+new file mode 100644
+index 0000000..73eef1b
+--- /dev/null
++++ b/crates/ui-egui/src/live/playground.rs
+@@ -0,0 +1,30 @@
++//! Live editing in a Playground session (`figcraft_engine::live_playground`): this person's pointer over the canvas
++//! for the others, and the others' pointers, names and selections on the page in front, drawn like a live session's.
++
++use super::{MAX_OUTLINES, name_tag, pointer};
++use crate::FigApp;
++use egui::{Align2, Color32, Shape, Stroke, vec2};
++use figcraft_engine::live_playground as live;
++
++/// On the canvas, over the document: the others' selection outlines, then their pointers with their names.
++pub(super) fn draw(app: &FigApp, painter: &egui::Painter) {
++    let at = painter.ctx().input(|i| i.pointer.hover_pos()).filter(|p| app.canvas.rect.contains(*p)).map(|p| app.to_page(p));
++    live::point(at.map(|p| (p.x, p.y)));
++    let Ok(ds) = app.session.ds() else { return };
++    for other in live::others(&app.session) {
++        let [r, g, b] = other.color;
++        let fill = Color32::from_rgb(r, g, b);
++        for id in other.selection.iter().take(MAX_OUTLINES) {
++            if let Some(q) = crate::canvas::node_quad(app, &ds.doc, *id) {
++                painter.add(Shape::closed_line(q.to_vec(), Stroke::new(1.5, fill)));
++            }
++        }
++        if let Some((x, y)) = other.pointer {
++            let tip = app.to_screen(x, y);
++            pointer(painter, tip, fill);
++            if !other.name.is_empty() {
++                name_tag(painter, tip + vec2(12.0, 16.0), Align2::LEFT_TOP, &other.name, fill);
++            }
++        }
 +    }
 +}
