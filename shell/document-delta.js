@@ -34,7 +34,7 @@ export async function applyDelta(bytes, edit, reverse = false) {
   bytes = new Uint8Array(bytes)
   const remove = new Uint8Array(from), insert = new Uint8Array(to)
   if (await digest(bytes) !== base) throw new Error('Document delta has a stale or corrupted base')
-  if (!remove.every((byte, i) => bytes[at + i] === byte)) throw new Error('Document delta removed bytes do not match')
+  for (let i = 0; i < remove.length; i++) if (bytes[at + i] !== remove[i]) throw new Error('Document delta removed bytes do not match')
   const output = new Uint8Array(size)
   output.set(bytes.subarray(0, at))
   output.set(insert, at)

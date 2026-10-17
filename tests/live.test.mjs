@@ -184,6 +184,27 @@ test('remote changes wait for a busy app, in order', async () => {
   await converge([owner, editor], [1, 2, 0])
 })
 
+test('others\' entries that queue behind a slow app merge as one change; this person\'s own is not merged again', async () => {
+  const hub = new Hub(), [o, e] = ids()
+  const owner = await hub.join(o, 'owner'), editor = await hub.join(e, 'editor')
+  await live(owner, editor)
+  const applied = [], apply = editor.app.apply.bind(editor.app)
+  editor.app.apply = (base, edited) => { if (base) applied.push([[...base], [...edited]]); return apply(base, edited) }
+  const gate = hub.hold(o, e)
+  const ownerEdit = async (i, value, revision) => { owner.app.edit(i, value); await eventually(() => assert.equal(owner.live.acked.revision, revision)) }
+  await ownerEdit(0, 1, 1)
+  editor.app.edit(2, 9); await eventually(() => assert.equal(owner.live.acked.revision, 2))
+  await ownerEdit(1, 2, 3); await ownerEdit(0, 3, 4); await ownerEdit(1, 4, 5)
+  // The first entry waits for the app; the rest arrive meanwhile.
+  const release = editor.app.hold()
+  gate(); await sleep(100)
+  release()
+  await converge([owner, editor], [3, 4, 9])
+  assert.deepEqual(applied, [[[0, 0, 0], [1, 0, 0]], [[1, 0, 9], [3, 4, 9]]])
+  assert.equal(editor.live.acked.revision, 5)
+  assert.deepEqual(editor.store.drafts, [])
+})
+
 test('Undo reverts only this person, around and after a remote edit', async () => {
   const hub = new Hub(), [o, e] = ids()
   const owner = await hub.join(o, 'owner'), editor = await hub.join(e, 'editor')

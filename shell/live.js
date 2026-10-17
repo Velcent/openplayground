@@ -15,7 +15,12 @@
 import { DocumentHistory, stacks } from './document-history.js'
 import { applyDelta, delta } from './document-delta.js'
 
-const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i])
+// A plain loop: every() with a callback takes 20-30 ms on a 2 MB document (the loop ~1 ms), and steps compare often.
+const same = (a, b) => {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+  return true
+}
 const busy = (e) => e === 'busy' || e?.message === 'busy'
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const RETAINED = 100, MAX_WANTED = 8, PRESENCE_MS = 50, MAX_PRESENCE = 4096, MAX_DEPTH = 16
@@ -277,14 +282,21 @@ export class LiveDocument extends EventTarget {
     }
     // Snapshots, entries and replies come from the host only: a previous host's late ones are ignored.
     if (peer && peer.id !== this.hostId()) return
-    this.work = this.work.then(() => this.process(value)).catch((e) => this.report(e))
+    // Entries that arrive while the work before them runs go together (take()), nothing else queued in between.
+    if (value?.type === 'entry' && this.arriving?.work === this.work) return void this.arriving.list.push(value.entry)
+    const arriving = value?.type === 'entry' ? { list: [value.entry] } : null
+    this.work = this.work.then(() => {
+      if (this.arriving === arriving) this.arriving = null
+      return this.process(value, arriving?.list)
+    }).catch((e) => this.report(e))
+    if (arriving) this.arriving = Object.assign(arriving, { work: this.work })
   }
-  async process(value) {
+  async process(value, list) {
     if (value?.type === 'snapshot') return this.adopt(value.record)
     if (!this.acked || this.incompatible) return
     if (value?.type === 'entry') {
       // An entry that does not apply to our acknowledged document means we diverged: start again from a snapshot.
-      try { await this.entry(value.entry) } catch (e) { this.resync(); throw e }
+      try { await this.take(list) } catch (e) { this.resync(); throw e }
     } else if (value?.type === 'reject' && value.id === this.inflight?.proposal.id) {
       const { proposal, inLive } = this.inflight
       this.inflight = null
@@ -309,7 +321,7 @@ export class LiveDocument extends EventTarget {
     let replayed = false
     if (known) {
       try {
-        for (const entry of record.entries) await this.entry(entry)
+        await this.take(record.entries)
         replayed = true
       } catch {}
     }
@@ -324,19 +336,39 @@ export class LiveDocument extends EventTarget {
     }
     this.error = null; this.changed(); this.kick()
   }
-  // The live document takes the entry before the acknowledged one does: a failure leaves both as they were.
-  async entry(entry) {
-    if (entry.revision <= this.acked.revision) return
-    if (entry.revision !== this.acked.revision + 1) return this.resync()
-    const before = this.acked.bytes, after = await applyDelta(before, entry.change)
-    const own = entry.id === this.inflight?.proposal.id
-    // An acknowledged edit is already in the live document, unless a conflict replaced it meanwhile.
-    if (!own || !this.inflight.inLive) await this.merge(before, after)
-    this.acked = { ...this.acked, revision: entry.revision, bytes: after }
-    this.entries = [...this.entries, entry].slice(-RETAINED)
-    if (own) this.inflight = null
-    if (entry.author === this.session.id && entry.kind === 'edit') await this.introduced(before, after)
-    this.changed()
+  // Entries in revision order. The live document takes them before the acknowledged one does: a failure leaves both as
+  // they were. Other people's entries in a row merge as one change (one quiet frame, one merge, however fast they come).
+  async take(list) {
+    // Those not merged yet: the acknowledged document before and after them (no copy per entry), and the before and
+    // after of this browser's own replayed edits (media they brought in).
+    let run = null
+    const accept = async ({ entries, before, after, mine }, merge) => {
+      if (merge) await this.merge(before, after)
+      this.acked = { ...this.acked, revision: entries.at(-1).revision, bytes: after }
+      this.entries = [...this.entries, ...entries].slice(-RETAINED)
+      for (const [before, after] of mine) await this.introduced(before, after)
+      this.changed()
+    }
+    const others = async () => { if (run) { const done = run; run = null; await accept(done, true) } }
+    try {
+      for (const entry of list) {
+        const revision = run?.entries.at(-1).revision ?? this.acked.revision
+        if (entry.revision <= revision) continue
+        if (entry.revision !== revision + 1) { this.resync(); break }
+        const before = run?.after ?? this.acked.bytes, after = await applyDelta(before, entry.change)
+        const mine = entry.author === this.session.id && entry.kind === 'edit' ? [[before, after]] : []
+        if (entry.id !== this.inflight?.proposal.id) {
+          run ??= { entries: [], before, mine: [] }
+          run.entries.push(entry); run.after = after; run.mine.push(...mine)
+          continue
+        }
+        await others()
+        // An acknowledged edit is already in the live document, unless a conflict replaced it meanwhile.
+        const { inLive } = this.inflight
+        this.inflight = null
+        await accept({ entries: [entry], before, after, mine }, !inLive)
+      }
+    } finally { await others() }
   }
   async introduced(before, after) {
     if (!this.adapter.assetsOf) return
