@@ -1,13 +1,17 @@
 # PdfCraft: no rule patches outside live editing; its diffs (patches/acrobat/) and the live adapter (tools.yaml live:) apply.
 #
 # Live editing in Playground sessions (patches/acrobat/live.diff + patches/live/playground_live.rs)
-# What it's for: people in a Playground session edit one PDF together (the file plus its changed objects, merged per
-#   object and dictionary key) and see each other's pointer and selected comment on the pages they look at.
-# How: the adapter lives in new files: crates/ui-egui/live/live.rs (the shared document, merge, adopt, Undo, presence
-#   and its drawing, the kept web runner and the app wrapper whose frames end with the session's frame hook; it
-#   declares the template, copied next to it) and crates/engine/src/live_playground.rs (installs a shared graph with
-#   no undo step, forgets history, and saves of the shared PDF keep its graph). These rules only declare them and call
-#   in, each one line at the end of a file, right after a function's signature, or at the web runner.
+# What it's for: people in a Playground session edit the session's PDFs together (each one the file plus its changed
+#   objects, merged per object and dictionary key; every PDF opened in the session reaches the others as a tab behind
+#   theirs, closing a tab is personal) and see each other's pointer, selected comment and the gesture under way (comments
+#   being drawn, moved or resized, text being selected or typed) on the pages they look at, with dots on the tabs for
+#   who is where.
+# How: the adapter lives in new files: crates/ui-egui/live/live.rs (the shared PDFs, merge, adopt, Undo, presence and
+#   its drawing, tab dots, Home's "In this session", the kept web runner and the app wrapper whose frames end with the
+#   session's frame hook; it declares the template, copied next to it) and crates/engine/src/live_playground.rs
+#   (installs a shared graph with no undo step, forgets history, and saves of a shared PDF keep its graph). These rules
+#   only declare them and call in, each one line at the end of a file, right after a function's signature or one
+#   statement, or at the web runner.
 # Verify: node scripts/build.mjs check acrobat head|release (and LIVE=0), the e2e (tests/live-apps/acrobat.mjs) and
 #   `cargo test -p pdfcraft-ui-egui --lib live::` with these rules and live.diff applied.
 # If upstream changes: if a function named below is renamed, anchor on its new signature (keep the argument names
@@ -53,3 +57,16 @@
   file: apps/pdfcraft-web/src/main.rs
   find: 'Ok\(\s*Box::new\((?=\s*app\s*\)\s*\))'
   replace: 'Ok(pdfcraft_ui_egui::live::wrap('
+# Shared tabs: each tab of a PDF of the session shows dots in the colours of the others on it (in chrome::tab_strip,
+#   right after the statement that draws a document tab, the first `let response = tab(ui, …);`), and Home lists the
+#   session's PDFs ("In this session", above Recent) to go to or open again. Verify: the e2e's openTab step and the
+#   screenshots. If the document tab is drawn otherwise, call tab_dots(app, ui, i, rect) right after it with its index
+#   and rect; if Home's Recent section moves, call session_list(app, ui) before it.
+- live: true
+  file: crates/ui-egui/src/chrome.rs
+  find: 'let\s+response\s*=\s*tab\(\s*ui\b[^;]*;'
+  after: "\n                                #[cfg(target_arch = \"wasm32\")] crate::live::tab_dots(app, ui, i, response.rect);"
+- live: true
+  file: crates/ui-egui/src/home.rs
+  find: 'let\s+mut\s+clear\s*=\s*false\s*;'
+  before: "#[cfg(target_arch = \"wasm32\")] crate::live::session_list(app, ui);\n            "

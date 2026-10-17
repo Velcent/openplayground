@@ -1,29 +1,29 @@
 diff --git a/crates/engine/src/live_playground.rs b/crates/engine/src/live_playground.rs
 new file mode 100644
-index 0000000..a628597
+index 0000000..6fac43b
 --- /dev/null
 +++ b/crates/engine/src/live_playground.rs
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,74 @@
 +//! Playground live editing (web only; `pdfcraft_ui_egui`'s `live` module drives it): what a shared document needs of
 +//! the session's editing state. A child of the crate root, so it reaches `Document`'s and `Session`'s private parts.
 +
 +use crate::{DocId, Document, EditError, Session, guard};
-+use std::cell::Cell;
++use std::cell::RefCell;
 +
 +thread_local! {
-+    /// The document a live session shares: its saves keep the working graph.
-+    static SHARED: Cell<Option<DocId>> = const { Cell::new(None) };
++    /// The documents a live session shares: their saves keep the working graph.
++    static SHARED: RefCell<Vec<DocId>> = const { RefCell::new(Vec::new()) };
 +}
 +
-+/// Marks the document a live session shares (`None`: none).
-+pub fn share(id: Option<DocId>) {
-+    SHARED.set(id);
++/// Marks the documents a live session shares (none: no session).
++pub fn share(ids: Vec<DocId>) {
++    SHARED.set(ids);
 +}
 +
-+/// Whether a save of `id` keeps its graph ([`Session::mark_saved`] asks first): the shared document must not take the
++/// Whether a save of `id` keeps its graph ([`Session::mark_saved`] asks first): a shared document must not take the
 +/// save's own changes (`/ModDate`, a rewritten file), which are not everyone's.
 +pub(crate) fn keeps_graph(id: DocId) -> bool {
-+    SHARED.get() == Some(id)
++    SHARED.with_borrow(|ids| ids.contains(&id))
 +}
 +
 +impl Document {
@@ -64,6 +64,13 @@ index 0000000..a628597
 +        }
 +    }
 +
++    /// Names document `id` as the session does.
++    pub fn live_rename(&mut self, id: DocId, name: &str) {
++        if let Ok(doc) = self.doc_mut(id) {
++            name.clone_into(&mut doc.name);
++        }
++    }
++
 +    /// A save of the shared document: nothing unsaved, the graph kept. The next save writes the file as opened plus
 +    /// every change again.
 +    pub(crate) fn live_mark_saved(&mut self, id: DocId) -> Result<(), EditError> {
@@ -73,38 +80,45 @@ index 0000000..a628597
 +}
 diff --git a/crates/ui-egui/live/live.rs b/crates/ui-egui/live/live.rs
 new file mode 100644
-index 0000000..a7f867a
+index 0000000..f58c9ea
 --- /dev/null
 +++ b/crates/ui-egui/live/live.rs
-@@ -0,0 +1,1107 @@
-+//! Playground live editing of one PDF (web only; the template [`playground_live`], copied next to this file, drives
-+//! it). The shared document is the PDF the session started from plus every object that differs from it, as JSON:
-+//! `{"pdf": base64, "objects": {"<number>": base64("N G obj … endobj") or null when deleted}, "trailer"?: base64(the
-+//! trailer's own entries), "rewrite"?: true}`; `{}` before anyone shares a PDF, and `{"refused": why}` for PDFs this
-+//! version does not share (encrypted, signed, XFA forms, read-only). Objects are written by the PDF writer, so equal
-+//! graphs give equal bytes and one edit changes only the objects it touched.
+@@ -0,0 +1,1916 @@
++//! Playground live editing (web only; the template [`playground_live`], copied next to this file, drives it). The
++//! shared document is the set of PDFs open in the session, `{"documents": [{"id", "name", ...that PDF}]}` by id: the
++//! one shown when the session started and every PDF opened, created or dropped here or by the others since, which
++//! reaches the others as a tab behind theirs. Closing a tab is this person's own: the PDF stays in the session, up to
++//! date, and Home lists it to open again. One PDF is the file it was opened from plus every object that differs from
++//! it, as JSON: `{"pdf": base64, "objects": {"<number>": base64("N G obj … endobj") or null when deleted}, "trailer"?:
++//! base64(the trailer's own entries), "rewrite"?: true}`. Objects are written by the PDF writer, so equal graphs give
++//! equal bytes and one edit changes only the objects it touched. PDFs this version does not share (encrypted, signed,
++//! XFA forms, read-only) stay this person's own, and they are told why.
 +//!
-+//! The merge is per object, then per dictionary key: arrays of references (`/Annots`, `/Kids`, `/Fields`, …) merge as
-+//! sets that keep their order, so two comments on one page both stay; a value both sides changed is a conflict.
-+//! Objects both sides added under one number are told apart by giving the unsent side's (`current`'s) new objects
-+//! fresh numbers. The coordinator checks every document it records the way receivers install it (written, then
-+//! inspected); receivers check by installing.
++//! The merge is per PDF (by id), per object, then per dictionary key: arrays of references (`/Annots`, `/Kids`,
++//! `/Fields`, …) merge as sets that keep their order, so two comments on one page both stay; a value both sides
++//! changed is a conflict. Objects both sides added under one number are told apart by giving the unsent side's
++//! (`current`'s) new objects fresh numbers. The coordinator checks every document it records the way receivers install
++//! it (written, then inspected); receivers check by installing.
 +//!
-+//! Presence: `{"page": <page object number>, "pointer"?: [x, y] in that page's user space, "selection": [object numbers
-+//! of selected comments]}`, drawn on the pages shown ([`paint`]). The web entry runs the app wrapped ([`wrap`]), so each
-+//! frame ends with the session's [`frame`]; the engine's `live_playground` installs graphs without undo steps.
++//! Presence: `{"doc", "page": <page object number>, "pointer"?: [x, y] in that page's user space, "selection": [object
++//! numbers of selected comments]}` and the gesture under way: `draw` (a comment being drawn: its tool, points and
++//! width), `ghost` (a comment being moved or resized: its number and rectangle), `text` (a text selection being
++//! dragged, as rectangles), `typing` (text being typed into a comment, a form field or a text box: where, and its
++//! end). Drawn on the pages shown in the session's look, eased ([`paint`]); dots on the tabs ([`tab_dots`]) and Home's
++//! "In this session" ([`session_list`]) show who is on which PDF. The web entry runs the app wrapped ([`wrap`]), so
++//! each frame ends with the session's [`frame`]; the engine's `live_playground` installs graphs without undo steps.
 +
 +#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 +
-+#[allow(dead_code)] // fresh_id: PdfCraft numbers objects through the merge
 +#[path = "playground_live.rs"]
 +mod playground_live;
 +
-+use crate::PdfCraftApp;
-+use playground_live::{Error, Live, Presence};
++use crate::{DocView, PdfCraftApp};
 +use base64::Engine as _;
++use egui::{Color32, Pos2, Rect, Shape, Stroke, pos2, vec2};
 +use pdfcraft_cos::{Dict, Document, Lexer, Name, ObjRef, Object, SaveOptions, Stream, parse_indirect, serialize, write_incremental};
 +use pdfcraft_engine::DocId;
++use playground_live::{Error, Live, Presence};
 +use serde_json::{Map, Value, json};
 +use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 +use std::rc::Rc;
@@ -114,7 +128,7 @@ index 0000000..a7f867a
 +/// Trailer entries that describe the file's layout, not the document: each save writes its own.
 +const LAYOUT: &[&[u8]] = &[b"Size", b"Prev", b"XRefStm", b"Type", b"W", b"Index", b"Filter", b"DecodeParms", b"Length"];
 +
-+/// The PDF a session started from, opened once.
++/// A file a shared PDF was opened from, opened once.
 +struct Base {
 +    pdf: String,
 +    doc: Document,
@@ -122,25 +136,52 @@ index 0000000..a7f867a
 +    next: u32,
 +}
 +
++/// A PDF of the session.
++struct Doc {
++    /// Its id in the session.
++    id: u64,
++    name: String,
++    /// Its tab here; `None` once this person closed it.
++    tab: Option<DocId>,
++    base: Rc<Base>,
++    /// Its graph as last read or installed: what the session goes on with while its tab is closed.
++    last: Document,
++    /// The tab's edit generation `last` was read at.
++    seen: u64,
++    /// It became a PDF that is not shared (signed, encrypted here): for the rest of the session it reports its last
++    /// shared state, and remote changes leave the tab alone.
++    paused: bool,
++}
++
++/// Another person, and their moving marks as last drawn here.
++struct Peer {
++    who: Presence,
++    /// `pointer`, `ghost` and `tip` (the newest point drawn), eased toward their presence, in their page's user space.
++    shown: Value,
++}
++
 +#[derive(Default)]
 +struct State {
-+    /// The shared document's tab: the active one when the session first needs a document.
-+    pin: Option<DocId>,
-+    /// Its graph as last read, still reported once the tab is closed.
-+    last: Option<Document>,
-+    base: Option<Rc<Base>>,
-+    /// The last base decoded for a merge of another file.
-+    other: Option<Rc<Base>>,
-+    generation: u64,
-+    /// The shared tab became a PDF that is not shared (signed, encrypted): for the rest of the session it reports its
-+    /// last shared state, and remote changes leave it alone.
-+    paused: bool,
++    /// The session's PDFs, by id.
++    docs: Vec<Doc>,
++    /// Tabs opened from then on are new PDFs of the session (tab ids only grow).
++    since: Option<u64>,
++    /// For [`playground_live::fresh_id`].
++    next: u64,
++    /// Changes to `docs`, for [`Live::live_generation`].
++    revision: u64,
++    /// Files of shared PDFs decoded for merges.
++    bases: Vec<Rc<Base>>,
++    /// Tabs whose PDF is not shared, told why once.
++    told: HashSet<DocId>,
++    /// PDFs the coordinator checked already (a hash of their canonical bytes).
++    checked: HashSet<u64>,
 +    /// Inside [`frame`], where merged documents are this browser's to install: installing checks them.
 +    in_frame: bool,
 +    notice: Option<String>,
 +    ctx: Option<egui::Context>,
 +    /// The others in the session, as the shell last showed them.
-+    others: Vec<Presence>,
++    others: Vec<Peer>,
 +    ids: Option<Rc<Ids>>,
 +}
 +
@@ -159,14 +200,18 @@ index 0000000..a7f867a
 +    Ok(Rc::new(Base { pdf: pdf.unwrap_or_else(|| B64.encode(&*bytes)), doc, next }))
 +}
 +
++/// The decoded file of a shared document's `pdf`: one of the session's, or decoded once and kept for a while.
 +fn base_for(pdf: &str) -> Result<Rc<Base>, Error> {
-+    let known = STATE.with_borrow(|s| [&s.base, &s.other].into_iter().flatten().find(|b| b.pdf == pdf).cloned());
++    let known = STATE.with_borrow(|s| s.docs.iter().map(|d| &d.base).chain(&s.bases).find(|b| b.pdf.len() == pdf.len() && b.pdf == pdf).cloned());
 +    if let Some(base) = known {
 +        return Ok(base);
 +    }
 +    let bytes = B64.decode(pdf).map_err(|e| format!("Invalid shared document: {e}"))?;
 +    let base = base_of(Arc::new(bytes), Some(pdf.to_owned()))?;
-+    STATE.with_borrow_mut(|s| s.other = Some(base.clone()));
++    STATE.with_borrow_mut(|s| {
++        s.bases.insert(0, base.clone());
++        s.bases.truncate(4);
++    });
 +    Ok(base)
 +}
 +
@@ -194,18 +239,12 @@ index 0000000..a7f867a
 +    rewrite: bool,
 +}
 +
-+/// Reads a shared document, strictly: anything [`project`] would not write back byte for byte is refused, and so is
-+/// no document (`{}`, nothing open yet).
++/// Reads one PDF of a shared document (its `id` and `name` aside), strictly: anything [`project`] would not write back
++/// byte for byte is refused.
 +fn read(doc: &Value) -> Result<Shared<'_>, Error> {
 +    let Some(map) = doc.as_object() else { return Err("Invalid shared document: not an object".into()) };
-+    if let Some(why) = map.get("refused") {
-+        return Err(why.as_str().unwrap_or("This PDF can't be edited live").to_owned());
-+    }
-+    if map.is_empty() {
-+        return Err("Open a PDF to share it live.".into());
-+    }
 +    let invalid = |what: &str| format!("Invalid shared document: {what}");
-+    if map.keys().any(|k| !["pdf", "objects", "trailer", "rewrite"].contains(&k.as_str())) {
++    if map.keys().any(|k| !["pdf", "objects", "trailer", "rewrite", "id", "name"].contains(&k.as_str())) {
 +        return Err(invalid("unknown entry"));
 +    }
 +    let pdf = map.get("pdf").and_then(Value::as_str).ok_or_else(|| invalid("no PDF"))?;
@@ -332,12 +371,18 @@ index 0000000..a7f867a
 +    Ok(project(&build(shared, base), base))
 +}
 +
-+/// Whether every peer can install `doc`: it is canonical, and its file writes and inspects as installing does.
++/// Whether every peer can install the PDF `doc`: it is canonical, and its file writes and inspects as installing does.
 +fn validate(doc: &Value) -> Result<(), Error> {
 +    let shared = read(doc)?;
 +    let base = base_for(shared.pdf)?;
 +    let cos = build(&shared, &base);
-+    if project(&cos, &base) != *doc {
++    let mut again = project(&cos, &base);
++    for key in ["id", "name"] {
++        if let Some(v) = doc.get(key) {
++            again[key] = v.clone();
++        }
++    }
++    if again != *doc {
 +        return Err("Invalid shared document: not in its canonical form".into());
 +    }
 +    let bytes = write_incremental(&cos, &SaveOptions::default()).map_err(|e| format!("Conflict: the PDF can't be written: {e}"))?;
@@ -489,8 +534,8 @@ index 0000000..a7f867a
 +    Ok(out)
 +}
 +
-+/// The three-way merge of shared documents: `current` is the side not accepted yet (a proposal on the coordinator,
-+/// this browser's unsent work on a receiver), and its new objects move when both sides added one under one number.
++/// The three-way merge of one PDF: `current` is the side not accepted yet (a proposal on the coordinator, this
++/// browser's unsent work on a receiver), and its new objects move when both sides added one under one number.
 +fn merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
 +    let (b, mut c, e) = (read(base)?, read(current)?, read(edited)?);
 +    if current == base {
@@ -546,12 +591,75 @@ index 0000000..a7f867a
 +    Some(format!("This PDF can't be edited live: {why}. Live editing shares unencrypted, unsigned PDFs without XFA forms."))
 +}
 +
-+/// Whether `id` is the shared document (Undo and Redo go to the session).
-+pub(crate) fn shared(id: DocId) -> bool {
-+    STATE.with_borrow(|s| s.pin == Some(id) && !s.paused) && playground_live::connected()
++/// The PDFs of a shared document, each `(id, the PDF with its id and name)`, in order of id; strictly.
++fn entries(document: &Value) -> Result<Vec<(u64, &Value)>, Error> {
++    let invalid = |what: &str| format!("Invalid shared document: {what}");
++    let map = document.as_object().ok_or_else(|| invalid("not an object"))?;
++    let list = map.get("documents").and_then(Value::as_array).filter(|_| map.len() == 1).ok_or_else(|| invalid("no list of documents"))?;
++    let mut out: Vec<(u64, &Value)> = Vec::with_capacity(list.len());
++    for v in list {
++        let id = v.get("id").and_then(Value::as_u64).filter(|n| *n < 1 << 53).ok_or_else(|| invalid("a document's id"))?;
++        if !v.get("name").is_some_and(Value::is_string) {
++            return Err(invalid("a document's name"));
++        }
++        if out.last().is_some_and(|(last, _)| *last >= id) {
++            return Err(invalid("documents out of order"));
++        }
++        out.push((id, v));
++    }
++    Ok(out)
 +}
 +
-+/// Commands that act otherwise on the shared document while live: Undo and Redo go to the session (whatever this
++/// The three-way merge of shared documents, PDF by PDF ([`merge`]; a name both sides changed is a conflict); a PDF
++/// one side added joins the set.
++fn merge_set(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
++    if current == base {
++        return Ok(edited.clone());
++    }
++    if edited == base {
++        return Ok(current.clone());
++    }
++    let (b, c, e) = (entries(base)?, entries(current)?, entries(edited)?);
++    fn find<'a>(list: &[(u64, &'a Value)], id: u64) -> Option<&'a Value> {
++        list.iter().find(|(i, _)| *i == id).map(|(_, v)| *v)
++    }
++    let ids: BTreeSet<u64> = b.iter().chain(&c).chain(&e).map(|(id, _)| *id).collect();
++    let mut out = Vec::with_capacity(ids.len());
++    for id in ids {
++        let (vb, vc, ve) = (find(&b, id), find(&c, id), find(&e, id));
++        let entry = if ve == vb {
++            vc.cloned()
++        } else if vc == vb {
++            ve.cloned()
++        } else {
++            let (Some(vb), Some(vc), Some(ve)) = (vb, vc, ve) else { return Err(conflict(format!("document {id}"))) };
++            let name = if ve["name"] == vb["name"] {
++                &vc["name"]
++            } else if vc["name"] == vb["name"] {
++                &ve["name"]
++            } else {
++                return Err(conflict(format!("the name of document {id}")));
++            };
++            let mut merged = merge(vb, vc, ve)?;
++            (merged["id"], merged["name"]) = (id.into(), name.clone());
++            Some(merged)
++        };
++        out.extend(entry);
++    }
++    Ok(json!({ "documents": out }))
++}
++
++/// The session's id of the PDF in tab `tab`, while it is shared and the session connected.
++fn session_id(tab: DocId) -> Option<u64> {
++    STATE.with_borrow(|s| s.docs.iter().find(|d| d.tab == Some(tab) && !d.paused).map(|d| d.id)).filter(|_| playground_live::connected())
++}
++
++/// Whether `id` is a PDF of the session (Undo and Redo go to the session).
++pub(crate) fn shared(id: DocId) -> bool {
++    session_id(id).is_some()
++}
++
++/// Commands that act otherwise on a shared document while live: Undo and Redo go to the session (whatever this
 +/// browser's own history holds), and Revert, which would take back everyone's edits, is off.
 +pub(crate) fn command_enabled(app: &PdfCraftApp, id: &str) -> Option<bool> {
 +    if app.combine_showing() || !app.active_ids().is_some_and(|(_, doc)| shared(doc)) {
@@ -564,7 +672,7 @@ index 0000000..a7f867a
 +    }
 +}
 +
-+/// Undo or Redo of the shared document goes to the session: whether it did (the app's Undo then stops).
++/// Undo or Redo of a shared document goes to the session: whether it did (the app's Undo then stops).
 +pub(crate) fn undo(app: &PdfCraftApp, undo: bool) -> bool {
 +    app.active_ids().is_some_and(|(_, id)| shared(id)) && playground_live::undo(!undo)
 +}
@@ -572,9 +680,14 @@ index 0000000..a7f867a
 +/// The end of each frame.
 +pub(crate) fn frame(app: &mut PdfCraftApp) {
 +    STATE.with_borrow_mut(|s| (s.ctx.clone_from(&app.ctx), s.in_frame = true));
-+    pdfcraft_engine::live_playground::share(STATE.with_borrow(|s| s.pin).filter(|&id| shared(id)));
++    let tabs = STATE.with_borrow(|s| s.docs.iter().filter(|d| !d.paused).filter_map(|d| d.tab).collect());
++    pdfcraft_engine::live_playground::share(if playground_live::connected() { tabs } else { Vec::new() });
 +    playground_live::frame(app);
 +    STATE.with_borrow_mut(|s| s.in_frame = false);
++    // The shown PDF's pages and comments, which the others' marks refer to.
++    if let Some((_, id)) = app.active_ids().filter(|&(_, id)| shared(id)) {
++        ids(app, id);
++    }
 +    if let Some(notice) = STATE.with_borrow_mut(|s| s.notice.take()) {
 +        app.notify(notice);
 +    }
@@ -605,85 +718,184 @@ index 0000000..a7f867a
 +    }
 +}
 +
-+impl PdfCraftApp {
-+    /// The shared document's tab, binding the active document the first time one is needed.
-+    fn live_pin(&self) -> Option<DocId> {
-+        let active = self.active_ids().map(|(_, id)| id);
-+        STATE.with_borrow_mut(|s| {
-+            if s.pin.is_none()
-+                && let Some(id) = active
-+            {
-+                (s.pin, s.base, s.last, s.paused) = (Some(id), None, None, false);
-+                s.notice = self.session.get(id).and_then(refusal);
++/// Brings the session's PDFs up to date with this page's tabs: the shown one when nothing is shared yet, each one
++/// opened since (a new PDF of the session), the latest graph of each open one, and which ones were closed here.
++fn register(app: &PdfCraftApp) {
++    let active = app.active_ids().map(|(_, id)| id);
++    STATE.with_borrow_mut(|s| {
++        let since = *s.since.get_or_insert_with(|| app.views.iter().map(|v| v.id.0 + 1).max().unwrap_or(0));
++        let (mut changed, mut notice) = (false, None);
++        for d in &mut s.docs {
++            let Some(tab) = d.tab else { continue };
++            let Some(doc) = app.session.get(tab) else {
++                d.tab = None;
++                changed = true;
++                continue;
++            };
++            if d.paused {
++                continue;
 +            }
-+            s.pin
-+        })
++            if let Some(why) = refusal(doc) {
++                d.paused = true;
++                notice = Some(format!("Live editing is paused for this PDF: your changes to it stay in this browser. {why}"));
++                changed = true;
++            } else if doc.edit_generation() != d.seen || doc.name != d.name {
++                if let Some(cos) = doc.live_cos() {
++                    d.last = cos.clone();
++                }
++                (d.seen, d.name) = (doc.edit_generation(), doc.name.clone());
++                changed = true;
++            }
++        }
++        let first = s.docs.is_empty();
++        let fresh: Vec<DocId> = (app.views.iter().map(|v| v.id))
++            .filter(|&id| (id.0 >= since || first && Some(id) == active) && !s.told.contains(&id) && !s.docs.iter().any(|d| d.tab == Some(id)))
++            .collect();
++        for tab in fresh {
++            let Some(doc) = app.session.get(tab) else { continue };
++            let opened = match (refusal(doc), doc.live_cos()) {
++                (None, Some(cos)) => base_of(cos.bytes().clone(), None).map(|base| (base, cos.clone())),
++                (why, _) => Err(why.unwrap_or_default()),
++            };
++            match opened {
++                Ok((base, last)) => {
++                    let id = new_id(&mut s.next);
++                    let at = s.docs.partition_point(|d| d.id < id);
++                    let (name, seen) = (doc.name.clone(), doc.edit_generation());
++                    s.docs.insert(at, Doc { id, name, tab: Some(tab), base, last, seen, paused: false });
++                    changed = true;
++                }
++                Err(why) => {
++                    s.told.insert(tab);
++                    notice = Some(why).filter(|w| !w.is_empty());
++                }
++            }
++        }
++        if changed {
++            s.revision += 1;
++        }
++        if notice.is_some() {
++            s.notice = notice;
++        }
++    });
++}
++
++/// A new id for a PDF of the session: [`playground_live::fresh_id`]'s random one, also before the session connects
++/// (two people's PDFs never share one).
++fn new_id(next: &mut u64) -> u64 {
++    let id = playground_live::fresh_id(next);
++    #[cfg(target_arch = "wasm32")]
++    if id < 1 << 52 {
++        return (1 << 52) | (js_sys::Math::random() * (1u64 << 52) as f64) as u64;
++    }
++    id
++}
++
++/// The shared document entry of `d`.
++fn entry(d: &Doc) -> Value {
++    let mut v = project(&d.last, &d.base);
++    (v["id"], v["name"]) = (d.id.into(), d.name.clone().into());
++    v
++}
++
++impl PdfCraftApp {
++    /// Opens a PDF of the session in a tab of its own, behind this person's.
++    fn live_open(&mut self, name: &str, base: &Base, cos: Document) -> Result<DocId, String> {
++        let bytes = base.doc.bytes().clone();
++        let prepared = self.session.prepare_open(name, None, bytes.clone(), None).map_err(|e| e.to_string())?;
++        let active = self.active;
++        let id = self.finish_open(name, None, bytes.len(), prepared, false)?;
++        self.active = active;
++        if let Err(e) = self.live_install(id, cos, base, name) {
++            // Shown as the file it was opened from: never this PDF of the session.
++            STATE.with_borrow_mut(|s| s.told.insert(id));
++            return Err(e);
++        }
++        Ok(id)
++    }
++
++    /// Puts the session's graph `cos` of a PDF in tab `tab` unless it is there already, with no undo step.
++    fn live_install(&mut self, tab: DocId, cos: Document, base: &Base, name: &str) -> Result<(), String> {
++        let Some(doc) = self.session.get(tab) else { return Ok(()) };
++        if doc.name != name {
++            self.session.live_rename(tab, name);
++        }
++        let before = self.session.get(tab).and_then(|d| d.live_cos()).cloned();
++        if before.as_ref().is_some_and(|b| project(b, base) == project(&cos, base)) {
++            return Ok(());
++        }
++        self.session.live_replace_graph(tab, cos).map_err(|e| e.to_string())?;
++        views_changed(self, tab, before.as_ref());
++        Ok(())
 +    }
 +}
 +
 +impl Live for PdfCraftApp {
++    /// `{"documents": [{"id", "name", ...PDF}]}`: every PDF of the session, open here or not.
 +    fn live_document(&self) -> Value {
-+        let Some(id) = self.live_pin() else { return json!({}) };
-+        let cos = match self.session.get(id) {
-+            Some(doc) => match refusal(doc) {
-+                // Shared before (then signed or protected here): its last shared state stays the one reported for the
-+                // rest of the session, and this browser says why.
-+                Some(why) if STATE.with_borrow(|s| s.last.is_some()) => {
-+                    STATE.with_borrow_mut(|s| {
-+                        if !s.paused {
-+                            s.paused = true;
-+                            s.notice = Some(format!("Live editing is paused for this PDF: your changes to it stay in this browser. {why}"));
-+                        }
-+                    });
-+                    None
-+                }
-+                Some(why) => return json!({ "refused": why }),
-+                None if STATE.with_borrow(|s| s.paused) => None,
-+                None => doc.live_cos().cloned(),
-+            },
-+            None => None,
-+        };
-+        let Some(cos) = cos.or_else(|| STATE.with_borrow(|s| s.last.clone())) else { return json!({}) };
-+        let base = match STATE.with_borrow(|s| s.base.clone()) {
-+            Some(base) => base,
-+            None => match base_of(cos.bytes().clone(), None) {
-+                Ok(base) => base,
-+                Err(why) => return json!({ "refused": why }),
-+            },
-+        };
-+        let document = project(&cos, &base);
-+        STATE.with_borrow_mut(|s| (s.base, s.last) = (Some(base), Some(cos)));
-+        document
++        register(self);
++        STATE.with_borrow(|s| json!({ "documents": s.docs.iter().map(entry).collect::<Vec<_>>() }))
 +    }
 +
++    /// Each PDF goes into its tab here; one new to this browser opens in a tab behind this person's, one they closed
++    /// stays closed (and up to date). Joining, a tab showing the same file takes the session's PDF, and the session's
++    /// first PDF comes to the front unless this person already looks at one of them.
 +    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
-+        let shared = read(&document)?;
-+        let base = base_for(shared.pdf)?;
-+        let cos = build(&shared, &base);
-+        let pin = self.live_pin();
-+        let (same_file, paused) = STATE.with_borrow(|s| (s.base.as_ref().is_some_and(|b| b.pdf == base.pdf), s.paused));
-+        let id = match pin {
-+            // Closed or paused: the shared state is kept as the one reported, the tab is left alone.
-+            Some(id) if paused || self.session.get(id).is_none() => {
-+                STATE.with_borrow_mut(|s| (s.base, s.last, s.generation) = (Some(base), Some(cos), s.generation.wrapping_add(1)));
-+                return Ok(());
-+            }
-+            Some(id) if same_file => id,
-+            // Another file than the one this tab shows (or no tab yet): it opens in a tab of its own.
-+            _ => {
-+                let open: HashSet<DocId> = self.views.iter().map(|v| v.id).collect();
-+                self.open_bytes("Shared document.pdf", None, base.doc.bytes().to_vec())?;
-+                self.views.iter().map(|v| v.id).find(|id| !open.contains(id)).ok_or("The shared PDF did not open")?
-+            }
-+        };
-+        let before = self.session.get(id).and_then(|d| d.live_cos()).cloned();
-+        self.session.live_replace_graph(id, cos).map_err(|e| e.to_string())?;
-+        STATE.with_borrow_mut(|s| (s.pin, s.base) = (Some(id), Some(base)));
-+        views_changed(self, id, before.as_ref());
++        // Decoded before anything changes: (id, name, file, graph).
++        let mut plan = Vec::new();
++        for (id, v) in entries(&document)? {
++            let shared = read(v)?;
++            let base = base_for(shared.pdf)?;
++            let cos = build(&shared, &base);
++            plan.push((id, v["name"].as_str().unwrap_or_default().to_owned(), base, cos));
++        }
++        register(self);
++        let old = STATE.with_borrow_mut(|s| std::mem::take(&mut s.docs));
++        let joining = !plan.is_empty() && !plan.iter().any(|(id, ..)| old.iter().any(|d| d.id == *id));
++        let mut docs: Vec<Doc> = Vec::with_capacity(plan.len());
++        let mut failed = None;
++        for (id, name, base, cos) in plan {
++            let prev = old.iter().find(|d| d.id == id);
++            let same_file = || {
++                let tabs = old.iter().filter(|d| d.base.pdf.len() == base.pdf.len() && d.base.pdf == base.pdf).filter_map(|d| d.tab);
++                tabs.filter(|t| !docs.iter().any(|x| x.tab == Some(*t))).next()
++            };
++            let tab = match prev {
++                Some(p) => p.tab,
++                None if joining => same_file(),
++                None => None,
++            };
++            let paused = prev.is_some_and(|p| p.paused);
++            let tab = match tab.filter(|t| self.session.get(*t).is_some()) {
++                Some(t) if paused => Some(t),
++                Some(t) => {
++                    if let Err(e) = self.live_install(t, cos.clone(), &base, &name) {
++                        failed.get_or_insert(e);
++                    }
++                    Some(t)
++                }
++                // Closed here: it stays closed.
++                None if prev.is_some() => None,
++                None => self.live_open(&name, &base, cos.clone()).map_err(|e| failed.get_or_insert(e).clone()).ok(),
++            };
++            let seen = tab.and_then(|t| self.session.get(t)).map_or(0, |d| d.edit_generation());
++            docs.push(Doc { id, name, tab, base, last: cos, seen, paused });
++        }
++        let looking = self.active_ids().is_some_and(|(_, id)| docs.iter().any(|d| d.tab == Some(id)));
++        if joining
++            && !looking
++            && let Some(t) = docs.first().and_then(|d| d.tab)
++        {
++            self.active = self.views.iter().position(|v| v.id == t);
++        }
++        STATE.with_borrow_mut(|s| {
++            s.docs = docs;
++            s.revision += 1;
++        });
 +        if let Some(ctx) = &self.ctx {
 +            ctx.request_repaint();
 +        }
-+        Ok(())
++        failed.map_or(Ok(()), Err)
 +    }
 +
 +    fn live_quiet(&self) -> bool {
@@ -707,48 +919,95 @@ index 0000000..a7f867a
 +    }
 +
 +    fn live_generation(&self) -> Option<u64> {
-+        let id = self.live_pin();
-+        let now = id.and_then(|id| Some(self.session.get(id)?.edit_generation().wrapping_add(id.0 << 40).wrapping_add(1)));
-+        STATE.with_borrow_mut(|s| {
-+            s.generation = now.unwrap_or(s.generation);
-+            Some(s.generation)
-+        })
++        register(self);
++        Some(STATE.with_borrow(|s| s.revision))
 +    }
 +
 +    fn live_disconnected(&mut self) {
-+        if let Some(id) = STATE.with_borrow(|s| s.pin) {
-+            self.session.live_clear_history(id);
++        for tab in STATE.with_borrow(|s| s.docs.iter().filter_map(|d| d.tab).collect::<Vec<_>>()) {
++            self.session.live_clear_history(tab);
 +        }
-+        pdfcraft_engine::live_playground::share(None);
++        pdfcraft_engine::live_playground::share(Vec::new());
 +        STATE.with_borrow_mut(|s| *s = State { ctx: s.ctx.take(), ..State::default() });
 +    }
 +
 +    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
-+        merge(base, current, edited)
++        merge_set(base, current, edited)
 +    }
 +
-+    /// The coordinator checks fully; a receiver's merge is checked by installing it (the same write and inspection).
++    /// The coordinator checks fully (each PDF once); a receiver's merge is checked by installing it (the same write
++    /// and inspection).
 +    fn live_check(document: &Value) -> Result<(), Error> {
-+        if STATE.with_borrow(|s| s.in_frame) { read(document).map(drop) } else { validate(document) }
++        use std::hash::{Hash, Hasher};
++        let in_frame = STATE.with_borrow(|s| s.in_frame);
++        for (_, pdf) in entries(document)? {
++            if in_frame {
++                read(pdf)?;
++                continue;
++            }
++            let mut h = std::hash::DefaultHasher::new();
++            playground_live::canonical(pdf).hash(&mut h);
++            let key = h.finish();
++            if !STATE.with_borrow(|s| s.checked.contains(&key)) {
++                validate(pdf)?;
++                STATE.with_borrow_mut(|s| {
++                    if s.checked.len() > 256 {
++                        s.checked.clear();
++                    }
++                    s.checked.insert(key);
++                });
++            }
++        }
++        Ok(())
 +    }
 +
 +    fn live_presence(&self) -> Value {
 +        presence(self).unwrap_or(Value::Null)
 +    }
 +
++    /// Who is still on the same PDF and page keeps their marks where they were drawn, to ease on from there.
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        STATE.with_borrow_mut(|s| s.others = others);
++        STATE.with_borrow_mut(|s| {
++            let mut old = std::mem::take(&mut s.others);
++            let place = |v: &Value| (v["doc"].clone(), v["page"].clone());
++            s.others = (others.into_iter())
++                .map(|who| {
++                    let same = old.iter_mut().find(|o| o.who.id == who.id && place(&o.who.state) == place(&who.state));
++                    Peer { shown: same.map(|o| o.shown.take()).unwrap_or_default(), who }
++                })
++                .collect();
++        });
 +    }
 +}
 +
-+/// The shared document's page and comment object numbers (what presence refers to), for one state of its graph.
++/// A comment as presence names it: its page, index in `/Annots`, rectangle in user space, whether it is an oval, and
++/// the boxes of the text it marks up (highlights and the like, outlined box by box as the app outlines its own).
++struct Annot {
++    page: usize,
++    index: usize,
++    rect: [f32; 4],
++    oval: bool,
++    boxes: Vec<[f32; 4]>,
++}
++
++/// A shared PDF's page and comment object numbers (what presence refers to), for one state of its graph.
 +struct Ids {
 +    doc: DocId,
 +    generation: u64,
 +    /// Each page's object number and geometry.
 +    pages: Vec<(u32, pdfcraft_render::PageInfo)>,
-+    /// Each annotation's object number: its page, index in `/Annots` and rectangle in user space.
-+    annots: HashMap<u32, (usize, usize, [f32; 4])>,
++    annots: HashMap<u32, Annot>,
++}
++
++impl Ids {
++    fn annot_at(&self, page: usize, index: usize) -> Option<u32> {
++        self.annots.iter().find(|(_, a)| (a.page, a.index) == (page, index)).map(|(n, _)| *n)
++    }
++
++    fn page(&self, num: &Value) -> Option<usize> {
++        let num = num.as_u64()?;
++        self.pages.iter().position(|(p, _)| u64::from(*p) == num)
++    }
 +}
 +
 +/// [`Ids`] of document `id` as it is now, read again only after a change.
@@ -767,11 +1026,17 @@ index 0000000..a7f867a
 +            list.and_then(|l| Some(l.as_array()?.iter().map(|o| o.as_ref().map(|r| r.num)).collect())).unwrap_or_default()
 +        })
 +        .collect();
-+    let annots = doc
-+        .info
-+        .annotations
-+        .iter()
-+        .filter_map(|a| Some((lists.get(a.page)?.get(a.index).copied().flatten()?, (a.page, a.index, a.rect))))
++    let annots = (doc.info.annotations.iter())
++        .filter_map(|a| {
++            let num = lists.get(a.page)?.get(a.index).copied().flatten()?;
++            let markup = matches!(a.subtype.as_str(), "Highlight" | "Underline" | "StrikeOut" | "Squiggly");
++            let bbox = |q: &[f32; 8]| {
++                let (xs, ys) = ([q[0], q[2], q[4], q[6]], [q[1], q[3], q[5], q[7]]);
++                [xs.into_iter().fold(f32::MAX, f32::min), ys.into_iter().fold(f32::MAX, f32::min), xs.into_iter().fold(f32::MIN, f32::max), ys.into_iter().fold(f32::MIN, f32::max)]
++            };
++            let boxes = if markup { a.quads.iter().take(MAX_ITEMS).map(bbox).collect() } else { Vec::new() };
++            Some((num, Annot { page: a.page, index: a.index, rect: a.rect, oval: a.subtype == "Circle", boxes }))
++        })
 +        .collect();
 +    let pages = pages.iter().zip(&doc.info.pages).map(|(p, info)| (p.obj.num, info.clone())).collect();
 +    let ids = Rc::new(Ids { doc: id, generation, pages, annots });
@@ -779,57 +1044,535 @@ index 0000000..a7f867a
 +    Some(ids)
 +}
 +
-+/// This person's presence: the page under the pointer (else the current one), the pointer in its user space while it
-+/// is over a page, and the selected comment.
++/// The most points of a stroke, items of a list and characters of typed text a presence holds.
++const MAX_POINTS: usize = 200;
++const MAX_ITEMS: usize = 50;
++const MAX_TEXT: usize = 200;
++/// The most bytes of a presence (the shell sends at most 4 KiB).
++const MAX_BYTES: usize = 4000;
++
++/// User-space numbers to a tenth (of a point: below a pixel at any usual zoom), so a presence stays small.
++fn tenth(x: impl Into<f64>) -> f64 {
++    (x.into() * 10.0).round() / 10.0
++}
++
++fn rect_value(r: [f32; 4]) -> Value {
++    json!([tenth(r[0].min(r[2])), tenth(r[1].min(r[3])), tenth(r[0].max(r[2])), tenth(r[1].max(r[3]))])
++}
++
++/// This person's presence on the shown PDF: the page of their gesture (else under the pointer, else the current one),
++/// the pointer in its user space, the selected comment, and the gesture under way ([`Live::live_presence`]).
 +fn presence(app: &PdfCraftApp) -> Option<Value> {
-+    let (i, id) = app.active_ids().filter(|&(_, id)| shared(id))?;
-+    let (ids, view) = (ids(app, id)?, app.views.get(i)?);
-+    let pointer = app.ctx.as_ref().and_then(|ctx| ctx.pointer_hover_pos()).filter(|p| !view.organize && view.viewport_rect().contains(*p));
-+    let at = pointer.and_then(|p| {
-+        let (page, _) = view.visible_page_rects().into_iter().find(|(_, r)| r.contains(p))?;
-+        Some((page, view.page_xform(page)?.screen_to_view(p)))
-+    });
-+    let (num, info) = ids.pages.get(at.map_or(view.current, |(page, _)| page))?;
-+    let selected = view.comments.selected.and_then(|(page, index)| ids.annots.iter().find(|(_, a)| (a.0, a.1) == (page, index)).map(|(n, _)| *n));
-+    let mut state = json!({ "page": num, "selection": selected.into_iter().collect::<Vec<_>>() });
-+    if let Some((_, (x, y))) = at {
-+        state["pointer"] = json!(info.view_to_user(x, y).map(|v| (f64::from(v) * 10.0).round() / 10.0));
++    use crate::comments::{CommentTool as T, Gesture};
++    let (i, id) = app.active_ids()?;
++    let doc_id = session_id(id)?;
++    let (ids, view, doc) = (ids(app, id)?, app.views.get(i)?, app.session.get(id)?);
++    let info = &doc.info;
++    let ctx = app.ctx.as_ref();
++    let latest = ctx.and_then(|ctx| ctx.pointer_hover_pos());
++    let hover = latest.filter(|p| !view.organize && view.viewport_rect().contains(*p));
++    let gesture = view.comments.gesture.as_ref();
++    let pressed = ctx.is_some_and(|ctx| ctx.input(|i| i.pointer.primary_down()));
++    let text = view.selection_quads(info).filter(|_| pressed && gesture.is_none());
++    let page = match gesture {
++        Some(Gesture::Draw { page, .. } | Gesture::Move { page, .. } | Gesture::Resize { page, .. }) => *page,
++        None => (text.as_ref().map(|(page, _)| *page))
++            .or_else(|| hover.and_then(|p| view.visible_page_rects().into_iter().find(|(_, r)| r.contains(p)).map(|(page, _)| page)))
++            .unwrap_or(view.current),
++    };
++    let (num, page_info) = ids.pages.get(page)?;
++    let selected = view.comments.selected.and_then(|(page, index)| ids.annot_at(page, index));
++    let mut state = json!({ "doc": doc_id, "page": num, "selection": selected.into_iter().collect::<Vec<_>>() });
++    let xf = view.page_xform(page);
++    let user = |p: Pos2| {
++        let (x, y) = xf?.screen_to_view(p);
++        Some(page_info.view_to_user(x, y))
++    };
++    if let Some([x, y]) = hover.and_then(user) {
++        state["pointer"] = json!([tenth(x), tenth(y)]);
++    }
++    let zoom = xf.map_or(1.0, |xf| xf.rect.width() / xf.pw.max(1.0)).max(1e-3);
++    match gesture {
++        Some(Gesture::Draw { tool, points, .. }) => {
++            let name = match tool {
++                T::Ink => "ink",
++                T::Eraser => "eraser",
++                T::Line => "line",
++                T::Arrow => "arrow",
++                T::Rectangle => "rect",
++                T::Oval => "oval",
++                T::Polygon => "polygon",
++                T::PolyLine => "polyline",
++                T::Cloud => "cloud",
++                T::Callout => "callout",
++                _ => "",
++            };
++            // Points closer than a pixel apart go, but the newest stays; clicked vertices end at the pointer.
++            let min = 1.0 / f64::from(zoom);
++            let mut kept: Vec<[f64; 2]> = Vec::new();
++            for (k, p) in points.iter().enumerate().filter(|(_, p)| p.iter().all(|v| v.is_finite())) {
++                if k + 1 == points.len() || kept.last().is_none_or(|q| (q[0] - p[0]).hypot(q[1] - p[1]) >= min) {
++                    kept.push(*p);
++                }
++            }
++            if tool.clicks_points()
++                && let Some([x, y]) = latest.and_then(user)
++            {
++                kept.push([x.into(), y.into()]);
++            }
++            let newest = &kept[kept.len().saturating_sub(MAX_POINTS)..];
++            let width = if *tool == T::Eraser { 12.0 / f64::from(zoom) } else { app.comment_prefs.style(*tool).width };
++            if !name.is_empty() && !newest.is_empty() {
++                let points: Vec<Value> = newest.iter().map(|p| json!([tenth(p[0]), tenth(p[1])])).collect();
++                state["draw"] = json!({ "tool": name, "points": points, "width": tenth(width) });
++            }
++        }
++        Some(&Gesture::Move { page, index, from }) | Some(&Gesture::Resize { page, index, from, .. }) => {
++            let a = info.annotations.iter().find(|a| (a.page, a.index) == (page, index));
++            if let (Some(a), Some(xf), Some(p), Some(n)) = (a, xf, latest, ids.annot_at(page, index)) {
++                let r = xf.user_rect(info, page, a.rect);
++                let r = match gesture {
++                    Some(&Gesture::Resize { handle, aspect_ratio, .. }) => {
++                        let shift = ctx.is_some_and(|ctx| ctx.input(|i| i.modifiers.shift));
++                        let ratio = aspect_ratio.or((shift && r.width() > 0.0 && r.height() > 0.0).then(|| r.width() / r.height()));
++                        resized(r, handle, p - from, ratio)
++                    }
++                    _ => r.translate(p - from),
++                };
++                if let (Some(a), Some(b)) = (user(r.left_top()), user(r.right_bottom())) {
++                    state["ghost"] = json!({ "id": n, "rect": rect_value([a[0], a[1], b[0], b[1]]) });
++                }
++            }
++        }
++        None => {}
++    }
++    if let Some((_, quads)) = &text {
++        let bbox = |q: &[f64; 8]| {
++            let (xs, ys) = ([q[0], q[2], q[4], q[6]], [q[1], q[3], q[5], q[7]]);
++            let (min, max) = (|v: [f64; 4]| v.into_iter().fold(f64::MAX, f64::min), |v: [f64; 4]| v.into_iter().fold(f64::MIN, f64::max));
++            json!([tenth(min(xs)), tenth(min(ys)), tenth(max(xs)), tenth(max(ys))])
++        };
++        state["text"] = quads.iter().take(MAX_ITEMS).map(bbox).collect();
++    }
++    if let Some((page, rect, typed)) = typing(view, doc).filter(|(.., t)| !t.is_empty())
++        && let Some((num, _)) = ids.pages.get(page)
++    {
++        let n = typed.chars().count();
++        let end: String = typed.chars().skip(n.saturating_sub(MAX_TEXT)).collect();
++        state["typing"] = json!({ "page": num, "rect": rect_value(rect), "text": end });
++    }
++    // Within what the shell sends: the oldest points go first.
++    while state.to_string().len() > MAX_BYTES {
++        match state["draw"]["points"].as_array_mut() {
++            Some(points) if points.len() > 2 => drop(points.drain(..points.len() / 2)),
++            _ => {
++                state.as_object_mut()?.remove("typing");
++                state.as_object_mut()?.remove("text");
++                if state.to_string().len() > MAX_BYTES {
++                    return None;
++                }
++            }
++        }
 +    }
 +    Some(state)
 +}
 +
-+/// Draws the others' selected comments and pointers (with their names) on the pages `view` shows, in their colors.
-+pub(crate) fn paint(view: &crate::DocView, area: egui::Rect, ui: &egui::Ui) {
-+    use egui::{Color32, CornerRadius, Pos2, Rect, Stroke, StrokeKind, vec2};
-+    STATE.with_borrow(|s| {
-+        let Some(ids) = s.ids.as_ref().filter(|ids| ids.doc == view.id && !s.others.is_empty() && shared(view.id)) else { return };
-+        let painter = ui.painter().with_clip_rect(area);
-+        let screen = |page: usize, [x, y]: [f32; 2]| -> Option<Pos2> {
-+            let (xf, (_, info)) = (view.page_xform(page)?, ids.pages.get(page)?);
-+            let v = info.user_to_view(x, y);
-+            Some(xf.norm_to_screen(v[0] / xf.pw, v[1] / xf.ph))
-+        };
-+        for other in &s.others {
-+            let color = Color32::from_rgb(other.color[0], other.color[1], other.color[2]);
-+            let num = |v: &Value| v.as_u64().and_then(|n| u32::try_from(n).ok());
-+            for n in other.state["selection"].as_array().into_iter().flatten().take(50).filter_map(num) {
-+                let Some(&(page, _, r)) = ids.annots.get(&n) else { continue };
-+                if let (Some(a), Some(b)) = (screen(page, [r[0], r[1]]), screen(page, [r[2], r[3]])) {
-+                    painter.rect_stroke(Rect::from_two_pos(a, b).expand(2.0), CornerRadius::ZERO, Stroke::new(2.0, color), StrokeKind::Middle);
++/// A comment's box on screen `r` resized by dragging its `handle` by `d`, as the app resizes it: from a corner, the
++/// proportions `ratio` (the box's own, or its current ones while Shift is held) stay.
++fn resized(r: Rect, (hx, hy): (i8, i8), d: egui::Vec2, ratio: Option<f32>) -> Rect {
++    let (sx, sy) = (f32::from(hx), f32::from(hy));
++    if hx != 0
++        && hy != 0
++        && let Some(ratio) = ratio.filter(|v| v.is_finite() && *v > 0.0)
++    {
++        let width = (r.width() + sx * d.x).max((r.height() + sy * d.y) * ratio).max(4.0).max(4.0 * ratio);
++        let anchor = pos2(if hx < 0 { r.right() } else { r.left() }, if hy < 0 { r.bottom() } else { r.top() });
++        return Rect::from_two_pos(anchor, anchor + vec2(sx * width, sy * width / ratio));
++    }
++    let mut r = r;
++    match hx {
++        -1 => r.min.x += d.x,
++        1 => r.max.x += d.x,
++        _ => {}
++    }
++    match hy {
++        -1 => r.min.y += d.y,
++        1 => r.max.y += d.y,
++        _ => {}
++    }
++    Rect::from_two_pos(r.min, r.max)
++}
++
++/// Text being typed in `view`: its page, where (a user-space rectangle, or a point as one) and the text so far, in a
++/// new comment, a comment edited in the Comments panel, a form field, Fill & Sign text, added text or a paragraph being
++/// edited.
++fn typing<'a>(view: &'a DocView, doc: &'a pdfcraft_engine::Document) -> Option<(usize, [f32; 4], &'a str)> {
++    let at = |p: [f64; 2]| [p[0] as f32, p[1] as f32, p[0] as f32, p[1] as f32];
++    let rect = |r: [f64; 4]| r.map(|v| v as f32);
++    if let Some(c) = &view.comments.composer {
++        return Some((c.page, at(c.at), &c.text));
++    }
++    if let Some((page, index, text)) = &view.comments.editing {
++        let a = doc.info.annotations.iter().find(|a| (a.page, a.index) == (*page, *index))?;
++        return Some((*page, a.rect, text));
++    }
++    if let Some(t) = &view.fill_text {
++        return Some((t.page, at(t.at), &t.text));
++    }
++    if let Some(f) = &view.forms.focus {
++        let w = doc.form.iter().find(|x| x.name == f.name)?.widgets.get(f.widget)?;
++        return Some((w.page?, rect(w.rect), &f.text));
++    }
++    if let Some(d) = &view.content.draft {
++        // Display space: view space with y up.
++        let p = doc.info.pages.get(d.page)?;
++        let h = f64::from(p.height);
++        let (a, b) = (p.view_to_user(d.rect[0] as f32, (h - d.rect[3]) as f32), p.view_to_user(d.rect[2] as f32, (h - d.rect[1]) as f32));
++        return Some((d.page, [a[0], a[1], b[0], b[1]], &d.text));
++    }
++    let e = view.line_editor.as_ref()?;
++    Some((e.page, rect(view.edit_lines.get(&e.page)?.1.get(e.block)?.rect), &e.text))
++}
++
++/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
++const EASE: f32 = 0.08;
++/// Coordinates beyond this are not drawn (remote data).
++const FAR_OUT: f64 = 1e6;
++/// A ghost's fill and edge, a live stroke, in the person's colour at these opacities.
++const GHOST: f32 = 0.28;
++const GHOST_EDGE: f32 = 0.85;
++const LIVE_STROKE: f32 = 0.7;
++
++fn sane(v: &Value) -> bool {
++    match v {
++        Value::Number(n) => n.as_f64().is_some_and(|x| x.abs() < FAR_OUT),
++        Value::Array(items) => items.iter().all(sane),
++        Value::Object(m) => m.values().all(sane),
++        _ => true,
++    }
++}
++
++/// `N` numbers in range, or none.
++fn numbers<const N: usize>(v: &Value) -> Option<[f64; N]> {
++    let items = v.as_array().filter(|a| a.len() == N)?;
++    let mut out = [0.0; N];
++    for (o, x) in out.iter_mut().zip(items) {
++        *o = x.as_f64().filter(|x| x.abs() < FAR_OUT)?;
++    }
++    Some(out)
++}
++
++/// The moving part of a person's `state` (remote data: out-of-range values dropped), as [`Peer::shown`] holds it.
++fn marks(state: &Value) -> Value {
++    let tip = state["draw"]["points"].as_array().and_then(|p| p.last());
++    let picks = [("pointer", state.get("pointer")), ("ghost", state["ghost"].get("rect")), ("tip", tip)];
++    Value::Object(picks.into_iter().filter_map(|(key, v)| Some((key.to_owned(), v.filter(|v| sane(v))?.clone()))).collect())
++}
++
++/// `shown` moved `k` of the way to `to`, key by key and number by number; a new key, another shape or a jump of more
++/// than `far` goes there at once. Whether a number is still more than `near` away.
++fn ease(shown: &mut Value, to: Value, k: f64, near: f64, far: f64) -> bool {
++    let Value::Object(to) = to else { return false };
++    let Value::Object(s) = shown else {
++        *shown = Value::Object(to);
++        return false;
++    };
++    s.retain(|key, _| to.contains_key(key));
++    let mut moving = false;
++    for (key, t) in to {
++        match s.get_mut(&key) {
++            Some(v) if gap(v, &t).is_some_and(|g| g <= far) => {
++                lerp(v, &t, k);
++                if gap(v, &t).is_some_and(|g| g > near) {
++                    moving = true;
++                } else {
++                    *v = t;
 +                }
 +            }
-+            let page = num(&other.state["page"]).and_then(|n| ids.pages.iter().position(|(p, _)| *p == n));
-+            let xy = other.state["pointer"].as_array().filter(|a| a.len() == 2).and_then(|a| Some([a[0].as_f64()? as f32, a[1].as_f64()? as f32]));
-+            let at = page.zip(xy.filter(|xy| xy.iter().all(|v| v.abs() < 1e6))).and_then(|(page, xy)| screen(page, xy));
-+            let Some(at) = at.filter(|at| area.contains(*at)) else { continue };
-+            let arrow = vec![at, at + vec2(0.0, 17.0), at + vec2(12.0, 12.0)];
-+            painter.add(egui::Shape::convex_polygon(arrow, color, Stroke::new(1.0, Color32::WHITE)));
-+            let name = painter.layout_no_wrap(other.name.clone(), egui::FontId::proportional(12.0), Color32::WHITE);
-+            let tag = Rect::from_min_size(at + vec2(10.0, 16.0), name.size() + vec2(8.0, 4.0));
-+            painter.rect_filled(tag, CornerRadius::same(3), color);
-+            painter.galley(tag.min + vec2(4.0, 2.0), name, Color32::WHITE);
++            _ => {
++                s.insert(key, t);
++            }
 +        }
++    }
++    moving
++}
++
++/// The largest difference between numbers in the same place of `a` and `b`; `None` when they differ otherwise.
++fn gap(a: &Value, b: &Value) -> Option<f64> {
++    match (a, b) {
++        (Value::Number(x), Value::Number(y)) => Some((x.as_f64()? - y.as_f64()?).abs()),
++        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => x.iter().zip(y).try_fold(0.0, |g: f64, (x, y)| Some(g.max(gap(x, y)?))),
++        _ => (a == b).then_some(0.0),
++    }
++}
++
++/// `a`'s numbers moved `k` of the way to `b`'s.
++fn lerp(a: &mut Value, b: &Value, k: f64) {
++    match (a, b) {
++        (Value::Number(x), Value::Number(y)) => {
++            if let (Some(p), Some(q)) = (x.as_f64(), y.as_f64())
++                && let Some(n) = serde_json::Number::from_f64(p + (q - p) * k)
++            {
++                *x = n;
++            }
++        }
++        (Value::Array(x), Value::Array(y)) => x.iter_mut().zip(y).for_each(|(x, y)| lerp(x, y, k)),
++        _ => {}
++    }
++}
++
++fn color_of(who: &Presence) -> Color32 {
++    Color32::from_rgb(who.color[0], who.color[1], who.color[2])
++}
++
++/// A rubber band: 1.5 px dashed (4 on, 3 off).
++fn band(painter: &egui::Painter, points: &[Pos2], color: Color32) {
++    painter.extend(Shape::dashed_line(points, Stroke::new(1.5, color), 4.0, 3.0));
++}
++
++/// Draws the others on the PDF `view` shows, on its pages, in the session's look (after the pages; the find bar and
++/// every popup come after): their drawings under way, moved comments' ghosts and selected text, then their selected
++/// comments outlined, then what they type, then their pointers with their names, each in their colour and eased toward
++/// their latest presence.
++pub(crate) fn paint(view: &DocView, area: Rect, ui: &egui::Ui) {
++    if !playground_live::connected() {
++        return;
++    }
++    let ctx = ui.ctx();
++    let k = f64::from(1.0 - (-ctx.input(|i| i.stable_dt).clamp(0.0, 0.1) / EASE).exp());
++    let moving = STATE.with_borrow_mut(|s| {
++        let Some(doc) = s.docs.iter().find(|d| d.tab == Some(view.id) && !d.paused).map(|d| d.id) else { return false };
++        let Some(ids) = s.ids.clone().filter(|i| i.doc == view.id) else { return false };
++        let painter = ui.painter().with_clip_rect(area);
++        let mut moving = false;
++        // Who is here, on which page, and where that page is drawn.
++        let mut here = Vec::new();
++        for (n, o) in s.others.iter_mut().enumerate().filter(|(_, o)| o.who.state["doc"].as_u64() == Some(doc)) {
++            let Some((page, xf)) = ids.page(&o.who.state["page"]).and_then(|p| Some((p, view.page_xform(p)?))) else { continue };
++            let zoom = f64::from(xf.rect.width() / xf.pw.max(1.0)).max(1e-3);
++            moving |= ease(&mut o.shown, marks(&o.who.state), k, 0.5 / zoom, f64::from(area.height()) / 4.0 / zoom);
++            here.push((n, page, xf));
++        }
++        let here: Vec<(&Peer, usize, crate::canvas::PageXform)> = here.into_iter().map(|(n, page, xf)| (&s.others[n], page, xf)).collect();
++        let at = |page: usize, xf: &crate::canvas::PageXform, [x, y]: [f64; 2]| -> Option<Pos2> {
++            let v = ids.pages.get(page)?.1.user_to_view(x as f32, y as f32);
++            Some(xf.norm_to_screen(v[0] / xf.pw, v[1] / xf.ph))
++        };
++        let screen_rect = |page: usize, xf: &crate::canvas::PageXform, r: [f64; 4]| Some(Rect::from_two_pos(at(page, xf, [r[0], r[1]])?, at(page, xf, [r[2], r[3]])?));
++        for &(o, page, ref xf) in &here {
++            let (state, color) = (&o.who.state, color_of(&o.who));
++            let zoom = xf.rect.width() / xf.pw.max(1.0);
++            if let Some(draw) = state["draw"].as_object() {
++                let points = draw["points"].as_array().into_iter().flatten().take(MAX_POINTS);
++                let mut pts: Vec<Pos2> = points.filter_map(|p| at(page, xf, numbers::<2>(p)?)).collect();
++                if let (Some(last), Some(tip)) = (pts.last_mut(), numbers::<2>(&o.shown["tip"]).and_then(|t| at(page, xf, t))) {
++                    *last = tip;
++                }
++                let width = draw["width"].as_f64().filter(|w| (0.0..1000.0).contains(w)).unwrap_or(1.0) as f32;
++                match (draw["tool"].as_str().unwrap_or_default(), pts.as_slice()) {
++                    ("ink" | "eraser", _) => {
++                        painter.add(Shape::line(pts, Stroke::new((width * zoom).max(2.0), color.gamma_multiply(LIVE_STROKE))));
++                    }
++                    ("rect", &[a, b]) => {
++                        let r = Rect::from_two_pos(a, b);
++                        band(&painter, &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()], color);
++                    }
++                    ("oval", &[a, b]) => {
++                        let r = Rect::from_two_pos(a, b);
++                        let ring: Vec<Pos2> = (0..=64)
++                            .map(|i| std::f32::consts::TAU * i as f32 / 64.0)
++                            .map(|t| r.center() + vec2(t.cos() * r.width() / 2.0, t.sin() * r.height() / 2.0))
++                            .collect();
++                        band(&painter, &ring, color);
++                    }
++                    ("line" | "arrow" | "callout", &[a, b]) => {
++                        band(&painter, &[a, b], color);
++                        if draw["tool"] == "arrow" && a.distance(b) > 1.0 {
++                            let (d, s) = ((a - b).normalized(), (6.0 + 3.0 * width) * zoom);
++                            let turn = |v: egui::Vec2, t: f32| vec2(v.x * t.cos() - v.y * t.sin(), v.x * t.sin() + v.y * t.cos());
++                            band(&painter, &[b + turn(d, 0.52) * s, b, b + turn(d, -0.52) * s], color);
++                        }
++                        if draw["tool"] == "callout" {
++                            let r = Rect::from_min_size(b, vec2(160.0, 40.0) * zoom);
++                            band(&painter, &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()], color);
++                        }
++                    }
++                    ("polygon" | "polyline" | "cloud", _) => band(&painter, &pts, color),
++                    _ => {}
++                }
++            }
++            let ghost = ids.annots.get(&state["ghost"]["id"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0));
++            if let (Some(a), Some(r)) = (ghost, numbers::<4>(&o.shown["ghost"]).and_then(|r| screen_rect(page, xf, r))) {
++                let (fill, edge) = (color.gamma_multiply(GHOST), Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE)));
++                if a.oval {
++                    painter.add(Shape::ellipse_filled(r.center(), r.size() / 2.0, fill));
++                    painter.add(Shape::ellipse_stroke(r.center(), r.size() / 2.0, edge));
++                } else {
++                    painter.rect(r, 0.0, fill, edge, egui::StrokeKind::Middle);
++                }
++            }
++            for r in state["text"].as_array().into_iter().flatten().take(MAX_ITEMS).filter_map(|r| screen_rect(page, xf, numbers::<4>(r)?)) {
++                painter.rect_filled(r, 1.0, color.gamma_multiply(GHOST));
++            }
++        }
++        // Their selected comments, on whichever shown page they are, where they were (a moved one's ghost is above).
++        for o in s.others.iter().filter(|o| o.who.state["doc"].as_u64() == Some(doc)) {
++            let numbers = o.who.state["selection"].as_array().into_iter().flatten().take(MAX_ITEMS).filter_map(Value::as_u64);
++            for a in numbers.filter_map(|n| ids.annots.get(&u32::try_from(n).ok()?)) {
++                let Some(xf) = view.page_xform(a.page) else { continue };
++                let boxes = if a.boxes.is_empty() { std::slice::from_ref(&a.rect) } else { &a.boxes[..] };
++                for r in boxes.iter().filter_map(|r| screen_rect(a.page, &xf, r.map(f64::from))) {
++                    painter.rect_stroke(r.expand(2.0), 0.0, Stroke::new(2.0, color_of(&o.who)), egui::StrokeKind::Middle);
++                }
++            }
++        }
++        // What they type, in a tag above where it goes.
++        for o in s.others.iter().filter(|o| o.who.state["doc"].as_u64() == Some(doc)) {
++            let t = &o.who.state["typing"];
++            let (Some(page), Some(r), Some(text)) = (ids.page(&t["page"]), numbers::<4>(&t["rect"]), t["text"].as_str()) else { continue };
++            let Some(r) = view.page_xform(page).and_then(|xf| screen_rect(page, &xf, r)) else { continue };
++            let n = text.chars().count();
++            let end: String = text.chars().skip(n.saturating_sub(40)).map(|c| if c.is_control() { ' ' } else { c }).collect();
++            let shown = if n > 40 { format!("…{end}") } else { end };
++            let size = tag_text(&painter, &shown, Color32::WHITE).size() + 2.0 * TAG_PAD;
++            tag(&painter, r.left_top() - vec2(0.0, size.y + 4.0), &shown, color_of(&o.who));
++        }
++        for &(o, page, ref xf) in &here {
++            let tip = numbers::<2>(&o.shown["pointer"]).and_then(|p| at(page, xf, p));
++            if let Some(tip) = tip.filter(|t| area.expand(20.0).contains(*t)) {
++                cursor(&painter, tip, color_of(&o.who), &o.who.name);
++            }
++        }
++        moving
 +    });
++    if moving {
++        ctx.request_repaint();
++    }
++}
++
++/// The session's pointer arrow, tip first, in points.
++const ARROW: [(f32, f32); 7] = [(0.0, 0.0), (0.0, 16.0), (4.5, 12.2), (7.6, 18.6), (10.4, 17.3), (7.3, 11.0), (12.5, 11.0)];
++/// The most characters of a name tag, its ellipsis included.
++const MAX_NAME: usize = 24;
++/// Inside a tag, in points.
++const TAG_PAD: egui::Vec2 = vec2(7.0, 3.0);
++
++/// Another person's pointer at `tip`: an arrow in their colour with a white edge and a soft shadow, and a tag with
++/// their name.
++fn cursor(painter: &egui::Painter, tip: Pos2, color: Color32, name: &str) {
++    let arrow = |at: Pos2| ARROW.iter().map(|&(x, y)| at + vec2(x, y)).collect::<Vec<_>>();
++    // Filled as a fan from the tip (the arrow is not convex, which egui's polygon fill needs), edged after.
++    let fan = |pts: &[Pos2], fill: Color32| {
++        let mut mesh = egui::Mesh::default();
++        pts.iter().for_each(|q| mesh.colored_vertex(*q, fill));
++        (1..pts.len() as u32 - 1).for_each(|i| mesh.add_triangle(0, i, i + 1));
++        mesh
++    };
++    painter.add(fan(&arrow(tip + vec2(0.0, 1.0)), Color32::from_black_alpha(64)));
++    painter.add(fan(&arrow(tip), color));
++    painter.add(Shape::closed_line(arrow(tip), Stroke::new(1.5, Color32::WHITE)));
++    let name: String = match name.chars().nth(MAX_NAME) {
++        Some(_) => name.chars().take(MAX_NAME - 1).chain(['…']).collect(),
++        None => name.to_owned(),
++    };
++    if !name.is_empty() {
++        tag(painter, tip + vec2(12.0, 15.0), &name, color);
++    }
++}
++
++/// White, or near-black on a colour whose relative luminance passes 0.55.
++fn ink(color: Color32) -> Color32 {
++    let c = egui::Rgba::from(color);
++    if 0.2126 * c.r() + 0.7152 * c.g() + 0.0722 * c.b() > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE }
++}
++
++/// A tag's text: 12 points semibold.
++fn tag_text(painter: &egui::Painter, text: &str, color: Color32) -> Arc<egui::Galley> {
++    painter.layout_no_wrap(text.to_owned(), crate::theme::semibold(12.0), ink(color))
++}
++
++/// A name or typing tag in `color`, its top left at `at` (on whole pixels, so the text stays crisp).
++fn tag(painter: &egui::Painter, at: Pos2, text: &str, color: Color32) {
++    let galley = tag_text(painter, text, color);
++    let ppp = painter.pixels_per_point();
++    let at = pos2((at.x * ppp).round() / ppp, (at.y * ppp).round() / ppp);
++    let r = Rect::from_min_size(at, galley.size() + 2.0 * TAG_PAD);
++    painter.rect_filled(r, 6.0, color);
++    painter.galley(r.min + TAG_PAD, galley, ink(color));
++}
++
++/// The others in a PDF of the session: their colours, at most four.
++fn on(doc: u64) -> Vec<Color32> {
++    STATE.with_borrow(|s| s.others.iter().filter(|o| o.who.state["doc"].as_u64() == Some(doc)).take(4).map(|o| color_of(&o.who)).collect())
++}
++
++/// Dots in the colours of the others on the PDF in tab `i` (drawn at `tab`, right after the tab strip draws it), in
++/// its top right corner above the close button.
++pub(crate) fn tab_dots(app: &PdfCraftApp, ui: &egui::Ui, i: usize, tab: Rect) {
++    let Some(doc) = app.views.get(i).and_then(|v| session_id(v.id)) else { return };
++    for (k, color) in on(doc).into_iter().enumerate() {
++        ui.painter().circle(pos2(tab.right() - 16.0 - 9.0 * k as f32, tab.top() + 6.0), 3.5, color, Stroke::new(1.0, Color32::WHITE));
++    }
++}
++
++/// Home's "In this session" (in a session, above Recent): a row for each PDF of the session, with dots in the colours
++/// of the others on it; a click goes to it, opening it again when this person closed it.
++pub(crate) fn session_list(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
++    use crate::theme::{self, Tokens};
++    if !playground_live::connected() {
++        return;
++    }
++    register(app);
++    let rows: Vec<(u64, String, Option<DocId>)> = STATE.with_borrow(|s| s.docs.iter().map(|d| (d.id, d.name.clone(), d.tab)).collect());
++    if rows.is_empty() {
++        return;
++    }
++    let t = Tokens::get(ui.ctx());
++    ui.label(egui::RichText::new("In this session").font(theme::semibold(17.0)));
++    ui.add_space(8.0);
++    let mut chosen = None;
++    for (id, name, tab) in rows {
++        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), egui::Sense::click());
++        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name));
++        let press = theme::Press::track(ui, &resp);
++        press.wash(ui, rect, 8, false);
++        let body = rect.translate(press.offset());
++        crate::icons::paint(ui, Rect::from_min_size(body.min + vec2(10.0, 11.0), vec2(24.0, 24.0)), "file-text", 22.0, Color32::from_rgb(0xE0, 0x3E, 0x3E));
++        let dots = on(id);
++        for (k, color) in dots.iter().enumerate() {
++            ui.painter().circle(pos2(body.right() - 20.0 - 11.0 * k as f32, body.center().y), 4.0, *color, Stroke::new(1.0, Color32::WHITE));
++        }
++        let width = body.right() - 36.0 - 11.0 * dots.len() as f32 - (body.left() + 46.0);
++        let detail = if tab.is_some() { "Open in a tab" } else { "Closed here: open it again" };
++        crate::widgets::row_text(ui, body.min + vec2(46.0, 15.0), crate::bidi::visual(&name), theme::medium(13.5), t.text, width);
++        crate::widgets::row_text(ui, body.min + vec2(46.0, 32.0), detail, theme::regular(11.0), t.text_faint, width);
++        if theme::hand(resp).on_hover_text(if tab.is_some() { "Go to it" } else { "Open it again" }).clicked() {
++            chosen = Some((id, tab));
++        }
++    }
++    ui.add_space(26.0);
++    let Some((id, tab)) = chosen else { return };
++    let tab = match tab {
++        Some(tab) => Some(tab),
++        None => {
++            let found = STATE.with_borrow(|s| s.docs.iter().find(|d| d.id == id).map(|d| (d.name.clone(), d.base.clone(), d.last.clone())));
++            let Some((name, base, last)) = found else { return };
++            match app.live_open(&name, &base, last) {
++                Ok(tab) => {
++                    let seen = app.session.get(tab).map_or(0, |d| d.edit_generation());
++                    STATE.with_borrow_mut(|s| s.docs.iter_mut().filter(|d| d.id == id).for_each(|d| (d.tab, d.seen) = (Some(tab), seen)));
++                    Some(tab)
++                }
++                Err(e) => {
++                    app.notify(format!("Couldn't open {name}: {e}"));
++                    None
++                }
++            }
++        }
++    };
++    if let Some(i) = tab.and_then(|tab| app.views.iter().position(|v| v.id == tab)) {
++        app.active = Some(i);
++    }
 +}
 +
 +/// The web runner, kept for the session to reach the app (the web entry starts it).
@@ -915,16 +1658,49 @@ index 0000000..a7f867a
 +        Edit::RotatePages { pages: vec![page], degrees }
 +    }
 +
-+    /// `doc` after `edits` in a browser of its own.
-+    fn edited(doc: &Value, edits: Vec<Edit>) -> Value {
-+        let (shared, base) = (read(doc).unwrap(), base_for(doc["pdf"].as_str().unwrap()).unwrap());
++    /// `pdf` (one PDF of a shared document) after `edits` in a browser of its own.
++    fn edited_pdf(pdf: &Value, edits: Vec<Edit>) -> Value {
++        let (shared, base) = (read(pdf).unwrap(), base_for(pdf["pdf"].as_str().unwrap()).unwrap());
 +        let mut session = Session::new();
 +        let id = session.open("other.pdf", None, base.doc.bytes().clone(), None).unwrap();
 +        session.live_replace_graph(id, build(&shared, &base)).unwrap();
 +        for edit in edits {
 +            session.apply(id, edit).unwrap();
 +        }
-+        project(session.get(id).unwrap().live_cos().unwrap(), &base)
++        let mut out = project(session.get(id).unwrap().live_cos().unwrap(), &base);
++        for key in ["id", "name"] {
++            if let Some(v) = pdf.get(key) {
++                out[key] = v.clone();
++            }
++        }
++        out
++    }
++
++    /// The shared document `doc` after `edits` to its PDF number `i`, in a browser of its own.
++    fn edited_at(doc: &Value, i: usize, edits: Vec<Edit>) -> Value {
++        let mut doc = doc.clone();
++        doc["documents"][i] = edited_pdf(&doc["documents"][i], edits);
++        doc
++    }
++
++    /// The shared document `doc` after `edits` to its first PDF.
++    fn edited(doc: &Value, edits: Vec<Edit>) -> Value {
++        edited_at(doc, 0, edits)
++    }
++
++    /// The shared document `doc` with `pdf` added (by its id).
++    fn with(doc: &Value, pdf: Value) -> Value {
++        let mut list = doc["documents"].as_array().unwrap().clone();
++        list.push(pdf);
++        list.sort_by_key(|d| d["id"].as_u64());
++        json!({ "documents": list })
++    }
++
++    /// A blank PDF of `pages` pages as a PDF of the session, `id` named `name`.
++    fn named(pages: usize, id: u64, name: &str) -> Value {
++        let mut pdf = blank(pages);
++        (pdf["id"], pdf["name"]) = (id.into(), name.into());
++        pdf
 +    }
 +
 +    /// A blank PDF of `pages` pages, as a shared document.
@@ -954,7 +1730,7 @@ index 0000000..a7f867a
 +    fn views_stay_local_remote_changes_wait_and_replace_history_while_undo_save_and_revert_act_on_the_session() {
 +        let mut app = app_with(2);
 +        let start = app.live_document();
-+        assert_eq!(start["objects"], json!({}), "an unedited PDF is just its file");
++        assert_eq!(start["documents"][0]["objects"], json!({}), "an unedited PDF is just its file");
 +        (app.views[0].zoom, app.views[0].current) = (3.0, 1);
 +        assert_eq!(app.live_document(), start, "views are not shared");
 +        let enabled = |app: &PdfCraftApp, id| app.command_enabled(pdfcraft_engine::commands::command(id).unwrap());
@@ -984,17 +1760,57 @@ index 0000000..a7f867a
 +    }
 +
 +    #[test]
-+    fn presence_names_the_page_and_the_selected_comment_by_object_number() {
++    fn presence_names_the_pdf_page_selected_comment_and_a_drawing_under_way() {
++        use crate::comments::{CommentTool, Gesture};
 +        let mut app = app_with(2);
 +        assert!(app.apply_edit(note(1, "mine")));
-+        let _ = app.live_document();
++        let doc = app.live_document()["documents"][0]["id"].clone();
 +        (app.views[0].current, app.views[0].comments.selected) = (1, Some((1, 0)));
 +        let id = app.views[0].id;
 +        let cos = app.session.get(id).unwrap().live_cos().unwrap().clone();
 +        let pages = pdfcraft_model::pages(&cos);
 +        let comment = cos.resolve(pages[1].dict.get(b"Annots").unwrap()).as_array().unwrap()[0].as_ref().unwrap();
-+        assert_eq!(app.live_presence(), json!({"page": pages[1].obj.num, "selection": [comment.num]}), "no pointer off the canvas");
-+        assert_eq!(ids(&app, id).unwrap().annots[&comment.num].0, 1, "the others' outline finds it by its number");
++        let rest = json!({"doc": doc, "page": pages[1].obj.num, "selection": [comment.num]});
++        assert_eq!(app.live_presence(), rest, "no pointer off the canvas");
++        assert_eq!(ids(&app, id).unwrap().annots[&comment.num].page, 1, "the others' outline finds it by its number");
++        let points = vec![[10.0, 20.0], [10.2, 20.3], [60.04, 80.0]];
++        app.views[0].comments.gesture = Some(Gesture::Draw { page: 1, tool: CommentTool::Rectangle, points });
++        let drawing = app.live_presence();
++        assert_eq!((&drawing["draw"]["tool"], &drawing["draw"]["points"]), (&json!("rect"), &json!([[10.0, 20.0], [60.0, 80.0]])), "a rubber band where it is drawn");
++        disconnect();
++    }
++
++    #[test]
++    fn pdfs_opened_in_a_session_reach_the_others_behind_theirs_and_stay_closed_where_closed() {
++        let mut app = app_with(1);
++        let one = app.live_document();
++        let bytes = app.session.create_blank(100.0, 100.0, 2).unwrap();
++        app.open_bytes("mine.pdf", None, bytes.to_vec()).unwrap();
++        let two = app.live_document();
++        assert_eq!(two["documents"].as_array().map(Vec::len), Some(2), "a PDF opened while connected joins the session");
++
++        let three = with(&two, named(3, 7, "theirs.pdf"));
++        let (active, tabs) = (app.active, app.views.len());
++        assert!(matches!(receive(&mut app, &two, &three), Some(Ok(None))));
++        assert_eq!((app.views.len(), app.active), (tabs + 1, active), "theirs opens in a tab behind this person's");
++        assert_eq!(canonical(&app.live_document()), canonical(&three));
++
++        app.close_tab(tabs);
++        assert_eq!(app.live_document(), three, "closing a tab is this person's own");
++        let theirs = three["documents"].as_array().unwrap().iter().position(|d| d["id"] == 7).unwrap();
++        let four = edited_at(&three, theirs, vec![rotate(0, 90)]);
++        assert!(matches!(receive(&mut app, &three, &four), Some(Ok(None))));
++        assert_eq!(app.views.len(), tabs, "a remote change does not reopen it");
++        assert_eq!(canonical(&app.live_document()), canonical(&four), "it stays up to date");
++
++        let both = merge_set(&one, &with(&one, named(1, 8, "c.pdf")), &with(&one, named(1, 9, "e.pdf"))).unwrap();
++        assert_eq!(both["documents"].as_array().map(Vec::len), Some(3), "both sides' new PDFs");
++        let renamed = |name: &str| {
++            let mut doc = one.clone();
++            doc["documents"][0]["name"] = name.into();
++            doc
++        };
++        assert!(merge_set(&one, &renamed("c"), &renamed("e")).unwrap_err().contains("name"), "one name renamed twice");
 +        disconnect();
 +    }
 +
@@ -1019,8 +1835,8 @@ index 0000000..a7f867a
 +    #[test]
 +    fn comments_on_one_page_merge_as_two_objects_and_one_key_changed_twice_conflicts() {
 +        let b = blank(2);
-+        let c = edited(&b, vec![rotate(0, 90), note(1, "c")]);
-+        let e = edited(&b, vec![note(1, "e"), rotate(1, 90)]);
++        let c = edited_pdf(&b, vec![rotate(0, 90), note(1, "c")]);
++        let e = edited_pdf(&b, vec![note(1, "e"), rotate(1, 90)]);
 +        let merged = merge(&b, &c, &e).unwrap();
 +        validate(&merged).unwrap();
 +        let (shared, base) = (read(&merged).unwrap(), base_for(b["pdf"].as_str().unwrap()).unwrap());
@@ -1031,7 +1847,7 @@ index 0000000..a7f867a
 +            annots.iter().filter_map(|a| cos.resolve(a).as_dict()?.get(b"Contents")?.as_string().map(|s| s.to_text())).collect();
 +        assert_eq!(contents, ["c".to_string(), "e".to_string()].into(), "both comments, as two objects");
 +        assert_eq!([0, 1].map(|p| pages[p].dict.int(b"Rotate")), [Some(90), Some(90)]);
-+        assert!(merge(&b, &c, &edited(&b, vec![rotate(0, 180)])).unwrap_err().contains("/Rotate"), "both turned page 1");
++        assert!(merge(&b, &c, &edited_pdf(&b, vec![rotate(0, 180)])).unwrap_err().contains("/Rotate"), "both turned page 1");
 +        assert!(merge(&b, &b, &json!({})).is_err() && validate(&json!({})).is_err(), "no document is never shared");
 +    }
 +
