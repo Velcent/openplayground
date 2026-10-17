@@ -408,3 +408,16 @@ test('a joiner whose page was untouched keeps no draft of it; one with its own c
     assert.equal(editor.store.drafts.length, edited ? 1 : 0)
   }
 })
+
+test('everyone in a session gets a colour of their own, and a newcomer changes no one else\'s', async () => {
+  const { colors } = await import('../shell/live.js')
+  // Three ids that all hash to the same colour (same last 8 hex digits).
+  const same = (n) => `0000000${n}-0000-4000-8000-0000deadbeef`
+  const session = { id: same(1), since: 1, peers: new Map([[same(2), { id: same(2), since: 2 }]]) }
+  const two = colors(session)
+  assert.notEqual(two.get(same(1)), two.get(same(2)))
+  session.peers.set(same(3), { id: same(3), since: 3 })
+  const three = colors(session)
+  assert.equal(new Set(three.values()).size, 3)
+  assert.equal(three.get(same(1)), two.get(same(1))); assert.equal(three.get(same(2)), two.get(same(2)))
+})

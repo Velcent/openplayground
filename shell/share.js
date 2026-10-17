@@ -1,5 +1,5 @@
 import { PeerSession, setPage } from './session.js'
-import { follow, liveAdapter, onAdapter, unfollow } from './live.js'
+import { colorOf, follow, liveAdapter, onAdapter, unfollow } from './live.js'
 import { SessionStore } from './session-store.js'
 import { readInvite } from './session-protocol.js'
 import * as store from './store.js'
@@ -7,7 +7,6 @@ import { formatSize, uniqueName } from './paths.js'
 import { h, icon, modal, toast, download, confirmIn } from './ui.js'
 
 const button = (label, run, primary = false) => h('button', { type:'button', class:`pg-btn${primary ? ' pg-primary' : ''}`, onclick:run }, label)
-const color = id => `hsl(${parseInt(id.slice(0, 6), 16) % 360} 65% 60%)`
 const total = files => [...new Map(files.map(f => [f.asset, f])).values()].reduce((n,f)=>n+f.size,0)
 const when = time => new Date(time).toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})
 const LIVE = { live:'Live editing', 'read-only':'Viewing live edits', paused:'Paused: reconnecting to the host. Your edits stay here.', 'catching up':'Catching up on edits', incompatible:'Not live: another app version' }
@@ -157,8 +156,8 @@ export async function mountShare(bar, app, here, groups = []) {
             for (const peer of peers) {
               let row=rows.get(peer.id)
               if (!row) {
-                const label=h('strong'), detail=h('small'), dot=h('span',{class:'pg-person-dot','aria-hidden':'true',style:`background:${color(peer.id)}`})
-                row=h('div',{class:'pg-share-person'},dot,h('span',{},label,detail)); row.label=label;row.detail=detail
+                const label=h('strong'), detail=h('small'), dot=h('span',{class:'pg-person-dot','aria-hidden':'true'})
+                row=h('div',{class:'pg-share-person'},dot,h('span',{},label,detail)); row.label=label;row.detail=detail;row.dot=dot
                 if (session.config.owner && peer.id!==session.id) {
                   const access=h('select',{class:'pg-input'},h('option',{value:'editor'},'editor'),h('option',{value:'viewer'},'viewer'))
                   access.onchange=()=>attempt(()=>session.admin({member:peer.id,role:access.value}));row.access=access
@@ -169,6 +168,7 @@ export async function mountShare(bar, app, here, groups = []) {
                 rows.set(peer.id,row);members.append(row)
               }
               const where=peer.id===session.id ? here.path : peer.page
+              row.dot.style.background=colorOf(session,peer.id)
               row.label.textContent=peer.name; row.detail.textContent=`${peer.role}${where ? ` · in ${appName(where)}` : ''} · ${peer.progress?.status||'connecting'}${peer.progress?.total ? ` · ${formatSize(peer.progress.received)} / ${formatSize(peer.progress.total)}`:''}`
               if (row.access) {row.access.value=peer.role;row.access.setAttribute('aria-label',`Access for ${peer.name}`)}
             }

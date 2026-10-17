@@ -28,7 +28,21 @@ const RETAINED = 100, MAX_WANTED = 8, PRESENCE_MS = 50, MAX_PRESENCE = 4096, MAX
 const MAX_ASSET = 1024 ** 3
 const depth = (v, d = 0) => d > MAX_DEPTH || !v || typeof v !== 'object' ? d : Math.max(d, ...Object.values(v).map((x) => depth(x, d + 1)))
 const COLORS = ['#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4', '#0fa5b5', '#f032e6', '#9a6324']
-const color = (id) => COLORS[parseInt(id.replaceAll('-', '').slice(-8), 16) % COLORS.length]
+const hue = (id) => parseInt(id.replaceAll('-', '').slice(-8), 16) % COLORS.length
+// Everyone here gets a colour of their own: each takes theirs (from their id), or the next free one, in the order they
+// connected (the roster's, so every browser agrees and a newcomer never changes anyone else's).
+export function colors(session) {
+  const people = [{ id: session.id, since: session.since }, ...session.peers.values()].filter((p) => p?.id)
+    .sort((a, b) => (a.since ?? Infinity) - (b.since ?? Infinity) || (a.id < b.id ? -1 : 1))
+  const given = new Map(), used = new Set()
+  for (const { id } of people) {
+    let i = hue(id)
+    for (let k = 0; k < COLORS.length && used.has(i); k++) i = (i + 1) % COLORS.length
+    used.add(i); given.set(id, COLORS[i])
+  }
+  return given
+}
+export const colorOf = (session, id) => colors(session).get(id) ?? COLORS[hue(id)]
 const fileIds = new Map()
 // The session file that carries an app's asset: one per app and asset ID, whoever shares it first.
 async function fileId(asset) {
@@ -470,7 +484,8 @@ export class LiveDocument extends EventTarget {
       // Someone whose connection dropped without a close event goes too.
       for (const id of this.others.keys()) if (!this.here().some((p) => p.id === id)) { this.others.delete(id); this.presenceDirty = true }
       if (this.presenceDirty) {
-        this.adapter.showPresence?.([...this.others].map(([id, state]) => ({ id, name: this.session.peers.get(id)?.name ?? '', color: color(id), state })))
+        const given = colors(this.session)
+        this.adapter.showPresence?.([...this.others].map(([id, state]) => ({ id, name: this.session.peers.get(id)?.name ?? '', color: given.get(id) ?? COLORS[hue(id)], state })))
         this.presenceDirty = false
       }
     } catch (e) { if (!busy(e)) this.report(e) }
