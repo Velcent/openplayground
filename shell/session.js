@@ -85,7 +85,9 @@ export class PeerSession extends EventTarget {
     } catch (e) {
       if (e.status === 403) throw e
       this.relayWarning = `${e.message}. Direct connections only.`
-      this.ice = { iceServers: [], expires: Date.now() + 60000 }
+      // A public address from STUN still lets browsers behind most home routers meet directly; local addresses alone
+      // often can't (Chrome hides them behind .local names that other machines, or Linux without mDNS, can't resolve).
+      this.ice = { iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }], expires: Date.now() + 60000 }
     }
     this.changed()
     return this.ice.iceServers
@@ -183,7 +185,14 @@ export class PeerSession extends EventTarget {
         await this.sendSignal(peer, { description: pc.localDescription.toJSON() })
       } catch (e) { if (this.peers.get(peer.id) === peer) this.fail(e) }
     }
+    // Still not connected after a while: say why it may be, rather than show "Connecting…" for good.
+    const stuck = `Can't reach the other browser yet.${this.relayWarning ? ' The encrypted relay is off, and this network may not allow a direct connection.' : ''}`
+    setTimeout(() => {
+      if (this.peers.get(peer.id) !== peer || ['connected', 'closed'].includes(pc.connectionState)) return
+      this.error = stuck; this.changed()
+    }, 20000)
     pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected' && this.error === stuck) this.error = null
       if (pc.connectionState === 'failed' && this.peers.get(peer.id) === peer) {
         this.error = `Connection to ${peer.name} failed${this.relayWarning ? ': relay unavailable' : ''}`
         if (this.requested?.peer === peer.id) this.requested = null
