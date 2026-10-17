@@ -1,9 +1,9 @@
 diff --git a/apps/web/src/live.rs b/apps/web/src/live.rs
 new file mode 100644
-index 0000000..3731e30
+index 0000000..78b0b7c
 --- /dev/null
 +++ b/apps/web/src/live.rs
-@@ -0,0 +1,606 @@
+@@ -0,0 +1,1175 @@
 +//! Playground live editing (`playground_live`): the shared document is the library's catalog as JSON (every photo's
 +//! develop settings, History, Versions, rating, flag, label and metadata; collections including saved Book, Print,
 +//! Slideshow and Web creations, stacks, the keyword list, folder labels, the Map's saved locations), without what only
@@ -12,19 +12,26 @@ index 0000000..3731e30
 +//! originals of imported photos travel as session files named by their content hash, and land in this browser's
 +//! storage as if imported here. Native undo history stays local; while connected Undo and Redo go to the session.
 +//! Each person sees the others' selections outlined on grid and filmstrip cells and their pointer over a photo both
-+//! have open, in their color with their name.
++//! have open, in their color with their name; and their gestures as they happen (a slider's value, the crop box, brush
++//! and spot strokes, a straighten line, photos dragged to a collection, text typed into a metadata field), until the
++//! change itself arrives on release.
 +//!
 +//! Everything lives in new files: this one, `live_web.rs` (the host's side, a child of `web`) and a `live` module in
 +//! the catalog, engine and UI crates. Playground's patches/lightroom-classic.yaml adds the one-line calls into them.
 +
++#![cfg_attr(test, allow(dead_code))]
++
 +use crate::store::{self, Originals};
 +use lcc_engine::catalog::{Catalog, PhotoId, Source};
++use lcc_engine::develop::controls;
++use lcc_engine::pipeline::geometry::Frame;
 +use lcc_ui_egui::module::ModuleId;
++use lcc_ui_egui::panels::detail::Gesture;
 +use lcc_ui_egui::state::ViewMode;
 +use lcc_ui_egui::{CommandError, LccApp};
 +use playground_live::{Live, Presence};
 +use serde::Deserialize as _;
-+use serde_json::Value;
++use serde_json::{Value, json};
 +use std::cell::{Cell, RefCell};
 +use std::collections::{BTreeMap, BTreeSet, HashSet};
 +
@@ -47,6 +54,8 @@ index 0000000..3731e30
 +
 +thread_local! {
 +    static POINTER_DOWN: Cell<bool> = const { Cell::new(false) };
++    /// A text field has the keyboard (a focused slider or button is no edit under way).
++    static TYPING: Cell<bool> = const { Cell::new(false) };
 +    static MEDIA: RefCell<Media> = RefCell::default();
 +    /// An original arrived from the session since the last frame.
 +    static ARRIVED: Cell<bool> = const { Cell::new(false) };
@@ -54,11 +63,29 @@ index 0000000..3731e30
 +    static STALE: RefCell<BTreeSet<u64>> = const { RefCell::new(BTreeSet::new()) };
 +    /// An open command is running under [`command`]'s watch.
 +    static OPENING: Cell<bool> = const { Cell::new(false) };
-+    /// Where this person points on the photo they have open, as fractions of its frame.
++    /// Where this person points over the photo open in the loupe, in its normalized coordinates ([`Loupe`]).
 +    static POINTER: Cell<Option<[f64; 2]>> = const { Cell::new(None) };
-+    /// The others in the session, as the shell last gave them.
-+    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
++    /// The collection row under the pointer while this person drags photos.
++    static DROP: Cell<Option<u64>> = const { Cell::new(None) };
++    /// The metadata field this person is typing into (the Metadata panel's), and its text so far.
++    static TYPED: RefCell<Option<(&'static str, String)>> = const { RefCell::new(None) };
++    /// The others in the session, as the shell last gave them, with their marks as this person last drew them.
++    static OTHERS: RefCell<Vec<(Presence, Shown)>> = const { RefCell::new(Vec::new()) };
 +}
++
++/// Photos sent as a selection or a drag, and points as a stroke, at most; the most bytes a presence takes (the shell
++/// sends none past 4096).
++const MAX_SELECTION: usize = 50;
++const MAX_STROKE: usize = 200;
++const MAX_PRESENCE: usize = 4000;
++
++/// The Metadata panel's text fields (panels/metadata.rs `text_field`: each keeps its text while edited, by this key,
++/// and saves it on Return or leaving).
++const META_FIELDS: [&str; 12] =
++    ["title", "caption", "altText", "extendedDescription", "copyright", "usageTerms", "copyrightUrl", "creator", "location", "city", "state", "country"];
++
++/// How long the others' marks take to go most (1 - 1/e) of the way to their latest place, in seconds.
++const EASE: f64 = 0.08;
 +
 +/// The shared photo this person has open (the loupe, in Library or Develop).
 +fn open_photo(app: &LccApp) -> Option<PhotoId> {
@@ -67,62 +94,579 @@ index 0000000..3731e30
 +    loupe.then_some(active).flatten()
 +}
 +
-+/// The end of a frame in the browser: notes where this person points on the open photo, draws the others' selections
-+/// and pointers over the app, then [`frame`].
++/// Ten-thousandths are plenty on a photo.
++fn round(v: f64) -> f64 {
++    (v * 1e4).round() / 1e4
++}
++
++/// This person's loupe as last drawn: the photo open in it, and where that photo's normalized coordinates (its oriented,
++/// uncropped frame, 0..1: the same for everyone whatever their zoom, crop tool or panels) are on screen
++/// (`lcc_ui_egui::live::loupe`, the loupe's own mapping), as affine coefficients.
++#[derive(Clone, Copy)]
++struct Loupe {
++    photo: PhotoId,
++    to_norm: [f64; 6],
++    from_norm: [f64; 6],
++}
++
++impl Loupe {
++    fn of(app: &LccApp) -> Option<Loupe> {
++        let photo = open_photo(app)?;
++        let (to_norm, from_norm) = lcc_ui_egui::live::loupe(app)?;
++        Some(Loupe { photo, to_norm, from_norm })
++    }
++
++    /// A screen point, normalized.
++    fn norm(&self, x: f32, y: f32) -> [f64; 2] {
++        affine(self.to_norm, [x.into(), y.into()])
++    }
++
++    /// A normalized point on screen.
++    fn screen(&self, n: [f64; 2]) -> [f32; 2] {
++        affine(self.from_norm, n).map(|v| v as f32)
++    }
++}
++
++fn affine([a, b, c, d, e, f]: [f64; 6], [x, y]: [f64; 2]) -> [f64; 2] {
++    [x * a + y * c + e, x * b + y * d + f]
++}
++
++/// A gesture under way, as the others are shown it until its change arrives on release, in the open photo's normalized
++/// coordinates: a develop adjustment (`adjust`: the photo, its History label, and a slider's control and value so far),
++/// the crop box it makes (`crop`: four corners), a brush or spot stroke (`stroke`: the newest points, and the brush's
++/// radius as a fraction of the photo's long edge), a straighten line (`line`: where it starts; it ends at the pointer),
++/// photos dragged toward a collection (`drag`: the photos, and the collection under the pointer), text typed into a
++/// metadata field (`typing`: the active photo, the field, the newest 200 characters; it is saved on Return or leaving).
++fn in_progress(app: &LccApp, state: &mut Value) {
++    let s = &app.session;
++    if let Some(i) = &s.interaction
++        && let Some(p) = s.catalog.photo(i.photo)
++    {
++        let d = &p.develop;
++        state["adjust"] = json!({"photo": i.photo.0, "label": i.label});
++        if let Some(id) = app.ui.dragging_control.as_deref()
++            && let Some(v) = controls::get(d, id)
++        {
++            (state["adjust"]["control"], state["adjust"]["value"]) = (id.into(), v.into());
++        }
++        if d.crop.geometry != i.original.crop.geometry {
++            let f = Frame::with_lens(p.width.max(1) as usize, p.height.max(1) as usize, d, false, p.embedded_lens.as_deref());
++            let f = Frame { crop: d.crop.geometry, ..f };
++            state["crop"] = json!(f.crop_quad_norm().map(|q| [round(q.x), round(q.y)]));
++        }
++    }
++    let loupe = Loupe::of(app);
++    let stroke = match &app.gesture {
++        Some(Gesture::Brush { points, .. }) => Some((points, app.ui.brush_size)),
++        Some(Gesture::Spot { points }) => Some((points, app.ui.remove_size)),
++        Some(Gesture::StraightenLine { a }) => {
++            if let Some(l) = loupe {
++                state["line"] = json!(l.norm(a.x, a.y).map(round));
++            }
++            None
++        }
++        _ => None,
++    };
++    if let Some((points, size)) = stroke {
++        // a point at least a pixel from the last, where this person draws them
++        let apart = |a: [f64; 2], b: [f64; 2]| {
++            loupe.is_none_or(|l| {
++                let (a, b) = (l.screen(a), l.screen(b));
++                (a[0] - b[0]).hypot(a[1] - b[1]) >= 1.0
++            })
++        };
++        let mut line: Vec<[f64; 2]> = Vec::new();
++        for q in points {
++            if line.last().is_none_or(|last| apart(*last, [q.x, q.y])) {
++                line.push([q.x, q.y]);
++            }
++        }
++        let newest: Vec<_> = line[line.len().saturating_sub(MAX_STROKE)..].iter().map(|n| n.map(round)).collect();
++        state["stroke"] = json!({"points": newest, "size": round(size.into())});
++    }
++    if let Some((field, text)) = TYPED.with_borrow(Clone::clone)
++        && let Some(photo) = s.selection.active
++    {
++        let n = text.chars().count();
++        state["typing"] = json!({"photo": photo.0, "field": field, "text": text.chars().skip(n.saturating_sub(200)).collect::<String>()});
++    }
++    if let Some(ids) = &app.ui.dragging_photos {
++        let shared: Vec<u64> = ids.iter().copied().filter(|id| s.catalog.photo(PhotoId(*id)).is_some_and(|p| !p.local)).take(MAX_SELECTION).collect();
++        if !shared.is_empty() {
++            state["drag"] = json!({"photos": shared});
++            if let Some(album) = DROP.get() {
++                state["drag"]["album"] = album.into();
++            }
++        }
++    }
++    // a long stroke keeps its newest points
++    while state.to_string().len() > MAX_PRESENCE
++        && let Some(points) = state.pointer_mut("/stroke/points").and_then(Value::as_array_mut).filter(|p| p.len() > 1)
++    {
++        points.drain(..points.len() / 2);
++    }
++}
++
++/// Points of someone's stroke kept at most (a longer one starts again from its newest).
++const MAX_SHOWN_STROKE: usize = 10_000;
++
++/// Another person's moving marks as this person last drew them, eased toward their latest presence in the photo's
++/// normalized coordinates (so this person's own zooming and panning never lag them): the pointer and the crop box's
++/// corners; and a stroke, whose points show one after the other as they come.
++#[derive(Default)]
++struct Shown {
++    pointer: Option<[f64; 2]>,
++    crop: Option<[f64; 8]>,
++    /// The stroke's points so far, and how many of them show (a fraction is that far toward the next).
++    stroke: Vec<[f64; 2]>,
++    reveal: f64,
++    /// What the stroke's coverage was painted from: the view (the loupe's mapping), its points on screen so far, how
++    /// many of `stroke` they hold whole; and the coverage.
++    view: [f64; 6],
++    fed: Vec<[f32; 2]>,
++    fed_whole: usize,
++    #[cfg(target_arch = "wasm32")]
++    painted: Option<Painted>,
++}
++
++impl Shown {
++    /// `dt` seconds on toward the pointer and crop box of `to`, and toward the end of `stroke` (its newest points);
++    /// `px`: points a normalized unit across and down; `far`: a quarter of the canvas, past which a mark goes at once (as
++    /// it does when first seen, and as a stroke first seen shows whole). Whether a mark is still on its way.
++    fn step(&mut self, to: Shown, stroke: &[[f64; 2]], dt: f32, [x, y]: [f64; 2], [fx, fy]: [f64; 2]) -> bool {
++        let k = 1.0 - (-f64::from(dt.clamp(0.0, 0.1)) / EASE).exp();
++        let moving = ease_to(&mut self.pointer, to.pointer, k, [x, y], [fx, fy]);
++        let moving = ease_to(&mut self.crop, to.crop, k, [x, y, x, y, x, y, x, y], [fx, fy, fx, fy, fx, fy, fx, fy]) | moving;
++        // the points after the last one this person has (the same numbers come again until they drop off the front)
++        match self.stroke.last().and_then(|last| stroke.iter().rposition(|p| p == last)) {
++            Some(i) if self.stroke.len() < MAX_SHOWN_STROKE => self.stroke.extend_from_slice(&stroke[i + 1..]),
++            _ => {
++                (self.stroke, self.reveal) = (stroke.to_vec(), stroke.len() as f64);
++                (self.fed, self.fed_whole) = (Vec::new(), 0);
++            }
++        }
++        let n = self.stroke.len() as f64;
++        self.reveal += (n - self.reveal) * k;
++        if n - self.reveal < 0.05 {
++            self.reveal = n;
++        }
++        moving | (self.reveal < n)
++    }
++}
++
++/// [`ease`], where a mark that was not there or is gone goes at once.
++fn ease_to<const N: usize>(s: &mut Option<[f64; N]>, t: Option<[f64; N]>, k: f64, px: [f64; N], far: [f64; N]) -> bool {
++    if let (Some(s), Some(t)) = (s.as_mut(), t) {
++        return ease(s, t, k, px, far);
++    }
++    *s = t;
++    false
++}
++
++/// `s` moved `k` of the way to `t`; all of it after a jump wider than `far` points on an axis, or once under half a
++/// point remains (`px`: points a unit). Whether it is still on its way.
++fn ease<const N: usize>(s: &mut [f64; N], t: [f64; N], k: f64, px: [f64; N], far: [f64; N]) -> bool {
++    let off = |s: &[f64; N], i: usize| ((t[i] - s[i]) * px[i]).abs();
++    if (0..N).any(|i| !(off(s, i) <= far[i])) {
++        *s = t;
++        return false;
++    }
++    for i in 0..N {
++        s[i] += (t[i] - s[i]) * k;
++    }
++    let moving = (0..N).any(|i| off(s, i) >= 0.5);
++    if !moving {
++        *s = t;
++    }
++    moving
++}
++
++/// A normalized point from someone else's presence: two finite numbers near the photo, else nothing.
++fn point(v: &Value) -> Option<[f64; 2]> {
++    let p = [v.get(0)?.as_f64()?, v.get(1)?.as_f64()?];
++    p.iter().all(|c| (-2.0..=3.0).contains(c)).then_some(p)
++}
++
++/// A crop box from someone else's presence: four [`point`]s.
++fn quad(v: &Value) -> Option<[f64; 8]> {
++    let c: Vec<[f64; 2]> = v.as_array()?.iter().map(point).collect::<Option<_>>()?;
++    let &[a, b, c, d] = c.as_slice() else { return None };
++    Some([a[0], a[1], b[0], b[1], c[0], c[1], d[0], d[1]])
++}
++
++/// The end of a frame in the browser: notes where this person points on the open photo (and the collection row under
++/// photos being dragged, and the metadata field being typed into), draws the others over the app, then [`frame`].
 +#[cfg(target_arch = "wasm32")]
 +pub fn end_frame(app: &mut LccApp, ctx: &egui::Context) {
 +    let (down, at) = ctx.input(|i| (i.pointer.any_down(), i.pointer.hover_pos()));
-+    let on = |r: egui::Rect| at.filter(|p| r.is_positive() && r.contains(*p) && app.canvas_rect.is_some_and(|c| c.contains(*p)));
-+    let fraction = |p: egui::Pos2, r: egui::Rect| [(p.x - r.left()) / r.width(), (p.y - r.top()) / r.height()].map(|f| (f64::from(f) * 1e4).round() / 1e4);
-+    POINTER.set(open_photo(app).and(app.image_rect).and_then(|r| Some(fraction(on(r)?, r))));
-+    OTHERS.with_borrow(|others| show_others(app, ctx, others));
++    TYPING.set(ctx.text_edit_focused());
++    let over_canvas = at.filter(|p| app.canvas_rect.is_some_and(|c| c.contains(*p)));
++    POINTER.set(Loupe::of(app).zip(over_canvas).map(|(l, p)| l.norm(p.x, p.y).map(round)));
++    let album = |p: egui::Pos2| app.widgets.iter().filter(|(_, r)| r.contains(p)).find_map(|(k, _)| k.strip_prefix("source:album:")?.parse().ok());
++    DROP.set(app.ui.dragging_photos.as_ref().and(at).and_then(album));
++    let draft = |key: &'static str| ctx.data(|d| d.get_temp::<String>(egui::Id::new(("info-field", key)))).map(|text| (key, text));
++    TYPED.set(META_FIELDS.into_iter().find_map(draft));
++    show_others(app, ctx);
 +    frame(app, down);
 +}
 +
-+/// Each other person's selection outlined on grid and filmstrip cells, and their pointer over the photo when this
-+/// person has the same one open, in their color with their name. Their states come from other people: what does not
-+/// resolve is skipped.
++/// The others over this person's app, in their colors (the look every Playground app shares), what does not resolve
++/// skipped: first the ghosts of their gestures (the crop box, a stroke, a straighten line on the photo this person has
++/// open too; photos being dragged, in the grid and filmstrip), then their selections outlined, then their pointers and
++/// tags (a slider's value beside this person's own slider, the collection photos are dragged to).
 +#[cfg(target_arch = "wasm32")]
-+fn show_others(app: &LccApp, ctx: &egui::Context, others: &[Presence]) {
-+    use egui::{Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, vec2};
-+    fn tag(p: &Painter, at: Pos2, name: &str, color: Color32) {
-+        let text = p.layout_no_wrap(name.chars().take(40).collect(), FontId::proportional(11.0), Color32::WHITE);
-+        let r = Rect::from_min_size(at, text.size() + vec2(8.0, 4.0));
-+        p.rect_filled(r, 3.0, color);
-+        p.galley(r.min + vec2(4.0, 2.0), text, Color32::WHITE);
-+    }
++fn show_others(app: &LccApp, ctx: &egui::Context) {
++    use egui::{Color32, Pos2, Shape, Stroke, StrokeKind, vec2};
 +    // over the panels, under menus and windows
 +    let painter = ctx.layer_painter(egui::LayerId::background());
-+    let area = |key: &str| app.widgets.iter().find(|(k, _)| k == key).map(|(_, r)| *r);
-+    let (grid, strip) = (area("grid:scroll"), area("filmstrip"));
-+    for (i, who) in others.iter().enumerate() {
-+        let color = Color32::from_rgb(who.color[0], who.color[1], who.color[2]);
-+        let selected: HashSet<u64> = who.state["selection"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
-+        for (key, r) in &app.widgets {
-+            let clip = match key.split_once(':') {
-+                Some(("thumb", id)) if id.parse().is_ok_and(|id| selected.contains(&id)) => grid,
-+                Some(("film", id)) if id.parse().is_ok_and(|id| selected.contains(&id)) => strip,
-+                _ => continue,
++    let ids = |v: &Value| v.as_array().into_iter().flatten().take(MAX_SELECTION).filter_map(Value::as_u64).collect::<HashSet<u64>>();
++    let color = |o: &Presence| Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
++    let (loupe, canvas, image) = (Loupe::of(app), app.canvas_rect, app.image_rect);
++    let on = |l: Loupe, n: [f64; 2]| Pos2::from(l.screen(n));
++    let ghost = |c: Color32| (c.gamma_multiply(0.28), Stroke::new(1.5, c.gamma_multiply(0.85)));
++    let dt = ctx.input(|i| i.stable_dt);
++    let mut moving = false;
++    OTHERS.with_borrow_mut(|others| {
++        for (o, shown) in others.iter_mut() {
++            let (c, s) = (color(o), &o.state);
++            for id in ids(&s["drag"]["photos"]) {
++                for (r, visible) in cells(app, id) {
++                    let (fill, edge) = ghost(c);
++                    painter.with_clip_rect(visible).rect(r, 0.0, fill, edge, StrokeKind::Inside);
++                }
++            }
++            let (Some(l), Some(canvas)) = (loupe.filter(|l| s["page"].as_u64() == Some(l.photo.0)), canvas) else {
++                *shown = Shown::default();
++                continue;
 +            };
-+            let Some(clip) = clip else { continue };
-+            let p = painter.with_clip_rect(clip.intersect(*r));
-+            // one inside the other when several people select the same photo
-+            let inner = r.shrink(1.0 + 3.0 * i.min(8) as f32);
-+            p.rect_stroke(inner, 0.0, Stroke::new(2.0, color), StrokeKind::Inside);
-+            tag(&p, inner.min + vec2(3.0, 3.0), &who.name, color);
-+        }
-+        let pointer = who.state["pointer"].as_array().map(|xy| xy.iter().filter_map(Value::as_f64).collect::<Vec<_>>());
-+        if let (Some(photo), Some(image), Some(canvas), Some(&[x, y])) = (open_photo(app), app.image_rect, app.canvas_rect, pointer.as_deref())
-+            && who.state["page"].as_u64() == Some(photo.0)
-+            && (0.0..=1.0).contains(&x)
-+            && (0.0..=1.0).contains(&y)
-+        {
-+            let at = image.min + vec2(x as f32 * image.width(), y as f32 * image.height());
++            let stroke: Vec<[f64; 2]> = s["stroke"]["points"].as_array().into_iter().flatten().take(MAX_STROKE).filter_map(point).collect();
++            let to = Shown { pointer: point(&s["pointer"]), crop: quad(&s["crop"]), ..Shown::default() };
++            let (o0, o1, o2) = (on(l, [0.0, 0.0]), on(l, [1.0, 0.0]), on(l, [0.0, 1.0]));
++            let px = [o0.distance(o1).into(), o0.distance(o2).into()];
++            moving |= shown.step(to, &stroke, dt, px, [f64::from(canvas.width() / 4.0), f64::from(canvas.height() / 4.0)]);
 +            let p = painter.with_clip_rect(canvas);
-+            p.add(Shape::convex_polygon(vec![at, at + vec2(0.0, 16.0), at + vec2(11.0, 11.0)], color, Stroke::new(1.0, Color32::WHITE)));
-+            tag(&p, at + vec2(10.0, 14.0), &who.name, color);
++            if let Some(q) = shown.crop {
++                let (fill, edge) = ghost(c);
++                p.add(Shape::convex_polygon(q.chunks_exact(2).map(|n| on(l, [n[0], n[1]])).collect(), fill, edge));
++            }
++            if !shown.stroke.is_empty() {
++                // the brush's radius on this person's photo, a fraction of its long edge as for the drawer
++                let long = image.map_or(0.0, |r| r.width().max(r.height()));
++                let r = (s["stroke"]["size"].as_f64().filter(|v| v.is_finite()).unwrap_or(0.0).clamp(0.0, 1.0) as f32 * long).max(1.0);
++                live_stroke(ctx, &p, shown, l, canvas, r, o.color);
++            }
++            if let (Some(a), Some(b)) = (point(&s["line"]), shown.pointer) {
++                p.extend(Shape::dashed_line(&[on(l, a), on(l, b)], Stroke::new(1.5, c), 4.0, 3.0));
++            }
++        }
++        for (i, (o, _)) in others.iter().enumerate() {
++            let (c, s) = (color(o), &o.state);
++            for id in ids(&s["selection"]) {
++                for (r, visible) in cells(app, id) {
++                    // one inside the other when several people select the same photo
++                    let inner = r.shrink(1.0 + 3.0 * i.min(8) as f32);
++                    let p = painter.with_clip_rect(visible);
++                    p.rect_stroke(inner, 0.0, Stroke::new(2.0, c), StrokeKind::Inside);
++                    tag(&p, inner.min + vec2(3.0, 3.0), &o.name, c);
++                }
++            }
++            if let Some((row, panel)) = drop_row(app, ctx, s) {
++                painter.with_clip_rect(panel).rect_stroke(row.shrink2(vec2(8.0, 1.0)), 4.0, Stroke::new(2.0, c), StrokeKind::Inside);
++            }
++        }
++        for (o, shown) in others.iter() {
++            let (c, s) = (color(o), &o.state);
++            let here = loupe.filter(|l| s["page"].as_u64() == Some(l.photo.0));
++            if let (Some(l), Some(canvas), Some(tip)) = (here, canvas, shown.pointer)
++                && canvas.contains(on(l, tip))
++            {
++                cursor(&painter.with_clip_rect(canvas), on(l, tip), c, &o.name);
++            }
++            if let Some((row, panel)) = drop_row(app, ctx, s) {
++                let n = ids(&s["drag"]["photos"]).len();
++                beside(&painter, row, panel, canvas, &format!("{n} photo{}", if n == 1 { "" } else { "s" }), c);
++            }
++            editing(app, &painter, s, c, here.and(image));
++        }
++    });
++    if moving {
++        ctx.request_repaint();
++    }
++}
++
++/// The registered rect of widget `key` this frame.
++#[cfg(target_arch = "wasm32")]
++fn area(app: &LccApp, key: &str) -> Option<egui::Rect> {
++    app.widgets.iter().find(|(k, _)| k == key).map(|(_, r)| *r)
++}
++
++/// Photo `id`'s grid and filmstrip cells this frame, each with the part of it that shows.
++#[cfg(target_arch = "wasm32")]
++fn cells(app: &LccApp, id: u64) -> impl Iterator<Item = (egui::Rect, egui::Rect)> + '_ {
++    let (grid, strip) = (area(app, "grid:scroll"), area(app, "filmstrip"));
++    app.widgets.iter().filter_map(move |(k, r)| {
++        let (kind, of) = k.split_once(':')?;
++        let shown = match kind {
++            "thumb" => grid?,
++            "film" => strip?,
++            _ => return None,
++        };
++        (of.parse() == Ok(id)).then(|| (*r, shown.intersect(*r)))
++    })
++}
++
++/// The collection row someone drags photos to, when this person's left panel shows it, and the part of the panel the
++/// rows scroll in (panels/classic_left.rs: under the pinned Navigator, above the Import… / Export… bar).
++#[cfg(target_arch = "wasm32")]
++fn drop_row(app: &LccApp, ctx: &egui::Context, state: &Value) -> Option<(egui::Rect, egui::Rect)> {
++    let row = area(app, &format!("source:album:{}", state["drag"]["album"].as_u64()?))?;
++    let mut panel = area(app, "panel:left_panel")?;
++    if let Some(top) = ctx.data(|d| d.get_temp::<f32>(egui::Id::new("left-view-top"))) {
++        panel.min.y = panel.min.y.max(top);
++    }
++    if let Some(bar) = app.widgets.iter().filter(|(k, r)| k.starts_with("button:leftBar-") && panel.contains_rect(*r)).map(|(_, r)| r.top()).reduce(f32::min) {
++        panel.max.y = panel.max.y.min(bar);
++    }
++    panel.contains_rect(row).then_some((row, panel))
++}
++
++/// Someone's edit under way (`state`) shown as a tag, beside the control this person has for it when it shows the same
++/// photo, else on the photo (`image`: open in the loupe on the same photo, or its cell): a develop adjustment named with
++/// its value (and a ghost of the slider's thumb where theirs is; a crop shows as its box instead), or the text being
++/// typed into a metadata field.
++#[cfg(target_arch = "wasm32")]
++fn editing(app: &LccApp, painter: &egui::Painter, state: &Value, c: egui::Color32, image: Option<egui::Rect>) {
++    use lcc_ui_egui::i18n::tr;
++    let a = &state["adjust"];
++    if let Some(photo) = a["photo"].as_u64() {
++        let spec = a["control"].as_str().and_then(controls::find);
++        let value = a["value"].as_f64().filter(|v| v.is_finite()).zip(spec).map(|(v, spec)| spec.clamp(v));
++        let text = match (spec, value) {
++            (Some(spec), Some(v)) => format!("{} {}", tr(spec.label), spec.format(v)),
++            _ => tr(&a["label"].as_str().unwrap_or_default().chars().take(40).collect::<String>()).to_owned(),
++        };
++        let slider = spec.zip(value).map(|(spec, _)| format!("slider:{}", spec.id));
++        if let Some(track) = photo_tag(app, painter, photo, slider.as_deref(), state["crop"].is_null(), &text, c, image)
++            && let (Some(spec), Some(v)) = (spec, value)
++        {
++            let at = egui::pos2(track.left() + spec.position(v) as f32 * track.width(), track.center().y);
++            painter.circle(at, 7.0, c.gamma_multiply(0.28), egui::Stroke::new(1.5, c.gamma_multiply(0.85)));
 +        }
 +    }
++    let t = &state["typing"];
++    if let (Some(photo), Some(field), Some(text)) = (t["photo"].as_u64(), t["field"].as_str().filter(|f| META_FIELDS.contains(f)), t["text"].as_str()) {
++        // the end of it, on one line
++        let n = text.chars().count();
++        let end: String = text.chars().skip(n.saturating_sub(40)).map(|c| if c.is_control() { ' ' } else { c }).collect();
++        let text = if n > 40 { format!("…{end}") } else { end };
++        photo_tag(app, painter, photo, Some(&format!("field:{field}")), true, &text, c, image);
++    }
++}
++
++/// A tag about an edit of `photo`: beside this person's own `widget` for it in the right panel when that shows the same
++/// photo (which it returns), else, when `elsewhere`, on the photo (`image`, or its cell).
++#[cfg(target_arch = "wasm32")]
++#[allow(clippy::too_many_arguments)]
++fn photo_tag(
++    app: &LccApp,
++    painter: &egui::Painter,
++    photo: u64,
++    widget: Option<&str>,
++    elsewhere: bool,
++    text: &str,
++    c: egui::Color32,
++    image: Option<egui::Rect>,
++) -> Option<egui::Rect> {
++    let mine = app.session.selection.active.is_some_and(|p| p.0 == photo);
++    let beside_widget = widget.filter(|_| mine).and_then(|w| Some((area(app, w)?, area(app, "panel:right_panel")?)));
++    if let Some((anchor, panel)) = beside_widget.filter(|(anchor, panel)| panel.contains_rect(*anchor)) {
++        beside(painter, anchor, panel, app.canvas_rect, text, c);
++        return Some(anchor);
++    }
++    if elsewhere && let Some((r, visible)) = image.map(|r| (r, r)).or_else(|| cells(app, photo).next()) {
++        tag(&painter.with_clip_rect(visible), egui::pos2(r.left() + 8.0, r.bottom() - 8.0 - tag_size(painter, text).y), text, c);
++    }
++    None
++}
++
++/// A tag beside `anchor` (vertically centred on it), just outside `panel` on the side toward the canvas.
++#[cfg(target_arch = "wasm32")]
++fn beside(painter: &egui::Painter, anchor: egui::Rect, panel: egui::Rect, canvas: Option<egui::Rect>, text: &str, color: egui::Color32) {
++    let size = tag_size(painter, text);
++    let left = canvas.is_none_or(|c| panel.center().x > c.center().x);
++    let x = if left { panel.left() - 8.0 - size.x } else { panel.right() + 8.0 };
++    tag(painter, egui::pos2(x, anchor.center().y - size.y / 2.0), text, color);
++}
++
++/// Someone's stroke as far as it shows (`shown`), on photo `l` in this person's `canvas`, as a disc of radius `r`
++/// (points) all along it in their `color`. Only what is new is painted each frame; a new view paints it again.
++#[cfg(target_arch = "wasm32")]
++fn live_stroke(ctx: &egui::Context, painter: &egui::Painter, shown: &mut Shown, l: Loupe, canvas: egui::Rect, r: f32, color: [u8; 3]) {
++    if shown.view != l.to_norm {
++        (shown.view, shown.fed, shown.fed_whole) = (l.to_norm, Vec::new(), 0);
++    }
++    let whole = (shown.reveal as usize).min(shown.stroke.len());
++    for n in &shown.stroke[shown.fed_whole.min(whole)..whole] {
++        shown.fed.push(l.screen(*n));
++    }
++    shown.fed_whole = whole;
++    // part of the way to the next point: on the segment, so the coverage follows the stroke
++    if let (Some(a), Some(b)) = (whole.checked_sub(1).and_then(|i| shown.stroke.get(i)), shown.stroke.get(whole)) {
++        let f = shown.reveal - whole as f64;
++        shown.fed.push(l.screen([a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f]));
++    }
++    // the points it has were placed in another view (or the stroke is another): start again
++    let params = (canvas, ctx.pixels_per_point().min(4096.0 / canvas.width().max(canvas.height()).max(1.0)), r, color);
++    if shown.painted.as_ref().is_none_or(|p| p.params != params || shown.fed.len() < p.stamped) {
++        let side = |v: f32| ((v * params.1).ceil().max(1.0) as usize).min(4096);
++        let (w, h) = (side(canvas.width()), side(canvas.height()));
++        shown.painted = Some(Painted { params, w, h, cover: vec![0; w * h], stamped: 0, dirty: None, texture: None });
++    }
++    let Some(p) = shown.painted.as_mut() else { return };
++    if p.stamp(&shown.fed) {
++        ctx.request_repaint();
++    }
++    p.show(ctx, painter);
++}
++
++/// A stroke at screen resolution: each pixel's coverage (0..=255) by a disc stamped all along it, the most any disc gives
++/// it (round at the ends and turns, never darker where the stroke crosses itself); and the texture showing it at 70%.
++#[cfg(target_arch = "wasm32")]
++struct Painted {
++    /// Where (the canvas), at how many pixels a point, the disc's radius (points), the color.
++    params: (egui::Rect, f32, f32, [u8; 3]),
++    w: usize,
++    h: usize,
++    cover: Vec<u8>,
++    /// Points stamped so far, and the pixels changed since the last upload (x0, y0, x1, y1).
++    stamped: usize,
++    dirty: Option<[usize; 4]>,
++    texture: Option<egui::TextureHandle>,
++}
++
++#[cfg(target_arch = "wasm32")]
++impl Painted {
++    /// Each new point of `points` (screen), joined to the one before it; at most a few million pixels a frame (someone
++    /// else's points: a long scribble finishes over the next frames). Whether some are left.
++    fn stamp(&mut self, points: &[[f32; 2]]) -> bool {
++        let (clip, scale, r, _) = self.params;
++        let px = |q: [f32; 2]| [(q[0] - clip.min.x) * scale, (q[1] - clip.min.y) * scale];
++        let r = r * scale;
++        let mut budget = 4_000_000usize;
++        for i in self.stamped..points.len() {
++            let (a, b) = (px(points[i.saturating_sub(1)]), px(points[i]));
++            if !a.iter().chain(&b).all(|v| v.is_finite()) {
++                continue;
++            }
++            // the capsule's box, in the buffer
++            let span = |u: f32, v: f32, n: usize| (((u.min(v) - r - 1.0).floor().max(0.0) as usize).min(n), ((u.max(v) + r + 1.0).ceil().max(0.0) as usize).min(n));
++            let ((x0, x1), (y0, y1)) = (span(a[0], b[0], self.w), span(a[1], b[1], self.h));
++            let area = (x1 - x0) * (y1 - y0);
++            if area > budget && i > self.stamped {
++                self.stamped = i;
++                return true;
++            }
++            budget = budget.saturating_sub(area);
++            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
++            let len2 = dx * dx + dy * dy;
++            for y in y0..y1 {
++                for x in x0..x1 {
++                    let (qx, qy) = (x as f32 + 0.5 - a[0], y as f32 + 0.5 - a[1]);
++                    let t = if len2 > 0.0 { ((qx * dx + qy * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
++                    let cover = ((r + 0.5 - (qx - t * dx).hypot(qy - t * dy)).clamp(0.0, 1.0) * 255.0) as u8;
++                    let at = &mut self.cover[y * self.w + x];
++                    *at = (*at).max(cover);
++                }
++            }
++            if x0 < x1 && y0 < y1 {
++                let d = self.dirty.get_or_insert([x0, y0, x1, y1]);
++                *d = [d[0].min(x0), d[1].min(y0), d[2].max(x1), d[3].max(y1)];
++            }
++        }
++        self.stamped = points.len();
++        false
++    }
++
++    /// Uploads what changed and draws it.
++    fn show(&mut self, ctx: &egui::Context, painter: &egui::Painter) {
++        let (clip, scale, _, [r, g, b]) = self.params;
++        let image = |[x0, y0, x1, y1]: [usize; 4]| {
++            let pixels = (y0..y1).flat_map(|y| (x0..x1).map(move |x| (y, x)));
++            let pixels = pixels.map(|(y, x)| egui::Color32::from_rgba_unmultiplied(r, g, b, (f32::from(self.cover[y * self.w + x]) * 0.7) as u8));
++            egui::ColorImage::new([x1 - x0, y1 - y0], pixels.collect())
++        };
++        match (&mut self.texture, self.dirty.take()) {
++            (None, _) => self.texture = Some(ctx.load_texture("live-stroke", image([0, 0, self.w, self.h]), egui::TextureOptions::LINEAR)),
++            (Some(t), Some(d)) => t.set_partial([d[0], d[1]], image(d), egui::TextureOptions::LINEAR),
++            (Some(_), None) => {}
++        }
++        if let Some(t) = &self.texture {
++            let at = egui::Rect::from_min_size(clip.min, egui::vec2(self.w as f32 / scale, self.h as f32 / scale));
++            painter.image(t.id(), at, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
++        }
++    }
++}
++
++/// The pointer arrow, tip at (0, 0), in points; and the triangles that fill it.
++#[cfg(target_arch = "wasm32")]
++const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
++#[cfg(target_arch = "wasm32")]
++const ARROW_FILL: [[u32; 3]; 5] = [[0, 1, 2], [0, 2, 5], [0, 5, 6], [2, 3, 4], [2, 4, 5]];
++
++/// Another person's pointer at `tip`: an arrow in their color with a white edge and a soft shadow, and a tag with their
++/// name.
++#[cfg(target_arch = "wasm32")]
++fn cursor(painter: &egui::Painter, tip: egui::Pos2, color: egui::Color32, name: &str) {
++    use egui::{Color32, Shape, Stroke, Vec2, epaint::Mesh, vec2};
++    let arrow = |offset: Vec2, fill: Color32| {
++        let at = ARROW.map(|[x, y]| tip + offset + vec2(x, y));
++        let mut mesh = Mesh::default();
++        at.into_iter().for_each(|p| mesh.colored_vertex(p, fill));
++        ARROW_FILL.into_iter().for_each(|[a, b, c]| mesh.add_triangle(a, b, c));
++        (mesh, at.to_vec())
++    };
++    let shadow = Color32::from_black_alpha(64);
++    let (mesh, at) = arrow(vec2(0.0, 1.0), shadow);
++    painter.add(mesh);
++    painter.add(Shape::closed_line(at, Stroke::new(1.5, shadow)));
++    let (mesh, at) = arrow(Vec2::ZERO, color);
++    painter.add(mesh);
++    painter.add(Shape::closed_line(at, Stroke::new(1.5, Color32::WHITE)));
++    if !name.is_empty() {
++        let name: String = match name.chars().count() > 24 {
++            true => name.chars().take(23).chain(['…']).collect(),
++            false => name.to_owned(),
++        };
++        tag(painter, tip + vec2(12.0, 15.0), &name, color);
++    }
++}
++
++/// Inside a tag, in points.
++#[cfg(target_arch = "wasm32")]
++const TAG_PAD: egui::Vec2 = egui::vec2(7.0, 3.0);
++
++/// A tag's text: 12 points semibold, white, or near black on a light color.
++#[cfg(target_arch = "wasm32")]
++fn tag_text(painter: &egui::Painter, text: &str, color: egui::Color32) -> std::sync::Arc<egui::Galley> {
++    let l = egui::Rgba::from(color);
++    let ink = if 0.2126 * l.r() + 0.7152 * l.g() + 0.0722 * l.b() > 0.55 { egui::Color32::from_gray(0x11) } else { egui::Color32::WHITE };
++    let font = lcc_ui_egui::theme::Tokens::get(painter.ctx()).semibold(12.0);
++    painter.layout_no_wrap(text.to_owned(), font, ink)
++}
++
++#[cfg(target_arch = "wasm32")]
++fn tag_size(painter: &egui::Painter, text: &str) -> egui::Vec2 {
++    tag_text(painter, text, egui::Color32::BLACK).size() + 2.0 * TAG_PAD
++}
++
++/// A name or value tag in `color`, its top left at `at`.
++#[cfg(target_arch = "wasm32")]
++fn tag(painter: &egui::Painter, at: egui::Pos2, text: &str, color: egui::Color32) {
++    use egui::emath::GuiRounding as _;
++    let galley = tag_text(painter, text, color);
++    let r = egui::Rect::from_min_size(at.round_to_pixels(painter.pixels_per_point()), galley.size() + 2.0 * TAG_PAD);
++    painter.rect_filled(r, 6.0, color);
++    painter.galley(r.min + TAG_PAD, galley, color);
 +}
 +
 +/// The end of a frame.
@@ -346,7 +890,7 @@ index 0000000..3731e30
 +
 +    fn live_quiet(&self) -> bool {
 +        !POINTER_DOWN.get()
-+            && !self.text_focus
++            && !TYPING.get()
 +            && self.session.interaction.is_none()
 +            && self.gesture.is_none()
 +            && self.brush_live.is_none()
@@ -386,23 +930,34 @@ index 0000000..3731e30
 +        })
 +    }
 +
-+    /// `{ page: "library" | the shared photo open in the loupe, pointer: [x, y] on it (fractions of its frame),
-+    /// selection: the first 50 selected shared photos }`.
++    /// `{ page: "library" | the shared photo open in the loupe, pointer: [x, y] over it (its normalized coordinates,
++    /// [`Loupe`]), selection: the first 50 selected shared photos }`, and a gesture under way ([`in_progress`]).
 +    fn live_presence(&self) -> Value {
 +        let catalog = &self.session.catalog;
 +        let shared = self.session.selection.ids.iter().filter(|id| catalog.photo(**id).is_some_and(|p| !p.local));
-+        let mut state = serde_json::json!({"page": "library", "selection": shared.take(50).map(|id| id.0).collect::<Vec<_>>()});
++        let mut state = json!({"page": "library", "selection": shared.take(MAX_SELECTION).map(|id| id.0).collect::<Vec<_>>()});
 +        if let Some(photo) = open_photo(self) {
 +            state["page"] = photo.0.into();
 +            if let Some(at) = POINTER.get() {
-+                state["pointer"] = serde_json::json!(at);
++                state["pointer"] = json!(at);
 +            }
 +        }
++        in_progress(self, &mut state);
 +        state
 +    }
 +
++    /// Someone still on the same photo (or the library) keeps their marks where this person drew them, to ease on from
++    /// there.
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        OTHERS.set(others);
++        OTHERS.with_borrow_mut(|old| {
++            let mut new: Vec<(Presence, Shown)> = others.into_iter().map(|o| (o, Shown::default())).collect();
++            for (o, shown) in &mut new {
++                if let Some(was) = old.iter_mut().find(|(w, _)| w.id == o.id && w.state["page"] == o.state["page"]) {
++                    *shown = std::mem::take(&mut was.1);
++                }
++            }
++            *old = new;
++        });
 +    }
 +
 +    fn live_assets_of(document: &Value) -> Vec<String> {
@@ -491,7 +1046,7 @@ index 0000000..3731e30
 +    }
 +
 +    #[test]
-+    fn presence_is_the_open_photo_the_pointer_on_it_and_the_shared_selection() -> Result<(), String> {
++    fn presence_is_the_open_photo_the_pointer_on_it_the_shared_selection_and_a_gesture_under_way() -> Result<(), String> {
 +        let mut a = demo();
 +        let ids: Vec<u64> = a.session.catalog.photos().map(|p| p.id.0).take(2).collect();
 +        // a Local folder's photo is this person's own: the others are not shown it
@@ -505,6 +1060,20 @@ index 0000000..3731e30
 +        a.ui.view = ViewMode::Detail;
 +        let open = a.session.selection.active.ok_or("no active photo")?;
 +        assert_eq!(a.live_presence(), json!({"page": open.0, "pointer": [0.25, 0.5], "selection": ids}));
++        // a slider drag and a crop under way show as they go: the slider's value so far, the crop box's corners
++        let mut d = (*a.session.develop_of(open).ok_or("no settings")?).clone();
++        a.session.begin_interaction("Exposure").map_err(|e| e.to_string())?;
++        a.ui.dragging_control = Some("light.exposure".into());
++        d.light.exposure = 0.35;
++        a.session.set_develop(open, d.clone(), "Exposure").map_err(|e| e.to_string())?;
++        assert_eq!(a.live_presence()["adjust"], json!({"photo": open.0, "label": "Exposure", "control": "light.exposure", "value": 0.35}));
++        a.session.end_interaction().map_err(|e| e.to_string())?;
++        a.ui.dragging_control = None;
++        a.session.begin_interaction("Crop").map_err(|e| e.to_string())?;
++        let r = &mut d.crop.geometry.rect;
++        (r.x0, r.y0, r.x1, r.y1) = (0.1, 0.2, 0.6, 0.9);
++        a.session.set_develop(open, d, "Crop").map_err(|e| e.to_string())?;
++        assert_eq!(a.live_presence()["crop"], json!([[0.1, 0.2], [0.6, 0.2], [0.6, 0.9], [0.1, 0.9]]));
 +        Ok(())
 +    }
 +
@@ -803,13 +1372,14 @@ index 0000000..e59c16b
 +}
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..516c6ed
+index 0000000..c6c6424
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,106 @@
 +//! Playground live editing (Playground's patches/lightroom-classic.yaml calls [`command`] first thing in
 +//! `LccApp::run`, [`menu_item`] in the menu bar's items and [`native`] in the Presets panel): the hooks the web
-+//! build's live editing fills in. Elsewhere nothing changes.
++//! build's live editing fills in, and the loupe's mapping it draws the others' marks through ([`loupe`]). Elsewhere
++//! nothing changes.
 +
 +use std::cell::Cell;
 +
@@ -875,4 +1445,40 @@ index 0000000..516c6ed
 +        "edit.redo" if lcc_engine::live::is_live() => ("Redo".into(), true),
 +        _ => (label, enabled),
 +    }
++}
++
++/// How this frame's loupe drew the active photo: screen points to the photo's normalized coordinates (its oriented,
++/// uncropped frame: the same for everyone whatever their zoom, crop tool or panels) and back, as affine coefficients
++/// `[a, b, c, d, e, f]` (x' = a·x + c·y + e, y' = b·x + d·y + f). The loupe's own mapping (panels/detail.rs `show`:
++/// `CanvasMap` over the image, or the crop tool's turned view).
++pub fn loupe(app: &LccApp) -> Option<([f64; 6], [f64; 6])> {
++    use crate::state::{BeforeAfter, RightPanel};
++    use lcc_geom::Affine;
++    let photo = app.session.catalog.photo(app.session.active()?)?;
++    let (image, canvas) = (app.image_rect?, app.canvas_rect?);
++    let crop_tool = !app.ui.fullscreen && app.ui.right == RightPanel::Crop;
++    let (w, h) = (photo.width.max(1) as usize, photo.height.max(1) as usize);
++    let frame = lcc_pipeline::geometry::Frame::with_lens(w, h, &photo.develop, !crop_tool, photo.embedded_lens.as_deref());
++    let to_norm = if crop_tool {
++        // the view's own map (in the after view's area), read back at three points
++        let area = canvas.shrink(48.0);
++        let area = match app.ui.before_after {
++            BeforeAfter::SideBySide => egui::Rect::from_min_max(egui::pos2(area.center().x + 6.0, area.top()), area.max),
++            BeforeAfter::TopBottom => egui::Rect::from_min_max(egui::pos2(area.left(), area.center().y + 14.0), area.max),
++            _ => area,
++        };
++        let map = crate::panels::detail::crop_view(&frame, photo.develop.crop.geometry, area, app.crop_layout).map;
++        let o = canvas.center();
++        let [n, x, y] = [o, o + egui::vec2(100.0, 0.0), o + egui::vec2(0.0, 100.0)].map(|p| map.norm(p));
++        let (a, b, c, d) = ((x.x - n.x) / 100.0, (x.y - n.y) / 100.0, (y.x - n.x) / 100.0, (y.y - n.y) / 100.0);
++        let (ox, oy) = (f64::from(o.x), f64::from(o.y));
++        Affine([a, b, c, d, n.x - a * ox - c * oy, n.y - b * ox - d * oy])
++    } else {
++        // CanvasMap::new: 8 output pixels a point
++        let px = |v: f32| (v * 8.0).round().max(1.0) as usize;
++        let [a, b, c, d, e, f] = frame.out_to_norm(px(image.width()), px(image.height())).0;
++        let (x0, y0) = (f64::from(image.left()) * 8.0, f64::from(image.top()) * 8.0);
++        Affine([8.0 * a, 8.0 * b, 8.0 * c, 8.0 * d, e - a * x0 - c * y0, f - b * x0 - d * y0])
++    };
++    Some((to_norm.0, to_norm.inverse()?.0))
 +}
