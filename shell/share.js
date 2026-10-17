@@ -10,7 +10,7 @@ const button = (label, run, primary = false) => h('button', { type:'button', cla
 const color = id => `hsl(${parseInt(id.slice(0, 6), 16) % 360} 65% 60%)`
 const total = files => [...new Map(files.map(f => [f.asset, f])).values()].reduce((n,f)=>n+f.size,0)
 const when = time => new Date(time).toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})
-const LIVE = { live:'Live editing', 'read-only':'Viewing live edits', paused:'Paused: the owner is offline. Your edits stay here until they return.', 'catching up':'Catching up on edits', incompatible:'Not live: another app version' }
+const LIVE = { live:'Live editing', 'read-only':'Viewing live edits', paused:'Paused: reconnecting to the host. Your edits stay here.', 'catching up':'Catching up on edits', incompatible:'Not live: another app version' }
 // The session this browser is in: it follows the person from app to app (each app page resumes it).
 const active = {
   get() { try { return localStorage.getItem('pg-active-session') } catch { return null } },
@@ -114,8 +114,8 @@ export async function mountShare(bar, app, here, groups = []) {
           add.onchange=()=>attempt(async()=>{await session.share([...add.files]);add.value=''})
           body.append(status,warning,members,files,drafts,receive,addLabel,h('div',{class:'pg-actions'},forget,reconnect,leave))
           renderSession = () => {
-            const away=session.live?.status==='paused' && session.live.ownerElsewhere
-            status.textContent=`${session.live ? `${away ? `Paused: ${away.name} (owner) is in ${appName(away.page)}. Your edits stay here until they open ${app.name}.` : LIVE[session.live.status]} · ` : ''}${session.files.length} ${session.files.length===1?'file':'files'} · ${formatSize(total(session.files))}${kept.length ? ` · ${kept.length} kept ${kept.length===1?'draft':'drafts'}` : ''}`
+            const hostless=session.live?.status==='paused' && session.live.hostless
+            status.textContent=`${session.live ? `${hostless ? `Paused: nobody who can edit has ${app.name} open. Your edits stay here until someone does.` : LIVE[session.live.status]} · ` : ''}${session.files.length} ${session.files.length===1?'file':'files'} · ${formatSize(total(session.files))}${kept.length ? ` · ${kept.length} kept ${kept.length===1?'draft':'drafts'}` : ''}`
             warning.textContent=session.live?.error || session.error || session.relayWarning || (session.peers.size ? '' : 'Waiting for another participant. A person with a local copy must be online to send files.')
             addLabel.hidden=session.role==='viewer' || session.stopped
             receive.hidden=session.accepted; receive.disabled=!session.files.length

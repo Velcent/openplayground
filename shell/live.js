@@ -59,11 +59,11 @@ export function unfollow(session) {
 export class LiveDocument extends EventTarget {
   static async start({ session, adapter, store = session.store }) {
     const live = new LiveDocument(session, adapter, store)
-    // Connected first: the owner's coordinate() may need the app to apply a stored document.
+    // Connected first: hosting may need the app to apply a stored document.
     adapter.connect({ changed: () => queueMicrotask(() => live.kick()), undo: (redo) => queueMicrotask(() => live.undo(redo)) })
     live.mine = new Set(await store.media?.(undefined, `media-${live.slug}`).catch(() => null) ?? [])
-    if (session.config.owner) await live.coordinate()
     for (const [type, handler] of Object.entries(live.handlers)) session.addEventListener(type, handler)
+    live.reconsider()
     for (const peer of session.peers.values()) if (peer.document?.readyState === 'open') live.opened(peer)
     // A snapshot the owner sent before this document listened is gone: ask again.
     live.resync()
@@ -104,19 +104,39 @@ export class LiveDocument extends EventTarget {
     for (const [type, handler] of Object.entries(this.handlers)) this.session.removeEventListener(type, handler)
     this.adapter.disconnect()
   }
-  coordinator() {
-    return [...this.session.peers.values()].find((p) => p.role === 'owner' && p.page === this.app && p.document?.readyState === 'open')
+  // Who hosts this app's document: the owner while they have this app open, else whoever who can edit has had it open
+  // longest. Every browser derives it from the session server's roster, so they agree on it.
+  hostId() {
+    const s = this.session
+    // Not before the roster arrived: a browser that has not seen the others yet must not host a line of its own.
+    const people = [...(s.stopped || s.since === undefined ? [] : [{ id: s.id, role: s.role, page: s.page, since: s.since }]), ...s.peers.values()]
+      .filter((p) => p.page === this.app && p.role !== 'viewer')
+    const host = people.find((p) => p.role === 'owner') ?? people.sort((a, b) => (a.since ?? 0) - (b.since ?? 0) || (a.id < b.id ? -1 : 1))[0]
+    return host?.id ?? null
   }
-  // The owner, when connected but in another app: editing here waits for them (the app's own code merges its edits).
-  get ownerElsewhere() {
-    if (this.history || this.coordinator()) return null
-    return [...this.session.peers.values()].find((p) => p.role === 'owner' && p.page && p.page !== this.app) ?? null
+  coordinator() {
+    const id = this.hostId(), peer = id && id !== this.session.id ? this.session.peers.get(id) : null
+    return peer?.document?.readyState === 'open' ? peer : null
+  }
+  // Nobody who can edit has this app open: editing here waits for someone who can.
+  get hostless() { return !this.hostId() }
+  // Hosting follows the roster: take it over (catching up first), or hand it on.
+  reconsider() {
+    if (this.stopped || this.becoming) return
+    const mine = this.hostId() === this.session.id
+    if (mine && !this.history) {
+      this.becoming = this.host().catch((e) => this.report(e)).finally(() => { this.becoming = null; this.reconsider() })
+    } else if (!mine && this.history) {
+      // Someone else hosts now: their document is the shared one; anything only this browser had becomes a draft.
+      this.history = null; this.resyncing = false; this.changed(); this.resync()
+    }
   }
   post(peer, value) { return this.session.sendDocument(peer, { ...value, app: this.app }) }
   // The people in this app with the document channel open.
   here() { return [...this.session.peers.values()].filter((p) => p.page === this.app && p.document?.readyState === 'open') }
   // People say which app they are in once connected: a coordinator that appears is asked for this app's document.
   sessionChanged() {
+    this.reconsider()
     const owner = this.coordinator()
     if (owner !== this.seenCoordinator) { this.seenCoordinator = owner; if (owner) { this.resyncing = false; this.resync() } this.changed() }
     if (this.history) for (const peer of this.session.peers.values()) {
@@ -125,28 +145,62 @@ export class LiveDocument extends EventTarget {
     this.syncAssets()
   }
 
-  // Coordinator. Proposals go to the journal as they arrive (its own bounds apply); their replies and broadcasts
-  // follow in submission order, which is revision order.
-  async coordinate() {
+  // Host. Proposals go to the journal as they arrive (its own bounds apply); their replies and broadcasts follow in
+  // submission order, which is revision order. A new host carries on the furthest record of the line the others are
+  // on (a previous host's last, or whoever got furthest), so no acknowledged edit is lost; with none, it starts one.
+  async host() {
+    const name = `document-${this.slug}`
     const options = {
       merge: (base, current, edited) => this.adapter.merge(base, current, edited),
-      commit: (record) => this.store.document(record, `document-${this.slug}`),
+      commit: (record) => this.store.document(record, name),
       allowed: (id) => id === this.session.id ? this.editable : ['owner', 'editor'].includes(this.session.peers.get(id)?.role),
     }
-    const record = await this.store.document(undefined, `document-${this.slug}`).catch(() => null)
-    try {
-      if (record?.format !== this.adapter.format) throw new Error('another build')
-      this.history = DocumentHistory.restore(record, options)
-    } catch {
+    const stored = await this.store.document(undefined, name).catch(() => null)
+    const own = [stored?.format === this.adapter.format ? stored : null, this.acked && !this.incompatible ? this.record() : null].filter(Boolean)
+    // Everyone here who can edit, from the roster: wait for their channels before judging who got furthest, or a
+    // returning host would carry on an old line and turn the others' newer edits into drafts.
+    const roster = () => [...this.session.peers.values()].filter((p) => p.page === this.app && p.role !== 'viewer')
+    for (const end = Date.now() + 5000; Date.now() < end && !roster().every((p) => p.document?.readyState === 'open');) await sleep(50)
+    const others = roster().filter((p) => p.document?.readyState === 'open')
+    const states = [...await this.ask(others, { type: 'state?' }, 1500)]
+      .filter(([, v]) => v?.format === this.adapter.format && typeof v.document === 'string' && Number.isSafeInteger(v.revision))
+    // The line most of the others are on is the live one; within it, the furthest record.
+    const count = (d) => states.filter(([, v]) => v.document === d).length
+    const line = states.map(([, v]) => v.document).sort((a, b) => count(b) - count(a))[0] ?? own.sort((a, b) => b.revision - a.revision)[0]?.document
+    let best = own.filter((r) => r.document === line).sort((a, b) => b.revision - a.revision)[0] ?? null
+    for (const [id, v] of states.filter(([, v]) => v.document === line).sort((a, b) => b[1].revision - a[1].revision)) {
+      if (best && v.revision <= best.revision) break
+      const record = (await this.ask([this.session.peers.get(id)].filter(Boolean), { type: 'record?' }, 15000)).get(id)?.record
+      if (record?.document === line && record.format === this.adapter.format) { best = record; break }
+    }
+    try { if (best) this.history = DocumentHistory.restore(best, options) } catch { this.history = null }
+    if (this.history) await this.store.document(this.history.snapshot(), name)
+    else {
       // Another build's or an unreadable journal: its document carries over when this build can open it.
-      if (record?.bytes) await this.adapter.apply(null, record.bytes).catch(() => this.store.draft(record.bytes, this.app))
+      if (stored?.bytes && stored.format !== this.adapter.format) await this.adapter.apply(null, stored.bytes).catch(() => this.store.draft(stored.bytes, this.app))
       const bytes = await this.shareable()
       this.history = await DocumentHistory.create({ document: crypto.randomUUID(), format: this.adapter.format, bytes, ...options })
       await this.introduced(null, bytes)
     }
+    if (this.hostId() !== this.session.id) { this.history = null; return }
     const snapshot = this.history.snapshot()
     this.broadcasted = snapshot.revision
     this.work = this.work.then(() => this.adopt(snapshot)).catch((e) => this.report(e))
+    for (const peer of this.here()) { peer.offered = true; this.snapshot(peer) }
+  }
+  // This browser's acknowledged document as a journal record (its retained entries carry everyone's Undo).
+  record() {
+    return { version: 1, document: this.acked.document, format: this.adapter.format, revision: this.acked.revision, bytes: this.acked.bytes, entries: this.entries }
+  }
+  // Sends `value` to `peers` and gathers their replies (state, record) for at most `ms`.
+  ask(peers, value, ms) {
+    return new Promise((resolve) => {
+      const got = new Map(), done = () => { clearTimeout(timer); this.replies = null; resolve(got) }
+      const timer = setTimeout(done, ms)
+      if (!peers.length) return done()
+      this.replies = (peer, reply) => { if (peers.includes(peer)) got.set(peer.id, reply); if (got.size === peers.length) done() }
+      for (const peer of peers) this.post(peer, value).catch(() => {})
+    })
   }
   // A document every peer can install (the app's own merge validates it), or nothing is shared yet: a journal that
   // starts from no document would fail every joiner.
@@ -189,13 +243,13 @@ export class LiveDocument extends EventTarget {
   opened(peer) {
     this.presenceSent = null
     if (this.history && peer.page === this.app) { peer.offered = true; this.snapshot(peer) }
-    else if (peer.role === 'owner') this.resyncing = false
-    this.changed()
+    else if (peer.id === this.hostId()) this.resyncing = false
+    this.sessionChanged()
   }
   closed(peer) {
     // A late close from a peer that has reconnected since leaves the new one's presence alone.
     if (this.session.peers.get(peer.id) === peer && this.others.delete(peer.id)) this.presenceDirty = true
-    if (peer.role === 'owner') this.changed()
+    this.sessionChanged()
   }
   resync() {
     const owner = !this.history && !this.resyncing && this.coordinator()
@@ -208,12 +262,17 @@ export class LiveDocument extends EventTarget {
   receive(peer, value) {
     if (this.stopped || (peer && value?.app !== this.app)) return
     if (peer && value?.type === 'presence') return this.presence(peer, value.state, value.hello === true)
+    // A new host asks how far everyone got, then for the furthest record.
+    if (peer && value?.type === 'state?') return void this.post(peer, { type: 'state', ...(this.acked && !this.incompatible ? { document: this.acked.document, format: this.adapter.format, revision: this.history?.snapshot().revision ?? this.acked.revision } : {}) }).catch(() => {})
+    if (peer && value?.type === 'record?' && peer.role !== 'viewer') return void this.post(peer, { type: 'record', record: this.history?.snapshot() ?? (this.acked && !this.incompatible ? this.record() : null) }).catch(() => {})
+    if (peer && (value?.type === 'state' || value?.type === 'record')) return this.replies?.(peer, value)
     if (this.history && peer) {
       if (value?.type === 'propose') this.coordinateProposal(peer.id, value.proposal, (reply) => this.post(peer, reply).catch(() => {}))
       else if (value?.type === 'resync') this.snapshot(peer)
       return
     }
-    if (peer && peer.role !== 'owner') return
+    // Snapshots, entries and replies come from the host only: a previous host's late ones are ignored.
+    if (peer && peer.id !== this.hostId()) return
     this.work = this.work.then(() => this.process(value)).catch((e) => this.report(e))
   }
   async process(value) {

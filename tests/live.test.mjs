@@ -53,7 +53,7 @@ class App {
 const hubs = []
 after(() => { for (const hub of hubs) for (const s of hub.sessions.values()) s.live?.stop() })
 class Hub {
-  constructor() { hubs.push(this); this.sessions = new Map(); this.gates = new Map(); this.sent = []; this.pool = new Map() }
+  constructor() { hubs.push(this); this.clock = 0; this.sessions = new Map(); this.gates = new Map(); this.sent = []; this.pool = new Map() }
   // Holds messages from `from` to `to`, in order, until released.
   hold(from, to) {
     let release
@@ -90,15 +90,25 @@ class Hub {
     session.receiveFiles = async (wanted) => { for (const f of session.files) if (wanted.includes(f.id)) session.available.add(f.asset); session.dispatchEvent(new Event('change')) }
     this.sessions.set(id, session)
     const others = () => [...this.sessions.values()].filter((other) => other !== session)
+    // As a real session: the roster (who is here, in which app, since when) arrives first, the channels open after.
+    session.since = ++this.clock
+    for (const other of others()) this.list(session, other)
     if (linkFirst) { for (const other of others()) this.link(session, other); await sleep(250) }
     const live = session.live = await LiveDocument.start({ session, adapter: app, store })
     if (!linkFirst) for (const other of others()) this.link(session, other)
     return { session, app, live, store }
   }
+  list(a, b) {
+    for (const [from, to] of [[a, b], [b, a]]) {
+      from.peers.set(to.id, { id: to.id, role: to.role, page: to.page, since: to.since, document: { readyState: 'connecting' } })
+      from.dispatchEvent(new Event('change'))
+    }
+  }
   link(a, b) {
     for (const [from, to] of [[a, b], [b, a]]) {
-      const peer = { id: to.id, role: to.role, page: to.page, document: { readyState: 'open' } }
-      from.peers.set(to.id, peer)
+      const peer = from.peers.get(to.id)
+      if (peer.document.readyState === 'open') continue
+      peer.document.readyState = 'open'
       from.dispatchEvent(Object.assign(new Event('document-open'), { peer }))
     }
   }
@@ -185,19 +195,21 @@ test('Undo reverts only this person, around and after a remote edit', async () =
   owner.app.hooks.undo(false); await converge([owner, editor], [4, 0, 0])
 })
 
-test('the owner leaving pauses editing; local work syncs after the owner restores its journal', async () => {
-  const hub = new Hub(), [o, e] = ids()
-  const owner = await hub.join(o, 'owner'), editor = await hub.join(e, 'editor')
-  await live(owner, editor)
-  owner.app.edit(0, 1); await converge([editor], [1, 0, 0])
+test('when the owner leaves an app its earliest editor hosts on, keeping every edit and Undo, and the owner takes it back', async () => {
+  const hub = new Hub(), [o, e, f] = ids()
+  const owner = await hub.join(o, 'owner'), first = await hub.join(e, 'editor'), second = await hub.join(f, 'editor')
+  await live(owner, first, second)
+  first.app.edit(0, 4); await converge([owner, first, second], [4, 0, 0])
+  owner.app.edit(1, 5); await converge([owner, first, second], [4, 5, 0])
   hub.drop(o)
-  assert.equal(editor.live.status, 'paused')
-  editor.app.edit(2, 8)
+  second.app.edit(2, 6); await converge([first, second], [4, 5, 6])
+  assert.ok(first.live.history && !second.live.history, 'the editor here longest hosts')
+  first.app.hooks.undo(false); await converge([first, second], [0, 5, 6])
+  // Back with its older journal: the owner hosts again and carries on the line the others went on with.
   const back = await hub.join(o, 'owner', new App([0, 0, 0]), owner.store)
-  await converge([back, editor], [1, 0, 8])
-  assert.equal(editor.live.status, 'live')
-  editor.app.hooks.undo(false)
-  await converge([back, editor], [1, 0, 0])
+  await converge([back, first, second], [0, 5, 6])
+  await eventually(() => assert.ok(back.live.history && !first.live.history))
+  first.app.hooks.undo(true); await converge([back, first, second], [4, 5, 6])
 })
 
 test('a reject that arrives after a conflict kept the edit as a draft leaves newer local work alone', async () => {
@@ -337,18 +349,16 @@ test('presence reaches the others, stays out of the document, and goes when they
   owner.live.stop()
 })
 
-test('a session spans apps: each app edits its own document, and an app the owner is not in waits for them', async () => {
+test('a session spans apps: each app edits its own document with its own host', async () => {
   const hub = new Hub(), [o, e, x] = ids()
   const owner = await hub.join(o, 'owner', new App([1, 0, 0])), editor = await hub.join(e, 'editor')
   await converge([owner, editor], [1, 0, 0])
-  // Someone in another app: the owner's document is not theirs, and nobody there can coordinate theirs yet.
+  // Someone in another app hosts that app's document: the owner's is not theirs.
   const other = await hub.join(x, 'editor', new App([7, 7, 7], 'gridcraft:1:test'), undefined, { page: '/gridcraft/' })
-  await sleep(300)
-  assert.deepEqual([...other.app.doc], [7, 7, 7])
-  assert.equal(other.live.status, 'catching up')
-  assert.equal(other.live.ownerElsewhere?.id, o)
+  await eventually(() => assert.equal(other.live.status, 'live'))
+  other.app.edit(0, 8)
   owner.app.edit(1, 5)
   await converge([owner, editor], [1, 5, 0])
-  assert.deepEqual([...other.app.doc], [7, 7, 7])
-  assert.ok(!hub.sent.some((m) => m.from === o && m.to === x && ['snapshot', 'entry'].includes(m.type)), 'the owner sends one app\'s document only to people in that app')
+  await eventually(() => assert.deepEqual([...other.app.doc], [8, 7, 7]))
+  assert.ok(!hub.sent.some((m) => (m.from === o && m.to === x || m.from === x && m.to !== x) && ['snapshot', 'entry'].includes(m.type)), 'one app\'s document goes only to people in that app')
 })

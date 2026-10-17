@@ -50,7 +50,8 @@ export class SessionRoom extends DurableObject {
     const peers = this.sockets().flatMap((ws) => {
       const a = ws.deserializeAttachment()
       const member = a.id && room.members[a.id]
-      return member && a.epoch === room.epoch ? [{ id: a.id, role: member.role, generation: a.generation }] : []
+      // Which app each connection is in, and since when: every browser derives the same host for each app's document.
+      return member && a.epoch === room.epoch ? [{ id: a.id, role: member.role, generation: a.generation, page: a.page ?? null, since: a.since ?? 0 }] : []
     })
     const data = { type: 'roster', app: room.app, epoch: room.epoch, locked: room.locked, peers }
     for (const ws of this.sockets()) {
@@ -152,7 +153,8 @@ export class SessionRoom extends DurableObject {
         const room = this.load(), member = room?.members[message.id]
         if (!member || member.hash !== hash) return ws.close(4003, 'Invalid membership')
         for (const old of this.sockets()) if (old !== ws && old.deserializeAttachment().id === message.id) old.close(4004, 'Reconnected elsewhere')
-        a = { id: message.id, generation: crypto.randomUUID(), epoch: room.epoch, count: 0, window: Date.now(), seq: 0 }
+        const page = typeof message.page === 'string' && /^\/(?:head\/)?[a-z0-9-]+\/$/.test(message.page) ? message.page : null
+        a = { id: message.id, generation: crypto.randomUUID(), epoch: room.epoch, count: 0, window: Date.now(), seq: 0, page, since: Date.now() }
         ws.serializeAttachment(a)
         this.touch(); this.roster()
         return

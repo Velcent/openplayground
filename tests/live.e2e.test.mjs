@@ -146,18 +146,19 @@ test('Honeydew browsers edit one song live, keep views local, show each other wh
   await c.waitForTimeout(1500)
   assert.equal(await same([a, b, c], 'the viewer\'s edit to revert'), imported)
 
+  // The owner leaves: the editor hosts on, so editing goes on for the editor and the viewer.
   const room = await a.evaluate(() => { session.live.stop(); session.leave(); return session.room })
-  await until(async () => await status(b) === 'paused', 20000, 'the editor to pause')
+  await until(async () => await b.evaluate(() => !!session.live?.history), 20000, 'the editor to host')
+  await until(async () => await status(b) === 'live', 20000, 'the editor to stay live')
   await tempoUp(b)
-  const paused = await song(b)
-  assert.notEqual(paused, imported)
-  assert.equal(await song(c), imported, 'nothing is shared without the owner')
+  const hosted = await same([b, c], 'the editor\'s edit to reach the viewer without the owner', imported)
 
+  // Back, the owner hosts again and carries on from where the editor got to.
   await open(a)
   await a.evaluate(async (room) => { window.session = await PeerSession.restore(room); await session.connect() }, room)
   await follow(a)
-  await until(async () => await status(b) === 'live', 20000, 'the editor to resume')
-  assert.equal(await same([a, b, c], 'the paused edit to sync after the owner returns'), paused)
+  assert.equal(await same([a, b, c], 'the returning owner to carry on the editor\'s line'), hosted)
+  await until(async () => await a.evaluate(() => !!session.live?.history), 20000, 'the owner to host again')
   assert.equal(await sameMedia([a, b, c], 'the owner\'s reloaded page to get the sample back'), sample)
   for (const page of [a, b, c]) await page.evaluate(() => session.leave())
 })

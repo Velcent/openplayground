@@ -10,7 +10,7 @@ export const setPage = (path) => { page = APP_PATH.test(path) ? path : null }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 // Document messages by sender: the owner's snapshots (a document and its retained history, see document-history.js),
 // an editor's proposal to the owner (a delta's two spans), anything else small (a resync).
-const MAX_SNAPSHOT = 3 * MAX_DOCUMENT + 8 * 1024 ** 2, MAX_PROPOSAL = 2 * MAX_DOCUMENT + 64 * 1024, MAX_CONTROL = 64 * 1024
+const MAX_SNAPSHOT = 3 * MAX_DOCUMENT + 8 * 1024 ** 2, MAX_CONTROL = 64 * 1024
 async function request(room, action, data, token) {
   const response = await fetch(`/api/session/${room}/${action}`, { method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(data), cache: 'no-store' })
   const result = await response.json()
@@ -105,7 +105,7 @@ export class PeerSession extends EventTarget {
       const url = new URL(`/api/session/${this.room}/socket`, location.origin); url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
       const ws = this.ws = new WebSocket(url)
       const timer = setTimeout(() => { if (!settled) { settled = true; ws.close(); reject(new Error('Session connection timed out')) } }, 15000)
-      ws.onopen = () => ws.send(JSON.stringify({ type: 'auth', id: this.id, token: this.config.token }))
+      ws.onopen = () => ws.send(JSON.stringify({ type: 'auth', id: this.id, token: this.config.token, page: this.page }))
       let incoming = Promise.resolve()
       ws.onmessage = (event) => {
         if (event.data === 'pong') return
@@ -115,7 +115,7 @@ export class PeerSession extends EventTarget {
           if (message.type === 'roster') {
             const me = message.peers.find((p) => p.id === this.id)
             if (!me || message.app !== this.config.app) throw new Error('Session identity or app mismatch')
-            this.epoch = message.epoch; this.generation = me.generation; this.role = me.role; this.locked = message.locked
+            this.epoch = message.epoch; this.generation = me.generation; this.role = me.role; this.locked = message.locked; this.since = me.since
             this.members = message.members ?? []
             if (this.config.names) for (const id of Object.keys(this.config.names)) if (!this.members.some(m => m.id === id)) delete this.config.names[id]
             if (!settled) {
@@ -293,7 +293,8 @@ export class PeerSession extends EventTarget {
     const incoming = peer.documentIn
     if (typeof data === 'string') {
       const size = data.length < 64 && JSON.parse(data).size
-      const limit = peer.role === 'owner' ? MAX_SNAPSHOT : this.config.owner && peer.role === 'editor' ? MAX_PROPOSAL : MAX_CONTROL
+      // Owners and editors may host an app's document (snapshots, records); viewers only ever send small messages.
+      const limit = peer.role === 'viewer' ? MAX_CONTROL : MAX_SNAPSHOT
       if (incoming || !Number.isSafeInteger(size) || size < 4 || size > limit) throw new Error('Invalid document message')
       peer.documentIn = { size, frames: [], used: 0 }
       return
