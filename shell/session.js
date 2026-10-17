@@ -314,14 +314,14 @@ export class PeerSession extends EventTarget {
     return { value: unpack(bytes) }
   }
   sendDocument(peer, value) {
-    const blob = pack(value)
-    if (blob.size > MAX_SNAPSHOT) return Promise.reject(new Error('Document message too large'))
+    const bytes = pack(value)
+    if (bytes.length > MAX_SNAPSHOT) return Promise.reject(new Error('Document message too large'))
     const channel = peer.document
     if (!channel) return Promise.reject(new Error('Peer disconnected'))
     peer.documentSends = peer.documentSends.catch(() => {}).then(async () => {
       try {
-        await this.raw(peer, JSON.stringify({ size: blob.size }), channel)
-        for (let i = 0; i < blob.size; i += FRAME_SIZE) await this.raw(peer, await blob.slice(i, i + FRAME_SIZE).arrayBuffer(), channel)
+        await this.raw(peer, JSON.stringify({ size: bytes.length }), channel)
+        for (let i = 0; i < bytes.length; i += FRAME_SIZE) await this.raw(peer, bytes.subarray(i, i + FRAME_SIZE), channel)
       } catch (e) { channel.close(); throw e } // A half-sent message would desynchronize the receiver.
     })
     return peer.documentSends

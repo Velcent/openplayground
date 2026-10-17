@@ -28,7 +28,9 @@ function read(proposal) {
 // Identifies a request's content so a replayed ID can be told apart from a reused one.
 async function fingerprint({ base, kind, target, edit }) {
   const head = text.encode(JSON.stringify([base, kind, target ?? null, edit && [edit.version, edit.base, edit.result, edit.at, edit.remove.length]]))
-  return digest(await new Blob(edit ? [head, edit.remove, edit.insert] : [head]).arrayBuffer())
+  const parts = edit ? [head, edit.remove, edit.insert] : [head], all = new Uint8Array(parts.reduce((n, p) => n + p.length, 0))
+  parts.reduce((at, p) => (all.set(p, at), at + p.length), 0)
+  return digest(all) // not through a Blob: reading one back waits behind any big storage write
 }
 
 // An author's Undo and Redo stacks follow from the retained entries; expired targets simply drop out.
@@ -43,22 +45,38 @@ export function stacks(entries, author) {
   return { undo, redo }
 }
 
-// ponytail: each submit copies and commits the whole record and runs up to one merge per retained revision; fine for
-// typical songs, a ceiling near the 128 MiB document and 256 MiB history limits. Commit deltas incrementally if that shows.
+// The record is saved behind acknowledgement, coalesced: a keystroke or stroke never waits for the browser's storage,
+// and a burst of entries is one write. The others hold every acknowledged entry, and a new host carries on from the
+// furthest of them, so a lost write costs nothing while anyone else is there.
+// ponytail: each write is the whole record and each submit runs up to one merge per retained revision; append deltas
+// to a log if big documents show it.
 // Orders authored changes for one shared document. A proposal is rebased over every retained revision after its base,
 // one at a time, so changing a value and changing it back still fences stale work. Undo and Redo revert the
 // author's own latest operation and are checked against other authors' later changes only.
 export class DocumentHistory {
-  #document; #format; #merge; #commit; #allowed
+  #document; #format; #merge; #commit; #allowed; #failed
   #revision = 0; #bytes; #entries = []
-  #tail = Promise.resolve(); #pending = 0; #queued = 0
+  #tail = Promise.resolve(); #pending = 0; #queued = 0; #writing = null; #dirty = false
 
-  constructor({ document, format, bytes, merge, commit, allowed }) {
+  constructor({ document, format, bytes, merge, commit, allowed, failed }) {
     if (typeof document !== 'string' || !UUID.test(document) || typeof format !== 'string' || !format || !(bytes instanceof Uint8Array)
       || bytes.length > MAX_DOCUMENT || typeof merge !== 'function' || typeof commit !== 'function' || typeof allowed !== 'function') throw new Error('Invalid document history')
     this.#document = document; this.#format = format; this.#bytes = new Uint8Array(bytes)
-    this.#merge = merge; this.#commit = commit; this.#allowed = allowed
+    this.#merge = merge; this.#commit = commit; this.#allowed = allowed; this.#failed = failed
   }
+  // Saves the latest record once the write under way ends; failures are reported, never undone.
+  #persist() {
+    this.#dirty = true
+    this.#writing ??= (async () => {
+      while (this.#dirty) {
+        this.#dirty = false
+        try { await this.#commit(this.snapshot()) } catch (e) { this.#failed?.(e) }
+      }
+      this.#writing = null
+    })()
+  }
+  // Resolves once every acknowledged entry is saved (or its save failed).
+  async flushed() { while (this.#writing) await this.#writing }
 
   // The initial record is durable before any operation can be acknowledged.
   static async create(options) {
@@ -159,8 +177,8 @@ export class DocumentHistory {
     const entries = [...this.#entries, entry]
     let total = entries.reduce((sum, e) => sum + size(e.change), 0)
     while (entries.length > MAX_ENTRIES || total > MAX_HISTORY) total -= size(entries.shift().change)
-    await this.#commit(this.#record(entry.revision, next, entries))
     this.#revision = entry.revision; this.#bytes = next; this.#entries = entries
+    this.#persist()
     return copyEntry(entry)
   }
 }

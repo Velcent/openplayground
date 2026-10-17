@@ -11,7 +11,7 @@ function merge(base, current, edited) {
     return value
   })
 }
-const copy = async (value) => unpack(new Uint8Array(await pack(value).arrayBuffer()))
+const copy = async (value) => unpack(pack(value))
 // Retries `check` until it stops throwing: hashing and messages are asynchronous, and slow under a loaded machine.
 async function eventually(check, ms = 10000) {
   for (const end = Date.now() + ms; ; await new Promise((resolve) => setTimeout(resolve, 5))) {

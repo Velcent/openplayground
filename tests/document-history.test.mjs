@@ -98,20 +98,20 @@ test('replay returns the original receipt and rejects modified content or identi
   assert.deepEqual(state(j), [1, 0, 0])
 })
 
-test('rejected persistence never acknowledges or mutates the last committed state', async () => {
-  let fail = false, durable
-  const j = await setup({ commit: async record => {
-    if (fail) throw new Error('Quota exceeded')
-    durable = record
-  } })
-  const request = await edit(0, [0, 0, 0], [1, 0, 0])
+test('the record is saved behind acknowledgement, coalesced, and a failing store is reported, not undone', async () => {
+  let fail = false
+  const writes = [], failures = []
+  const j = await setup({ commit: async (record) => { if (fail) throw new Error('Quota exceeded'); writes.push(record.revision) }, failed: (e) => failures.push(e.message) })
   fail = true
-  await assert.rejects(j.submit(alice, request), /Quota/)
-  assert.equal(j.snapshot().revision, 0); assert.equal(durable.revision, 0)
-  assert.deepEqual(state(j), [0, 0, 0])
+  await j.submit(alice, await edit(0, [0, 0, 0], [1, 0, 0]))
+  assert.deepEqual(state(j), [1, 0, 0])
+  await j.flushed()
+  assert.deepEqual(failures, ['Quota exceeded'])
   fail = false
-  await j.submit(alice, request)
-  assert.equal(durable.revision, 1)
+  await Promise.all([j.submit(alice, await edit(1, [1, 0, 0], [1, 2, 0])), j.submit(bob, await edit(1, [1, 0, 0], [1, 0, 3]))])
+  await j.flushed()
+  assert.equal(writes.at(-1), 3)
+  assert.ok(writes.length <= 3, 'a burst of entries is at most one write after the one under way')
 })
 
 test('untrusted identities, formats, revisions and read-only senders cannot submit', async () => {

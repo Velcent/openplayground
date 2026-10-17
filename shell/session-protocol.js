@@ -89,9 +89,12 @@ export function pack(value) {
     const raw = this[key]
     return raw instanceof Uint8Array ? (parts.push(raw), { $bytes: raw.length }) : v
   }))
-  const head = new Uint8Array(4)
-  new DataView(head.buffer).setUint32(0, json.length)
-  return new Blob([head, json, ...parts])
+  // Plain bytes, not a Blob: reading a Blob back waits on the browser's storage, behind any big write under way.
+  const out = new Uint8Array(4 + json.length + parts.reduce((n, p) => n + p.length, 0))
+  new DataView(out.buffer).setUint32(0, json.length)
+  out.set(json, 4)
+  parts.reduce((at, p) => (out.set(p, at), at + p.length), 4 + json.length)
+  return out
 }
 export function unpack(bytes) {
   const invalid = () => new Error('Invalid document data')

@@ -128,7 +128,7 @@ export class LiveDocument extends EventTarget {
       this.becoming = this.host().catch((e) => this.report(e)).finally(() => { this.becoming = null; this.reconsider() })
     } else if (!mine && this.history) {
       // Someone else hosts now: their document is the shared one; anything only this browser had becomes a draft.
-      this.history = null; this.resyncing = false; this.changed(); this.resync()
+      this.saving = this.history.flushed(); this.history = null; this.resyncing = false; this.changed(); this.resync()
     }
   }
   post(peer, value) { return this.session.sendDocument(peer, { ...value, app: this.app }) }
@@ -153,8 +153,10 @@ export class LiveDocument extends EventTarget {
     const options = {
       merge: (base, current, edited) => this.adapter.merge(base, current, edited),
       commit: (record) => this.store.document(record, name),
+      failed: (e) => this.report(new Error(`This browser could not save the session's history (${e?.message ?? e}). The others still have every edit.`)),
       allowed: (id) => id === this.session.id ? this.editable : ['owner', 'editor'].includes(this.session.peers.get(id)?.role),
     }
+    await this.saving // the last line's save, so it cannot land over this one's
     const stored = await this.store.document(undefined, name).catch(() => null)
     const own = [stored?.format === this.adapter.format ? stored : null, this.acked && !this.incompatible ? this.record() : null].filter(Boolean)
     // Everyone here who can edit, from the roster: wait for their channels before judging who got furthest, or a
