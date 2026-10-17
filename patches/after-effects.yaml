@@ -8,9 +8,10 @@
 
 # Live editing in Playground sessions (patches/after-effects/live.diff + patches/live/playground_live.rs)
 # The adapter lives in new files: crates/engine/src/playground.rs (the template as its child module, the shared
-# project's binding, Undo/Redo/History hand-off) and crates/ui-egui/src/playground.rs (the shared document, merge
-# checks, media, presence, the kept runner and the web wrapper that ends each frame). These rules only declare them and
-# call in, at signatures, long-standing mod lines and file ends. Verify: node scripts/build.mjs check after-effects
+# project's binding, Undo/Redo/History hand-off), crates/ui-egui/src/playground.rs (the shared document, merge
+# checks, media, presence, the kept runner and the web wrapper that ends each frame) and
+# crates/ui-egui/src/panels/viewer_playground.rs (the viewer's Pen path and rubber band, for presence). These rules only
+# declare them and call in, at signatures, long-standing mod lines and file ends. Verify: node scripts/build.mjs check after-effects
 # head|release (and LIVE=0), then the e2e (tests/live-apps/after-effects.mjs).
 #
 # A session (`?pg-session=<room>`) opens in a browser store of its own, so this person's last session, auto-saves,
@@ -60,3 +61,16 @@
   file: crates/ui-egui/src/panels/viewer.rs
   find: 'pub\s+fn\s+show\s*\([^{]*\{'
   after: "\n    #[cfg(any(target_arch = \"wasm32\", debug_assertions))] crate::playground::viewer(ui);"
+# The viewer's child module (it reads the Pen's path and a shape drag, which the viewer keeps private, so the others
+# see them as they are drawn), declared at the end of the file. If upstream renames Gesture::Create, shape_drag or
+# pen_id, follow them in viewer_playground.rs.
+- live: true
+  file: crates/ui-egui/src/panels/viewer.rs
+  find: '(?![\s\S])'
+  after: "\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))] #[path = \"viewer_playground.rs\"] pub(crate) mod playground;\n"
+# The Timeline's first step records that it is on screen (its layer): the end-of-frame hook draws the others' dragged
+# keyframes and scrubbed current times over it, where its rows and ruler are (their automation ids).
+- live: true
+  file: crates/ui-egui/src/panels/timeline.rs
+  find: 'pub\s+fn\s+show\s*\([^{]*\{'
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", debug_assertions))] crate::playground::timeline(ui);"

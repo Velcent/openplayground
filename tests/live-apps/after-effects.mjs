@@ -20,6 +20,16 @@ export default {
     await page.mouse.move(600, 300)
     await page.waitForTimeout(300)
   },
+  // A gesture held down (the harness releases it): the owner scrubs the current time along the Timeline's ruler, which
+  // their presence shows as `time` while the button is down. The current time is personal: the document stays as it is.
+  drag: async (page) => {
+    await page.mouse.move(720, 560)
+    await page.mouse.down()
+    for (const x of [760, 800, 840]) {
+      await page.mouse.move(x, 560, { steps: 4 })
+      await page.waitForTimeout(100)
+    }
+  },
   // A Position keyframe on layer 1 (F2 is Deselect All, after point()'s selection).
   editA: (page) => key(page, 'F2', 'Control+ArrowDown', 'Alt+Shift+P'),
   // An Opacity keyframe on layer 2.
