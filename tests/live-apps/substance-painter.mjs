@@ -1,6 +1,7 @@
 // SubCraft (substance-painter): WebGPU only, so run with LIVE_GPU=1 (helpers.mjs GPU flags). Each page starts on the sample crate with Body's empty paint "Layer 1" selected and the
 // Brush tool; `ready` closes the welcome hub. The owner paints a stroke across the crate's front (Layer 1's tiles), the
-// editor adds a fill layer above it (Ctrl+Shift+F: appended, so no array shifts); Ctrl+Z is the owner's Undo.
+// editor adds a fill layer above it (Ctrl+Shift+F: appended, so no array shifts); Ctrl+Z is the owner's Undo. point():
+// the owner hovers over the crate, which the editor's 3D view shows as an arrow tagged "Alice · Layer 1".
 //
 // The checkpoint is binary (layer tree JSON, mesh, images, deflated tiles): `ready` defines liveTestDocument(), a JSON
 // view of it (tiles by content hash) for the harness.
@@ -8,7 +9,7 @@ import { until } from '../helpers.mjs'
 
 // Below the shell's 36 px top bar: the welcome hub's "Continue in workspace", and a stroke across the crate's front
 // between its bands.
-const CONTINUE = { x: 607, y: 455 }, STROKE = [{ x: 500, y: 370 }, { x: 630, y: 385 }]
+const CONTINUE = { x: 607, y: 455 }, STROKE = [{ x: 500, y: 370 }, { x: 630, y: 385 }], POINT = { x: 565, y: 378 }
 
 // The view: { doc, mesh, resources: { id: ... }, rasters: { layer: { slot: { comps, size, fill, tiles: { i: hash } } } } }.
 function view(bytes) {
@@ -78,5 +79,10 @@ export default {
     }
   },
   undo: (page) => page.keyboard.press('Control+z'),
+  // The owner hovers over the crate's front: their presence gains the surface point under the pointer.
+  point: async (page) => {
+    await page.mouse.move(POINT.x, POINT.y, { steps: 4 })
+    await until(() => page.evaluate(() => !!playgroundLiveAdapter.presence()?.pointer), 5000, 'the owner\'s pointer on the model')
+  },
 }
 

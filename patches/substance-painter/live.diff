@@ -1,166 +1,70 @@
-diff --git a/crates/app/src/session.rs b/crates/app/src/session.rs
-index 37c91c1..ca140d7 100644
---- a/crates/app/src/session.rs
-+++ b/crates/app/src/session.rs
-@@ -419,6 +419,16 @@ impl Session {
-         self.revision += 1;
-     }
- 
+diff --git a/crates/app/src/session/live.rs b/crates/app/src/session/live.rs
+new file mode 100644
+index 0000000..2fdd7ce
+--- /dev/null
++++ b/crates/app/src/session/live.rs
+@@ -0,0 +1,29 @@
++//! Live editing in a Playground session (subcraft-ui's `app::live`): a project changed elsewhere, installed into the
++//! session without an undo step of its own.
++
++use std::sync::Arc;
++
++use subcraft_doc::{Document, Resource};
++
++use super::Session;
++
++impl Session {
 +    /// Installs a document changed elsewhere (a live session) with no undo step of its own, adding the images it
 +    /// uses; the selection is repaired as after Undo. `restart`: the history starts over from it.
-+    pub fn adopt(&mut self, doc: Document, resources: Vec<Arc<subcraft_doc::Resource>>, restart: bool) {
++    pub fn live_adopt(&mut self, doc: Document, resources: Vec<Arc<Resource>>, restart: bool) {
 +        for r in resources {
 +            self.resources.insert_shared(r);
 +        }
-+        if restart { self.history.reset(doc, "Live session") } else { self.history.amend(doc) }
++        let h = &mut self.history;
++        let label = h.entries()[h.cursor()].label.clone();
++        if restart {
++            h.reset(doc, "Live session");
++        } else if h.undo().is_some() {
++            // The current entry, replaced in place (any redo branch, out of reach while connected, goes).
++            h.push(label, doc);
++        } else {
++            h.reset(doc, label);
++        }
 +        self.sync_after_history_move();
 +    }
-+
-     pub fn execute(&mut self, cmd: Command) -> Result<(), CommandError> {
-         if self.stroke.is_some() && !matches!(cmd, Command::Seal) {
-             return Err(CommandError::StrokeInProgress);
-diff --git a/crates/doc/src/history.rs b/crates/doc/src/history.rs
-index 7d96e89..893c78c 100644
---- a/crates/doc/src/history.rs
-+++ b/crates/doc/src/history.rs
-@@ -129,6 +129,12 @@ impl History {
-         Some(self.current())
-     }
- 
-+    /// Replace the current entry's document without a step of its own (a change made elsewhere, e.g. a live session).
-+    pub fn amend(&mut self, doc: Document) {
-+        self.entries[self.cursor].doc = doc;
-+        self.sealed = true;
-+    }
-+
-     /// Replace the whole history (project load / new project).
-     pub fn reset(&mut self, doc: Document, label: impl Into<String>) {
-         *self = History { max_entries: self.max_entries, ..History::new(doc, label) };
-diff --git a/crates/ui/Cargo.toml b/crates/ui/Cargo.toml
-index f784ac0..15797df 100644
---- a/crates/ui/Cargo.toml
-+++ b/crates/ui/Cargo.toml
-@@ -38,6 +38,10 @@ pollster.workspace = true
- 
- [dev-dependencies]
- subcraft-mesh.workspace = true
-+# Playground live editing (web only; tested natively).
-+subcraft-project.workspace = true
-+uuid.workspace = true
-+flate2 = "1"
- 
- # Web build: browser canvas, uploads and downloads.
- [target.'cfg(target_arch = "wasm32")'.dependencies]
-@@ -45,3 +49,7 @@ wasm-bindgen = "0.2.106"
- wasm-bindgen-futures = "0.4"
- js-sys = "0.3"
- web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "HtmlAnchorElement", "Blob", "BlobPropertyBag", "Url", "Response"] }
-+# Playground live editing.
-+subcraft-project.workspace = true
-+uuid.workspace = true
-+flate2 = "1"
-diff --git a/crates/ui/src/app.rs b/crates/ui/src/app.rs
-index 9ca775f..e63b211 100644
---- a/crates/ui/src/app.rs
-+++ b/crates/ui/src/app.rs
-@@ -110,6 +110,19 @@ pub fn default_layout() -> DockState<Tab> {
- 
- const DOCK_KEY: &str = "subcraft_dock_v4";
- 
-+// Live editing in a Playground session (web only).
-+#[cfg(any(target_arch = "wasm32", test))]
-+pub(crate) mod live;
-+
-+/// A Playground live session holds Undo and Redo (web only): they stay available, History jumps are off, and New and
-+/// Open wait until the session ends.
-+pub(crate) fn live_session() -> bool {
-+    #[cfg(any(target_arch = "wasm32", test))]
-+    return live::connected();
-+    #[cfg(not(any(target_arch = "wasm32", test)))]
-+    false
 +}
-+
- #[cfg(test)]
- mod launch_tests {
-     use super::*;
-@@ -347,6 +360,10 @@ impl SubcraftApp {
-                 }
-             }
-         }
-+        #[cfg(target_arch = "wasm32")]
-+        if matches!(action, Action::Undo | Action::Redo) && live::undo(action == Action::Redo) {
-+            return;
-+        }
-         match action {
-             Action::ResetCamera => self.state.camera = OrbitCamera::framing(&self.state.session.scene().mesh.bounds),
-             Action::BrushTool => self.state.tool = Tool::Brush,
-@@ -390,7 +407,7 @@ impl SubcraftApp {
-             }
-             ui.add_space(6.0);
-             let h = self.state.session.history();
--            let (can_undo, can_redo) = (h.can_undo(), h.can_redo());
-+            let (can_undo, can_redo) = (h.can_undo() || live_session(), h.can_redo() || live_session());
-             if ui.add_enabled_ui(can_redo, |ui| icon_button(ui, icons::REDO, "Redo (Ctrl+Y)")).inner.clicked() {
-                 self.perform(Action::Redo, now);
-             }
-@@ -509,7 +526,7 @@ impl SubcraftApp {
-                 let h = self.state.session.history();
-                 let undo = h.undo_label().map(|l| format!("Undo {l}")).unwrap_or("Undo".into());
-                 let redo = h.redo_label().map(|l| format!("Redo {l}")).unwrap_or("Redo".into());
--                let (can_undo, can_redo) = (h.can_undo(), h.can_redo());
-+                let (can_undo, can_redo) = (h.can_undo() || live_session(), h.can_redo() || live_session());
-                 if ui.add_enabled(can_undo, egui::Button::new(format!("{}   {undo}", icons::UNDO)).shortcut_text("Ctrl+Z")).clicked() {
-                     self.perform(Action::Undo, now);
-                 }
-@@ -591,6 +608,9 @@ impl SubcraftApp {
- 
-     /// Run `action` now, or after the unsaved-changes prompt.
-     fn request(&mut self, action: Pending, now: f64) {
-+        if action != Pending::Close && live_session() {
-+            return self.state.set_status("Leave the live session to open or start another project", now);
-+        }
-         if self.state.pen.is_editing() || self.state.pen.is_pending() || self.state.asset_preview.is_applying() {
-             if let Err(e) = self.state.pen.release(&self.state.session) { self.state.set_status(e.to_string(), now); }
-             if self.state.pen.is_pending() || self.state.asset_preview.is_applying() {
-@@ -870,6 +890,8 @@ impl eframe::App for SubcraftApp {
-             }
-             dialogs::run_pending(&mut self.state, action, &ctx, now);
-         }
-+        #[cfg(target_arch = "wasm32")]
-+        self.live_frame(&ctx);
-         let title = dialogs::title(&self.state);
-         if title != self.state.last_title {
-             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
-@@ -892,6 +914,11 @@ impl eframe::App for SubcraftApp {
-         if let Ok(j) = serde_json::to_string(&self.state.welcome.recent) { storage.set_string(crate::welcome::RECENTS_KEY, j); }
-     }
- 
-+    #[cfg(target_arch = "wasm32")]
-+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-+        Some(self)
-+    }
-+
-     /// Clean exit: the recovery folder of this session is no longer needed.
-     fn on_exit(&mut self) {
-         self.state.recovery.autosaver.finish_clean();
 diff --git a/crates/ui/src/app/live.rs b/crates/ui/src/app/live.rs
 new file mode 100644
-index 0000000..448ffe9
+index 0000000..43cc08d
 --- /dev/null
 +++ b/crates/ui/src/app/live.rs
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,514 @@
 +//! Live editing in a Playground session (`shell/live.js` drives it through [`web`]); nothing here runs until the shell
 +//! connects. The shared project is [`checkpoint`]'s canonical binary checkpoint: the layer trees and settings, the
 +//! painted tiles, the images they use and the mesh, without anyone's views (camera, selection, tool, brush, open
 +//! folders, panels). A remote change merges into the project at the end of a quiet frame, keeping this person's views
 +//! and unsent work, and is no step of the native undo history. While connected, Undo and Redo go to the session,
-+//! which reverts only this person's operations, and History jumps are off.
++//! which reverts only this person's operations, History jumps are off, and New and Open wait for the session's end.
++//! Presence: each person shares the surface point under their pointer on the model and their texture set and layer;
++//! the 3D view draws the others' pointers through this person's camera, tagged with their name and layer.
 +
 +pub(crate) mod checkpoint;
++// The template (patches/live/playground_live.rs, copied next to lib.rs): its JSON merge, canonical form and presence.
++#[path = "../playground_live.rs"]
++#[allow(dead_code)]
++mod playground_live;
 +
 +use std::collections::VecDeque;
 +
++use egui::{Pos2, Rect, vec2};
++use glam::{Vec2, Vec3};
++use serde_json::{Value, json};
++use subcraft_app::{Action, Camera, Command};
++
 +use super::SubcraftApp;
++use crate::dialogs::Pending;
++use crate::state::UiState;
++use playground_live::Presence;
 +
 +/// A remote change waiting for a quiet frame: `edited` relative to `base`, or with no base the whole shared project.
 +struct Remote {
@@ -182,6 +86,11 @@ index 0000000..448ffe9
 +    remote: VecDeque<Remote>,
 +    /// Shared changes reported so far.
 +    changes: u64,
++    /// This person's pointer on the model: as the 3D view drew it this frame, and as of the last frame (shared).
++    drawn: Option<[f32; 3]>,
++    pointer: Option<[f32; 3]>,
++    /// The others, as the shell gave them.
++    others: Vec<Presence>,
 +    #[cfg(test)]
 +    undos: Vec<bool>,
 +    #[cfg(target_arch = "wasm32")]
@@ -203,6 +112,7 @@ index 0000000..448ffe9
 +pub(crate) fn disconnect() {
 +    let waiting = LIVE.with_borrow_mut(|live| {
 +        live.connected = false;
++        live.others.clear();
 +        #[cfg(target_arch = "wasm32")]
 +        {
 +            live.hooks = None;
@@ -251,6 +161,106 @@ index 0000000..448ffe9
 +    connected
 +}
 +
++/// SubcraftApp::perform's first step: Undo and Redo go to the session while connected (a pending pen point or image
++/// still undoes first). Whether it took `action`.
++pub(super) fn perform(app: &mut SubcraftApp, action: Action) -> bool {
++    let s = &app.state;
++    match action {
++        Action::Undo => !(s.pen.is_editing() || s.pen.is_pending() || s.asset_preview.is_applying()) && undo(false),
++        Action::Redo => undo(true),
++        _ => false,
++    }
++}
++
++/// SubcraftApp::request's first step: New and Open wait for the session's end. Whether it refused `action`.
++pub(super) fn request(app: &mut SubcraftApp, action: Pending, now: f64) -> bool {
++    let refused = action != Pending::Close && connected();
++    if refused {
++        app.state.set_status("Leave the live session to open or start another project", now);
++    }
++    refused
++}
++
++/// The panels' commands, without History jumps while connected (they would take back the others' changes).
++pub(crate) fn commands(mut cmds: Vec<Command>) -> Vec<Command> {
++    if connected() {
++        cmds.retain(|c| !matches!(c, Command::JumpToHistory(_)));
++    }
++    cmds
++}
++
++/// The model's surface point under `at` (in points) in the 3D view at `rect`.
++fn surface_point(state: &UiState, camera: &Camera, rect: Rect, ppp: f32, at: Pos2) -> Option<Vec3> {
++    state.session.pick(camera, Vec2::new(at.x - rect.min.x, at.y - rect.min.y) * ppp).map(|hit| hit.position)
++}
++
++/// Where the surface point `p` shows in the 3D view at `rect` (in points), and whether the model hides it there.
++fn screen_point(state: &UiState, camera: &Camera, rect: Rect, ppp: f32, p: Vec3) -> Option<(Pos2, bool)> {
++    let screen = camera.project(p)?;
++    let at = rect.min + vec2(screen.x, screen.y) / ppp;
++    if !rect.contains(at) {
++        return None;
++    }
++    let tolerance = state.session.scene().mesh.bounds.diagonal() * 0.03;
++    Some((at, state.session.pick(camera, screen.truncate()).is_none_or(|hit| hit.position.distance(p) > tolerance)))
++}
++
++/// Another person's pointer: three finite coordinates of a sane size (remote data).
++fn point(v: &Value) -> Option<Vec3> {
++    let c = |i: usize| v.get(i)?.as_f64().filter(|c| c.abs() < 1e9).map(|c| c as f32);
++    (v.as_array()?.len() == 3).then_some(())?;
++    Some(Vec3::new(c(0)?, c(1)?, c(2)?))
++}
++
++/// "Name · Layer": their name and the layer they work on, when it is in this document.
++fn label(state: &UiState, o: &Presence) -> String {
++    use serde::Deserialize as _;
++    let layer = subcraft_core::TextureSetId::deserialize(&o.state["page"])
++        .ok()
++        .and_then(|ts| state.session.document().texture_set(ts))
++        .zip(subcraft_core::LayerId::deserialize(&o.state["selection"][0]).ok())
++        .and_then(|(ts, layer)| ts.find(layer));
++    match layer {
++        Some(layer) => format!("{} · {}", o.name, layer.name),
++        None => o.name.clone(),
++    }
++}
++
++/// The 3D view's overlays (after the render): this person's pointer on the model is noted for the others, and the
++/// others' pointers are drawn through this person's camera, each an arrow and a tag in their color (faded where the
++/// model hides the point).
++#[cfg(target_arch = "wasm32")]
++pub(crate) fn draw(state: &UiState, painter: &egui::Painter, rect: Rect) {
++    use egui::{Color32, Shape, Stroke};
++    if !connected() {
++        return;
++    }
++    let ctx = painter.ctx();
++    let ppp = ctx.pixels_per_point();
++    // The 3D view's camera, as viewport::show makes it.
++    let camera = state.camera.paint_camera([(rect.width() * ppp).round().max(1.0) as u32, (rect.height() * ppp).round().max(1.0) as u32]);
++    let mine = ctx
++        .pointer_hover_pos()
++        .filter(|_| ctx.rect_contains_pointer(painter.layer_id(), rect))
++        .and_then(|at| surface_point(state, &camera, rect, ppp, at));
++    LIVE.with_borrow_mut(|live| {
++        live.drawn = mine.map(|p| p.to_array());
++        for o in &live.others {
++            let Some((at, hidden)) = point(&o.state["pointer"]).and_then(|p| screen_point(state, &camera, rect, ppp, p)) else {
++                continue;
++            };
++            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
++            let color = if hidden { color.gamma_multiply(0.45) } else { color };
++            let arrow = vec![at, at + vec2(0.0, 15.0), at + vec2(10.0, 10.5)];
++            painter.add(Shape::convex_polygon(arrow, color, Stroke::new(1.0, Color32::WHITE)));
++            let text = painter.layout_no_wrap(label(state, o), crate::theme::font(11.0), Color32::WHITE);
++            let tag = Rect::from_min_size(at + vec2(10.0, 12.0), text.size() + vec2(8.0, 4.0));
++            painter.rect_filled(tag, 2.0, color);
++            painter.galley(tag.min + vec2(4.0, 2.0), text, Color32::WHITE);
++        }
++    });
++}
++
 +impl SubcraftApp {
 +    /// The canonical shared project, unless the last frame was busy: then the next quiet frame reports it again.
 +    pub(crate) fn live_checkpoint(&self) -> Result<Vec<u8>, String> {
@@ -271,6 +281,17 @@ index 0000000..448ffe9
 +        checkpoint::encode(s.history().current(), s.resources(), &s.scene().mesh)
 +    }
 +
++    /// This person's presence: the texture set and layer they work on and, while it is on the model, the surface point
++    /// under their pointer (object space, the same on everyone's mesh).
++    fn live_presence(&self) -> Value {
++        let s = self.state.session.selection();
++        let mut state = json!({ "page": s.texture_set, "selection": s.layer.into_iter().collect::<Vec<_>>() });
++        if let Some(p) = LIVE.with_borrow(|live| live.pointer) {
++            state["pointer"] = json!(p.map(|c| (f64::from(c) * 1e4).round() / 1e4));
++        }
++        state
++    }
++
 +    /// Nothing under way that a remote change would cut short or a checkpoint would catch half done: no pointer down
 +    /// (a stroke, a slider drag still coalescing into one history entry), no pen edit or image still being applied,
 +    /// no text being typed.
@@ -286,12 +307,13 @@ index 0000000..448ffe9
 +    }
 +
 +    /// The end of a frame: the remote changes waiting, then a report if the committed document changed, once quiet.
-+    pub(super) fn live_frame(&mut self, ctx: &egui::Context) {
++    fn live_frame(&mut self, ctx: &egui::Context) {
 +        let quiet = self.live_quiet(ctx);
 +        let waiting = LIVE.with_borrow_mut(|live| {
 +            #[cfg(target_arch = "wasm32")]
 +            live.ctx.get_or_insert_with(|| ctx.clone());
 +            live.busy = !quiet;
++            live.pointer = live.drawn.take();
 +            if live.connected && quiet { std::mem::take(&mut live.remote) } else { VecDeque::new() }
 +        });
 +        for remote in waiting {
@@ -336,7 +358,7 @@ index 0000000..448ffe9
 +        let s = &mut self.state.session;
 +        let install = checkpoint::install(&target, s.history().current(), s.resources(), &s.scene().mesh)?;
 +        match install.mesh {
-+            None => s.adopt(install.doc, install.resources, false),
++            None => s.live_adopt(install.doc, install.resources, false),
 +            // Another model: a session of its own, as when opening one.
 +            Some((mesh, bytes)) => {
 +                let mut store = subcraft_doc::ResourceStore::default();
@@ -353,20 +375,82 @@ index 0000000..448ffe9
 +    /// The session ended: native Undo starts over from the project as the session left it.
 +    fn live_disconnected(&mut self) {
 +        let doc = self.state.session.history().current().clone();
-+        self.state.session.adopt(doc, Vec::new(), true);
++        self.state.session.live_adopt(doc, Vec::new(), true);
 +    }
 +}
 +
-+/// The adapter object the Playground shell drives (`shell/live.js`): `format`; `checkpoint()`, the canonical shared
++/// The page's side: the kept runner, the app eframe runs (SubcraftApp, then the session's end-of-frame hook) and the
++/// adapter object the Playground shell drives (`shell/live.js`): `format`; `checkpoint()`, the canonical shared
 +/// project, throwing `busy` while a gesture is under way; `merge(base, current, edited)`, the pure strict merge;
 +/// `apply(base, edited)`, a promise that merges `edited` (with no base: adopts it whole, resolving to the checkpoint
-+/// it replaced) at the end of the next quiet frame; `connect({ changed, undo })` and `disconnect()`. The hooks are
-+/// called from inside a frame: the shell defers its calls back.
++/// it replaced) at the end of the next quiet frame; `connect({ changed, undo })`, `disconnect()`, `presence()` and
++/// `showPresence(others)`. The hooks are called from inside a frame: the shell defers its calls back.
 +#[cfg(target_arch = "wasm32")]
 +pub(crate) mod web {
-+    use super::{LIVE, SubcraftApp};
-+    use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
++    use super::{LIVE, Presence, SubcraftApp};
 +    use js_sys::{Function, Object, Promise, Reflect, Uint8Array};
++    use std::cell::OnceCell;
++    use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
++
++    thread_local! {
++        static RUNNER: OnceCell<eframe::WebRunner> = const { OnceCell::new() };
++    }
++
++    /// The page's web runner, kept for the adapter.
++    pub(crate) fn runner() -> eframe::WebRunner {
++        RUNNER.with(|kept| kept.get_or_init(eframe::WebRunner::new).clone())
++    }
++
++    /// The app eframe runs: `app`, offered to the page for live editing.
++    pub(crate) fn wrap(app: SubcraftApp) -> Box<dyn eframe::App> {
++        if let Err(e) = attach(&runner()) {
++            log::error!("subcraft: no live editing: {e:?}");
++        }
++        Box::new(Shell(app))
++    }
++
++    struct Shell(SubcraftApp);
++
++    impl eframe::App for Shell {
++        fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
++            self.0.logic(ctx, frame);
++        }
++
++        /// The app's frame, then this frame's edits go out and the others' come in (they show next frame).
++        fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++            eframe::App::ui(&mut self.0, ui, frame);
++            self.0.live_frame(ui.ctx());
++        }
++
++        /// The app itself, which the adapter reaches through the runner.
++        fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++            Some(&mut self.0)
++        }
++
++        fn save(&mut self, storage: &mut dyn eframe::Storage) {
++            self.0.save(storage);
++        }
++
++        fn on_exit(&mut self) {
++            self.0.on_exit();
++        }
++
++        fn auto_save_interval(&self) -> std::time::Duration {
++            self.0.auto_save_interval()
++        }
++
++        fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
++            self.0.clear_color(visuals)
++        }
++
++        fn persist_egui_memory(&self) -> bool {
++            self.0.persist_egui_memory()
++        }
++
++        fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
++            self.0.raw_input_hook(ctx, raw_input);
++        }
++    }
 +
 +    pub(super) struct Hooks {
 +        pub(super) changed: Function,
@@ -381,7 +465,7 @@ index 0000000..448ffe9
 +
 +    /// Offers the adapter as `globalThis.playgroundLiveAdapter`, and to `globalThis.playgroundLive.attach` when the
 +    /// shell is there already. A page without the shell never connects.
-+    pub(crate) fn attach(runner: &eframe::WebRunner) -> Result<(), JsValue> {
++    fn attach(runner: &eframe::WebRunner) -> Result<(), JsValue> {
 +        let adapter = Object::new();
 +        let set = |name: &str, value: JsValue| Reflect::set(&adapter, &name.into(), &value).map(drop);
 +        set("format", format!("substance-painter:1:{}", env!("CARGO_PKG_VERSION")).into())?;
@@ -436,6 +520,24 @@ index 0000000..448ffe9
 +            }
 +        };
 +        set("disconnect", Closure::<dyn Fn()>::new(disconnect).into_js_value())?;
++        let app = runner.clone();
++        let presence = move || -> Result<JsValue, JsValue> {
++            let app = app.app_mut::<SubcraftApp>().ok_or("busy")?;
++            js_sys::JSON::parse(&app.live_presence().to_string())
++        };
++        set("presence", Closure::<dyn Fn() -> _>::new(presence).into_js_value())?;
++        let show_presence = |others: JsValue| -> Result<(), JsValue> {
++            let text: String = js_sys::JSON::stringify(&others)?.into();
++            let others = Presence::list(&serde_json::from_str(&text).unwrap_or_default());
++            LIVE.with_borrow_mut(|live| {
++                live.others = others;
++                if let Some(ctx) = &live.ctx {
++                    ctx.request_repaint();
++                }
++            });
++            Ok(())
++        };
++        set("showPresence", Closure::<dyn Fn(_) -> _>::new(show_presence).into_js_value())?;
 +        let global = js_sys::global();
 +        Reflect::set(&global, &"playgroundLiveAdapter".into(), &adapter)?;
 +        let attach = Reflect::get(&global, &"playgroundLive".into())
@@ -453,7 +555,7 @@ index 0000000..448ffe9
 +mod tests;
 diff --git a/crates/ui/src/app/live/checkpoint.rs b/crates/ui/src/app/live/checkpoint.rs
 new file mode 100644
-index 0000000..d8f0853
+index 0000000..648d14a
 --- /dev/null
 +++ b/crates/ui/src/app/live/checkpoint.rs
 @@ -0,0 +1,931 @@
@@ -493,7 +595,7 @@ index 0000000..d8f0853
 +use subcraft_project::schema::*;
 +use uuid::Uuid;
 +
-+use crate::playground_live::canonical;
++use super::playground_live::canonical;
 +
 +/// The shell's document limit.
 +pub(crate) const MAX_BYTES: usize = 128 << 20;
@@ -1275,7 +1377,7 @@ index 0000000..d8f0853
 +/// id), rasters tile by tile, the mesh as one value and the images as a union.
 +pub(crate) fn merge<'a>(b: &Checkpoint<'a>, c: &Checkpoint<'a>, e: &Checkpoint<'a>) -> Result<Checkpoint<'a>, Error> {
 +    let [b_json, c_json, e_json] = [&b.json, &c.json, &e.json].map(|j| by_channel(j.clone()));
-+    let json = in_channel_order(crate::playground_live::merge(&b_json, &c_json, &e_json, &[])?);
++    let json = in_channel_order(super::playground_live::merge(&b_json, &c_json, &e_json, &[])?);
 +    let mesh = if e.mesh == b.mesh {
 +        c.mesh.clone()
 +    } else if c.mesh == b.mesh {
@@ -1390,10 +1492,10 @@ index 0000000..d8f0853
 +}
 diff --git a/crates/ui/src/app/live/tests.rs b/crates/ui/src/app/live/tests.rs
 new file mode 100644
-index 0000000..a5321c7
+index 0000000..477a6f1
 --- /dev/null
 +++ b/crates/ui/src/app/live/tests.rs
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,302 @@
 +use std::collections::HashSet;
 +use std::sync::Arc;
 +
@@ -1446,7 +1548,7 @@ index 0000000..a5321c7
 +    checkpoint::check_whole(&cp, Some(&parse(&bytes(s)).unwrap())).unwrap();
 +    let i = install(&cp, s.history().current(), s.resources(), &s.scene().mesh).unwrap();
 +    assert!(i.mesh.is_none());
-+    s.adopt(i.doc, i.resources, false);
++    s.live_adopt(i.doc, i.resources, false);
 +}
 +
 +fn png() -> Arc<Resource> {
@@ -1471,7 +1573,7 @@ index 0000000..a5321c7
 +fn image_fill(s: &mut Session, image: Arc<Resource>) {
 +    let id = image.id;
 +    let doc = s.history().current().clone();
-+    s.adopt(doc, vec![image], false);
++    s.live_adopt(doc, vec![image], false);
 +    s.execute(Command::AddLayer(NewLayer::Fill)).unwrap();
 +    let layer = s.selection().layer.unwrap();
 +    let fill = FillChannel::new(FillSource::Bitmap { resource: id });
@@ -1536,7 +1638,7 @@ index 0000000..a5321c7
 +    };
 +    let (pa, pb) = (painted(a.history().current()), painted(b.history().current()));
 +    assert_eq!(painted(&i.doc), pa + pb, "both strokes' tiles");
-+    a.adopt(i.doc, i.resources, false);
++    a.live_adopt(i.doc, i.resources, false);
 +    assert_eq!(bytes(&a), merged, "the merge is what the merged project reports");
 +
 +    // The same tile from both sides conflicts, as does one field both changed (even to the same value).
@@ -1672,45 +1774,27 @@ index 0000000..a5321c7
 +    assert!(err.contains("too large to edit live") && err.contains("128 MiB"), "{err}");
 +    assert!(parse(&vec![0; checkpoint::MAX_BYTES + 1]).unwrap_err().contains("too large"));
 +}
-diff --git a/crates/ui/src/lib.rs b/crates/ui/src/lib.rs
-index 6d36477..79ffb1b 100644
---- a/crates/ui/src/lib.rs
-+++ b/crates/ui/src/lib.rs
-@@ -20,6 +20,11 @@ pub mod welcome;
- 
- pub mod updates;
- 
-+// Playground live editing (web only): the template's JSON merge and canonical form.
-+#[cfg(any(target_arch = "wasm32", test))]
-+#[allow(dead_code)]
-+mod playground_live;
 +
- pub use app::{LaunchOptions, SubcraftApp, Tab};
- 
- /// Open the main window.
-@@ -56,9 +61,9 @@ pub async fn start_web(canvas_id: &str) -> Result<(), wasm_bindgen::JsValue> {
-         .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
-         .ok_or_else(|| wasm_bindgen::JsValue::from_str("canvas not found"))?;
-     let options = eframe::WebOptions { wgpu_options: wgpu_options(), ..Default::default() };
--    eframe::WebRunner::new()
--        .start(canvas, options, Box::new(|cc| Ok(Box::new(SubcraftApp::new(cc, LaunchOptions::default())))))
--        .await
-+    let runner = eframe::WebRunner::new();
-+    runner.start(canvas, options, Box::new(|cc| Ok(Box::new(SubcraftApp::new(cc, LaunchOptions::default()))))).await?;
-+    app::live::web::attach(&runner)
- }
- 
- #[cfg(target_arch = "wasm32")]
-diff --git a/crates/ui/src/panels/history.rs b/crates/ui/src/panels/history.rs
-index c816360..124ac23 100644
---- a/crates/ui/src/panels/history.rs
-+++ b/crates/ui/src/panels/history.rs
-@@ -25,7 +25,7 @@ pub fn show(state: &mut UiState, ui: &mut Ui) {
-                 }
-                 ui.add(egui::Label::new(text).truncate().selectable(false));
-             });
--            if resp.clicked() && i != cursor {
-+            if resp.clicked() && i != cursor && !crate::app::live_session() {
-                 cmds.push(Command::JumpToHistory(i));
-             }
-         }
++#[test]
++fn presence_shares_the_point_under_the_pointer_which_another_camera_places_on_the_model() {
++    let mut a = app(Session::sample());
++    let (rect, ppp) = (egui::Rect::from_min_size(egui::pos2(40.0, 30.0), egui::vec2(400.0, 300.0)), 2.0);
++    let camera = a.state.camera.paint_camera([800, 600]);
++    let p = surface_point(&a.state, &camera, rect, ppp, rect.center()).expect("the crate is under the center");
++    LIVE.with_borrow_mut(|live| live.drawn = Some(p.to_array()));
++    a.live_frame(&egui::Context::default());
++    let state = a.live_presence();
++    let s = a.state.session.selection();
++    assert_eq!((&state["page"], &state["selection"]), (&serde_json::json!(s.texture_set), &serde_json::json!([s.layer.unwrap()])));
++
++    // As someone else's: where it is under the same camera, unhidden, tagged with their layer.
++    let ann = Presence { id: "a".into(), name: "Ann".into(), color: [1, 2, 3], state: state.clone() };
++    let (at, hidden) = screen_point(&a.state, &camera, rect, ppp, point(&state["pointer"]).unwrap()).unwrap();
++    assert!(at.distance(rect.center()) < 1.0 && !hidden, "{at:?} {hidden}");
++    assert_eq!(label(&a.state, &ann), format!("Ann · {}", a.state.session.selected_layer().unwrap().name));
++    // Remote junk draws nothing.
++    for junk in [serde_json::json!([1.0, 2.0]), serde_json::json!([1e300, 0, 0]), serde_json::json!(["x", 0, 0])] {
++        assert_eq!(point(&junk), None);
++    }
++    assert_eq!(screen_point(&a.state, &camera, rect, ppp, glam::Vec3::splat(1e6)), None);
++}

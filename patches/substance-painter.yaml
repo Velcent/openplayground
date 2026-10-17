@@ -1,2 +1,71 @@
-# SubCraft: no rule patches; its diffs (patches/substance-painter/) and the live adapter (tools.yaml live:) apply.
-[]
+# SubCraft: its diffs (patches/substance-painter/) and the live adapter (tools.yaml live:) apply, then these rules.
+
+# Live editing in Playground sessions (patches/substance-painter/live.diff + patches/live/playground_live.rs)
+# What it's for: people in a Playground session paint one project together (layer trees, painted tiles, images and the
+#   mesh) and see where the others point on the model and which layer they work on, in each person's color.
+# How: the adapter lives in new files: crates/ui/src/app/live.rs (the binary checkpoint's adapter, Undo, the session
+#   guards, presence, the kept runner and the app that ends each frame with the session's frame hook; it declares the
+#   template, copied next to lib.rs), crates/ui/src/app/live/checkpoint.rs (the canonical checkpoint and its merge)
+#   and crates/app/src/session/live.rs (Session::live_adopt: a document from elsewhere, no undo step of its own).
+#   These rules only declare them and call in, each one line at the end of a file or right after a function's
+#   signature (the Undo/Redo buttons' line is the exception).
+# Verify: node scripts/build.mjs check substance-painter head (and LIVE=0), then the e2e (LIVE_GPU=1,
+#   tests/live-apps/substance-painter.mjs) and `cargo test -p subcraft-ui --lib app::live`.
+# If upstream changes: if a function named below is renamed, anchor on its new signature; if SubcraftApp, UiState or
+#   Session rename the fields app/live.rs and session/live.rs use, follow them there.
+#
+# Session's child module (everywhere: subcraft-ui's native tests use it; native builds never call it).
+- live: true
+  file: crates/app/src/session.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (subcraft-ui's app::live).\nmod live;\n"
+# The checkpoint's dependencies, for the web and for native tests, under target spellings nobody else uses.
+- live: true
+  file: crates/ui/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nsubcraft-project.workspace = true\nuuid.workspace = true\nflate2 = \"1\"\n\n[target.'cfg(all(not(target_arch = \"wasm32\")))'.dev-dependencies]\nsubcraft-project.workspace = true\nuuid.workspace = true\nflate2 = \"1\"\n"
+# The app's adapter module, a child of app.rs so it reaches SubcraftApp's fields (web, and its native tests).
+- live: true
+  file: crates/ui/src/app.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web only).\n#[cfg(any(target_arch = \"wasm32\", test))]\npub(crate) mod live;\n"
+# SubcraftApp::perform, every Undo and Redo: in a session they go to the session (a pending pen point still undoes
+# first); SubcraftApp::request: New and Open wait for the session's end.
+- live: true
+  file: crates/ui/src/app.rs
+  find: '\bfn\s+perform\s*\(\s*&mut\s+self\b[^{]*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if live::perform(self, action) { return; }"
+- live: true
+  file: crates/ui/src/app.rs
+  find: '\bfn\s+request\s*\(\s*&mut\s+self\b[^{]*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if live::request(self, action, now) { return; }"
+# The toolbar's and the Edit menu's Undo/Redo buttons stay enabled in a session (each rule takes the first line not
+# yet followed by its addition).
+- live: true
+  file: crates/ui/src/app.rs
+  find: '(?<!\]\s*)\blet\s*\(\s*can_undo\s*,\s*can_redo\s*\)\s*=[^;]*;(?!\s*#\[cfg[^\]]*\]\s*let\s*\(\s*can_undo\b)'
+  after: "\n                #[cfg(any(target_arch = \"wasm32\", test))] let (can_undo, can_redo) = (can_undo || live::connected(), can_redo || live::connected());"
+- live: true
+  file: crates/ui/src/app.rs
+  find: '(?<!\]\s*)\blet\s*\(\s*can_undo\s*,\s*can_redo\s*\)\s*=[^;]*;(?!\s*#\[cfg[^\]]*\]\s*let\s*\(\s*can_undo\b)'
+  after: "\n                #[cfg(any(target_arch = \"wasm32\", test))] let (can_undo, can_redo) = (can_undo || live::connected(), can_redo || live::connected());"
+# UiState::run, which runs the panels' commands: History jumps are off in a session.
+- live: true
+  file: crates/ui/src/state.rs
+  find: '\bpub\s+fn\s+run\s*\(\s*&mut\s+self\b[^{]*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] let cmds = crate::app::live::commands(cmds);"
+# The 3D view's overlays (draw_stencil runs after the render and the brush cursor): this person's pointer on the
+# model is noted, the others' are drawn.
+- live: true
+  file: crates/ui/src/viewport.rs
+  find: '\bfn\s+draw_stencil\s*\([^{]*\{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")] crate::app::live::draw(state, painter, rect);"
+# The web entry keeps its runner for the adapter and wraps its app.
+- live: true
+  file: crates/ui/src/lib.rs
+  find: 'eframe::WebRunner::new\(\)'
+  replace: 'app::live::web::runner()'
+- live: true
+  file: crates/ui/src/lib.rs
+  find: '(?<=\bstart_web\b[\s\S]*)Ok\(Box::new\((?=\s*SubcraftApp::new\b)'
+  replace: 'Ok(app::live::web::wrap('
