@@ -53,3 +53,46 @@
 - file: apps/*-web/src/**/*.rs
   find: 'if design && intent == Intent::Open \{'
   replace: 'if design {'
+
+# Live editing in Playground sessions (patches/fusion-360/live.diff + patches/live/playground_live.rs)
+# The adapter lives in one new file, apps/solidcraft-web/src/live.rs (it declares the template): the shared design and
+# its merge, adoption, ids, Undo's hand-off, presence (drawn over the viewport at the end of each frame), and the app
+# the web runner starts, which ends each frame with the session's hook. The rules below only declare it and call in,
+# each one line at the end of a file, after a function's signature, or around a call in the web entry. Native builds
+# behave as before: the hooks compile on wasm only (the module also for the web crate's native tests).
+# Verify all: node scripts/build.mjs check fusion-360 head|release, LIVE=0 the same, then the e2e
+# (tests/live-apps/fusion-360.mjs) and `cargo test -p solidcraft-web live::`. If upstream renames a function or type
+# named below, anchor on its new name.
+#
+# The web crate's live module, for the browser and its native tests.
+- live: true
+  file: apps/*-web/src/main.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session.\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
+# The web entry keeps its runner for the session, and the app it starts is the Shell wrapped by live::wrap (which
+# delegates every eframe::App method, then runs the session's frame hook, and gives the runner `as_any_mut`). If
+# upstream renames Shell or its `app` field (the SolveApp), follow it here.
+- live: true
+  file: apps/*-web/src/main.rs
+  find: 'eframe::WebRunner::new\(\)'
+  replace: 'crate::live::runner()'
+- live: true
+  file: apps/*-web/src/main.rs
+  find: 'Ok\(Box::new\((?=\s*Shell\s*\{)'
+  replace: 'Ok(crate::live::wrap(|shell: &mut Shell| &mut shell.app, '
+# serde_json for the web crate's native tests (it has it on wasm), under a target spelling nobody else uses.
+- live: true
+  file: apps/*-web/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(not(target_arch = \"wasm32\")))'.dev-dependencies]\nserde_json = { workspace = true }\n"
+# Undo and Redo of the shared design go to the session, which takes back only this person's edits: first in
+# SolveApp::run, which every Undo goes through (the app bar, Ctrl+Z/Y, menus, the control channel). The web app sets
+# the hook. Verify: the e2e's undo step reverts only the owner's edit.
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session: Undo and Redo, while the web app's session takes them.\n#[cfg(target_arch = \"wasm32\")]\npub static LIVE_UNDO: std::sync::OnceLock<fn(&str) -> bool> = std::sync::OnceLock::new();\n"
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\s*,\s*id\s*:\s*&str\b[^{]*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] if crate::LIVE_UNDO.get().is_some_and(|undo| undo(id)) { return Ok(Default::default()); }"

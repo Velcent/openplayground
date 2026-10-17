@@ -1,66 +1,84 @@
-diff --git a/apps/solidcraft-web/Cargo.toml b/apps/solidcraft-web/Cargo.toml
-index 4c615fb..fa1544e 100644
---- a/apps/solidcraft-web/Cargo.toml
-+++ b/apps/solidcraft-web/Cargo.toml
-@@ -19,6 +19,9 @@ solidcraft-ui-egui = { workspace = true }
- egui = { workspace = true }
- log = { workspace = true }
- 
-+[dev-dependencies]
-+serde_json = { workspace = true }
-+
- [target.'cfg(target_arch = "wasm32")'.dependencies]
- eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
- wasm-bindgen = "0.2"
 diff --git a/apps/solidcraft-web/src/live.rs b/apps/solidcraft-web/src/live.rs
 new file mode 100644
-index 0000000..a6ea97e
+index 00000000..46ef52e7
 --- /dev/null
 +++ b/apps/solidcraft-web/src/live.rs
-@@ -0,0 +1,439 @@
+@@ -0,0 +1,666 @@
 +//! Live editing in a Playground session (`playground_live` drives it). The shared document is a design's parametric
 +//! feature tree (`Session::doc`); every peer evaluates the bodies from it. The shared design is the one active when the
-+//! session started, followed by its `Session::uid` wherever its tab goes; while another design is active, or after it
-+//! closed, the session keeps its last state and remote changes wait for it. This person's own state stays out: the
++//! session started, marked ([`mark`]) so it is followed wherever its tab goes; while another design is active, or after
++//! it closed, the session keeps its last state and remote changes wait for it. This person's own state stays out: the
 +//! camera, selection and tools (outside the document anyway), what is hidden, each sketch's Sketch Palette options and
-+//! the timeline position Edit Sketch rolled to. New features, components and occurrences get ids unique across the
-+//! peers (`fresh_id`), and each peer keeps its own `next_id`.
++//! the timeline position Edit Sketch rolled to. Each peer numbers new features, components and occurrences on from a
++//! point of its own ([`jump`]), and keeps its own `next_id`.
++//!
++//! Presence: the scope (active component and sketch), the pointer as a point in the model and the selection; the others'
++//! show over the shared design's viewport in their colors, a pointer with their name and an outline around each item
++//! they selected.
++
++#[path = "playground_live.rs"]
++pub mod playground_live;
 +
 +use std::cell::{Cell, OnceCell, RefCell};
 +use std::collections::{BTreeMap, BTreeSet};
 +use std::sync::Arc;
 +
-+use serde_json::{Map, Value};
-+use solidcraft_engine::Session;
++use egui::{Color32, FontId, Rect, Shape, Stroke, StrokeKind, vec2};
++use serde_json::{Map, Value, json};
 +use solidcraft_engine::doc::{Document, FeatureKind};
++use solidcraft_engine::geom::{Aabb3, Vec3};
++use solidcraft_engine::{Sel, Session};
++use solidcraft_ui_egui::viewport::{self, Hit, Proj};
 +use solidcraft_ui_egui::{SolveApp, documents};
 +
-+use crate::playground_live::{self, Live, canonical};
++use playground_live::{Live, Presence, canonical};
 +
 +thread_local! {
 +    /// This frame's pointer is down or text is being typed (`live_quiet` has no context to ask).
 +    static INPUT_BUSY: Cell<bool> = const { Cell::new(false) };
-+    /// The shared design (`Session::uid`).
-+    static SHARED: Cell<Option<u64>> = const { Cell::new(None) };
++    /// The shared design's mark ([`marker`]).
++    static SHARED: Cell<Option<usize>> = const { Cell::new(None) };
 +    /// The active design is the shared one (or none is yet): Undo and Redo go to the session.
 +    static ON_SHARED: Cell<bool> = const { Cell::new(true) };
 +    /// The shared document as last reported or adopted: what is reported while the shared design is not active.
 +    static LAST: RefCell<Option<Value>> = const { RefCell::new(None) };
 +    /// Remote changes that came while the shared design was not active: it takes them when it is again.
-+    static PENDING: RefCell<Option<(u64, Value)>> = const { RefCell::new(None) };
++    static PENDING: RefCell<Option<(usize, Value)>> = const { RefCell::new(None) };
 +    /// Remote changes kept for later, counted (the generation).
 +    static KEPT: Cell<u64> = const { Cell::new(0) };
 +    /// The session ended while the shared design was not active: its Undo history goes when it is.
-+    static FORGET: Cell<Option<u64>> = const { Cell::new(None) };
++    static FORGET: Cell<Option<usize>> = const { Cell::new(None) };
++    /// The shared design's next id as this person last left it: another value means an id was taken since.
++    static NEXT: Cell<Option<u64>> = const { Cell::new(None) };
++    /// The others in the session.
++    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
 +    static CTX: OnceCell<egui::Context> = const { OnceCell::new() };
 +}
 +
++const FORMAT: &str = concat!("fusion-360:1:", env!("CARGO_PKG_VERSION"));
++
++/// Marks the shared design's session: a do-nothing callback in `open_preview`, which only `doc.open` reads (and takes,
++/// as the design it was in is replaced). Its address names the design wherever its tab goes; closing or replacing the
++/// design drops it.
++fn mark(s: &mut Session) -> Option<usize> {
++    // A captured byte: the box is an allocation of its own, so each mark has its own address.
++    let token = 0u8;
++    s.open_preview = Some(Box::new(move |_| {
++        std::hint::black_box(token);
++    }));
++    marker(s)
++}
++
++fn marker(s: &Session) -> Option<usize> {
++    s.open_preview.as_deref().map(|f| f as *const _ as *const () as usize)
++}
++
 +fn on_shared(app: &SolveApp) -> bool {
-+    SHARED.get().is_none_or(|uid| uid == app.session.uid)
++    SHARED.get().is_none_or(|m| marker(&app.session) == Some(m))
 +}
 +
 +fn pending_for(app: &SolveApp) -> bool {
-+    PENDING.with_borrow(|p| p.as_ref().is_some_and(|(uid, _)| *uid == app.session.uid))
++    PENDING.with_borrow(|p| p.as_ref().is_some_and(|(m, _)| marker(&app.session) == Some(*m)))
 +}
 +
 +/// The end of each frame.
@@ -69,10 +87,9 @@ index 0000000..a6ea97e
 +        c.get_or_init(|| ctx.clone());
 +    });
 +    INPUT_BUSY.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
-+    if FORGET.get() == Some(app.session.uid) {
++    if FORGET.get().is_some() && FORGET.get() == marker(&app.session) {
 +        FORGET.set(None);
-+        app.session.undo.clear();
-+        app.session.redo.clear();
++        forget(&mut app.session);
 +    }
 +    if pending_for(app)
 +        && app.live_quiet()
@@ -83,24 +100,97 @@ index 0000000..a6ea97e
 +    }
 +    ON_SHARED.set(on_shared(app));
 +    playground_live::frame(app);
++    // An id was taken: the next one comes from further on.
++    if playground_live::connected() && SHARED.get().is_some() && on_shared(app) {
++        let next = app.session.doc.next_id;
++        if NEXT.get().is_some_and(|n| n != next) {
++            jump(&mut app.session.doc_mut().next_id);
++        } else {
++            NEXT.set(Some(next));
++        }
++    } else {
++        NEXT.set(None);
++    }
++    draw(app, ctx);
 +}
 +
-+/// Undo and Redo of the shared design go to the session.
-+fn undo(redo: bool) -> bool {
-+    ON_SHARED.get() && playground_live::undo(redo)
++/// While connected, the shared design's next id moves on by a random step after each id taken and each remote change,
++/// so two people adding at once number from different points (one person's ids stay below their next id).
++// ponytail: up to 2^28 per step, 2^24 steps before ids pass MAX_FEATURE_ID (2^52); a per-peer id range if that matters.
++fn jump(next: &mut u64) {
++    *next = next.saturating_add(1 + (playground_live::fresh_id(&mut 0) & ((1 << 28) - 1)));
++    NEXT.set(Some(*next));
 +}
 +
-+/// Offers live editing to the Playground shell once the app runs; `app` finds the design in the runner's app.
++/// The session's end, for the shared design: its Undo history goes (it holds others' edits) and so does the mark.
++fn forget(s: &mut Session) {
++    s.undo.clear();
++    s.redo.clear();
++    s.open_preview = None;
++}
++
++/// Undo and Redo of the shared design go to the session (`SolveApp::run`, before anything else).
++fn undo(id: &str) -> bool {
++    matches!(id, "edit.undo" | "edit.redo") && ON_SHARED.get() && playground_live::undo(id == "edit.redo")
++}
++
 +#[cfg(target_arch = "wasm32")]
-+pub fn attach<S: eframe::App + 'static>(runner: &eframe::WebRunner, app: fn(&mut S) -> &mut SolveApp) {
-+    let _ = solidcraft_engine::doc::ID_ALLOCATOR.set(playground_live::fresh_id);
++thread_local! {
++    static RUNNER: OnceCell<eframe::WebRunner> = const { OnceCell::new() };
++}
++
++/// The page's web runner, kept so the session reaches the app between frames.
++#[cfg(target_arch = "wasm32")]
++pub fn runner() -> eframe::WebRunner {
++    RUNNER.with(|r| r.get_or_init(eframe::WebRunner::new).clone())
++}
++
++/// The app eframe runs: `shell`, whose design `app` gives, then the session's end-of-frame hook. Offers live editing
++/// to the Playground shell.
++#[cfg(target_arch = "wasm32")]
++pub fn wrap<S: eframe::App + 'static>(app: fn(&mut S) -> &mut SolveApp, shell: S) -> Box<dyn eframe::App> {
 +    let _ = solidcraft_ui_egui::LIVE_UNDO.set(undo);
-+    let runner = runner.clone();
-+    let with_app = move |f: &mut dyn FnMut(&mut SolveApp)| runner.app_mut::<S>().map(|mut s| f(app(&mut s))).is_some();
++    let with_app = move |f: &mut dyn FnMut(&mut SolveApp)| {
++        RUNNER.with(|r| r.get().and_then(|r| r.app_mut::<S>()).map(|mut s| f(app(&mut s))).is_some())
++    };
 +    let repaint = || CTX.with(|c| c.get().map_or((), egui::Context::request_repaint));
-+    let format = concat!("fusion-360:1:", env!("CARGO_PKG_VERSION"));
-+    if let Err(e) = playground_live::web::attach::<SolveApp>(format, with_app, repaint) {
++    if let Err(e) = playground_live::web::attach::<SolveApp>(FORMAT, with_app, repaint) {
 +        log::warn!("live editing: {e:?}");
++    }
++    Box::new(Wrapped(shell, app))
++}
++
++#[cfg(target_arch = "wasm32")]
++struct Wrapped<S>(S, fn(&mut S) -> &mut SolveApp);
++
++#[cfg(target_arch = "wasm32")]
++impl<S: eframe::App + 'static> eframe::App for Wrapped<S> {
++    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
++        self.0.logic(ctx, frame);
++    }
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        self.0.ui(ui, frame);
++        let ctx = ui.ctx().clone();
++        crate::live::frame((self.1)(&mut self.0), &ctx);
++    }
++    /// The shell itself, which the session reaches through the runner.
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(&mut self.0)
++    }
++    fn save(&mut self, storage: &mut dyn eframe::Storage) {
++        self.0.save(storage);
++    }
++    fn auto_save_interval(&self) -> std::time::Duration {
++        self.0.auto_save_interval()
++    }
++    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
++        self.0.clear_color(visuals)
++    }
++    fn persist_egui_memory(&self) -> bool {
++        self.0.persist_egui_memory()
++    }
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
++        self.0.raw_input_hook(ctx, raw_input);
 +    }
 +}
 +
@@ -132,14 +222,15 @@ index 0000000..a6ea97e
 +            if !documents::active_is_blank(self) && canonical(&self.live_document()) != canonical(&document) {
 +                documents::open_tab(self, Session::default())?;
 +            }
-+            SHARED.set(Some(self.session.uid));
++            FORGET.set(None);
++            SHARED.set(mark(&mut self.session));
 +        }
 +        if on_shared(self) {
 +            PENDING.take();
 +            install(self, document.clone())?;
 +        } else {
 +            design(document.clone())?;
-+            PENDING.set(SHARED.get().map(|uid| (uid, document.clone())));
++            PENDING.set(SHARED.get().map(|m| (m, document.clone())));
 +            KEPT.set(KEPT.get() + 1);
 +        }
 +        LAST.set(Some(document));
@@ -162,21 +253,21 @@ index 0000000..a6ea97e
 +        use std::hash::{Hash, Hasher};
 +        let mut h = std::hash::DefaultHasher::new();
 +        let s = &self.session;
-+        (s.uid, s.revision, Arc::as_ptr(&s.doc) as usize, self.pre_sketch_marker, KEPT.get()).hash(&mut h);
++        (marker(s), s.revision, Arc::as_ptr(&s.doc) as usize, self.pre_sketch_marker, KEPT.get()).hash(&mut h);
 +        Some(h.finish())
 +    }
 +
 +    fn live_disconnected(&mut self) {
-+        if let Some(uid) = SHARED.take() {
-+            if uid == self.session.uid {
-+                self.session.undo.clear();
-+                self.session.redo.clear();
++        if let Some(m) = SHARED.take() {
++            if marker(&self.session) == Some(m) {
++                forget(&mut self.session);
 +            } else {
-+                FORGET.set(Some(uid));
++                FORGET.set(Some(m));
 +            }
 +        }
 +        LAST.set(None);
 +        ON_SHARED.set(true);
++        NEXT.set(None);
 +    }
 +
 +    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
@@ -215,6 +306,97 @@ index 0000000..a6ea97e
 +        }
 +        Ok(())
 +    }
++
++    /// The scope (active component and sketch), the pointer as a point in the model while it is over the viewport, and
++    /// the selection (up to 3 KB of it).
++    fn live_presence(&self) -> Value {
++        if SHARED.get().is_none() || !on_shared(self) {
++            return Value::Null;
++        }
++        let s = &self.session;
++        let mut room = 3000usize;
++        let selection: Vec<Value> = s
++            .selection
++            .iter()
++            .filter_map(|x| serde_json::to_value(x).ok())
++            .take_while(|v| {
++                room = room.saturating_sub(v.to_string().len());
++                room > 0
++            })
++            .take(50)
++            .collect();
++        let mut p = json!({"component": s.active_component, "sketch": s.active_sketch, "selection": selection});
++        if let Some(at) = pointer(self) {
++            p["pointer"] = json!([at.x, at.y, at.z]);
++        }
++        p
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        OTHERS.set(others);
++    }
++}
++
++/// The model point under the pointer: where the pointer's ray meets what it is over, or else the point of the ray
++/// nearest the view's target. `None` while the pointer is not over the viewport.
++fn pointer(app: &SolveApp) -> Option<Vec3> {
++    let v = &app.viewport;
++    let (rect, mouse) = (v.rect?, v.mouse?);
++    let at = match &v.hover {
++        Some(Hit::Face { point, .. } | Hit::Vertex { point, .. } | Hit::Plane { point, .. }) => *point,
++        _ => {
++            let proj = viewport::projection(app, rect);
++            let (o, d) = proj.ray(mouse);
++            o + d * ((proj.cam.target - o).dot(d) / d.len2())
++        }
++    };
++    at.is_finite().then_some(at)
++}
++
++/// The others' pointers (an arrow with their name) and selections (an outline around each item's bounds, as the app
++/// bounds its own selection), in their colors, over the shared design's viewport. Their data come from other people:
++/// whatever does not resolve is skipped.
++fn draw(app: &mut SolveApp, ctx: &egui::Context) {
++    let others = OTHERS.take();
++    if let Some(rect) = app.viewport.rect.filter(|_| !others.is_empty() && SHARED.get().is_some() && on_shared(app)) {
++        let proj = viewport::projection(app, rect);
++        // Over the viewport (the root layer, after everything the app drew there), under dialogs and menus.
++        let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(rect);
++        let own = std::mem::take(&mut app.session.selection);
++        for o in &others {
++            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
++            for sel in o.state["selection"].as_array().into_iter().flatten().take(50) {
++                let Ok(sel) = serde_json::from_value::<Sel>(sel.clone()) else { continue };
++                app.session.selection = vec![sel];
++                if let Some(r) = viewport::selection_bounds(app).and_then(|b| screen_rect(&proj, &b)) {
++                    painter.rect_stroke(r.expand(3.0), 3.0, Stroke::new(2.0, color), StrokeKind::Outside);
++                }
++            }
++            let at: Option<Vec<f64>> = o.state["pointer"].as_array().and_then(|p| p.iter().map(Value::as_f64).collect());
++            if let Some(&[x, y, z]) = at.as_deref()
++                && let Some(p) = proj.to_screen(Vec3::new(x, y, z)).filter(|p| rect.expand(100.0).contains(*p))
++            {
++                painter.add(Shape::convex_polygon(vec![p, p + vec2(0.0, 17.0), p + vec2(12.0, 12.0)], color, Stroke::new(1.0, Color32::WHITE)));
++                let name: String = o.name.chars().take(40).collect();
++                let text = painter.layout_no_wrap(name, FontId::proportional(12.0), Color32::WHITE);
++                let tag = Rect::from_min_size(p + vec2(12.0, 14.0), text.size() + vec2(8.0, 4.0));
++                painter.rect_filled(tag, 3.0, color);
++                painter.galley(tag.min + vec2(4.0, 2.0), text, Color32::WHITE);
++            }
++        }
++        app.session.selection = own;
++    }
++    OTHERS.set(others);
++}
++
++/// A model box's outline on the screen (none behind the eye, or absurdly large).
++fn screen_rect(proj: &Proj, b: &Aabb3) -> Option<Rect> {
++    let mut r = Rect::NOTHING;
++    for i in 0..8 {
++        let pick = |bit: i32, lo: f64, hi: f64| if i & bit == 0 { lo } else { hi };
++        r.extend_with(proj.to_screen(Vec3::new(pick(1, b.min.x, b.max.x), pick(2, b.min.y, b.max.y), pick(4, b.min.z, b.max.z)))?);
++    }
++    (r.is_finite() && r.width() < 1e5 && r.height() < 1e5).then_some(r)
 +}
 +
 +/// Installs the shared document in the active design, keeping this person's views; no undo step.
@@ -229,6 +411,13 @@ index 0000000..a6ea97e
 +    }
 +    if let Some(marker) = &mut app.pre_sketch_marker {
 +        *marker = std::mem::replace(&mut doc.marker, local.marker);
++    }
++    // The same design (the owner adopting its own): nothing to do.
++    if doc == **local {
++        return Ok(());
++    }
++    if playground_live::connected() {
++        jump(&mut doc.next_id);
 +    }
 +    app.session.doc = Arc::new(doc);
 +    app.session.refresh();
@@ -296,8 +485,7 @@ index 0000000..a6ea97e
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
-+    use crate::playground_live::{checkpoint, connect, queue};
-+    use serde_json::json;
++    use playground_live::{checkpoint, connect, queue};
 +    use solidcraft_ui_egui::Services;
 +
 +    fn app() -> SolveApp {
@@ -367,8 +555,8 @@ index 0000000..a6ea97e
 +        let one: Value = serde_json::from_slice(&peer(&base, BOX.0, BOX.1())).unwrap();
 +        let mut two: Value = serde_json::from_slice(&peer(&base, BOX.0, json!({"length": "20", "width": "20", "height": "20"}))).unwrap();
 +        let base: Value = serde_json::from_slice(&base).unwrap();
-+        // Peer-unique ids, as `fresh_id` gives them while connected.
-+        two["features"][1]["id"] = json!(1u64 << 52 | 99);
++        // Ids apart, as two people's are while connected.
++        two["features"][1]["id"] = json!(1u64 << 40);
 +        let error = SolveApp::live_merge(&base, &one, &two).unwrap_err();
 +        assert!(error.contains("two features named Box1"), "{error}");
 +        // Each side drew a line in the sketch: counters take the larger.
@@ -392,7 +580,7 @@ index 0000000..a6ea97e
 +    }
 +
 +    #[test]
-+    fn a_remote_change_waits_while_a_dialog_is_open() {
++    fn a_remote_change_waits_while_a_dialog_is_open_and_ids_move_on_after_it_and_after_each_taken() {
 +        let mut a = bound();
 +        connect();
 +        let ctx = egui::Context::default();
@@ -410,6 +598,12 @@ index 0000000..a6ea97e
 +        frame(&mut a, &ctx);
 +        assert!(done.get());
 +        assert_eq!(shared(&a), theirs);
++        // Their box took the id after the sketch's; this person's next one is further on, and so after taking one.
++        let last = |a: &SolveApp| a.session.doc.features.iter().map(|f| f.id).max().unwrap();
++        assert!(a.session.doc.next_id > last(&a) + 1);
++        a.run("solid.cylinder", json!({"radius": "5", "height": "10"})).unwrap();
++        frame(&mut a, &ctx);
++        assert!(a.session.doc.next_id > last(&a) + 1);
 +    }
 +
 +    #[test]
@@ -427,7 +621,7 @@ index 0000000..a6ea97e
 +        documents::switch(&mut a, 0);
 +        frame(&mut a, &ctx);
 +        assert_eq!(shared(&a), base);
-+        assert!(!undo(false));
++        assert!(!undo("edit.undo"));
 +        // A remote change waits for the shared design, not the open one.
 +        let theirs = peer(&base, BOX.0, BOX.1());
 +        let done = std::rc::Rc::new(Cell::new(false));
@@ -442,7 +636,7 @@ index 0000000..a6ea97e
 +        assert_eq!(a.docs.active, 0);
 +        frame(&mut a, &ctx);
 +        assert_eq!(canonical(&project(&a.session.doc)), theirs);
-+        assert!(undo(false));
++        assert!(undo("edit.undo"));
 +        // A new design opens next to it, then it closes, then the last one does (a blank design takes its place):
 +        // the session keeps the shared design as it was, never another one.
 +        documents::new_design(&mut a);
@@ -454,191 +648,25 @@ index 0000000..a6ea97e
 +            frame(&mut a, &ctx);
 +            assert_eq!(shared(&a), theirs);
 +        }
-+        assert!(a.session.doc.features.is_empty() && !undo(false));
-+    }
-+}
-diff --git a/apps/solidcraft-web/src/main.rs b/apps/solidcraft-web/src/main.rs
-index 555fe38..76e845c 100644
---- a/apps/solidcraft-web/src/main.rs
-+++ b/apps/solidcraft-web/src/main.rs
-@@ -10,6 +10,11 @@
- mod files;
- #[cfg(target_arch = "wasm32")]
- mod install;
-+// Live editing in a Playground session.
-+#[cfg(any(target_arch = "wasm32", test))]
-+mod live;
-+#[cfg(any(target_arch = "wasm32", test))]
-+mod playground_live;
- #[cfg(any(target_arch = "wasm32", test))]
- mod space_mouse;
- 
-@@ -402,6 +407,10 @@ mod web {
-             self.file_panel(&ctx);
-             self.recovery_prompt(&ctx);
-             self.watch_text_for_font(&ctx);
-+            crate::live::frame(&mut self.app, &ctx);
-+        }
-+        fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-+            Some(self)
-         }
-         fn save(&mut self, storage: &mut dyn eframe::Storage) {
-             // Persist the user's own language, not a session-only English fallback.
-@@ -468,7 +477,8 @@ mod web {
-             {
-                 create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
-             }
--            let result = eframe::WebRunner::new()
-+            let runner = eframe::WebRunner::new();
-+            let result = runner
-                 .start(
-                     canvas,
-                     options,
-@@ -528,6 +538,9 @@ mod web {
-                     }),
-                 )
-                 .await;
-+            if result.is_ok() {
-+                crate::live::attach(&runner, |shell: &mut Shell| &mut shell.app);
-+            }
-             if let Some(el) = document.get_element_by_id(LOADING_ID) {
-                 match result {
-                     Ok(()) => el.remove(),
-diff --git a/crates/doc/src/assembly.rs b/crates/doc/src/assembly.rs
-index aeda6e2..1d3ed66 100644
---- a/crates/doc/src/assembly.rs
-+++ b/crates/doc/src/assembly.rs
-@@ -366,8 +366,7 @@ impl Document {
-         if self.occurrences.len() >= 100_000 {
-             return Err(DocError::Invalid("too many occurrences".into()));
-         }
--        let id = self.next_id.max(1);
--        self.next_id = id.checked_add(1).ok_or_else(|| DocError::Invalid("too many items in the design".into()))?;
-+        let id = self.new_id()?;
-         let cname = self.components.iter().find(|c| c.id == component).map(|c| c.name.clone()).unwrap_or_default();
-         let k = self.occurrences.iter().filter(|o| o.component == component).count() + 1;
-         self.occurrences.push(crate::Occurrence { id, component, parent, name: format!("{cname}:{k}"), transform, grounded: false });
-diff --git a/crates/doc/src/document.rs b/crates/doc/src/document.rs
-index 0463746..ff68585 100644
---- a/crates/doc/src/document.rs
-+++ b/crates/doc/src/document.rs
-@@ -10,8 +10,12 @@ use crate::{DocError, Result};
- pub const MAX_FEATURES: usize = 10_000;
- pub const MAX_PARAMS: usize = 10_000;
- /// Largest feature id a replayed feature may keep (`Document::insert_feature`): exact in JSON
--/// numbers, and far from overflowing the next id.
--pub const MAX_FEATURE_ID: u64 = 1 << 52;
-+/// numbers (live editing's ids are 2^52 and up), and far from overflowing the next id.
-+pub const MAX_FEATURE_ID: u64 = (1 << 53) - 1;
-+/// The host's allocator for new feature, component and occurrence ids, if any: given the next id, the id to use (the
-+/// web app's live editing makes them unique across the people editing).
-+#[cfg(target_arch = "wasm32")]
-+pub static ID_ALLOCATOR: std::sync::OnceLock<fn(&mut u64) -> u64> = std::sync::OnceLock::new();
- 
- /// A named parameter. User parameters are created by the user; model parameters (`d1`, `d2`…)
- /// are created by dimensions and features.
-@@ -2496,6 +2500,17 @@ impl Document {
-         if body.transferred { None } else { self.body_offsets.get(&body.name) }
-     }
- 
-+    /// A new feature, component or occurrence id.
-+    pub(crate) fn new_id(&mut self) -> Result<u64> {
-+        let id = self.next_id.max(1);
-+        self.next_id = id.checked_add(1).ok_or_else(|| DocError::Invalid("too many items in the design".into()))?;
-+        #[cfg(target_arch = "wasm32")]
-+        if let Some(fresh) = ID_ALLOCATOR.get() {
-+            return Ok(fresh(&mut { id }));
-+        }
-+        Ok(id)
++        assert!(a.session.doc.features.is_empty() && !undo("edit.undo"));
 +    }
 +
-     /// Add a component under `parent` and return its id.
-     pub fn add_component(&mut self, name: Option<&str>, parent: u64) -> Result<u64> {
-         if parent != 0 && !self.components.iter().any(|c| c.id == parent) {
-@@ -2504,8 +2519,7 @@ impl Document {
-         if self.components.len() >= 10_000 {
-             return Err(DocError::Invalid("too many components".into()));
-         }
--        let id = self.next_id.max(1);
--        self.next_id = id.checked_add(1).ok_or_else(|| DocError::Invalid("too many items in the design".into()))?;
-+        let id = self.new_id()?;
-         let name = match name.map(str::trim) {
-             Some(n) if !n.is_empty() => n.to_string(),
-             _ => {
-@@ -2616,8 +2630,7 @@ impl Document {
-         } else {
-             0
-         };
--        let id = self.next_id.max(1);
--        self.next_id = id.checked_add(1).ok_or_else(|| DocError::Invalid("too many items in the design".into()))?;
-+        let id = self.new_id()?;
-         let name = match name {
-             Some(n) if !n.trim().is_empty() => n.trim().to_string(),
-             _ => self.unique_name(kind.base_name()),
-diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 8fc7f21..2a94046 100644
---- a/crates/engine/src/lib.rs
-+++ b/crates/engine/src/lib.rs
-@@ -193,6 +193,8 @@ impl WorldCache {
- 
- /// An editing session on one design.
- pub struct Session {
-+    /// Names this design while it is open, wherever its tab moves (unique in this process).
-+    pub uid: u64,
-     pub doc: Arc<Document>,
-     pub model: Model,
-     pub undo: Vec<Snapshot>,
-@@ -295,6 +297,11 @@ const MAX_UNDO: usize = 200;
- const MAX_CHECKPOINTS: usize = 16;
- const MAX_LOG: usize = 2000;
- 
-+fn next_uid() -> u64 {
-+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
++    #[test]
++    fn presence_gives_the_pointer_as_a_model_point_on_its_ray_and_the_selection() {
++        let mut a = bound();
++        a.run(BOX.0, BOX.1()).unwrap();
++        let body = a.session.world_state().bodies[0].name.clone();
++        a.session.selection = vec![Sel::Body { name: body }];
++        let rect = Rect::from_min_size(egui::Pos2::ZERO, vec2(800.0, 600.0));
++        (a.viewport.rect, a.viewport.mouse, a.viewport.hover) = (Some(rect), None, None);
++        assert!(a.live_presence().get("pointer").is_none(), "no pointer off the viewport");
++        let mouse = egui::pos2(300.0, 200.0);
++        a.viewport.mouse = Some(mouse);
++        let p = a.live_presence();
++        let at: Vec<f64> = serde_json::from_value(p["pointer"].clone()).unwrap();
++        let shown = viewport::projection(&a, rect).to_screen(Vec3::new(at[0], at[1], at[2])).unwrap();
++        assert!((shown - mouse).length() < 0.5, "{shown:?}");
++        assert_eq!(serde_json::from_value::<Vec<Sel>>(p["selection"].clone()).unwrap(), a.session.selection);
++        assert_eq!(p["component"], 0);
++    }
 +}
-+
- impl Default for Session {
-     fn default() -> Self {
-         Session::new(Document::new("Untitled"))
-@@ -309,6 +316,7 @@ impl Session {
-         let mut model = Model::new();
-         model.evaluate(&doc);
-         Session {
-+            uid: next_uid(),
-             saved: doc.clone(),
-             doc,
-             model,
-@@ -776,6 +784,7 @@ impl Session {
-     /// commands on without touching this one.
-     pub fn scratch(&self) -> Session {
-         Session {
-+            uid: next_uid(),
-             doc: self.doc.clone(),
-             model: self.model.clone(),
-             undo: Vec::new(),
-diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index e90c6e1..419fd7f 100644
---- a/crates/ui-egui/src/lib.rs
-+++ b/crates/ui-egui/src/lib.rs
-@@ -240,6 +240,10 @@ impl Default for UiState {
-     }
- }
- 
-+/// Undo and Redo while the web app edits live in a Playground session: true when the session took them.
-+#[cfg(target_arch = "wasm32")]
-+pub static LIVE_UNDO: std::sync::OnceLock<fn(bool) -> bool> = std::sync::OnceLock::new();
-+
- /// Host services injected by the app so this crate stays portable.
- #[derive(Default)]
- pub struct Services {
-@@ -597,6 +601,10 @@ impl SolveApp {
- 
-     /// Run a command programmatically (JSON parameters, no dialogs).
-     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
-+        #[cfg(target_arch = "wasm32")]
-+        if matches!(id, "edit.undo" | "edit.redo") && LIVE_UNDO.get().is_some_and(|undo| undo(id == "edit.redo")) {
-+            return Ok(Value::Null);
-+        }
-         if self.file_load.busy() || self.file_picker.is_some() {
-             return Err("a file operation is in progress".into());
-         }

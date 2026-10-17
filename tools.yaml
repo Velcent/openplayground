@@ -224,8 +224,8 @@ groups:
         opens: [solidcraft, solvecraft, step, stp, iges, igs, stl, 3mf, obj]
         imports: []
         repo: bherbruck/solvecraft
-        # Its web zip is solvecraft-<tag>-web.zip; its 0.x releases are pre-releases.
-        asset: '-web\.zip$'
+        # Its web zip is solidcraft-web-<version>.zip (the default pattern; the old solvecraft-<tag>-web.zip naming
+        # stopped at v0.1.1); nightlies are pre-releases.
         # The web app and what it compiles (dependency changes show up in Cargo.lock; the root Cargo.toml holds
         # the release profile and the vendored truck patches): CI, docs and desktop-only commits don't rebuild it.
         paths: [apps/solidcraft-web, crates, vendor, Cargo.lock, Cargo.toml]
