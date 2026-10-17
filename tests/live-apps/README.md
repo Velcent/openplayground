@@ -17,6 +17,7 @@ export default {
   drag: async (page) => {},            // optional: the owner holds a gesture mid-way (no mouse up); the editor must be
                                        // shown its in-progress presence (ghost, stroke, rubber band…)
   release: async (page) => {},         // optional: ends drag() without an edit (default: Escape, then mouse up)
+  openTab: async (page) => {},         // optional: the owner opens another document; it must reach the editor
   point: async (page) => {},           // optional: the owner points at or selects something; the editor's app must
                                        // be shown the owner's presence() (draw it; check once with a screenshot)
 }

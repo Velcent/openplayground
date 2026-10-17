@@ -1,6 +1,6 @@
 diff --git a/apps/gridcraft-web/src/web/live.rs b/apps/gridcraft-web/src/web/live.rs
 new file mode 100644
-index 0000000..9a1013d
+index 0000000..f95415e
 --- /dev/null
 +++ b/apps/gridcraft-web/src/web/live.rs
 @@ -0,0 +1,77 @@
@@ -26,7 +26,7 @@ index 0000000..9a1013d
 +/// The app eframe runs: `shell`, offered to the page for live editing.
 +pub(super) fn wrap(shell: WebShell) -> Box<dyn eframe::App> {
 +    let attached = playground_live::web::attach::<SheetApp>(
-+        concat!("excel:1:", env!("CARGO_PKG_VERSION")),
++        concat!("excel:2:", env!("CARGO_PKG_VERSION")),
 +        |with| RUNNER.with(|runner| runner.get().and_then(|r| r.app_mut::<Live>().map(|mut live| with(&mut live.0.app))).is_some()),
 +        || {
 +            CONTEXT.with(|ctx| {
@@ -83,17 +83,20 @@ index 0000000..9a1013d
 +}
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..e6c7e80
+index 0000000..4c23264
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,534 @@
-+//! Live editing in a Playground session (web only): the shared document is the workbook open when the session started
-+//! (pinned by uid; if its window closes the session goes on with it as it was), as JSON. Sheets are keyed by name,
+@@ -0,0 +1,1092 @@
++//! Live editing in a Playground session (web only): the shared document is the session's workbooks as JSON, keyed by a
++//! session id: the one active when the session started (or that a joiner's active window takes) and each one opened,
++//! created or imported since by anyone, which opens behind the others' own. Closing one is personal: the session goes on
++//! with it as it was, and File › Home lists the session's workbooks to go to or open again. Sheets are keyed by name,
 +//! cells by address with their style inline (style ids are positions in a table each copy grows on its own), objects
 +//! by id. Formula results are recalculated where the workbook is, not shared. This person's active sheet, zoom, sheet
 +//! view mode, gridlines, headings and Show Formulas, scroll position and active cell, Watch Window, selection and the
-+//! file data GridCraft does not model stay local. Presence: the sheet each person is on, the cell under their pointer
-+//! and their selection, drawn over the others' grids in their color.
++//! file data GridCraft does not model stay local. Presence: the workbook and sheet each person is on, their pointer,
++//! their selection and what they are doing before it reaches the workbook (a draft being typed, a range moved or filled,
++//! a row or column edge, an object moved or resized, an ink stroke), drawn over the others' grids in their color.
 +
 +// The adapter template (patches/live/playground_live.rs), copied next to this file.
 +#[path = "playground_live.rs"]
@@ -102,15 +105,19 @@ index 0000000..e6c7e80
 +use std::cell::{Cell as Flag, RefCell};
 +use std::sync::Arc;
 +
-+use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, pos2, vec2};
-+use gridcraft_engine::core::{CellRef, RangeRef, Value as CellValue};
-+use gridcraft_engine::model::{Cell, CellStore, Formula, Sheet, Style, StyleId, StyleTable, Workbook};
-+use gridcraft_engine::{DocState, Mode, Session};
++use egui::epaint::PathShape;
++use egui::text::LayoutJob;
++use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, pos2, vec2};
++use gridcraft_engine::core::{CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value as CellValue};
++use gridcraft_engine::model::{
++    Anchor, Cell, CellStore, Formula, PatternType, Shape, ShapeKind, Sheet, Style, StyleId, StyleTable, Workbook,
++};
++use gridcraft_engine::{DocState, Mode, Selection, Session};
 +use serde::{Deserialize, Serialize};
 +use serde_json::{Map, Value, json};
 +
-+use crate::SheetApp;
 +use crate::grid::{Drag, Geo, outline_bands};
++use crate::{SheetApp, theme};
 +use playground_live::{Live, Presence};
 +
 +/// Sheet fields that are this person's view.
@@ -119,16 +126,14 @@ index 0000000..e6c7e80
 +const WATCH: &str = "_sc_watch";
 +
 +thread_local! {
-+    /// The shared workbook's `DocState::uid` (0: none yet).
-+    static SHARED: Flag<u64> = const { Flag::new(0) };
-+    /// The shared workbook as last seen, which the session goes on with if its window closes.
-+    static LAST: RefCell<Option<Arc<Workbook>>> = const { RefCell::new(None) };
++    /// The session's workbooks as this page knows them.
++    static SHARED: RefCell<Shared> = RefCell::new(Shared::default());
 +    /// A pointer is down or a text field has the keyboard (as of the last frame).
 +    static GESTURE: Flag<bool> = const { Flag::new(false) };
 +    /// Where the pointer is on screen (as of the last frame).
 +    static POINTER: Flag<Option<Pos2>> = const { Flag::new(None) };
 +    /// The others in the session, as they last showed themselves.
-+    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
++    static OTHERS: RefCell<Vec<Peer>> = const { RefCell::new(Vec::new()) };
 +}
 +
 +/// The end of each frame (web): [`playground_live::frame`], told whether a pointer or the keyboard is busy.
@@ -168,93 +173,504 @@ index 0000000..e6c7e80
 +    Some((at, (p.x - r.left()) / r.width().max(1.0), (p.y - r.top()) / r.height().max(1.0)))
 +}
 +
-+/// One of the others' ranges: a faint fill and a `width` outline in `color`, in each pane that shows it.
-+fn outline(p: &Painter, geo: &Geo, sh: &Sheet, range: RangeRef, width: f32, fill: bool, color: Color32) {
-+    let rect = geo.range_rect(sh, range);
-+    for pane in geo.range_panes(range) {
-+        let clip = pane.intersect(p.clip_rect());
-+        let p = p.with_clip_rect(clip);
-+        if fill {
-+            p.rect_filled(rect.intersect(clip.expand(4.0)), 0.0, color.gamma_multiply(0.1));
++/// The most ranges, stroke points and typed characters a presence carries.
++const MAX_SHOWN: usize = 50;
++const MAX_STROKE: usize = 200;
++const MAX_TEXT: usize = 300;
++/// The shell sends no presence over 4 KiB.
++const MAX_PRESENCE: usize = 4000;
++/// Names in tags are cut to this many characters.
++const MAX_NAME: usize = 24;
++/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
++const EASE: f64 = 0.08;
++/// A pointer's arrow, tip first: egui fills a closed path as a fan from its first point, which this shape allows.
++const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [12.5, 11.0], [7.3, 11.0], [10.4, 17.3], [7.6, 18.6], [4.5, 12.2], [0.0, 16.0]];
++
++/// The gesture under way in this person's grid, where it has its items so far, for the others' ghosts: the range a
++/// border drag moves (`move`: where it goes) or the fill handle fills (`fill`), a column's or a row's edge (`col` and
++/// `width`, `row` and `height`, in sheet points), the column whole columns move before (`before`), or a floating object
++/// moved or resized (`object`: [kind, id], `rect`: [x, y, width, height] in sheet points).
++fn drag(drag: &Drag, sh: &Sheet, sel: &Selection) -> Option<Value> {
++    let round = |f: f64| (f * 10.0).round() / 10.0;
++    Some(match *drag {
++        Drag::Move { to: Some(to), .. } => {
++            let r = sel.current();
++            json!({"move": RangeRef::new(to, to.offset_clamped(i64::from(r.height()) - 1, i64::from(r.width()) - 1)).a1()})
 +        }
-+        for side in outline_bands(rect, width, clip) {
-+            p.rect_filled(side, 0.0, color);
++        Drag::Fill { target: Some(t) } => json!({"fill": t.a1()}),
++        Drag::ResizeCol { col, .. } => json!({"col": col, "width": round(sh.col_width(col).into())}),
++        Drag::ResizeRow { row, .. } => json!({"row": row, "height": round(sh.row_height(row).into())}),
++        Drag::MoveCols { before: Some(before), .. } => json!({"before": before}),
++        Drag::Object { kind, id, .. } => {
++            let (a, _) = object(sh, Some(kind), id)?;
++            let (x, y) = (sh.col_left(a.cell.col) + f64::from(a.dx), sh.row_top(a.cell.row) + f64::from(a.dy));
++            json!({"object": [kind, id], "rect": [round(x), round(y), round(a.width.into()), round(a.height.into())]})
++        }
++        _ => return None,
++    })
++}
++
++/// What this person is typing on the active sheet `si`: a cell's draft (`cell`) or a text box's (`shape`: its id), up to
++/// its first [`MAX_TEXT`] characters.
++fn typing(app: &SheetApp, si: usize, sh: &Sheet) -> Option<Value> {
++    let text = |t: &str| t.chars().take(MAX_TEXT).collect::<String>();
++    if let Some(ed) = app.editor.as_ref().filter(|ed| ed.sheet == si) {
++        return Some(json!({"cell": ed.cell.a1(), "text": text(&ed.text)}));
++    }
++    let ed = app.text_box_editor.as_ref().filter(|ed| sh.shapes.iter().any(|s| s.id == ed.id))?;
++    Some(json!({"shape": ed.id, "text": text(&ed.text)}))
++}
++
++/// The ink stroke being drawn (sheet points), its points at least a pixel apart at this person's zoom `z`: the newest
++/// [`MAX_STROKE`], in whole points, as one flat list.
++fn stroke(ink: &[[f32; 2]], z: f32) -> Option<Value> {
++    let mut kept: Vec<[f32; 2]> = Vec::new();
++    for &p in ink {
++        if kept.last().is_none_or(|q| (p[0] - q[0]).hypot(p[1] - q[1]) * z >= 1.0) {
++            kept.push(p);
++        }
++    }
++    let kept = &kept[kept.len().saturating_sub(MAX_STROKE)..];
++    (kept.len() >= 2).then(|| kept.iter().flatten().map(|v| v.round() as i64).collect())
++}
++
++/// A floating object on `sh` by its kind (any when `None`) and id: its anchor and corner radius (sheet points).
++fn object(sh: &Sheet, kind: Option<&str>, id: u32) -> Option<(Anchor, f32)> {
++    let is = |k: &str| kind.is_none_or(|kind| kind == k);
++    let radius = |s: &Shape| if s.kind == ShapeKind::RoundedRectangle { 10.0 } else { 0.0 };
++    (sh.shapes.iter().find(|s| is("shape") && s.id == id).map(|s| (s.anchor, radius(s))))
++        .or_else(|| sh.charts.iter().find(|c| is("chart") && c.id == id).map(|c| (c.anchor, 0.0)))
++        .or_else(|| sh.images.iter().find(|c| is("image") && c.id == id).map(|c| (c.anchor, 0.0)))
++        .or_else(|| sh.slicers.iter().find(|c| is("slicer") && c.id == id).map(|c| (c.anchor, 0.0)))
++}
++
++/// Another person as they last showed themselves, with their moving marks where this grid last drew them (sheet
++/// points), eased toward where they are: the pointer, the ghost of a drag, and the stroke ([its length, how far its shown
++/// end is behind its newest point]; a length of infinity: not seen yet, shown whole at once).
++struct Peer {
++    who: Presence,
++    pointer: Option<[f64; 2]>,
++    ghost: Option<Ghost>,
++    ink: [f64; 2],
++}
++
++/// The ghost of a drag in sheet points: an area ([left, top, right, bottom] of cells or an object, with its corner radius)
++/// or the line a column's (x) or a row's (y) edge goes to.
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum Ghost {
++    Area([f64; 4], f32),
++    Col(f64),
++    Row(f64),
++}
++
++impl Peer {
++    /// One frame on toward this person's latest state on `sh` (`k`: the share of the way, `z`: screen points a sheet point,
++    /// `far`: the jump in screen points that goes at once). Whether a mark is still on its way.
++    fn step(&mut self, sh: &Sheet, k: f64, z: f64, far: f64) -> bool {
++        let state = &self.who.state;
++        let mut moving = false;
++        match (&mut self.pointer, pointer_at(sh, &state["pointer"])) {
++            (Some(s), Some(t)) => moving |= ease(s, &t, k, z, far),
++            (s, t) => *s = t,
++        }
++        match (&mut self.ghost, ghost(sh, &state["drag"])) {
++            (Some(Ghost::Area(s, r)), Some(Ghost::Area(t, q))) if *r == q => moving |= ease(s, &t, k, z, far),
++            (Some(Ghost::Col(s)), Some(Ghost::Col(t))) | (Some(Ghost::Row(s)), Some(Ghost::Row(t))) => {
++                moving |= ease(std::slice::from_mut(s), &[t], k, z, far);
++            }
++            (s, t) => *s = t,
++        }
++        let stroke = stroke_at(&state["stroke"]);
++        if stroke.is_empty() {
++            self.ink = [0.0; 2];
++        } else {
++            let [seen, behind] = &mut self.ink;
++            let length = length(&stroke);
++            *behind = (*behind + length - *seen).max(0.0);
++            *seen = length;
++            moving |= ease(std::slice::from_mut(behind), &[0.0], k, z, far);
++        }
++        moving
++    }
++}
++
++/// `s` moved `k` of the way to `t` (sheet points, `z` screen points each), all of it after a jump of more than `far`
++/// screen points or once under half a point remains. Whether it is still on its way.
++fn ease(s: &mut [f64], t: &[f64], k: f64, z: f64, far: f64) -> bool {
++    let off = |s: &[f64]| s.iter().zip(t).map(|(s, t)| (t - s).abs() * z).fold(0.0, f64::max);
++    let k = if off(s) > far { 1.0 } else { k };
++    s.iter_mut().zip(t).for_each(|(s, t)| *s += (t - *s) * k);
++    let moving = off(s) >= 0.5;
++    if !moving {
++        s.copy_from_slice(t);
++    }
++    moving
++}
++
++fn cell(v: &Value) -> Option<CellRef> {
++    v.as_str().and_then(CellRef::parse).filter(CellRef::is_valid)
++}
++
++/// The sheet point of a pointer `[cell, x, y]` (fractions of the cell's width and height) on `sh`.
++fn pointer_at(sh: &Sheet, at: &Value) -> Option<[f64; 2]> {
++    let c = cell(&at[0])?;
++    let f = |i: usize| at[i].as_f64().filter(|f| f.is_finite()).map(|f| f.clamp(0.0, 1.0));
++    Some([sh.col_left(c.col) + f(1)? * f64::from(sh.col_width(c.col)), sh.row_top(c.row) + f(2)? * f64::from(sh.row_height(c.row))])
++}
++
++/// Where a drag (see [`drag`]) has its items on `sh`. What does not resolve or fit is left out.
++fn ghost(sh: &Sheet, d: &Value) -> Option<Ghost> {
++    let range = |k: &str| d[k].as_str().and_then(RangeRef::parse).filter(|r| r.start.is_valid() && r.end.is_valid());
++    let number = |v: &Value, max: f64| v.as_f64().filter(|f| (0.0..=max).contains(f));
++    let index = |k: &str, max: u32| d[k].as_u64().filter(|&i| i < u64::from(max)).map(|i| i as u32);
++    if let Some(r) = range("move").or_else(|| range("fill")) {
++        let (right, bottom) = (sh.col_left(r.end.col) + f64::from(sh.col_width(r.end.col)), sh.row_top(r.end.row) + f64::from(sh.row_height(r.end.row)));
++        return Some(Ghost::Area([sh.col_left(r.start.col), sh.row_top(r.start.row), right, bottom], 0.0));
++    }
++    if let (Some(c), Some(w)) = (index("col", MAX_COLS), number(&d["width"], 1e4)) {
++        return Some(Ghost::Col(sh.col_left(c) + w));
++    }
++    if let (Some(r), Some(h)) = (index("row", MAX_ROWS), number(&d["height"], 1e4)) {
++        return Some(Ghost::Row(sh.row_top(r) + h));
++    }
++    if let Some(before) = index("before", MAX_COLS) {
++        return Some(Ghost::Col(sh.col_left(before)));
++    }
++    let id = u32::try_from(d["object"][1].as_u64()?).ok()?;
++    let (_, radius) = object(sh, Some(d["object"][0].as_str()?), id)?;
++    let [x, y, w, h] = [0, 1, 2, 3].map(|i| number(&d["rect"][i], 1e9));
++    Some(Ghost::Area([x?, y?, x? + w?, y? + h?], radius))
++}
++
++/// A stroke's points (sheet points) from its flat list; none unless every number is a sheet point.
++fn stroke_at(v: &Value) -> Vec<[f64; 2]> {
++    let numbers = v.as_array().into_iter().flatten().take(2 * MAX_STROKE).map(|v| v.as_f64().filter(|f| (0.0..=1e9).contains(f)));
++    numbers.collect::<Option<Vec<f64>>>().unwrap_or_default().chunks_exact(2).map(|p| [p[0], p[1]]).collect()
++}
++
++fn length(stroke: &[[f64; 2]]) -> f64 {
++    stroke.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum()
++}
++
++/// Sheet point `at` on this person's grid (through its panes, zoom and scroll).
++fn screen(geo: &Geo, sh: &Sheet, at: &[f64]) -> Pos2 {
++    let (c, r) = (sh.col_at(at[0]), sh.row_at(at[1]));
++    pos2(geo.x(sh, c) + (at[0] - sh.col_left(c)) as f32 * geo.z, geo.y(sh, r) + (at[1] - sh.row_top(r)) as f32 * geo.z)
++}
++
++/// The ghost of a drag in `color`: the area translucent with its edge, or the edge's line across the grid.
++fn paint_ghost(p: &Painter, geo: &Geo, sh: &Sheet, ghost: Ghost, color: Color32) {
++    let edge = color.gamma_multiply(0.85);
++    let cells = geo.cells;
++    match ghost {
++        Ghost::Area(a, radius) => {
++            let rect = Rect::from_min_max(screen(geo, sh, &a[..2]), screen(geo, sh, &a[2..]));
++            let last = |v: f64, start: f64| (v - 0.01).max(start);
++            let covered = RangeRef::new(
++                CellRef::new(sh.row_at(a[1]), sh.col_at(a[0])),
++                CellRef::new(sh.row_at(last(a[3], a[1])), sh.col_at(last(a[2], a[0]))),
++            );
++            let radius = radius * geo.z;
++            for pane in geo.range_panes(covered) {
++                let clip = pane.intersect(p.clip_rect());
++                // Cut to what shows (a whole column is millions of points tall), keeping its edges out of sight.
++                let shown = rect.intersect(clip.expand(radius + 4.0));
++                if shown.is_positive() {
++                    p.with_clip_rect(clip).rect(shown, radius, color.gamma_multiply(0.28), Stroke::new(1.5, edge), StrokeKind::Inside);
++                }
++            }
++        }
++        Ghost::Col(x) => {
++            let x = screen(geo, sh, &[x, 0.0]).x;
++            p.line_segment([pos2(x, cells.top()), pos2(x, cells.bottom())], Stroke::new(2.0, edge));
++        }
++        Ghost::Row(y) => {
++            let y = screen(geo, sh, &[0.0, y]).y;
++            p.line_segment([pos2(cells.left(), y), pos2(cells.right(), y)], Stroke::new(2.0, edge));
 +        }
 +    }
 +}
 +
-+/// A name in a tag of `color`, its top left at `at`.
-+fn tag(p: &Painter, at: Pos2, name: &str, color: Color32) {
-+    let name = p.layout_no_wrap(name.to_owned(), crate::theme::ui_font(11.0), Color32::WHITE);
-+    let tag = Rect::from_min_size(at, name.size() + vec2(8.0, 4.0));
-+    p.rect_filled(tag, 2.0, color);
-+    p.galley(tag.min + vec2(4.0, 2.0), name, Color32::WHITE);
++/// A stroke being drawn, up to `behind` sheet points short of its newest point: translucent, as wide as the pen.
++fn paint_stroke(p: &Painter, geo: &Geo, sh: &Sheet, stroke: &[[f64; 2]], behind: f64, color: Color32) {
++    let Some(&first) = stroke.first() else { return };
++    let mut left = length(stroke) - behind;
++    let mut line = vec![screen(geo, sh, &first)];
++    for w in stroke.windows(2) {
++        let d = (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
++        if d >= left {
++            let f = if d > 0.0 { (left / d).max(0.0) } else { 0.0 };
++            line.push(screen(geo, sh, &[w[0][0] + (w[1][0] - w[0][0]) * f, w[0][1] + (w[1][1] - w[0][1]) * f]));
++            break;
++        }
++        left -= d;
++        line.push(screen(geo, sh, &w[1]));
++    }
++    // ponytail: butt caps; round ones would show only past ~6 px wide (the pen is 2 sheet points).
++    p.add(PathShape::line(line, Stroke::new((2.0 * geo.z).max(2.0), color.gamma_multiply(0.7))));
 +}
 +
-+/// The others on this person's sheet of the shared workbook: their selections, their active cells with their names
-+/// and their pointers, in their colors. The grid's overlays call it first: `p` paints over the cells of `sh`, the
-+/// active sheet, laid out by `geo`, left to right.
-+pub(crate) fn draw_presence(app: &SheetApp, p: &Painter, geo: &Geo, sh: &Sheet) {
-+    OTHERS.with_borrow(|others| {
-+        if others.is_empty() || !shared_active(&app.session) {
-+            return;
++/// What a person is typing, where it goes: over the cell as GridCraft's cell editor shows a draft (in the cell's font,
++/// growing to the right) or over the text box, outlined in their color, with their caret at its end.
++fn paint_typing(p: &Painter, geo: &Geo, wb: &Workbook, sh: &Sheet, typing: &Value, color: Color32) {
++    let Some(text) = typing["text"].as_str() else { return };
++    let text: String = text.chars().take(MAX_TEXT).collect();
++    let (p, rect, galley, at, fill) = if let Some(c) = cell(&typing["cell"]) {
++        let range = sh.merge_at(c).unwrap_or(RangeRef::cell(c));
++        let Some(pane) = geo.range_panes(range).first().copied().filter(|_| !geo.hidden_under_frozen(sh, c)) else { return };
++        let cell = geo.range_rect(sh, range);
++        let st = wb.styles.get(sh.style_id(c));
++        let font = FontId::new(st.font.size * 96.0 / 72.0 * geo.z, theme::cell_family(&st.font.name, st.font.bold, st.font.italic));
++        let g = p.layout_no_wrap(text, font, Color32::BLACK);
++        let w = (g.size().x + 14.0).max(cell.width()).min((geo.cells.right() - cell.left()).max(cell.width()));
++        let rect = Rect::from_min_size(cell.min, vec2(w, (g.size().y + 4.0).max(cell.height())));
++        let fill = (st.fill.pattern == PatternType::Solid).then(|| st.fill.fg.resolve(&wb.theme).map(theme::color32)).flatten();
++        let at = rect.min + vec2(3.0, ((cell.height() - g.size().y) / 2.0).max(2.0));
++        (p.with_clip_rect(pane.intersect(p.clip_rect())), rect, g, at, fill)
++    } else if let Some(sp) = typing["shape"].as_u64().and_then(|id| sh.shapes.iter().find(|s| u64::from(s.id) == id)) {
++        let rect = crate::chartview::anchor_rect(geo, sh, &sp.anchor);
++        let f = &sp.format;
++        let size = f.font_size.map_or(14.0, |pt| pt * 96.0 / 72.0).clamp(1.0, 2000.0) * geo.z;
++        let font = FontId::new(size, theme::cell_family(f.font.as_deref().unwrap_or(""), f.bold, f.italic));
++        let ink = f.text_color.and_then(|c| c.resolve(&wb.theme)).map(theme::color32).unwrap_or(Color32::BLACK);
++        let g = p.layout_job(LayoutJob::simple(text, font, ink, (rect.width() - 8.0).max(1.0)));
++        (p.clone(), rect, g, rect.min + vec2(4.0, 4.0), sp.fill.resolve(&wb.theme).map(theme::color32))
++    } else {
++        return;
++    };
++    p.rect_filled(rect, 0.0, fill.unwrap_or(Color32::WHITE));
++    let caret = galley.pos_from_cursor(galley.end()).translate(at.to_vec2());
++    p.galley(at, galley, Color32::BLACK);
++    p.line_segment([caret.left_top(), caret.left_bottom()], Stroke::new(1.5, color));
++    p.rect_stroke(rect.expand(1.0), 0.0, Stroke::new(2.0, color), StrokeKind::Middle);
++}
++
++/// A person's selection in `color`: each range outlined (2 points) and faintly filled but for the active cell, as
++/// GridCraft shades its own, in each pane that shows it; and their selected object outlined.
++fn paint_selection(p: &Painter, geo: &Geo, sh: &Sheet, state: &Value, color: Color32) {
++    let ranges = state["selection"].as_array().into_iter().flatten().take(MAX_SHOWN).filter_map(Value::as_str);
++    let mut ranges: Vec<RangeRef> = ranges.filter_map(RangeRef::parse).filter(|r| r.start.is_valid() && r.end.is_valid()).collect();
++    if let Some(active) = cell(&state["active"]) {
++        if !ranges.iter().any(|r| r.contains(active)) {
++            ranges.push(sh.merge_at(active).unwrap_or(RangeRef::cell(active)));
 +        }
-+        let cell = |v: &Value| v.as_str().and_then(CellRef::parse).filter(CellRef::is_valid);
-+        for o in others.iter().filter(|o| o.state["sheet"].as_str() == Some(sh.name.as_str())) {
-+            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
-+            let ranges = o.state["selection"].as_array().into_iter().flatten().take(50).filter_map(Value::as_str);
-+            for range in ranges.filter_map(RangeRef::parse).filter(|r| r.start.is_valid() && r.end.is_valid()) {
-+                outline(p, geo, sh, range, 1.0, true, color);
-+            }
-+            if let Some(active) = cell(&o.state["active"]) {
-+                let range = sh.merge_at(active).unwrap_or(RangeRef::cell(active));
-+                outline(p, geo, sh, range, 2.0, false, color);
-+                if !geo.hidden_under_frozen(sh, active) {
-+                    let r = geo.range_rect(sh, range);
-+                    // Above the cell, or inside it at the top of the grid.
-+                    let top = if r.top() - 16.0 >= geo.cells.top() { r.top() - 16.0 } else { r.top() + 1.0 };
-+                    tag(p, pos2(r.left(), top), &o.name, color);
++        for range in ranges {
++            let rect = geo.range_rect(sh, range);
++            let one = Selection { active, anchor: active, ranges: vec![range] };
++            for pane in geo.range_panes(range) {
++                let clip = pane.intersect(p.clip_rect());
++                let p = p.with_clip_rect(clip);
++                for piece in crate::grid::selection_fill(geo, sh, &one, rect) {
++                    p.rect_filled(piece.intersect(clip.expand(4.0)), 0.0, color.gamma_multiply(0.1));
++                }
++                for side in outline_bands(rect, 2.0, clip) {
++                    p.rect_filled(side, 0.0, color);
 +                }
 +            }
-+            let at = &o.state["pointer"];
-+            let fraction = |i: usize| at[i].as_f64().filter(|f| f.is_finite()).map(|f| f.clamp(0.0, 1.0) as f32);
-+            if let (Some(c), Some(fx), Some(fy)) = (cell(&at[0]), fraction(1), fraction(2))
-+                && !geo.hidden_under_frozen(sh, c)
-+            {
-+                let r = geo.cell_rect(sh, c);
-+                let at = r.min + vec2(r.width() * fx, r.height() * fy);
-+                let arrow = vec![at, at + vec2(0.0, 15.0), at + vec2(10.0, 10.5)];
-+                p.add(Shape::convex_polygon(arrow, color, Stroke::new(1.0, Color32::WHITE)));
-+                tag(p, at + vec2(10.0, 12.0), &o.name, color);
++        }
++    }
++    if let Some((a, radius)) = state["object"].as_u64().and_then(|id| object(sh, None, u32::try_from(id).ok()?)) {
++        let r = crate::chartview::anchor_rect(geo, sh, &a);
++        p.rect_stroke(r, radius * geo.z, Stroke::new(2.0, color), StrokeKind::Outside);
++    }
++}
++
++/// A pointer: the arrow, its tip at `tip`, in `color` with a white edge and a soft shadow.
++fn paint_arrow(p: &Painter, tip: Pos2, color: Color32, rtl: bool) {
++    let mut points: Vec<Pos2> = ARROW.iter().map(|&[x, y]| tip + vec2(x, y)).collect();
++    // A right-to-left sheet flips painted paths and reverses them: the tip comes first again.
++    if rtl {
++        points.rotate_left(1);
++    }
++    let shadow = points.iter().map(|q| *q + vec2(0.0, 1.0)).collect();
++    p.add(PathShape::convex_polygon(shadow, Color32::from_black_alpha(64), Stroke::NONE));
++    p.add(PathShape::convex_polygon(points, color, Stroke::new(1.5, Color32::WHITE)));
++}
++
++/// A name tag in `color`, its top left at `at`; or, given the top of a place to go `below` instead when the grid's top
++/// would cut it, its bottom left at `at`. Dark text on light colors.
++fn paint_tag(p: &Painter, at: Pos2, below: f32, name: &str, color: Color32) {
++    if name.is_empty() {
++        return;
++    }
++    let name: String = if name.chars().count() > MAX_NAME { name.chars().take(MAX_NAME - 1).chain(['…']).collect() } else { name.into() };
++    let lin = egui::ecolor::linear_f32_from_gamma_u8;
++    let luminance = 0.2126 * lin(color.r()) + 0.7152 * lin(color.g()) + 0.0722 * lin(color.b());
++    let ink = if luminance > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE };
++    let text = p.layout_no_wrap(name, theme::ui_bold(12.0), ink);
++    let size = text.size() + vec2(14.0, 6.0);
++    let r = match below.is_nan() {
++        true => Rect::from_min_size(at, size),
++        false if at.y - size.y >= p.clip_rect().top() => Rect::from_min_size(at - vec2(0.0, size.y), size),
++        false => Rect::from_min_size(pos2(at.x, below), size),
++    };
++    p.rect_filled(r, 6.0, color);
++    p.galley(r.min + vec2(7.0, 3.0), text, ink);
++}
++
++/// The others on this person's workbook and sheet, in their colors: first what they are dragging, then their
++/// selections and drafts, then their pointers with their names (a name by the active cell for whoever's pointer is off
++/// the grid). The grid's overlays call it first: `p` paints over the cells of `sh`, the active sheet, laid out by `geo`,
++/// left to right. Marks ease toward where they were last shown, repainting until they get there.
++pub(crate) fn draw_presence(app: &SheetApp, p: &Painter, geo: &Geo, sh: &Sheet) {
++    OTHERS.with_borrow_mut(|others| {
++        let (Some(doc), Some(d)) = (active_id(&app.session).filter(|_| !others.is_empty()), app.session.active()) else { return };
++        let here = |s: &Value| s["doc"].as_u64() == Some(doc) && s["sheet"].as_str() == Some(sh.name.as_str());
++        let mut here: Vec<&mut Peer> = others.iter_mut().filter(|o| here(&o.who.state)).collect();
++        let dt = p.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
++        let (k, z) = (1.0 - (-f64::from(dt) / EASE).exp(), f64::from(geo.z));
++        let far = 0.25 * f64::from(geo.cells.width().max(geo.cells.height()));
++        let mut moving = false;
++        for o in &mut here {
++            moving |= o.step(sh, k, z, far);
++        }
++        if moving {
++            p.ctx().request_repaint();
++        }
++        let color = |o: &Peer| Color32::from_rgb(o.who.color[0], o.who.color[1], o.who.color[2]);
++        for o in &here {
++            if let Some(ghost) = o.ghost {
++                paint_ghost(p, geo, sh, ghost, color(o));
++            }
++            paint_stroke(p, geo, sh, &stroke_at(&o.who.state["stroke"]), o.ink[1], color(o));
++        }
++        for o in &here {
++            paint_selection(p, geo, sh, &o.who.state, color(o));
++            paint_typing(p, geo, &d.wb, sh, &o.who.state["typing"], color(o));
++        }
++        for o in &here {
++            let shown = |at: &[f64; 2]| !geo.hidden_under_frozen(sh, CellRef::new(sh.row_at(at[1]), sh.col_at(at[0])));
++            if let Some(tip) = o.pointer.filter(shown).map(|at| screen(geo, sh, &at)) {
++                paint_arrow(p, tip, color(o), geo.rtl);
++                paint_tag(p, tip + vec2(12.0, 15.0), f32::NAN, &o.who.name, color(o));
++            } else if let Some(active) = cell(&o.who.state["active"]).filter(|&c| !geo.hidden_under_frozen(sh, c)) {
++                let r = geo.range_rect(sh, sh.merge_at(active).unwrap_or(RangeRef::cell(active)));
++                paint_tag(p, r.left_top(), r.bottom() + 2.0, &o.who.name, color(o));
 +            }
 +        }
 +    });
 +}
 +
-+/// Whether the active workbook is the one the session shares (its Undo and Redo go to the session).
++/// The session's workbooks on this page: the one active when it started (or that it joined into), and every one opened,
++/// created or imported here or by the others since.
++#[derive(Default)]
++struct Shared {
++    docs: Vec<Doc>,
++    /// Workbooks whose `DocState::uid` is at least this were opened since the session started (uids only grow).
++    since: u64,
++    /// For [`playground_live::fresh_id`].
++    next: u64,
++}
++
++/// A workbook of the session.
++struct Doc {
++    /// Its id in the session.
++    id: u64,
++    /// Its window here; none once this person closed it (closing is personal, the workbook stays in the session).
++    uid: Option<u64>,
++    /// As last seen: what the session goes on with while it is closed here.
++    wb: Arc<Workbook>,
++    title: String,
++}
++
++/// The session id of the active workbook when it is one of the session's (its Undo and Redo go to the session).
++fn active_id(s: &Session) -> Option<u64> {
++    let uid = s.active()?.uid;
++    SHARED.with_borrow(|sh| sh.docs.iter().find(|d| d.uid == Some(uid)).map(|d| d.id))
++}
++
++/// Whether the active workbook is one the session shares.
 +pub fn shared_active(s: &Session) -> bool {
-+    SHARED.get() != 0 && s.active().is_some_and(|d| d.uid == SHARED.get())
++    active_id(s).is_some()
 +}
 +
-+/// The shared workbook's index, pinning the active one when nothing is shared yet; `None` once its window closed.
-+fn pinned(s: &Session) -> Option<usize> {
-+    if SHARED.get() == 0
-+        && let Some(d) = s.active()
-+    {
-+        SHARED.set(d.uid);
-+    }
-+    s.documents().iter().position(|d| d.uid == SHARED.get())
-+}
-+
-+/// The shared workbook: the pinned one, else as it was when its window closed (a blank one if none was ever open).
-+fn shared(s: &Session) -> Arc<Workbook> {
-+    match pinned(s).and_then(|i| s.documents().get(i)) {
-+        Some(d) => {
-+            LAST.set(Some(d.wb.clone()));
-+            d.wb.clone()
++/// Brings the session's workbooks up to date with this page's windows: the active one when nothing is shared yet, each
++/// one opened since (as a new workbook of the session), the latest of each that is open, and which ones were closed.
++fn sync(s: &Session) {
++    SHARED.with_borrow_mut(|sh| {
++        if sh.docs.is_empty() {
++            let Some(d) = s.active() else { return };
++            sh.since = s.documents().iter().map(|d| d.uid).max().unwrap_or(0) + 1;
++            let id = playground_live::fresh_id(&mut sh.next);
++            sh.docs.push(Doc { id, uid: Some(d.uid), wb: d.wb.clone(), title: d.title.clone() });
 +        }
-+        None => LAST.with_borrow(Clone::clone).unwrap_or_default(),
++        for doc in &mut sh.docs {
++            match s.documents().iter().find(|d| Some(d.uid) == doc.uid) {
++                Some(d) => (doc.wb, doc.title) = (d.wb.clone(), d.title.clone()),
++                None => doc.uid = None,
++            }
++        }
++        for d in s.documents().iter().filter(|d| d.uid >= sh.since) {
++            if !sh.docs.iter().any(|doc| doc.uid == Some(d.uid)) {
++                let id = playground_live::fresh_id(&mut sh.next);
++                sh.docs.push(Doc { id, uid: Some(d.uid), wb: d.wb.clone(), title: d.title.clone() });
++            }
++        }
++    });
++}
++
++/// File › Home in a session: the session's workbooks, a row each with dots in the colors of the others on it; a click
++/// goes to one, opening it again if this person closed it. Whether it did (Backstage then closes).
++pub(crate) fn session_list(app: &mut SheetApp, ui: &mut egui::Ui) -> bool {
++    if !playground_live::connected() {
++        return false;
 +    }
++    sync(&app.session);
++    let rows: Vec<(u64, String, Option<u64>)> = SHARED.with_borrow(|sh| sh.docs.iter().map(|d| (d.id, d.title.clone(), d.uid)).collect());
++    let (t, here) = (theme::Tokens::get(ui.ctx()), active_id(&app.session));
++    ui.add_space(6.0);
++    ui.label(egui::RichText::new("In this session").font(theme::ui_bold(15.0)).color(t.text));
++    ui.add_space(8.0);
++    let mut chosen = None;
++    for (id, title, uid) in rows {
++        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), egui::Sense::click());
++        let p = ui.painter();
++        if resp.hovered() || here == Some(id) {
++            p.rect_filled(rect, 4.0, t.hover);
++        }
++        let icon = Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(20.0, 20.0));
++        crate::icons::paint(p, icon, crate::icons::Icon::Book, t.text);
++        let note = match (here == Some(id), uid) {
++            (true, _) => "You are here",
++            (false, Some(_)) => "Open",
++            (false, None) => "Closed here: click to open it again",
++        };
++        p.text(pos2(rect.left() + 42.0, rect.center().y - 8.0), egui::Align2::LEFT_CENTER, &title, theme::ui_font(13.5), t.text);
++        p.text(pos2(rect.left() + 42.0, rect.center().y + 9.0), egui::Align2::LEFT_CENTER, note, theme::ui_font(11.5), t.text_dim);
++        let names = OTHERS.with_borrow(|others| {
++            let on = others.iter().filter(|o| o.who.state["doc"].as_u64() == Some(id));
++            on.enumerate()
++                .map(|(k, o)| {
++                    let at = pos2(rect.right() - 16.0 - 16.0 * k as f32, rect.center().y);
++                    p.circle(at, 5.0, Color32::from_rgb(o.who.color[0], o.who.color[1], o.who.color[2]), Stroke::new(1.5, Color32::WHITE));
++                    o.who.name.clone()
++                })
++                .collect::<Vec<_>>()
++        });
++        let resp = if names.is_empty() { resp } else { resp.on_hover_text(names.join(", ")) };
++        if resp.clicked() {
++            chosen = Some((id, uid));
++        }
++    }
++    ui.add_space(22.0);
++    let Some((id, uid)) = chosen else { return false };
++    let s = &mut app.session;
++    let i = match uid.and_then(|uid| s.documents().iter().position(|d| d.uid == uid)) {
++        Some(i) => i,
++        None => {
++            // Open again: a window of its own with the session's copy.
++            let found = SHARED.with_borrow(|sh| sh.docs.iter().find(|d| d.id == id).map(|d| ((*d.wb).clone(), d.title.clone())));
++            let Some((wb, title)) = found else { return false };
++            let active = s.active_index();
++            let i = s.add_document(DocState::new(wb, None, title));
++            let uid = s.documents()[i].uid;
++            SHARED.with_borrow_mut(|sh| sh.docs.iter_mut().filter(|d| d.id == id).for_each(|d| d.uid = Some(uid)));
++            s.set_active(active);
++            i
++        }
++    };
++    app.run_or_alert("window.activate", json!({"index": i}));
++    true
 +}
 +
 +/// Runs `f` on document `i` (the session lends out only the active one).
@@ -375,40 +791,104 @@ index 0000000..e6c7e80
 +    Ok(wb)
 +}
 +
++/// The session's workbooks in a shared document: (id, name, workbook).
++fn entries(document: &Value) -> Result<Vec<(u64, String, Value)>, String> {
++    let list = document["documents"].as_array().ok_or("no list of workbooks")?;
++    let entry = |v: &Value| {
++        let id = v["id"].as_u64().ok_or("a workbook without an id")?;
++        let name = v["name"].as_str().ok_or("a workbook without a name")?.to_owned();
++        let mut wb = v.clone();
++        if let Some(m) = wb.as_object_mut() {
++            (m.remove("id"), m.remove("name"));
++        }
++        Ok((id, name, wb))
++    };
++    list.iter().map(entry).collect()
++}
++
++/// What adopting the session's workbooks does to each, worked out before anything changes: (id, name, this page's copy
++/// as (window, workbook) if it has one, the workbook to install if it changed).
++type Plan = Vec<(u64, String, Option<(Option<u64>, Arc<Workbook>)>, Option<Workbook>)>;
++
++fn plan(docs: &[Doc], incoming: Vec<(u64, String, Value)>) -> Result<Plan, String> {
++    // Joining: the session's first workbook goes into the window this page offered (its active one).
++    let joining = !incoming.iter().any(|(id, ..)| docs.iter().any(|d| d.id == *id));
++    let mut plan = Vec::new();
++    for (i, (id, title, json)) in incoming.into_iter().enumerate() {
++        let old = if joining && i == 0 { docs.first() } else { docs.iter().find(|d| d.id == id) };
++        let wb = match old.is_some_and(|d| document(&d.wb).ok().as_ref() == Some(&json)) {
++            true => None,
++            false => Some(install(&old.map(|d| d.wb.clone()).unwrap_or_default(), json).map_err(|e| format!("Invalid shared workbook: {e}"))?),
++        };
++        plan.push((id, title, old.map(|d| (d.uid, d.wb.clone())), wb));
++    }
++    Ok(plan)
++}
++
 +impl Live for SheetApp {
++    /// `{ documents: [{ id, name, ...workbook }] }`: every workbook of the session, open here or not.
 +    fn live_document(&self) -> Value {
-+        // Serializing the model cannot fail (every map key is text); a null would fail every peer's check.
-+        document(&shared(&self.session)).unwrap_or_default()
++        sync(&self.session);
++        SHARED.with_borrow(|sh| {
++            let docs = sh.docs.iter().map(|d| {
++                // Serializing the model cannot fail (every map key is text); a null would fail every peer's check.
++                let mut v = document(&d.wb).unwrap_or_default();
++                (v["id"], v["name"]) = (d.id.into(), d.title.clone().into());
++                v
++            });
++            json!({"documents": docs.collect::<Vec<_>>()})
++        })
 +    }
 +
++    /// Each workbook goes into its window here; one new to the session opens in a window behind this person's, one they
++    /// closed stays closed.
 +    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
++        let incoming = entries(&document)?;
 +        let s = &mut self.session;
-+        if SHARED.get() == 0 && s.active().is_none() {
-+            // Joining with no workbook open: a window for the shared one.
++        if SHARED.with_borrow(|sh| sh.docs.is_empty()) && s.active().is_none() {
++            // Joining with no workbook open: a window for the session's first one.
 +            s.new_workbook();
 +        }
-+        let current = shared(s);
-+        if self::document(&current).ok().as_ref() == Some(&document) {
-+            return Ok(());
++        sync(s);
++        let plan = SHARED.with_borrow(|sh| plan(&sh.docs, incoming))?;
++        let active = s.active_index();
++        let mut docs = Vec::new();
++        for (id, title, old, wb) in plan {
++            let at = old.as_ref().and_then(|o| o.0).and_then(|uid| s.documents().iter().position(|d| d.uid == uid));
++            docs.extend(match (at, old) {
++                (Some(i), _) => with_doc(s, i, |d| {
++                    if let Some(mut wb) = wb {
++                        d.calc.recalc_all(&mut wb);
++                        d.wb = Arc::new(wb);
++                        d.revision += 1;
++                    }
++                    d.title.clone_from(&title);
++                    Doc { id, uid: Some(d.uid), wb: d.wb.clone(), title }
++                }),
++                (None, Some((_, last))) => Some(Doc { id, uid: None, wb: wb.map_or(last, Arc::new), title }),
++                (None, None) => {
++                    let i = s.add_document(DocState::new(wb.unwrap_or_default(), None, title.clone()));
++                    s.set_active(active);
++                    let d = &s.documents()[i];
++                    Some(Doc { id, uid: Some(d.uid), wb: d.wb.clone(), title })
++                }
++            });
 +        }
-+        let mut wb = install(&current, document).map_err(|e| format!("Invalid shared workbook: {e}"))?;
-+        let Some(i) = pinned(s) else {
-+            LAST.set(Some(Arc::new(wb)));
-+            return Ok(());
-+        };
-+        with_doc(s, i, |d| {
-+            d.calc.recalc_all(&mut wb);
-+            d.wb = Arc::new(wb);
-+            d.revision += 1;
-+            LAST.set(Some(d.wb.clone()));
-+        });
++        SHARED.with_borrow_mut(|sh| sh.docs = docs);
 +        Ok(())
 +    }
 +
 +    /// Whether every peer can install `document` (two people deleting a sheet each can leave none).
 +    fn live_check(document: &Value) -> Result<(), String> {
-+        // ponytail: decodes the whole workbook per merge (O(cells)); a lighter schema check if big sessions lag.
-+        install(&Workbook::default(), document.clone()).map(drop).map_err(|e| format!("Conflict: {e}"))
++        let docs = entries(document).map_err(|e| format!("Conflict: {e}"))?;
++        for (i, (id, _, wb)) in docs.iter().enumerate() {
++            if docs[..i].iter().any(|d| d.0 == *id) {
++                return Err("Conflict: two workbooks with one id".into());
++            }
++            // ponytail: decodes every workbook per merge (O(cells)); a lighter schema check if big sessions lag.
++            install(&Workbook::default(), wb.clone()).map_err(|e| format!("Conflict: {e}"))?;
++        }
++        Ok(())
 +    }
 +
 +    fn live_quiet(&self) -> bool {
@@ -427,46 +907,78 @@ index 0000000..e6c7e80
 +
 +    fn live_generation(&self) -> Option<u64> {
 +        use std::hash::{Hash, Hasher};
-+        let s = &self.session;
 +        let mut h = std::hash::DefaultHasher::new();
-+        match pinned(s).and_then(|i| s.documents().get(i)) {
-+            Some(d) => (d.uid, d.revision, Arc::as_ptr(&d.wb) as usize).hash(&mut h),
-+            None => LAST.with_borrow(|wb| wb.as_ref().map(Arc::as_ptr)).hash(&mut h),
++        for d in self.session.documents() {
++            (d.uid, d.revision, Arc::as_ptr(&d.wb) as usize, &d.title).hash(&mut h);
 +        }
++        SHARED.with_borrow(|sh| sh.docs.iter().for_each(|d| (d.id, d.uid, Arc::as_ptr(&d.wb) as usize).hash(&mut h)));
 +        Some(h.finish())
 +    }
 +
-+    /// `{ sheet, active, selection: [ranges], pointer?: [cell, x, y] }` (see [`pointer`]), on the shared workbook only.
++    /// `{ doc: session id, sheet, active, selection: [ranges], pointer?: [cell, x, y] (see [`pointer`]), object?: selected
++    /// id, drag?, stroke?, typing? }` (see [`drag`], [`stroke`], [`typing`]), on the session's workbooks only. A row or column edge
++    /// being dragged moves the cells after it in this copy only: the pointer is left out meanwhile.
 +    fn live_presence(&self) -> Value {
-+        let Some(d) = self.session.active().filter(|_| shared_active(&self.session)) else { return Value::Null };
++        let (Some(doc), Some(d)) = (active_id(&self.session), self.session.active()) else { return Value::Null };
 +        let Some(sh) = d.wb.active() else { return Value::Null };
-+        let sel = &d.selection;
++        let (sel, grid) = (&d.selection, &self.grid);
 +        let mut state = json!({
++            "doc": doc,
 +            "sheet": sh.name,
 +            "active": sel.active.a1(),
-+            "selection": sel.ranges.iter().take(50).map(RangeRef::a1).collect::<Vec<_>>(),
++            "selection": sel.ranges.iter().take(MAX_SHOWN).map(RangeRef::a1).collect::<Vec<_>>(),
 +        });
-+        if let Some((at, x, y)) = pointer(self, sh) {
++        if !matches!(grid.drag, Drag::ResizeCol { .. } | Drag::ResizeRow { .. })
++            && let Some((at, x, y)) = pointer(self, sh)
++        {
 +            let round = |f: f32| (f64::from(f) * 100.0).round() / 100.0;
 +            state["pointer"] = json!([at.a1(), round(x), round(y)]);
++        }
++        if let Some(id) = self.selected_chart.filter(|&id| object(sh, None, id).is_some()) {
++            state["object"] = id.into();
++        }
++        let z = grid.geo.as_ref().map_or(1.0, |g| g.z);
++        let marks = [("drag", drag(&grid.drag, sh, sel)), ("stroke", stroke(&grid.ink, z)), ("typing", typing(self, d.wb.active_sheet, sh))];
++        for (key, mark) in marks {
++            if let Some(mark) = mark {
++                state[key] = mark;
++            }
++        }
++        // The shell sends nothing bigger: the stroke's oldest points go first.
++        while state.to_string().len() > MAX_PRESENCE
++            && let Some(s) = state.get_mut("stroke").and_then(Value::as_array_mut).filter(|s| s.len() > 4)
++        {
++            s.drain(..s.len() / 4 * 2);
 +        }
 +        state
 +    }
 +
++    /// Who is still on the same workbook and sheet keeps their marks where they were drawn, to ease on from there.
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        OTHERS.set(others);
++        OTHERS.with_borrow_mut(|old| {
++            *old = (others.into_iter())
++                .map(|who| {
++                    let place = |s: &Value| (s["doc"].clone(), s["sheet"].clone());
++                    let same = |o: &&Peer| o.who.id == who.id && place(&o.who.state) == place(&who.state);
++                    let (pointer, ghost, ink) = old.iter().find(same).map_or((None, None, [f64::INFINITY, 0.0]), |o| (o.pointer, o.ghost, o.ink));
++                    Peer { who, pointer, ghost, ink }
++                })
++                .collect();
++        });
 +    }
 +
 +    fn live_disconnected(&mut self) {
 +        let s = &mut self.session;
-+        if let Some(i) = s.documents().iter().position(|d| d.uid == SHARED.get()) {
-+            // Its steps hold other people's edits.
-+            with_doc(s, i, |d| {
-+                d.undo.clear();
-+                d.redo.clear();
-+            });
++        let shared = SHARED.take();
++        for i in 0..s.documents().len() {
++            if shared.docs.iter().any(|d| d.uid == Some(s.documents()[i].uid)) {
++                // Their steps hold other people's edits.
++                with_doc(s, i, |d| {
++                    d.undo.clear();
++                    d.redo.clear();
++                });
++            }
 +        }
-+        (SHARED.set(0), LAST.set(None));
 +    }
 +}
 +
@@ -476,18 +988,22 @@ index 0000000..e6c7e80
 +    use crate::Services;
 +    use super::playground_live::{self as live, canonical};
 +
-+    /// Another person's app, its workbook not shared yet (each page pins its own).
++    /// Another person's app on a page of its own, its workbook not shared yet.
 +    fn app() -> SheetApp {
 +        let mut s = Session::new();
 +        s.new_workbook();
-+        pin(None);
++        SHARED.take();
 +        SheetApp::new(s, Services::default())
 +    }
 +
-+    /// Switches the test to `app`'s page: its active workbook is the shared one.
-+    fn pin(app: Option<&SheetApp>) {
-+        SHARED.set(app.and_then(|a| a.session.active()).map_or(0, |d| d.uid));
-+        LAST.set(None);
++    /// Switches the test to another page: the session as this page knows it goes into `saved`, `saved`'s comes in.
++    fn swap(saved: &mut Shared) {
++        SHARED.with_borrow_mut(|sh| std::mem::swap(sh, saved));
++    }
++
++    /// The session's first workbook in a shared document.
++    fn first(doc: &Value) -> &Value {
++        &doc["documents"][0]
 +    }
 +
 +    fn run(app: &mut SheetApp, id: &str, params: Value) {
@@ -507,10 +1023,12 @@ index 0000000..e6c7e80
 +        run(&mut a, "home.bold", json!({"range": "B1", "on": true}));
 +        run(&mut a, "home.insertSheet", json!({"name": "Notes"}));
 +        let doc = a.live_document();
-+        assert_eq!(doc["sheets"][0]["cells"]["B1"]["formula"]["text"], "A1*3");
-+        assert!(doc["sheets"][0]["cells"]["B1"].get("value").is_none(), "formula results are not shared");
-+        assert_eq!(doc["sheets"][0]["cells"]["B1"]["style"]["font"]["bold"], true, "styles are inline");
-+        assert_eq!(doc["sheets"][1]["id"], "Notes");
++        let cell = &first(&doc)["sheets"][0]["cells"]["B1"];
++        assert_eq!(cell["formula"]["text"], "A1*3");
++        assert!(cell.get("value").is_none(), "formula results are not shared");
++        assert_eq!(cell["style"]["font"]["bold"], true, "styles are inline");
++        assert_eq!(first(&doc)["sheets"][1]["id"], "Notes");
++        assert_eq!(first(&doc)["name"], "Book1");
 +
 +        // Views are not shared.
 +        run(&mut a, "view.zoom", json!({"percent": 150}));
@@ -537,6 +1055,8 @@ index 0000000..e6c7e80
 +        let mut a = app();
 +        live::connect();
 +        let base = a.live_document();
++        let mut page = Shared::default();
++        swap(&mut page);
 +        let mut b = app();
 +        b.live_adopt(base.clone()).unwrap();
 +        // Both add a new style: each copy gives it the next id in its own table.
@@ -545,10 +1065,10 @@ index 0000000..e6c7e80
 +        run(&mut b, "cell.set", json!({"cell": "C3", "input": "x"}));
 +        run(&mut b, "home.bold", json!({"range": "C3", "on": true}));
 +        let edited = b.live_document();
-+        pin(Some(&a));
++        swap(&mut page);
 +        let merged = SheetApp::live_merge(&base, &a.live_document(), &edited).unwrap();
-+        assert_eq!(merged["sheets"][0]["cells"]["A1"]["style"]["font"]["italic"], true);
-+        assert_eq!(merged["sheets"][0]["cells"]["C3"]["style"]["font"]["bold"], true);
++        assert_eq!(first(&merged)["sheets"][0]["cells"]["A1"]["style"]["font"]["italic"], true);
++        assert_eq!(first(&merged)["sheets"][0]["cells"]["C3"]["style"]["font"]["bold"], true);
 +        SheetApp::live_check(&merged).unwrap();
 +
 +        a.begin_edit(Some("5".into()), false);
@@ -564,43 +1084,79 @@ index 0000000..e6c7e80
 +    }
 +
 +    #[test]
-+    fn the_shared_workbook_stays_pinned_after_its_window_closes_and_undo_elsewhere_stays_native() {
++    fn the_shared_workbook_stays_after_its_window_closes_and_undo_in_one_open_before_the_session_stays_native() {
 +        let mut a = app();
++        a.session.new_workbook();
++        run(&mut a, "cell.set", json!({"cell": "A1", "input": "private"}));
++        a.session.set_active(0);
 +        run(&mut a, "cell.set", json!({"cell": "A1", "input": "shared"}));
 +        let doc = a.live_document();
 +        assert!(shared_active(&a.session));
-+        a.session.new_workbook();
-+        run(&mut a, "cell.set", json!({"cell": "A1", "input": "private"}));
-+        assert!(!shared_active(&a.session), "Undo in another workbook is its own");
++        a.session.set_active(1);
++        assert!(!shared_active(&a.session), "Undo in a workbook open before the session is its own");
 +        assert_eq!(canonical(&a.live_document()), canonical(&doc));
-+        let shared = a.session.documents().iter().position(|d| d.title == "Book1").unwrap();
-+        a.session.close_document(shared);
++        a.session.close_document(0);
 +        assert_eq!(canonical(&a.live_document()), canonical(&doc), "not the private workbook");
 +        a.session.close_document(0);
 +        assert_eq!(canonical(&a.live_document()), canonical(&doc), "never null");
 +        let mut edited = doc.clone();
-+        edited["sheets"][0]["cells"]["B2"] = json!({"value": {"t": "Number", "v": 7.0}});
++        edited["documents"][0]["sheets"][0]["cells"]["B2"] = json!({"value": {"t": "Number", "v": 7.0}});
 +        a.live_adopt(edited.clone()).unwrap();
 +        assert_eq!(canonical(&a.live_document()), canonical(&edited), "remote changes go on in it");
 +    }
 +
 +    #[test]
++    fn a_workbook_opened_in_a_session_reaches_the_others_behind_their_own_and_stays_closed_where_closed() {
++        let mut a = app();
++        let base = a.live_document();
++        let mut page = Shared::default();
++        swap(&mut page);
++        let mut b = app();
++        b.live_adopt(base).unwrap();
++        swap(&mut page);
++        run(&mut a, "file.new", json!({}));
++        run(&mut a, "cell.set", json!({"cell": "A1", "input": "new"}));
++        let opened = a.live_document();
++        assert_eq!(opened["documents"].as_array().map(Vec::len), Some(2), "it joins the session");
++        swap(&mut page);
++        b.live_adopt(opened.clone()).unwrap();
++        assert_eq!((b.session.documents().len(), b.session.active_index()), (2, 0), "a window behind b's own");
++        assert_eq!(canonical(&b.live_document()), canonical(&opened));
++        b.session.close_document(1);
++        assert_eq!(canonical(&b.live_document()), canonical(&opened), "closing is personal");
++        let mut edited = opened.clone();
++        edited["documents"][1]["sheets"][0]["cells"]["B1"] = json!({"value": {"t": "Number", "v": 2.0}});
++        b.live_adopt(edited.clone()).unwrap();
++        assert_eq!(b.session.documents().len(), 1, "a change does not open it again");
++        assert_eq!(canonical(&b.live_document()), canonical(&edited));
++    }
++
++    #[test]
 +    fn presence_names_the_sheet_the_selection_and_the_cell_under_the_pointer_in_the_shared_workbook_only() {
 +        let mut a = app();
++        a.session.new_workbook();
++        a.session.set_active(0);
 +        run(&mut a, "home.insertSheet", json!({"name": "Notes"}));
-+        a.live_document();
++        let doc = first(&a.live_document())["id"].clone();
 +        run(&mut a, "selection.set", json!({"range": "A1:B2,D4", "active": "D4"}));
-+        let d = a.session.active().unwrap();
-+        let sh = d.wb.active().unwrap();
++        let wb = a.session.active().unwrap().wb.clone();
++        let sh = wb.active().unwrap();
 +        let geo = Geo::new(sh, Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)), egui::Vec2::ZERO);
 +        let c3 = geo.cell_rect(sh, CellRef::parse("C3").unwrap());
 +        POINTER.set(Some(c3.min + vec2(c3.width() / 4.0, c3.height() / 2.0)));
 +        a.grid.geo = Some(geo);
-+        assert_eq!(a.live_presence(), json!({"sheet": "Notes", "active": "D4", "selection": ["A1:B2", "D4"], "pointer": ["C3", 0.25, 0.5]}));
++        let state = json!({"doc": doc, "sheet": "Notes", "active": "D4", "selection": ["A1:B2", "D4"], "pointer": ["C3", 0.25, 0.5]});
++        assert_eq!(a.live_presence(), state);
 +        POINTER.set(None);
 +        assert!(a.live_presence().get("pointer").is_none(), "no pointer off the grid");
-+        a.session.new_workbook();
-+        assert_eq!(a.live_presence(), Value::Null, "nothing from another workbook");
++        // A fill under way: the others see its ghost over the range it fills so far.
++        a.grid.drag = Drag::Fill { target: RangeRef::parse("D4:D9") };
++        let Some(Ghost::Area(at, _)) = ghost(sh, &a.live_presence()["drag"]) else { panic!("no ghost for a fill") };
++        let (geo, d4) = (a.grid.geo.as_ref().unwrap(), RangeRef::parse("D4:D9").unwrap());
++        let ghost = Rect::from_min_max(screen(geo, sh, &at[..2]), screen(geo, sh, &at[2..]));
++        assert!((ghost.min - geo.range_rect(sh, d4).min).length() + (ghost.max - geo.range_rect(sh, d4).max).length() < 0.01);
++        a.session.set_active(1);
++        assert_eq!(a.live_presence(), Value::Null, "nothing from a workbook outside the session");
 +    }
 +
 +    #[test]
@@ -608,14 +1164,16 @@ index 0000000..e6c7e80
 +        let mut a = app();
 +        run(&mut a, "home.insertSheet", json!({"name": "S2"}));
 +        let base = a.live_document();
++        let mut page = Shared::default();
++        swap(&mut page);
 +        let mut b = app();
 +        b.live_adopt(base.clone()).unwrap();
 +        run(&mut b, "home.deleteSheet", json!({"sheet": 1}));
 +        let edited = b.live_document();
-+        pin(Some(&a));
++        swap(&mut page);
 +        run(&mut a, "home.deleteSheet", json!({"sheet": 0}));
 +        let merged = SheetApp::live_merge(&base, &a.live_document(), &edited).unwrap();
-+        assert_eq!(merged["sheets"], json!([]), "each deleted a different sheet");
++        assert_eq!(first(&merged)["sheets"], json!([]), "each deleted a different sheet");
 +        assert!(SheetApp::live_check(&merged).is_err());
 +        assert!(SheetApp::live_check(&Value::Null).is_err());
 +        SheetApp::live_check(&base).unwrap();

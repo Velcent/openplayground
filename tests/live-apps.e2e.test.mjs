@@ -10,7 +10,8 @@ import { until } from './helpers.mjs'
 // two edits to different objects, then Undo of the owner's; `ignore` lists path prefixes of allocator counters. An app
 // that keeps media outside the document also exports importMedia(page), which adds one in the owner's browser; one
 // that shows the others' pointers and selections exports point(page), which moves or selects in the owner's; drag(page)
-// holds a gesture mid-way (mouse down, no release), and release(page) ends it without an edit (default: Escape, up).
+// holds a gesture mid-way (mouse down, no release), and release(page) ends it without an edit (default: Escape, up);
+// openTab(page) opens another document in the owner's app (shared tabs).
 const publicDir = process.env.LIVE_PUBLIC
 const only = process.env.LIVE_APPS?.split(',')
 const specs = readdirSync(new URL('./live-apps/', import.meta.url)).filter((f) => f.endsWith('.mjs'))
@@ -117,6 +118,13 @@ for (const slug of specs) {
       await app.importMedia(a)
       await same([a, b], 'the owner\'s import to reach the editor', JSON.stringify(undone))
       await sameMedia([a, b], 'the imported media to reach the editor')
+    }
+
+    // A second document opened in the session (shared tabs) reaches the editor, and the late viewer gets both.
+    if (app.openTab) {
+      const before = await json(a)
+      await app.openTab(a)
+      await same([a, b], 'the owner\'s new document to reach the editor', before)
     }
 
     const c = await open(app)

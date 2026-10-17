@@ -319,8 +319,9 @@
             playground::report_unsaved(self.app.session.documents().iter().any(|d| d.is_dirty()));
 
 # Live editing in Playground sessions (patches/excel/live.diff + patches/live/playground_live.rs)
-# What it's for: people in a Playground session edit one workbook together and see each other's sheet, selection,
-#   active cell and pointer, in each person's color.
+# What it's for: people in a Playground session edit the session's workbooks together (the one open when it started and
+#   every one opened since, which reaches the others behind their own) and see each other's workbook, sheet, selection,
+#   pointer and gestures under way (drafts, moves, fills, edges, objects, ink), in each person's color.
 # How: the adapter lives in new files: crates/ui-egui/src/live.rs (the shared document, merge, adopt, Undo, presence;
 #   it declares the template, copied next to it) and apps/gridcraft-web/src/web/live.rs (the kept runner and the shell
 #   that ends each frame with the session's frame hook). These rules only declare them and call in, each one line at
@@ -363,3 +364,10 @@
   file: apps/gridcraft-web/src/web.rs
   find: 'Ok\(Box::new\((?=\s*WebShell\b)'
   replace: 'Ok(live::wrap('
+# File › Home: the session's workbooks ("In this session", with dots for who is on each), the way to one the others
+# opened (GridCraft shows one workbook at a time and has no window list). The parameter names are in the anchor so a
+# rename fails here, not in the compiler.
+- live: true
+  file: crates/ui-egui/src/backstage.rs
+  find: '\bfn\s+home\s*\(\s*app\b[^{]*\bui\b[^{]*\bout\b[^{]*\{'
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] if crate::live::session_list(app, ui) { out.close = true; }"
