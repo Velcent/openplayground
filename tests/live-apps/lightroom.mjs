@@ -1,7 +1,8 @@
 // LightCraft (lightroom): a fresh profile opens the demo library on its first photo in Detail view. The owner rates
 // that photo 1 star (key 1); the editor steps to the next photo (Right arrow) and rates it 2 stars; Ctrl+Z is the
 // owner's Undo (crates/ui-egui/src/shortcuts.rs: 0-5 rate the active photo, the arrows step through the filmstrip).
-// The owner then imports a photo: its original reaches the others as a session file.
+// The owner then imports a photo: its original reaches the others as a session file. drag() holds the Exposure slider
+// (presence `adjust`) and lets go with nothing changed.
 // Each page has its own browser context, so LightCraft's one-tab-per-browser lock never trips.
 import { until } from '../helpers.mjs'
 
@@ -29,6 +30,21 @@ export default {
   point: async (page) => {
     await page.mouse.move(480, 345)
     await until(() => page.evaluate(() => !!playgroundLiveAdapter.presence()?.pointer), 10000, 'the pointer on the photo')
+  },
+  // Holds a drag of the Edit panel's Exposure slider by its thumb (a fresh profile shows it there at 1280×800). Shift
+  // makes it a fine drag, which moves the value by the pointer's sideways travel only (widgets.rs `slider`): straight
+  // down, the value stays where it is. Presence `adjust` names the slider while it is held; let go, the interaction
+  // ends with nothing changed (Escape would be Back, which leaves the loupe mid-drag).
+  drag: async (page) => {
+    await page.mouse.move(1100, 450)
+    await page.keyboard.down('Shift')
+    await page.mouse.down()
+    for (let i = 1; i <= 6; i++) { await page.mouse.move(1100, 450 + 4 * i); await page.waitForTimeout(50) }
+    await page.waitForTimeout(300)
+  },
+  release: async (page) => {
+    await page.mouse.up()
+    await page.keyboard.up('Shift')
   },
   // File ▸ Import Photos… (file.addPhotos) opens the browser's file picker; the photo is a 16×16 PNG drawn here.
   importMedia: async (page) => {
