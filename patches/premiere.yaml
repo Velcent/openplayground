@@ -380,9 +380,12 @@
   after: "\n        #[cfg(any(target_arch = \"wasm32\", debug_assertions))] if filmcraft_project::playground_live::undo(true) { return None; }"
 
 # Rule 19: the UI crate's live module (wasm, and the crate's own tests).
-# Rule 20: the others' pointers and selected clips, drawn on the Timeline in their colors: in timeline::show right
-#   before its interaction pass (the clips are drawn; `layout` is this frame's). If that call moves, call it anywhere
-#   in timeline::show after the clips are painted, with the frame's Layout.
+# Rule 20: the others' pointers, playheads, selected clips and drags, drawn on the Timeline in their colors: in
+#   timeline::show right before its interaction pass (the clips are drawn; `layout` is this frame's). If that call
+#   moves, call it anywhere in timeline::show after the clips are painted, with the frame's Layout.
+# Rule 20a: the Timeline's own drag preview (preview_drag) opened to the crate, so a person's presence carries a drag
+#   under way exactly where their Timeline shows its clips. Verify: hold a clip drag in one browser, the other shows a
+#   ghost there. If upstream renames it, open whatever fills the clips' (start, duration, track) preview.
 - live: true
   file: crates/ui-egui/src/lib.rs
   find: '(?![\s\S])'
@@ -391,6 +394,10 @@
   file: crates/ui-egui/src/panels/timeline.rs
   find: '^\s*interact\(app,'
   before: "    #[cfg(any(target_arch = \"wasm32\", test))] crate::live::paint_timeline(app, ui, &layout);\n"
+- live: true
+  file: crates/ui-egui/src/panels/timeline.rs
+  find: '^(?:pub(?:\([^)]*\))?\s+)?fn\s+preview_drag\b'
+  replace: 'pub(crate) fn preview_drag'
 
 # Rules 21–23: the web glue. The module; the app the web runner starts wrapped in live::Shell, which delegates every
 #   eframe::App method to WebApp, then runs the session's frame hook, and gives the runner `as_any_mut`; and the

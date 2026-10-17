@@ -9,7 +9,8 @@ import { until } from './helpers.mjs'
 // tests/live-apps/<slug>.mjs exports { path, viewport?, ready?(page), editA(page), editB(page), undo(page), ignore? }:
 // two edits to different objects, then Undo of the owner's; `ignore` lists path prefixes of allocator counters. An app
 // that keeps media outside the document also exports importMedia(page), which adds one in the owner's browser; one
-// that shows the others' pointers and selections exports point(page), which moves or selects in the owner's.
+// that shows the others' pointers and selections exports point(page), which moves or selects in the owner's; drag(page)
+// holds a gesture mid-way (mouse down, no release), and release(page) ends it without an edit (default: Escape, up).
 const publicDir = process.env.LIVE_PUBLIC
 const only = process.env.LIVE_APPS?.split(',')
 const specs = readdirSync(new URL('./live-apps/', import.meta.url)).filter((f) => f.endsWith('.mjs'))
@@ -77,12 +78,26 @@ for (const slug of specs) {
     await until(async () => await status(a) === 'live' && await status(b) === 'live', 30000, 'live editing')
     const start = JSON.parse(await same([a, b], 'the joiner to adopt the owner\'s document'))
 
-    if (app.point) {
+    if (app.point || app.drag) {
       // What the editor's app is given to show of the others.
       await b.evaluate(() => {
         const show = playgroundLiveAdapter.showPresence
         playgroundLiveAdapter.showPresence = (others) => { window.shownPresence = others; return show(others) }
       })
+    }
+    // A gesture held mid-way (no release): the editor is shown its in-progress state, which at rest is not there.
+    if (app.drag) {
+      const id = await a.evaluate(() => session.id), rest = await a.evaluate(() => playgroundLiveAdapter.presence())
+      await app.drag(a)
+      const held = await a.evaluate(() => playgroundLiveAdapter.presence())
+      assert.ok(Object.keys(held ?? {}).some((k) => !(k in (rest ?? {}))), 'drag() gives the owner an in-progress field in presence()')
+      await until(() => b.evaluate(([id, held]) => JSON.stringify(window.shownPresence?.find((p) => p.id === id)?.state) === JSON.stringify(held), [id, held]), 10000, 'the owner\'s gesture to reach the editor mid-way')
+      // Cancelled, so nothing changes: Escape first, then let go.
+      if (app.release) await app.release(a)
+      else { await a.keyboard.press('Escape'); await a.mouse.up() }
+      await a.waitForTimeout(300)
+    }
+    if (app.point) {
       await app.point(a)
       const [id, mine] = await a.evaluate(() => [session.id, playgroundLiveAdapter.presence()])
       assert.notEqual(mine, null, 'point() gives the owner a presence')

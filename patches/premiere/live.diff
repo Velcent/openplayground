@@ -105,30 +105,32 @@ index 0000000..cea9cd3
 +}
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..36f1702
+index 0000000..82749f4
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,656 @@
 +//! Live editing in a Playground session (web only). The shared document is the open project (`Project`). What each
 +//! person sees for themselves (selection, playheads, open sequences, Timeline zoom and scroll, panels, the Source
 +//! monitor) already lives outside it, in the engine's `EditorState` and the UI; so does what belongs to this machine:
 +//! the renderer, the scratch disks and record-armed tracks. Imported media (files the project refers to by path,
 +//! `/files/<name>` on the web) travel as session files: the web host reads and installs their bytes.
-+//! Presence: each person's sequence, Timeline pointer (track and time) and selected clips, drawn on the others'
-+//! Timeline in that person's color.
++//! Presence: each person's sequence, Timeline pointer (track and time), playhead, selected clips and the clip or
++//! transition drag under way, drawn on the others' Timeline in that person's color and eased toward where it last was.
 +
 +use std::cell::{Cell, RefCell};
-+use std::collections::BTreeSet;
++use std::collections::{BTreeSet, HashMap};
 +use std::sync::Arc;
 +
-+use egui::{Color32, FontId, Pos2, Rect, Shape, Stroke, StrokeKind, pos2, vec2};
++use egui::emath::GuiRounding as _;
++use egui::{Color32, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2, pos2, vec2};
 +use filmcraft_project::playground_live::{self, Live, Presence};
-+use filmcraft_project::{ClipId, MediaClip, MediaRef, Project, ProjectItem, ProjectSettings};
++use filmcraft_project::{ClipId, MediaClip, MediaRef, Project, ProjectItem, ProjectSettings, Sequence};
 +use filmcraft_time::Tick;
 +use serde_json::{Map, Value, json};
 +
 +use crate::FilmcraftApp;
-+use crate::panels::timeline::Layout;
++use crate::panels::timeline::{Drag, Layout, Row, preview_drag};
++use crate::theme::Tokens;
 +
 +thread_local! {
 +    /// The last frame had a pointer button down or a text field focused.
@@ -137,11 +139,11 @@ index 0000000..36f1702
 +    static POINTER: Cell<Option<Pos2>> = const { Cell::new(None) };
 +    /// The Timeline was shown this frame ([`paint_timeline`]).
 +    static SHOWN: Cell<bool> = const { Cell::new(false) };
-+    /// The others in the session.
-+    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
++    /// The others in the session, with their marks as this person's Timeline last drew them.
++    static OTHERS: RefCell<Vec<(Presence, Shown)>> = const { RefCell::new(Vec::new()) };
 +}
 +
-+/// Clips sent as this person's selection, at most.
++/// Clips sent as this person's selection, or as a drag's, at most.
 +const MAX_SELECTION: usize = 50;
 +
 +/// Project settings that belong to this machine.
@@ -150,6 +152,12 @@ index 0000000..36f1702
 +/// Lists the model keeps in time order (`start`).
 +const TIMED: [&str; 4] = ["items", "transitions", "markers", "captions"];
 +
++/// How long the others' marks take to go most (1 - 1/e) of the way to their latest place, in seconds.
++const EASE: f64 = 0.08;
++
++/// The most characters of a name tag.
++const MAX_NAME: usize = 24;
++
 +/// The end of a frame: [`playground_live::frame`], with what egui knows of the pointer and the keyboard.
 +pub fn frame(app: &mut FilmcraftApp, ctx: &egui::Context) {
 +    INPUT.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
@@ -157,45 +165,201 @@ index 0000000..36f1702
 +    playground_live::frame(app);
 +}
 +
-+/// The others' pointers and selected clips on this person's Timeline, in their colors, when they show the same
-+/// sequence. Called after the Timeline drew its clips (`layout` is this frame's).
++/// Another person's moving marks as this Timeline last drew them, eased toward their latest presence: the pointer
++/// (seconds, row), the playhead (seconds) and a drag's ghosts (whether a transition; start, row, duration). A row counts
++/// the tracks from the top, plus the fraction down one; -1 is the ruler. All in the sequence's terms, so this person's
++/// own scrolling and zooming never lag.
++#[derive(Default)]
++struct Shown {
++    pointer: Option<[f64; 2]>,
++    playhead: Option<[f64; 1]>,
++    ghosts: Vec<(bool, [f64; 3])>,
++}
++
++impl Shown {
++    /// `dt` seconds on toward `to`; `px`: points a second and a row; `far`: a quarter of the view's width and height,
++    /// past which a mark goes at once, as it does when first seen or when the drag's ghosts change. Whether a mark is
++    /// still on its way.
++    fn step(&mut self, to: Shown, dt: f32, [x, y]: [f64; 2], [fx, fy]: [f64; 2]) -> bool {
++        let k = 1.0 - (-f64::from(dt.clamp(0.0, 0.1)) / EASE).exp();
++        let mut moving = ease_to(&mut self.pointer, to.pointer, k, [x, y], [fx, fy]);
++        moving |= ease_to(&mut self.playhead, to.playhead, k, [x], [fx]);
++        if self.ghosts.len() == to.ghosts.len() && self.ghosts.iter().zip(&to.ghosts).all(|(s, t)| s.0 == t.0) {
++            for (s, t) in self.ghosts.iter_mut().zip(to.ghosts) {
++                moving |= ease(&mut s.1, t.1, k, [x, y, x], [fx, fy, fx]);
++            }
++        } else {
++            self.ghosts = to.ghosts;
++        }
++        moving
++    }
++}
++
++/// [`ease`], where a mark that was not there or is gone goes at once.
++fn ease_to<const N: usize>(s: &mut Option<[f64; N]>, t: Option<[f64; N]>, k: f64, px: [f64; N], far: [f64; N]) -> bool {
++    if let (Some(s), Some(t)) = (s.as_mut(), t) {
++        return ease(s, t, k, px, far);
++    }
++    *s = t;
++    false
++}
++
++/// `s` moved `k` of the way to `t`; all of it after a jump wider than `far` points on an axis, or once under half a
++/// point remains (`px`: points a unit). Whether it is still on its way.
++fn ease<const N: usize>(s: &mut [f64; N], t: [f64; N], k: f64, px: [f64; N], far: [f64; N]) -> bool {
++    let off = |s: &[f64; N], i: usize| ((t[i] - s[i]) * px[i]).abs();
++    if (0..N).any(|i| !(off(s, i) <= far[i])) {
++        *s = t;
++        return false;
++    }
++    for i in 0..N {
++        s[i] += (t[i] - s[i]) * k;
++    }
++    let moving = (0..N).any(|i| off(s, i) >= 0.5);
++    if !moving {
++        *s = t;
++    }
++    moving
++}
++
++/// Where a person's presence `state` puts their marks, in [`Shown`]'s terms (`row`: a track's row from the top).
++/// Remote data: what does not resolve is left out.
++fn targets(state: &Value, row: impl Fn(u64) -> Option<f64>) -> Shown {
++    let seconds = |v: &Value| v.as_i64().map(|t| Tick(t).seconds());
++    let down = |v: &Value| v.as_f64().filter(|y| (0.0..=1.0).contains(y)).unwrap_or(0.5);
++    let p = &state["pointer"];
++    let on = match p.get("track") {
++        Some(track) => track.as_u64().and_then(&row),
++        None => Some(-1.0),
++    };
++    let ghost = |g: &Value, transition| Some((transition, [seconds(&g[1])?, row(g[0].as_u64()?)?, seconds(&g[2])?.max(0.0)]));
++    Shown {
++        pointer: seconds(&p["time"]).zip(on).map(|(t, on)| [t, on + down(&p["y"])]),
++        playhead: seconds(&state["playhead"]).map(|t| [t]),
++        ghosts: (state["ghosts"].as_array().into_iter().flatten().take(MAX_SELECTION))
++            .filter_map(|g| ghost(g, false))
++            .chain(ghost(&state["transition"], true))
++            .collect(),
++    }
++}
++
++/// The others on this person's Timeline, in their colors, when they show the same sequence: their playheads and the
++/// ghosts of their drags, then outlines around their selected clips (where the clips are in this person's project),
++/// then their pointers. Called after the Timeline drew its clips and playhead (`layout` is this frame's).
 +pub fn paint_timeline(app: &FilmcraftApp, ui: &egui::Ui, layout: &Layout) {
 +    SHOWN.set(true);
 +    let (Some(id), Some(seq)) = (app.session.state.active_sequence, app.session.active_sequence()) else { return };
-+    let painter = ui.painter().with_clip_rect(layout.content);
-+    // Remote numbers: clamped to the visible area (a pointer off it is left out).
-+    let (left, right) = (layout.content.min.x - 8.0, layout.content.max.x + 8.0);
-+    let x = |t: i64| layout.x_of(Tick(t)).clamp(left, right);
-+    let row = |track: u64| layout.rows.iter().find(|r| r.track.0 == track);
-+    OTHERS.with_borrow(|others| {
-+        for o in others.iter().filter(|o| o.state["sequence"].as_u64() == Some(id.0)) {
++    let (content, ruler) = (layout.content, layout.ruler);
++    let mut rows: Vec<&Row> = layout.rows.iter().collect();
++    rows.sort_by(|a, b| a.rect.min.y.total_cmp(&b.rect.min.y));
++    let row = |track: u64| rows.iter().position(|r| r.track.0 == track).map(|i| i as f64);
++    // The band of row `v`, moved down by its fraction: the ruler's, or a track's.
++    let band = |v: f64| {
++        if v < 0.0 {
++            return Some(ruler.translate(vec2(0.0, (v.max(-1.0) + 1.0) as f32 * ruler.height())));
++        }
++        let i = (v as usize).min(rows.len().checked_sub(1)?);
++        let r = rows[i].rect;
++        Some(r.translate(vec2(0.0, (v - i as f64) as f32 * r.height())))
++    };
++    // Remote numbers: x clamped to just past the visible area.
++    let x = |t: Tick| layout.x_of(t).clamp(content.min.x - 8.0, content.max.x + 8.0);
++    let at = |s: f64| x(Tick::from_seconds_f64(s));
++    // Video rows show above the divider, audio rows below it.
++    let area = |r: Rect| match r.center().y < layout.split_y {
++        true => Rect::from_x_y_ranges(content.x_range(), content.min.y..=layout.split_y),
++        false => Rect::from_x_y_ranges(content.x_range(), layout.split_y..=content.max.y),
++    };
++    let marks = ui.painter().with_clip_rect(content);
++    let tall = ui.painter().with_clip_rect(Rect::from_min_max(pos2(content.min.x, ruler.min.y), content.max));
++    let px = [layout.pps, rows.first().map_or(30.0, |r| f64::from(r.rect.height()))];
++    let far = [f64::from(content.width()) / 4.0, f64::from(content.height()) / 4.0];
++    let dt = ui.input(|i| i.stable_dt);
++    let mut moving = false;
++    OTHERS.with_borrow_mut(|others| {
++        let mut here: Vec<_> = others.iter_mut().filter(|(o, _)| o.state["sequence"].as_u64() == Some(id.0)).collect();
++        for (o, shown) in &mut here {
++            moving |= shown.step(targets(&o.state, row), dt, px, far);
++            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
++            if let Some(at) = shown.playhead.map(|[s]| layout.x_of(Tick::from_seconds_f64(s))).filter(|x| content.x_range().contains(*x)) {
++                let at = tall.round_to_pixel_center(at);
++                tall.line_segment([pos2(at, ruler.min.y), pos2(at, content.max.y)], Stroke::new(1.0, color));
++            }
++            for &(transition, [s, v, d]) in &shown.ghosts {
++                let Some(r) = band(v) else { continue };
++                let (x0, x1) = (at(s), at(s + d));
++                let top = if transition { 17.0 } else { 1.0 };
++                let body = Rect::from_min_max(pos2(x0, r.min.y + top), pos2(x1.max(x0 + 1.0), r.max.y - 1.0));
++                let edge = Stroke::new(1.5, color.gamma_multiply(0.85));
++                marks.with_clip_rect(area(r)).rect(body, 0.0, color.gamma_multiply(0.28), edge, StrokeKind::Inside);
++            }
++        }
++        for (o, _) in &here {
 +            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
 +            for clip in o.state["selection"].as_array().into_iter().flatten().take(MAX_SELECTION).filter_map(Value::as_u64) {
 +                let Some((track, item)) = seq.find_item(ClipId(clip)) else { continue };
-+                let Some(r) = row(track.0) else { continue };
-+                let (x0, x1) = (x(item.start.0), x(item.end().0));
-+                painter.rect_stroke(Rect::from_x_y_ranges(x0..=x1, r.rect.y_range()), 2.0, Stroke::new(2.0, color), StrokeKind::Inside);
++                let Some(r) = layout.rows.iter().find(|r| r.track == track) else { continue };
++                // The Timeline's own selection border (draw_clip), in their color.
++                let (x0, x1) = (x(item.start), x(item.end()));
++                let body = Rect::from_min_max(pos2(x0, r.rect.min.y + 1.0), pos2(x1.max(x0 + 1.0), r.rect.max.y - 1.0));
++                marks.with_clip_rect(area(r.rect)).rect_stroke(body, 0.0, Stroke::new(2.0, color), StrokeKind::Inside);
 +            }
-+            let pointer = &o.state["pointer"];
-+            let px = pointer["time"].as_i64().map(x).filter(|x| (left..right).contains(x));
-+            if let (Some(r), Some(x)) = (pointer["track"].as_u64().and_then(row), px) {
-+                arrow(&painter, pos2(x, r.rect.center().y), color, &o.name);
++        }
++        for (o, shown) in &here {
++            let tip = shown.pointer.and_then(|[s, v]| Some(pos2(layout.x_of(Tick::from_seconds_f64(s)), band(v)?.min.y)));
++            if let Some(tip) = tip.filter(|p| tall.clip_rect().contains(*p)) {
++                cursor(ui.painter(), tip, Color32::from_rgb(o.color[0], o.color[1], o.color[2]), &o.name);
 +            }
 +        }
 +    });
++    if moving {
++        ui.ctx().request_repaint();
++    }
 +}
 +
-+/// A pointer arrow at `tip` with a name tag, in `color`.
-+fn arrow(painter: &egui::Painter, tip: Pos2, color: Color32, name: &str) {
-+    let points = [vec2(0.0, 0.0), vec2(0.0, 16.0), vec2(11.0, 11.0)].map(|v| tip + v).to_vec();
-+    painter.add(Shape::convex_polygon(points, color, Stroke::new(1.0, Color32::WHITE)));
++/// A pointer at `tip` with a name tag, in `color` (the look every Playground app shares).
++fn cursor(painter: &egui::Painter, tip: Pos2, color: Color32, name: &str) {
++    const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
++    // Star-shaped around the tip (its first point), which is what a filled path's triangle fan needs.
++    let arrow = |d: Vec2| ARROW.iter().map(|&[x, y]| tip + d + vec2(x, y)).collect::<Vec<_>>();
++    let shadow = Color32::from_black_alpha(64);
++    painter.add(Shape::convex_polygon(arrow(vec2(0.0, 1.0)), shadow, Stroke::new(1.5, shadow)));
++    painter.add(Shape::convex_polygon(arrow(Vec2::ZERO), color, Stroke::new(1.5, Color32::WHITE)));
 +    if name.is_empty() {
 +        return;
 +    }
-+    let text = painter.layout_no_wrap(name.to_owned(), FontId::proportional(11.0), Color32::WHITE);
-+    let tag = Rect::from_min_size(tip + vec2(10.0, 13.0), text.size() + vec2(8.0, 4.0));
-+    painter.rect_filled(tag, 3.0, color);
-+    painter.galley(tag.min + vec2(4.0, 2.0), text, Color32::WHITE);
++    let name: String = match name.chars().count() > MAX_NAME {
++        true => name.chars().take(MAX_NAME - 1).chain(['…']).collect(),
++        false => name.to_owned(),
++    };
++    let l = egui::Rgba::from(color);
++    let ink = match 0.2126 * l.r() + 0.7152 * l.g() + 0.0722 * l.b() > 0.55 {
++        true => Color32::from_gray(0x11),
++        false => Color32::WHITE,
++    };
++    let text = painter.layout_no_wrap(name, Tokens::semibold(12.0), ink);
++    let pad = vec2(7.0, 3.0);
++    let tag = Rect::from_min_size((tip + vec2(12.0, 15.0)).round_to_pixels(painter.pixels_per_point()), text.size() + 2.0 * pad);
++    painter.rect_filled(tag, 6.0, color);
++    painter.galley(tag.min + pad, text, ink);
++}
++
++/// The clips a drag under way has elsewhere so far ([`preview_drag`], what this person's Timeline shows), each as
++/// `[track, start, duration]` (ticks), in clip order; and a transition dragged by its middle or an end.
++fn dragged(app: &FilmcraftApp, seq: &Sequence, state: &mut Map<String, Value>) {
++    let (mut moved, mut edited) = (HashMap::new(), HashMap::new());
++    preview_drag(app, seq, &mut moved, &mut edited);
++    let mut ghosts: Vec<_> = moved.into_iter().filter_map(|(c, (start, len, to))| Some((c, to.or(seq.find_item(c).map(|f| f.0))?, start, len))).collect();
++    ghosts.sort_by_key(|g| g.0.0);
++    if !ghosts.is_empty() {
++        let ghosts: Vec<_> = ghosts.into_iter().take(MAX_SELECTION).map(|(_, track, start, len)| json!([track.0, start.0, len.0])).collect();
++        state.insert("ghosts".into(), ghosts.into());
++    }
++    if let Some(Drag::Transition { id, start, duration, .. }) = &app.tl.drag
++        && let Some(track) = seq.all_tracks().find(|t| t.transitions.iter().any(|t| t.id == *id))
++    {
++        state.insert("transition".into(), json!([track.id.0, start.0, duration.0]));
++    }
 +}
 +
 +/// The files a media item reads: its media and its proxy (generators have none).
@@ -356,25 +520,44 @@ index 0000000..36f1702
 +        paths.into_iter().map(String::from).collect()
 +    }
 +
-+    /// The sequence shown, the Timeline pointer as track and time, the selected clips.
++    /// The sequence shown; the Timeline pointer as a time and how far down a track (or the ruler) it is; the playhead;
++    /// the selected clips; and a drag under way, where it has its clips or transition so far ([`dragged`]).
 +    fn live_presence(&self) -> Value {
 +        let Some(sequence) = self.session.state.active_sequence else { return Value::Null };
 +        let mut state = Map::new();
 +        state.insert("sequence".into(), json!(sequence.0));
-+        let layout = self.tl.layout.as_ref();
-+        let at = POINTER.get().zip(layout).filter(|(p, l)| l.content.contains(*p));
-+        if let Some((p, l)) = at
-+            && let Some(row) = l.row_at(p.y)
-+        {
-+            state.insert("pointer".into(), json!({"track": row.track.0, "time": l.tick_at(p.x).0}));
++        if let Some((p, l)) = POINTER.get().zip(self.tl.layout.as_ref()) {
++            // How far down `r` the pointer is, in thousandths.
++            let down = |r: Rect| (f64::from((p.y - r.min.y) / r.height()).clamp(0.0, 1.0) * 1000.0).round() / 1000.0;
++            let time = l.tick_at(p.x).0;
++            if l.content.contains(p)
++                && let Some(row) = l.row_at(p.y)
++            {
++                state.insert("pointer".into(), json!({"track": row.track.0, "time": time, "y": down(row.rect)}));
++            } else if l.ruler.contains(p) {
++                state.insert("pointer".into(), json!({"time": time, "y": down(l.ruler)}));
++            }
 +        }
++        state.insert("playhead".into(), json!(self.session.playhead().0));
 +        let selection: Vec<u64> = self.session.state.selection.iter().take(MAX_SELECTION).map(|c| c.0).collect();
 +        state.insert("selection".into(), json!(selection));
++        if let Some(seq) = self.session.active_sequence() {
++            dragged(self, seq, &mut state);
++        }
 +        Value::Object(state)
 +    }
 +
++    /// Someone still on the same sequence keeps their marks where this Timeline drew them, to ease on from there.
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        OTHERS.set(others);
++        OTHERS.with_borrow_mut(|old| {
++            let mut new: Vec<(Presence, Shown)> = others.into_iter().map(|o| (o, Shown::default())).collect();
++            for (o, shown) in &mut new {
++                if let Some(was) = old.iter_mut().find(|(w, _)| w.id == o.id && w.state["sequence"] == o.state["sequence"]) {
++                    *shown = std::mem::take(&mut was.1);
++                }
++            }
++            *old = new;
++        });
 +    }
 +
 +    fn live_quiet(&self) -> bool {
@@ -535,21 +718,26 @@ index 0000000..36f1702
 +    }
 +
 +    #[test]
-+    fn presence_is_the_sequence_the_timeline_pointer_as_track_and_time_and_the_selected_clips() {
++    fn presence_is_the_sequence_the_pointer_the_playhead_the_selected_clips_and_a_drag_where_it_has_them() {
 +        let mut app = demo();
 +        let seq = app.session.active_sequence().unwrap();
-+        let (v1, clip) = (seq.video_tracks[0].id, seq.video_tracks[0].items[1].id);
++        let (v1, item) = (seq.video_tracks[0].id, seq.video_tracks[0].items[1].clone());
 +        let content = Rect::from_min_max(pos2(100.0, 50.0), pos2(1100.0, 450.0));
++        let ruler = Rect::from_min_max(pos2(100.0, 30.0), pos2(1100.0, 50.0));
 +        let rect = Rect::from_min_max(pos2(100.0, 50.0), pos2(1100.0, 100.0));
 +        let row = crate::panels::timeline::Row { track: v1, kind: filmcraft_project::TrackKind::Video, index: 0, rect, lane: false };
-+        app.tl.layout = Some(Layout { content, ruler: content, rows: vec![row], pps: 100.0, scroll: 2.0, split_y: 300.0 });
-+        app.session.state.selection = vec![clip];
-+        POINTER.set(Some(pos2(350.0, 75.0)));
-+        let sequence = app.session.state.active_sequence.unwrap().0;
-+        let pointer = json!({"track": v1.0, "time": Tick::from_seconds_f64(4.5).0});
-+        assert_eq!(app.live_presence(), json!({"sequence": sequence, "pointer": pointer, "selection": [clip.0]}));
++        app.tl.layout = Some(Layout { content, ruler, rows: vec![row], pps: 100.0, scroll: 2.0, split_y: 300.0 });
++        app.session.state.selection = vec![item.id];
++        POINTER.set(Some(pos2(350.0, 60.0)));
++        let (sequence, playhead) = (app.session.state.active_sequence.unwrap().0, app.session.playhead().0);
++        let pointer = json!({"track": v1.0, "time": Tick::from_seconds_f64(4.5).0, "y": 0.2});
++        let rest = json!({"sequence": sequence, "pointer": pointer, "playhead": playhead, "selection": [item.id.0]});
++        assert_eq!(app.live_presence(), rest);
 +        POINTER.set(Some(pos2(350.0, 200.0)));
-+        assert_eq!(app.live_presence(), json!({"sequence": sequence, "selection": [clip.0]}), "no track under the pointer");
++        assert_eq!(app.live_presence(), json!({"sequence": sequence, "playhead": playhead, "selection": [item.id.0]}), "no track under the pointer");
++        let second = Tick::from_seconds_f64(1.0);
++        app.tl.drag = Some(Drag::Move { clips: vec![item.id], grab_tick: item.start, start_track: v1, offset: second, track_delta: 0, new_track: None, copy: false });
++        assert_eq!(app.live_presence()["ghosts"], json!([[v1.0, (item.start + second).0, item.duration.0]]), "a second later, as the Timeline shows it");
 +    }
 +
 +    #[test]
