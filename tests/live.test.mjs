@@ -362,3 +362,15 @@ test('a session spans apps: each app edits its own document with its own host', 
   await eventually(() => assert.deepEqual([...other.app.doc], [8, 7, 7]))
   assert.ok(!hub.sent.some((m) => (m.from === o && m.to === x || m.from === x && m.to !== x) && ['snapshot', 'entry'].includes(m.type)), 'one app\'s document goes only to people in that app')
 })
+
+test('media an app turns down is not handed to it again on every change', async () => {
+  const hub = new Hub(), [o, e] = ids(), ownerApp = new App([0, 1, 0]), editorApp = new App()
+  ownerApp.media.set('photo-1', new Blob([Uint8Array.of(1)]))
+  let offered = 0
+  editorApp.writeAsset = async () => { offered++ }
+  const owner = await hub.join(o, 'owner', ownerApp), editor = await hub.join(e, 'editor', editorApp)
+  await live(owner, editor)
+  await eventually(() => assert.equal(offered, 1))
+  for (let i = 0; i < 5; i++) { editor.session.dispatchEvent(new Event('change')); await sleep(20) }
+  assert.equal(offered, 1)
+})

@@ -79,7 +79,7 @@ export class LiveDocument extends EventTarget {
     // A session spans apps: this document is the one of the app this page runs, and only that app's people see it.
     this.app = session.page ?? null
     this.slug = (this.app ?? '').split('/').filter(Boolean).join('-') || 'app'
-    Object.assign(this, { session, adapter, store, acked: null, entries: [], inflight: null, wanted: [], error: null, unsaved: [], mine: new Set(), others: new Map() })
+    Object.assign(this, { session, adapter, store, acked: null, entries: [], inflight: null, wanted: [], error: null, unsaved: [], mine: new Set(), others: new Map(), installed: new Map() })
     this.work = this.coordinating = this.assetWork = Promise.resolve()
     this.handlers = {
       document: (e) => this.receive(e.peer, e.value),
@@ -399,10 +399,14 @@ export class LiveDocument extends EventTarget {
       const file = files.get(await fileId(`${this.app}\n${id}`))
       // One at a time, so a large catalog is never in memory at once.
       if (have && !file && this.editable && this.mine.has(id)) await this.session.share([new File([await this.adapter.readAsset(id)], fileName(name))], [await fileId(`${this.app}\n${id}`)])
-      else if (!have && file && file.size <= MAX_ASSET) {
+      // Once per version of a file: an app that turns it down is not handed it again on every change.
+      else if (!have && file && file.size <= MAX_ASSET && this.installed.get(file.id) !== file.asset) {
         // Only this file: the session's other files still wait for the person to accept them.
         if (!this.session.accepted) await this.session.receiveFiles([file.id])
-        if (this.session.available.has(file.asset)) await this.adapter.writeAsset(id, file.name, new Uint8Array(await (await this.session.store.file(file.asset)).arrayBuffer()))
+        if (this.session.available.has(file.asset)) {
+          await this.adapter.writeAsset(id, file.name, new Uint8Array(await (await this.session.store.file(file.asset)).arrayBuffer()))
+          this.installed.set(file.id, file.asset)
+        }
       }
     }
   }

@@ -1,9 +1,9 @@
 diff --git a/apps/filmcraft-web/src/live.rs b/apps/filmcraft-web/src/live.rs
 new file mode 100644
-index 0000000..cea9cd3
+index 0000000..44f1a8c
 --- /dev/null
 +++ b/apps/filmcraft-web/src/live.rs
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,97 @@
 +//! Live editing in a Playground session (`patches/premiere.yaml` wires it in): the web app wrapped so each frame ends
 +//! with the session's work, the adapter attached to the running app, and the media the shared project refers to
 +//! read from and installed into the browser's file table ([`crate::fs`]). The model side is
@@ -76,26 +76,24 @@ index 0000000..cea9cd3
 +}
 +
 +/// The media the shared project refers to travel as session files: read as the `Blob`s this browser has, and media
-+/// another person imported installed under the project's path (imported files kept in OPFS like an import), without an
-+/// edit. A path this browser uses already keeps its own file.
++/// another person imported installed under the project's path, without an edit. A path this browser uses already
++/// keeps its own file. Only ids in FilmCraft's own `/files/<name>` form are installed
++/// ([`filmcraft_ui_egui::live::session_file_name`]), and only for this page: the session's store keeps them for a
++/// reload, and they never enter this browser's own media (`recovery::keep_media`), where they could later bind by name
++/// to this person's own projects.
 +fn share_media() -> Result<(), JsValue> {
 +    let adapter = js_sys::Reflect::get(&js_sys::global(), &"playgroundLiveAdapter".into())?;
 +    let read = |path: String| fs::blob(&path).ok_or_else(|| JsValue::from_str("Missing media"));
 +    let read = Closure::<dyn Fn(String) -> Result<web_sys::Blob, JsValue>>::new(read);
 +    js_sys::Reflect::set(&adapter, &"readAsset".into(), &read.into_js_value())?;
 +    let write = |path: String, _name: String, bytes: js_sys::Uint8Array| -> Result<(), JsValue> {
++        let Some(name) = filmcraft_ui_egui::live::session_file_name(&path) else { return Ok(()) };
 +        if fs::WebServices.file_size(&path).is_ok() {
 +            return Ok(());
 +        }
-+        match path.strip_prefix("/files/") {
-+            // Free, so registering the name gives exactly this path.
-+            Some(name) => {
-+                let file = web_sys::File::new_with_u8_array_sequence(&js_sys::Array::of1(&bytes), name)?;
-+                let at = fs::register_blob(name, file.clone().into());
-+                crate::recovery::keep_media(&at, &file);
-+            }
-+            None => fs::put(&path, bytes.to_vec()),
-+        }
++        // Free, so registering the name gives exactly this path.
++        let file = web_sys::File::new_with_u8_array_sequence(&js_sys::Array::of1(&bytes), name)?;
++        fs::register_blob(name, file.into());
 +        crate::post(move |w, _| filmcraft_ui_egui::live::media_arrived(&mut w.app, &path));
 +        Ok(())
 +    };
@@ -105,10 +103,10 @@ index 0000000..cea9cd3
 +}
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..82749f4
+index 0000000..14eb55b
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,656 @@
+@@ -0,0 +1,665 @@
 +//! Live editing in a Playground session (web only). The shared document is the open project (`Project`). What each
 +//! person sees for themselves (selection, playheads, open sequences, Timeline zoom and scroll, panels, the Source
 +//! monitor) already lives outside it, in the engine's `EditorState` and the UI; so does what belongs to this machine:
@@ -368,6 +366,13 @@ index 0000000..82749f4
 +        MediaRef::File { path } => Some(path.as_str()),
 +        MediaRef::Generator(_) => None,
 +    })
++}
++
++/// The name another person's media file installs under: the `<name>` of an id in FilmCraft's own `/files/<name>` form,
++/// which the browser's file table registers at exactly that id. Anything else stores nothing: it would land at another
++/// path, still count as missing, and arrive again on every session change.
++pub fn session_file_name(id: &str) -> Option<&str> {
++    id.strip_prefix("/files/").filter(|n| !n.contains(['/', '\\']) && !matches!(*n, "" | "." | ".."))
 +}
 +
 +/// Media someone else imported arrived at `path` (the web host registered them): the items that showed them missing
@@ -715,6 +720,8 @@ index 0000000..82749f4
 +        assert!(s.media.offline_status(item).is_none() && app.live_assets()[0].2);
 +        assert_eq!((canonical(&app.live_document()), app.session.history.undo.len()), (doc, steps), "no edit");
 +        std::fs::remove_dir_all(&dir).unwrap();
++        let ids = ["/files/tone.wav", "/files/a/b.wav", "/files/a\\b.wav", "/files/..", "/files/", "/etc/tone.wav"];
++        assert_eq!(ids.map(session_file_name), [Some("tone.wav"), None, None, None, None, None], "a web page stores only /files/<name>");
 +    }
 +
 +    #[test]
