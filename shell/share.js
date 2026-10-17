@@ -142,7 +142,7 @@ export async function mountShare(bar, app, here) {
         async function start() {
           if (session) {live();return}
           if (invite) {
-            body.append(h('p',{},'Join to see the shared file list and download size. Nothing is received until you accept.'),button('Join session',()=>attempt(async()=>{use(await PeerSession.join(invite,{name:name.value}));live()}),true))
+            body.append(h('p',{},liveAdapter()?'Joining opens the shared project here, live, with the media it uses. Other shared files wait until you accept them.':'Join to see the shared file list and download size. Nothing is received until you accept.'),button('Join session',()=>attempt(async()=>{use(await PeerSession.join(invite,{name:name.value}));live()}),true))
             return
           }
           const selection=h('div',{class:'pg-share-pick'}), picks=[]
