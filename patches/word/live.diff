@@ -1,18 +1,18 @@
 diff --git a/apps/wordcraft-web/src/live.rs b/apps/wordcraft-web/src/live.rs
 new file mode 100644
-index 0000000..e022069
+index 0000000..14b9d43
 --- /dev/null
 +++ b/apps/wordcraft-web/src/live.rs
-@@ -0,0 +1,617 @@
+@@ -0,0 +1,575 @@
 +//! Playground live editing (`playground_live`): the shared document is the open document's model as JSON (as the
 +//! app's own JSON format writes it, with pictures and kept parts as base64) without what is personal or stamped on
 +//! save: the zoom saved with it, the save times, author and count, and field-code toggles. Text merges character by
 +//! character (`text_merge`). Native undo history stays local; while connected Undo and Redo go to the session.
 +//!
-+//! Presence: each person shares their selection in the shared document (`anchor` and `focus`: story, paragraph path,
-+//! byte offset) and their pointer over a page (`[page, x, y]`, page points); the others are drawn over the pages in
-+//! their color: the selection shaded, the caret as a bar with their name, the pointer as an arrow (`web/live.rs`
-+//! calls [`frame`] after each frame).
++//! Presence (`presence`): each person shares their selection in the shared document, their pointer over a page and
++//! what a gesture under way is doing (an object's frame dragged, a table border dragged, ink being drawn); the others
++//! are drawn over the pages in their color, eased toward where they are (`web/live.rs` calls [`frame`] after each
++//! frame).
 +//!
 +//! Upstream calls in through two hooks (rules in patches/word.yaml): `wordcraft_engine::LIVE_UNDO` at the top of
 +//! `Session::run` and `wordcraft_engine::LIVE_HISTORY` at the top of the QAT's `qat_enabled`.
@@ -23,17 +23,16 @@ index 0000000..e022069
 +#[path = "playground_live.rs"]
 +#[allow(dead_code)]
 +pub mod playground_live;
++mod presence;
 +mod text_merge;
 +
 +use std::cell::{Cell, RefCell};
 +use std::collections::BTreeMap;
 +use std::sync::Arc;
 +
-+use egui::{Color32, FontId, Pos2, Rect, Shape, Stroke, pos2, vec2};
 +use serde_json::{Map, Value, json};
 +use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph, Pos, StoryRef};
 +use wordcraft_engine::cmd::insert::{base64_decode, base64_encode};
-+use wordcraft_engine::layout::DocLayout;
 +use wordcraft_ui_egui::WordApp;
 +
 +use playground_live::{Error, Live, Presence};
@@ -51,30 +50,8 @@ index 0000000..e022069
 +    static CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
 +    /// This person's pointer over the shared document's pages as of the last frame: page, x, y (points).
 +    static POINTER: Cell<Option<(usize, f64, f64)>> = const { Cell::new(None) };
-+    /// The others in the session, as the shell last gave them.
-+    static OTHERS: RefCell<Vec<Other>> = const { RefCell::new(Vec::new()) };
-+}
-+
-+/// Another person's presence, read defensively: positions are checked against the document before use.
-+struct Other {
-+    name: String,
-+    color: Color32,
-+    selection: Option<(Pos, Pos)>,
-+    pointer: Option<(usize, f32, f32)>,
-+}
-+
-+impl From<Presence> for Other {
-+    fn from(p: Presence) -> Other {
-+        let pos = |key: &str| serde_json::from_value::<Pos>(p.state[key].clone()).ok();
-+        let number = |v: &Value| v.as_f64().filter(|v| v.abs() < 1e6).map(|v| v as f32);
-+        let at = &p.state["pointer"];
-+        Other {
-+            name: p.name.chars().take(32).collect(),
-+            color: Color32::from_rgb(p.color[0], p.color[1], p.color[2]),
-+            selection: pos("anchor").zip(pos("focus")),
-+            pointer: at[0].as_u64().and_then(|page| Some((usize::try_from(page).ok()?, number(&at[1])?, number(&at[2])?))),
-+        }
-+    }
++    /// The others in the session, as the shell last gave them, with their marks where this page last drew them.
++    static OTHERS: RefCell<Vec<presence::Other>> = const { RefCell::new(Vec::new()) };
 +}
 +
 +/// Hooks the engine's Undo and Redo, and the QAT's state of them.
@@ -98,7 +75,7 @@ index 0000000..e022069
 +        pointer = hover
 +            .and_then(|p| wordcraft_ui_egui::canvas::page_at(&app.canvas.page_rects, &layout, app.canvas.scale, p))
 +            .map(|(page, x, y)| (page, round(x), round(y)));
-+        draw_presence(app, ui, &layout);
++        OTHERS.with_borrow_mut(|others| presence::draw(app, ui, &layout, others));
 +    }
 +    POINTER.set(pointer);
 +    playground_live::frame(app);
@@ -129,60 +106,6 @@ index 0000000..e022069
 +        playground_live::undo(redo);
 +    }
 +    true
-+}
-+
-+/// A selection from another person that lies in this document: both ends in one story, each a paragraph's position on
-+/// a character boundary.
-+fn resolved<'a>(doc: &Document, selection: &'a Option<(Pos, Pos)>) -> Option<(&'a Pos, &'a Pos)> {
-+    let valid = |pos: &Pos| doc.para_at(pos).is_some_and(|p| p.text.is_char_boundary(pos.off));
-+    selection.as_ref().filter(|(a, f)| a.story == f.story && valid(a) && valid(f)).map(|(a, f)| (a, f))
-+}
-+
-+/// The others' selections (shaded), carets (a bar with their name) and pointers (an arrow), in their color, over the
-+/// pages as this frame drew them.
-+fn draw_presence(app: &WordApp, ui: &egui::Ui, layout: &DocLayout) {
-+    let Some(clip) = app.canvas.canvas_rect else { return };
-+    let painter = ui.painter().with_clip_rect(clip);
-+    let (doc, hint, rects) = (&app.session.doc, app.session.page_hint, &app.canvas.page_rects);
-+    // A page point on screen, with the page's scale (as the canvas places its own selection).
-+    let screen = |page: usize, x: f32, y: f32| {
-+        let (r, p) = (rects.get(page)?, layout.pages.get(page)?);
-+        let scale = if p.w > 0.0 { r.width() / p.w } else { app.canvas.scale };
-+        Some((pos2(r.min.x + x * scale, r.min.y + y * scale), scale))
-+    };
-+    OTHERS.with_borrow(|others| {
-+        for other in others {
-+            let color = other.color;
-+            if let Some((anchor, focus)) = resolved(doc, &other.selection) {
-+                if anchor != focus {
-+                    for (page, r) in layout.selection_rects(doc, anchor, focus, hint) {
-+                        if let Some((min, scale)) = screen(page, r.x, r.y) {
-+                            painter.rect_filled(Rect::from_min_size(min, vec2(r.w, r.h) * scale), 0.0, color.gamma_multiply(0.25));
-+                        }
-+                    }
-+                }
-+                if let Some(c) = layout.caret_on(focus, hint)
-+                    && let Some((top, scale)) = screen(c.page, c.x, c.top)
-+                {
-+                    // Turned text (a table cell's text direction): the caret lies across the page.
-+                    let end = if c.width > 0.0 { top + vec2(c.width * scale, 0.0) } else { top + vec2(0.0, c.height * scale) };
-+                    painter.line_segment([top, end], Stroke::new(2.0, color));
-+                    name_tag(&painter, top, &other.name, color);
-+                }
-+            }
-+            if let Some((tip, _)) = other.pointer.and_then(|(page, x, y)| screen(page, x, y)) {
-+                painter.add(Shape::convex_polygon(vec![tip, tip + vec2(0.0, 16.0), tip + vec2(11.0, 11.0)], color, Stroke::new(1.0, Color32::WHITE)));
-+            }
-+        }
-+    });
-+}
-+
-+/// `name` on a tag in `color` just above `at`.
-+fn name_tag(painter: &egui::Painter, at: Pos2, name: &str, color: Color32) {
-+    let text = painter.layout_no_wrap(name.to_owned(), FontId::proportional(11.0), Color32::WHITE);
-+    let tag = Rect::from_min_size(at - vec2(0.0, text.size().y + 4.0), text.size() + vec2(8.0, 4.0));
-+    painter.rect_filled(tag, 2.0, color);
-+    painter.galley(tag.min + vec2(4.0, 2.0), text, Color32::WHITE);
 +}
 +
 +/// Whether the open document is the shared one; the first document open becomes it.
@@ -458,7 +381,8 @@ index 0000000..e022069
 +        if valid { Ok(()) } else { Err("Conflict: the merged document is not valid".into()) }
 +    }
 +
-+    /// `{anchor, focus, pointer?}` while the shared document is open: the selection's ends and the pointer over a page.
++    /// `{anchor, focus, pointer?, drag?, border?, stroke?}` while the shared document is open: the selection's ends, the
++    /// pointer over a page and the gestures under way (`presence`).
 +    fn live_presence(&self) -> Value {
 +        if !self.has_document() || SHARED.get() != Some(self.session.document_id()) {
 +            return Value::Null;
@@ -467,11 +391,12 @@ index 0000000..e022069
 +        if let Some((page, x, y)) = POINTER.get() {
 +            v["pointer"] = json!([page, x, y]);
 +        }
++        CTX.with_borrow(|ctx| presence::gestures(self, ctx.as_ref(), &mut v));
 +        v
 +    }
 +
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        OTHERS.set(others.into_iter().map(Other::from).collect());
++        OTHERS.with_borrow_mut(|old| *old = others.into_iter().map(|p| presence::Other::new(p, old)).collect());
 +    }
 +}
 +
@@ -594,14 +519,47 @@ index 0000000..e022069
 +        let end = |path: Value, off: usize| json!({"story": "body", "path": path, "off": off});
 +        assert_eq!(mine, json!({"anchor": end(json!([0]), 6), "focus": end(json!([0]), 12)}));
 +        let drawn = |state: Value| {
-+            let other = Other::from(Presence { id: "b".into(), name: "Bob".into(), color: [9, 9, 9], state });
-+            resolved(&a.session.doc, &other.selection).is_some()
++            let other = presence::Other::new(Presence { id: "b".into(), name: "Bob".into(), color: [9, 9, 9], state }, &[]);
++            presence::resolved(&a.session.doc, &other.selection).is_some()
 +        };
 +        assert!(drawn(mine));
 +        let part = json!({"story": {"part": 1}, "path": [0], "off": 0});
 +        for focus in [end(json!([0]), 8), end(json!([0]), 13), end(json!([2]), 0), end(json!([0, 0]), 0), part, json!(-1)] {
 +            assert!(!drawn(json!({"anchor": end(json!([0]), 0), "focus": focus})), "{focus}");
 +        }
++
++        // A shape dragged by its frame and held mid-way (Alt: no snapping): the others see its ghost where it would land.
++        caret(&mut a, 0, 0);
++        a.run("view.commentsPane", json!({"value": false})).unwrap();
++        a.run("insert.shape", json!({"kind": "rectangle", "width": 100, "height": 50})).unwrap();
++        a.run("arrange.bounds", json!({"page": 0, "x": 100, "y": 250})).unwrap();
++        let (ctx, mut time) = (egui::Context::default(), 0.0);
++        let mut frame = |app: &mut WordApp, events: Vec<egui::Event>| {
++            time += 1.0 / 60.0;
++            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
++            let events = [vec![egui::Event::ModifiersChanged(egui::Modifiers::ALT)], events].concat();
++            let input = egui::RawInput { events, time: Some(time), screen_rect: Some(screen), ..Default::default() };
++            ctx.run_ui(input, |ui| {
++                app.logic(&ui.ctx().clone());
++                app.ui(ui);
++            })
++            .drop_without_applying_deltas();
++        };
++        (0..6).for_each(|_| frame(&mut a, Vec::new()));
++        let shape = wordcraft_engine::cmd::objects::object_selection(&a.session).unwrap().0;
++        let r = a.session.layout().object(&shape, 0).unwrap().rect;
++        let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
++        let at = |a: &mut WordApp, dx: f32, dy: f32| wordcraft_ui_egui::canvas::page_to_screen(a, 0, cx + dx, cy + dy).unwrap();
++        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::ALT };
++        let from = at(&mut a, 0.0, 0.0);
++        frame(&mut a, vec![egui::Event::PointerMoved(from), button(from, true)]);
++        for (dx, dy) in [(0.0, 30.0), (20.0, 30.0)] {
++            let to = at(&mut a, dx, dy);
++            frame(&mut a, vec![egui::Event::PointerMoved(to)]);
++        }
++        let ghost: Vec<f64> = serde_json::from_value(a.live_presence()["drag"].clone()).unwrap();
++        let near = |got: f64, want: f32| (got - f64::from(want)).abs() < 0.11;
++        assert!(ghost.len() == 6 && [0.0, r.x + 20.0, r.y + 30.0, r.w, r.h, 0.0].iter().zip(&ghost).all(|(w, g)| near(*g, *w)), "{ghost:?} for {r:?}");
 +    }
 +
 +    #[test]
@@ -620,6 +578,369 @@ index 0000000..e022069
 +            assert!(WordApp::live_check(&bad).is_err(), "{bad}");
 +        }
 +    }
++}
+diff --git a/apps/wordcraft-web/src/live/presence.rs b/apps/wordcraft-web/src/live/presence.rs
+new file mode 100644
+index 0000000..e1714e1
+--- /dev/null
++++ b/apps/wordcraft-web/src/live/presence.rs
+@@ -0,0 +1,357 @@
++//! Presence: what each person shows the others and how the others are drawn over the pages, in their color.
++//!
++//! Shared (page points, `[page, …]`): the selection's ends (`anchor`, `focus`: story, paragraph path, byte offset), the
++//! pointer over a page (`pointer`: `[page, x, y]`), and what a gesture under way is doing before it reaches the document:
++//! a picture, shape or text box moved, resized or turned by its frame (`drag`: `[page, x, y, w, h, degrees]`), a table
++//! border or the table's resize handle dragged (`border`: `[page, x0, y0, x1, y1, outline]`) and an ink stroke being
++//! drawn (`stroke`: `{page, width, points}`). Typing needs nothing of its own: each keystroke edits the document (the
++//! app is quiet between keystrokes), and a selection being dragged moves `focus` as it goes.
++//!
++//! Drawn, under menus and dialogs: the others' gestures (ghosts, border lines, strokes), then their selections (text
++//! shaded, a picture or shape outlined, the caret as a bar), then their pointers with their names (a name at the caret
++//! for whoever's pointer is off the pages). Moving marks ease toward where they are, in page points.
++
++use egui::epaint::PathShape;
++use egui::{Color32, Painter, Pos2, Rect, Stroke, pos2, vec2};
++use serde_json::{Value, json};
++use wordcraft_doc::{Document, Pos};
++use wordcraft_engine::layout::DocLayout;
++use wordcraft_ui_egui::WordApp;
++
++use super::playground_live::Presence;
++
++/// The most stroke points a presence carries; the shell sends no presence over 4 KiB.
++const MAX_STROKE: usize = 200;
++const MAX_PRESENCE: usize = 4000;
++/// Names in tags are cut to this many characters.
++const MAX_NAME: usize = 24;
++/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
++const EASE: f32 = 0.08;
++/// A pointer's arrow, tip first: egui fills a closed path as a fan from its first point, which this shape allows.
++const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [12.5, 11.0], [7.3, 11.0], [10.4, 17.3], [7.6, 18.6], [4.5, 12.2], [0.0, 16.0]];
++
++/// A mark on a page: the page and its numbers (page points; a frame's angle last, in degrees).
++type Mark<const N: usize> = (usize, [f32; N]);
++
++/// What moves of another person's: the pointer, the frame being dragged and the table border being dragged (with
++/// whether it is the table's outline).
++#[derive(Clone, Copy, Default)]
++struct Marks {
++    pointer: Option<Mark<2>>,
++    drag: Option<Mark<5>>,
++    border: Option<(Mark<4>, bool)>,
++}
++
++/// Another person's presence, read defensively: positions are checked against the document before use.
++pub(super) struct Other {
++    id: String,
++    name: String,
++    color: Color32,
++    pub(super) selection: Option<(Pos, Pos)>,
++    /// Where their marks are, as they last showed themselves.
++    to: Marks,
++    /// Where this page last drew them, eased toward `to`.
++    shown: Marks,
++    /// The stroke being drawn: page, pen width (points) and points.
++    stroke: Option<(usize, f32, Vec<[f32; 2]>)>,
++    /// The stroke's length as last seen and how far its shown end is behind its newest point (page points); a length of
++    /// infinity: not seen yet, shown whole at once.
++    ink: [f32; 2],
++}
++
++/// A number from another person's presence, if it is one worth drawing.
++fn number(v: &Value) -> Option<f32> {
++    v.as_f64().filter(|v| v.abs() < 1e6).map(|v| v as f32)
++}
++
++/// `[page, n…]` from another person's presence.
++fn mark<const N: usize>(v: &Value) -> Option<Mark<N>> {
++    let page = usize::try_from(v[0].as_u64()?).ok()?;
++    let mut at = [0.0; N];
++    for (i, n) in at.iter_mut().enumerate() {
++        *n = number(&v[i + 1])?;
++    }
++    Some((page, at))
++}
++
++impl Other {
++    /// Who `p` is and where, keeping where this page last drew their marks when `old` has them.
++    pub(super) fn new(p: Presence, old: &[Other]) -> Other {
++        let state = &p.state;
++        let pos = |key: &str| serde_json::from_value::<Pos>(state[key].clone()).ok();
++        let s = &state["stroke"];
++        let points: Option<Vec<f32>> = s["points"].as_array().into_iter().flatten().take(2 * MAX_STROKE).map(number).collect();
++        let points: Vec<[f32; 2]> = points.unwrap_or_default().chunks_exact(2).map(|p| [p[0], p[1]]).collect();
++        let page = s["page"].as_u64().and_then(|page| usize::try_from(page).ok());
++        let stroke = page.zip(number(&s["width"])).filter(|_| points.len() >= 2).map(|(page, width)| (page, width.clamp(0.0, 200.0), points));
++        let to = Marks {
++            pointer: mark(&state["pointer"]),
++            drag: mark(&state["drag"]).filter(|(_, d): &Mark<5>| d[2] >= 0.0 && d[3] >= 0.0),
++            border: mark(&state["border"]).map(|m| (m, state["border"][5].as_bool() == Some(true))),
++        };
++        let (shown, ink) = old.iter().find(|o| o.id == p.id).map_or((Marks::default(), [f32::INFINITY, 0.0]), |o| (o.shown, o.ink));
++        Other {
++            name: p.name.trim().to_owned(),
++            color: Color32::from_rgb(p.color[0], p.color[1], p.color[2]),
++            selection: pos("anchor").zip(pos("focus")),
++            id: p.id,
++            to,
++            shown,
++            stroke,
++            ink,
++        }
++    }
++
++    /// One frame on toward where they are (`k`: the share of the way, `z`: screen points a page point, `far`: the jump in
++    /// screen points that goes at once). Whether a mark is still on its way.
++    fn step(&mut self, k: f32, z: f32, far: f32) -> bool {
++        let mut moving = ease(&mut self.shown.pointer, self.to.pointer, k, z, far);
++        if let (Some((_, s)), Some((_, t))) = (&self.shown.drag, &mut self.to.drag) {
++            // A frame turns the short way round.
++            t[4] = s[4] + (t[4] - s[4] + 540.0).rem_euclid(360.0) - 180.0;
++        }
++        moving |= ease(&mut self.shown.drag, self.to.drag, k, z, far);
++        // A line and an outline do not turn into each other.
++        let same = matches!((self.shown.border, self.to.border), (Some((_, a)), Some((_, b))) if a == b);
++        let mut border = self.shown.border.filter(|_| same).map(|(m, _)| m);
++        moving |= ease(&mut border, self.to.border.map(|(m, _)| m), k, z, far);
++        self.shown.border = border.zip(self.to.border.map(|(_, outline)| outline));
++        if let Some((_, _, points)) = &self.stroke {
++            let [seen, behind] = &mut self.ink;
++            let length = length(points);
++            *behind = (*behind + length - *seen).max(0.0);
++            *seen = length;
++            let mut tail = Some((0, [*behind]));
++            moving |= ease(&mut tail, Some((0, [0.0])), k, z, far);
++            *behind = tail.map_or(0.0, |(_, [b])| b);
++        } else {
++            self.ink = [0.0; 2];
++        }
++        moving
++    }
++}
++
++/// `shown` moved `k` of the way to `to` (page points, `z` screen points each): all of it when either is missing, on
++/// another page, after a jump of more than `far` screen points, or once under half a screen point remains. Whether it is
++/// still on its way.
++fn ease<const N: usize>(shown: &mut Option<Mark<N>>, to: Option<Mark<N>>, k: f32, z: f32, far: f32) -> bool {
++    let (Some((page, s)), Some((to_page, t))) = (shown.as_mut(), to) else {
++        *shown = to;
++        return false;
++    };
++    let off = |s: &[f32; N]| s.iter().zip(&t).map(|(s, t)| (t - s).abs() * z).fold(0.0, f32::max);
++    let k = if *page != to_page || off(s) > far { 1.0 } else { k };
++    *page = to_page;
++    s.iter_mut().zip(&t).for_each(|(s, t)| *s += (t - *s) * k);
++    let moving = off(s) >= 0.5;
++    if !moving {
++        *s = t;
++    }
++    moving
++}
++
++fn length(stroke: &[[f32; 2]]) -> f32 {
++    stroke.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum()
++}
++
++fn round(v: f32) -> f64 {
++    (f64::from(v) * 10.0).round() / 10.0
++}
++
++/// This person's gestures under way, for [`Live::live_presence`](super::Live::live_presence): see the module's comment.
++/// `ctx` gives the keys held (a table border's drag depends on them).
++pub(super) fn gestures(app: &WordApp, ctx: Option<&egui::Context>, v: &mut Value) {
++    if let Some((page, r, deg)) = wordcraft_ui_egui::objects::live::ghost(app) {
++        v["drag"] = json!([page, round(r[0]), round(r[1]), round(r[2]), round(r[3]), round(deg)]);
++    }
++    if let Some((page, l, outline)) = ctx.and_then(|ctx| wordcraft_ui_egui::table_resize::live::border(app, ctx)) {
++        v["border"] = json!([page, round(l[0]), round(l[1]), round(l[2]), round(l[3]), outline]);
++    }
++    if let Some((page, width, points)) = wordcraft_ui_egui::ink::live::stroke(app) {
++        // Points at least a pixel apart at this person's zoom, the newest ones.
++        let z = app.canvas.scale.max(0.01);
++        let mut kept: Vec<[f32; 2]> = Vec::new();
++        for p in points {
++            if kept.last().is_none_or(|q| (p[0] - q[0]).hypot(p[1] - q[1]) * z >= 1.0) {
++                kept.push(*p);
++            }
++        }
++        let kept = &kept[kept.len().saturating_sub(MAX_STROKE)..];
++        let flat: Vec<f64> = kept.iter().flatten().map(|v| round(*v)).collect();
++        v["stroke"] = json!({"page": page, "width": round(width), "points": flat});
++    }
++    // The shell sends nothing bigger: the stroke's oldest points go first.
++    while v.to_string().len() > MAX_PRESENCE
++        && let Some(points) = v.get_mut("stroke").and_then(|s| s.get_mut("points")).and_then(Value::as_array_mut).filter(|p| p.len() > 4)
++    {
++        points.drain(..points.len() / 4 * 2);
++    }
++}
++
++/// A selection from another person that lies in this document: both ends in one story, each a paragraph's position on
++/// a character boundary.
++pub(super) fn resolved<'a>(doc: &Document, selection: &'a Option<(Pos, Pos)>) -> Option<(&'a Pos, &'a Pos)> {
++    let valid = |pos: &Pos| doc.para_at(pos).is_some_and(|p| p.text.is_char_boundary(pos.off));
++    selection.as_ref().filter(|(a, f)| a.story == f.story && valid(a) && valid(f)).map(|(a, f)| (a, f))
++}
++
++/// The others over the pages as this frame drew them, in their colors (see the module's comment). Marks ease toward
++/// where they are, repainting until they get there.
++pub(super) fn draw(app: &WordApp, ui: &egui::Ui, layout: &DocLayout, others: &mut [Other]) {
++    let Some(clip) = app.canvas.canvas_rect else { return };
++    let p = ui.painter().with_clip_rect(clip);
++    let (doc, hint, rects) = (&app.session.doc, app.session.page_hint, &app.canvas.page_rects);
++    // A page point on screen, with the page's scale (as the canvas places its own selection).
++    let screen = |page: usize, x: f32, y: f32| {
++        let (r, pg) = (rects.get(page)?, layout.pages.get(page)?);
++        let scale = if pg.w > 0.0 { r.width() / pg.w } else { app.canvas.scale };
++        Some((pos2(r.min.x + x * scale, r.min.y + y * scale), scale))
++    };
++    // A frame `[x, y, w, h]` turned `deg` about its centre: its corners on screen, clockwise from the top left.
++    let corners = |page: usize, r: [f32; 4], deg: f32| -> Option<Vec<Pos2>> {
++        let (min, scale) = screen(page, r[0], r[1])?;
++        let f = Rect::from_min_size(min, vec2(r[2], r[3]) * scale);
++        let (s, k) = deg.to_radians().sin_cos();
++        let turn = |q: Pos2| f.center() + vec2((q.x - f.center().x) * k - (q.y - f.center().y) * s, (q.x - f.center().x) * s + (q.y - f.center().y) * k);
++        Some([f.left_top(), f.right_top(), f.right_bottom(), f.left_bottom()].into_iter().map(turn).collect())
++    };
++
++    let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1);
++    let (k, z, far) = (1.0 - (-dt / EASE).exp(), app.canvas.scale.max(0.01), 0.25 * clip.width().max(clip.height()));
++    let mut moving = false;
++    for o in others.iter_mut() {
++        moving |= o.step(k, z, far);
++    }
++    if moving {
++        ui.ctx().request_repaint();
++    }
++
++    // What they are doing: frames being dragged, table borders, strokes.
++    for o in others.iter() {
++        let (fill, edge) = (o.color.gamma_multiply(0.28), Stroke::new(1.5, o.color.gamma_multiply(0.85)));
++        if let Some((page, d)) = o.shown.drag
++            && let Some(c) = corners(page, [d[0], d[1], d[2], d[3]], d[4])
++        {
++            p.add(PathShape::convex_polygon(c, fill, edge));
++        }
++        if let Some(((page, l), outline)) = o.shown.border
++            && let (Some((a, _)), Some((b, _))) = (screen(page, l[0], l[1]), screen(page, l[2], l[3]))
++        {
++            if outline {
++                p.add(PathShape::convex_polygon(vec![a, pos2(b.x, a.y), b, pos2(a.x, b.y)], fill, edge));
++            } else {
++                p.line_segment([a, b], Stroke::new(6.0, fill));
++                p.line_segment([a, b], edge);
++            }
++        }
++        if let Some((page, width, points)) = &o.stroke {
++            paint_stroke(&p, |q| screen(*page, q[0], q[1]), points, *width, o.ink[1], o.color);
++        }
++    }
++    // Their selections: text shaded, a picture or shape outlined, the caret.
++    let mut carets = Vec::new();
++    for o in others.iter() {
++        let Some((anchor, focus)) = resolved(doc, &o.selection) else { continue };
++        let object = (anchor.story == focus.story && anchor.path == focus.path && anchor.off.abs_diff(focus.off) == wordcraft_doc::para::OBJ.len_utf8())
++            .then(|| if anchor.off < focus.off { anchor } else { focus })
++            .filter(|at| doc.para_at(at).and_then(|para| para.object_at(at.off)).is_some_and(|obj| obj.is_drawing()))
++            .and_then(|at| layout.object(at, hint));
++        if let Some(obj) = object {
++            if let Some(c) = corners(obj.page, [obj.rect.x, obj.rect.y, obj.rect.w, obj.rect.h], obj.spin.deg) {
++                p.add(PathShape::closed_line(c, Stroke::new(2.0, o.color)));
++            }
++            continue;
++        }
++        if anchor != focus {
++            for (page, r) in layout.selection_rects(doc, anchor, focus, hint) {
++                if let Some((min, scale)) = screen(page, r.x, r.y) {
++                    p.rect_filled(Rect::from_min_size(min, vec2(r.w, r.h) * scale), 0.0, o.color.gamma_multiply(0.25));
++                }
++            }
++        }
++        if let Some(c) = layout.caret_on(focus, hint)
++            && let Some((top, scale)) = screen(c.page, c.x, c.top)
++        {
++            // Turned text (a table cell's text direction): the caret lies across the page.
++            let end = if c.width > 0.0 { top + vec2(c.width * scale, 0.0) } else { top + vec2(0.0, c.height * scale) };
++            p.line_segment([top, end], Stroke::new(2.0, o.color));
++            if o.shown.pointer.is_none() {
++                carets.push((top, end, o));
++            }
++        }
++    }
++    // Their pointers with their names, and a name at the caret of whoever's pointer is off the pages.
++    for (top, end, o) in carets {
++        paint_tag(&p, top, Some(end.y.max(top.y)), &o.name, o.color);
++    }
++    for o in others.iter() {
++        if let Some((tip, _)) = o.shown.pointer.and_then(|(page, [x, y])| screen(page, x, y)) {
++            paint_arrow(&p, tip, o.color);
++            paint_tag(&p, tip + vec2(12.0, 15.0), None, &o.name, o.color);
++        }
++    }
++}
++
++/// A stroke being drawn, up to `behind` page points short of its newest point: translucent, as wide as the pen.
++fn paint_stroke(p: &Painter, at: impl Fn([f32; 2]) -> Option<(Pos2, f32)>, stroke: &[[f32; 2]], width: f32, behind: f32, color: Color32) {
++    let Some((first, scale)) = stroke.first().and_then(|q| at(*q)) else { return };
++    let mut left = length(stroke) - behind;
++    let mut line = vec![first];
++    for w in stroke.windows(2) {
++        let d = (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
++        let q = if d >= left {
++            let f = if d > 0.0 { (left / d).max(0.0) } else { 0.0 };
++            [w[0][0] + (w[1][0] - w[0][0]) * f, w[0][1] + (w[1][1] - w[0][1]) * f]
++        } else {
++            w[1]
++        };
++        line.extend(at(q).map(|(q, _)| q));
++        if d >= left {
++            break;
++        }
++        left -= d;
++    }
++    let stroke = Stroke::new((width * scale).max(2.0), color.gamma_multiply(0.7));
++    // Round caps: a half disc past each end, so nothing is painted twice and the color stays even.
++    // ponytail: egui's own (mitred) joins; round ones would show only at sharp turns of a wide highlighter.
++    let r = stroke.width / 2.0;
++    if let ([a, b, ..], [.., y, z]) = (line.as_slice(), line.as_slice())
++        && r > 1.5
++    {
++        for (end, from) in [(*a, *b), (*z, *y)] {
++            let d = (end - from).normalized();
++            let cap = (0..=8).map(|i| (i as f32 * std::f32::consts::PI / 8.0).sin_cos()).map(|(s, c)| end + (d.rot90() * c + d * s) * r);
++            p.add(PathShape::convex_polygon(cap.collect(), stroke.color, Stroke::NONE));
++        }
++    }
++    p.add(PathShape::line(line, stroke));
++}
++
++/// A pointer: the arrow, its tip at `tip`, in `color` with a white edge and a soft shadow.
++fn paint_arrow(p: &Painter, tip: Pos2, color: Color32) {
++    let points: Vec<Pos2> = ARROW.iter().map(|&[x, y]| tip + vec2(x, y)).collect();
++    let shadow = points.iter().map(|q| *q + vec2(0.0, 1.0)).collect();
++    p.add(PathShape::convex_polygon(shadow, Color32::from_black_alpha(64), Stroke::NONE));
++    p.add(PathShape::convex_polygon(points, color, Stroke::new(1.5, Color32::WHITE)));
++}
++
++/// A name tag in `color`: its top left at `at`; or, given the bottom of a caret whose top is `at`, just above the caret
++/// (below it when the view's top would cut the tag). Dark text on light colors.
++fn paint_tag(p: &Painter, at: Pos2, caret_bottom: Option<f32>, name: &str, color: Color32) {
++    if name.is_empty() {
++        return;
++    }
++    let name: String = if name.chars().count() > MAX_NAME { name.chars().take(MAX_NAME - 1).chain(['…']).collect() } else { name.into() };
++    let lin = egui::ecolor::linear_f32_from_gamma_u8;
++    let luminance = 0.2126 * lin(color.r()) + 0.7152 * lin(color.g()) + 0.0722 * lin(color.b());
++    let ink = if luminance > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE };
++    let text = p.layout_no_wrap(name, wordcraft_ui_egui::theme::semibold(12.0), ink);
++    let size = text.size() + vec2(14.0, 6.0);
++    let r = match caret_bottom {
++        None => Rect::from_min_size(at, size),
++        Some(_) if at.y - size.y - 1.0 >= p.clip_rect().top() => Rect::from_min_size(at - vec2(0.0, size.y + 1.0), size),
++        Some(bottom) => Rect::from_min_size(pos2(at.x, bottom + 1.0), size),
++    };
++    p.rect_filled(r, 6.0, color);
++    p.galley(r.min + vec2(7.0, 3.0), text, ink);
 +}
 diff --git a/apps/wordcraft-web/src/live/text_merge.rs b/apps/wordcraft-web/src/live/text_merge.rs
 new file mode 100644
@@ -1140,4 +1461,77 @@ index 0000000..3b2715c
 +    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
 +        self.0.raw_input_hook(ctx, raw_input);
 +    }
++}
+diff --git a/crates/ui-egui/src/ink/live.rs b/crates/ui-egui/src/ink/live.rs
+new file mode 100644
+index 0000000..3c40ffc
+--- /dev/null
++++ b/crates/ui-egui/src/ink/live.rs
+@@ -0,0 +1,10 @@
++//! Live editing in a Playground session (patches/word.yaml): the ink stroke being drawn, for the others to see before it
++//! is finished. A child of `ink` to read its drag.
++
++use crate::WordApp;
++
++/// The stroke being drawn with a pen: its page, the pen's width (points) and its points so far (page points).
++pub fn stroke(app: &WordApp) -> Option<(usize, f32, &[[f32; 2]])> {
++    let d = app.canvas.ink.as_ref()?;
++    Some((d.page, app.session.view.draw.settings(d.tool).width, &d.pts))
++}
+diff --git a/crates/ui-egui/src/objects/live.rs b/crates/ui-egui/src/objects/live.rs
+new file mode 100644
+index 0000000..b2da449
+--- /dev/null
++++ b/crates/ui-egui/src/objects/live.rs
+@@ -0,0 +1,12 @@
++//! Live editing in a Playground session (patches/word.yaml): a picture, shape or text box being moved, resized or turned
++//! by its frame, for the others to see before it is dropped. A child of `objects` to read its drag.
++
++use crate::WordApp;
++
++/// The dragged object's frame where the drag would put it: its page, `[x, y, w, h]` (page points, unturned) and its angle
++/// (degrees clockwise); `None` until it moves, and for a connector's end.
++pub fn ghost(app: &WordApp) -> Option<(usize, [f32; 4], f32)> {
++    let d = app.canvas.obj_drag.as_ref().filter(|d| d.drag.moved && d.end.is_none())?;
++    let r = d.drag.rect;
++    Some((d.drag.to_page, [r.x, r.y, r.w, r.h], d.drag.deg))
++}
+diff --git a/crates/ui-egui/src/table_resize/live.rs b/crates/ui-egui/src/table_resize/live.rs
+new file mode 100644
+index 0000000..ed8e8ba
+--- /dev/null
++++ b/crates/ui-egui/src/table_resize/live.rs
+@@ -0,0 +1,33 @@
++//! Live editing in a Playground session (patches/word.yaml): a table border (or the table's resize handle) being dragged,
++//! for the others to see before it is let go. A child of `table_resize` to read its drag.
++
++use wordcraft_engine::cmd::table_resize::Edge;
++
++use crate::WordApp;
++
++/// Where the dragged border is now, as this page's own dashed preview shows it: its page and the line `[x0, y0, x1, y1]`
++/// (page points), or with `true` the table's new outline (the handle); `None` until it moves. `ctx` gives the keys held.
++pub fn border(app: &WordApp, ctx: &egui::Context) -> Option<(usize, [f32; 4], bool)> {
++    let d = app.canvas.table_resize.as_ref().filter(|d| (d.to.0 - d.from.0).abs() >= 0.5 || (d.to.1 - d.from.1).abs() >= 0.5)?;
++    let (tg, plan) = (&d.target, d.plan(ctx));
++    let line = match tg.edge {
++        Edge::Column(_) => {
++            // Down the rows it moves in (the selected cells'), else the whole table.
++            let rows = tg.rows.iter().filter(|r| plan.cells.is_empty() || plan.cells.iter().any(|(c, _)| *c == r.row));
++            let (y0, y1) = rows.fold((f32::INFINITY, f32::NEG_INFINITY), |(y0, y1), r| (y0.min(r.top), y1.max(r.bottom)));
++            let x = d.line_now(&plan)?;
++            (y0 <= y1).then_some([x, y0, x, y1])?
++        }
++        Edge::Row(_) => {
++            let y = d.line_now(&plan)?;
++            [tg.left(), y, tg.right(), y]
++        }
++        Edge::Corner => {
++            let (left, top) = (tg.left(), tg.top());
++            let right = plan.widths.as_ref().map_or(tg.right(), |w| left + w.iter().sum::<f32>());
++            let height = |r: &wordcraft_engine::cmd::table_resize::DrawnRow| plan.heights.iter().find(|(i, _)| *i == r.row).map_or(r.bottom - r.top, |(_, h)| *h);
++            [left, top, right, top + tg.rows.iter().map(height).sum::<f32>()]
++        }
++    };
++    Some((d.page, line, matches!(tg.edge, Edge::Corner)))
 +}

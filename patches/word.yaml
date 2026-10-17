@@ -355,13 +355,17 @@
 
 
 # Live editing in Playground sessions (patches/word/live.diff + patches/live/playground_live.rs)
+# What it's for: people in a Playground session edit the open document together and see each other's pointer, selection
+#   and caret, and gestures under way before they reach the document (a picture's, shape's or text box's frame moved,
+#   resized or turned, a table border dragged, ink being drawn), in each person's color.
 # The adapter lives in new files: apps/wordcraft-web/src/live.rs (the shared document, adopt, Undo and presence; the
-# template is its child module, live/text_merge.rs merges text character by character) and
-# apps/wordcraft-web/src/web/live.rs (the kept runner, and the shell that ends each frame with the session's frame hook,
-# which draws the others' carets, selections and pointers over the pages). These rules only declare them and call in,
-# one line each at the end of a file or after a function's signature, the same on both channels. Verify: node
-# scripts/build.mjs check word head|release, then the e2e (tests/live-apps/word.mjs). If upstream renames a function
-# named below, anchor on its new signature; if it renames WebShell or its `app` field, follow it in web/live.rs.
+# template is its child module, live/text_merge.rs merges text character by character, live/presence.rs shares and
+# draws the others) and apps/wordcraft-web/src/web/live.rs (the kept runner, and the shell that ends each frame with the
+# session's frame hook, which draws the others over the pages); crates/ui-egui/src/{objects,ink,table_resize}/live.rs
+# read the canvas's drags. These rules only declare them and call in, one line each at the end of a file or after a
+# function's signature, the same on both channels. Verify: node scripts/build.mjs check word head|release, then the
+# e2e (tests/live-apps/word.mjs). If upstream renames a function named below, anchor on its new signature; if it renames
+# WebShell or its `app` field, follow it in web/live.rs; if it renames a drag's fields, follow them in its live.rs.
 #
 # The adapter's module (web, and native tests).
 - live: true
@@ -398,3 +402,17 @@
   file: apps/wordcraft-web/src/web.rs
   find: 'Ok\(Box::new\((?=\s*WebShell\b)'
   replace: 'Ok(live::wrap('
+# The canvas's drags under way, read for the others where they are kept (each module a child, so it reaches its drag's
+# private fields): an object's frame (objects.rs), an ink stroke (ink.rs), a table border (table_resize.rs).
+- live: true
+  file: crates/ui-egui/src/objects.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session: what a drag here is doing, for the others (objects/live.rs).\npub mod live;\n"
+- live: true
+  file: crates/ui-egui/src/ink.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session: what a drag here is doing, for the others (ink/live.rs).\npub mod live;\n"
+- live: true
+  file: crates/ui-egui/src/table_resize.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session: what a drag here is doing, for the others (table_resize/live.rs).\npub mod live;\n"
