@@ -93,10 +93,10 @@ index 0000000..9927650
 +}
 diff --git a/crates/ui-egui/src/playground.rs b/crates/ui-egui/src/playground.rs
 new file mode 100644
-index 0000000..bc81c2b
+index 0000000..2edcc98
 --- /dev/null
 +++ b/crates/ui-egui/src/playground.rs
-@@ -0,0 +1,1008 @@
+@@ -0,0 +1,1022 @@
 +//! Live editing in a Playground session (web only). The shared document is the project open when the session started
 +//! (`Project`), minus what is this person's: the id counter, each comp's Resolution, Draft 3D and Hide Shy Layers
 +//! switches (viewer and Timeline toggles), which footage is missing in this browser, and the Render Queue (its jobs,
@@ -654,9 +654,19 @@ index 0000000..bc81c2b
 +        .flat_map(|i| [if let ItemKind::Footage(f) = &i.kind { Some(f) } else { None }, i.proxy.as_ref().map(|x| &x.footage)])
 +        .flatten()
 +        .flat_map(files)
-+        .filter(|p| p.starts_with('/') && !p.to_ascii_lowercase().ends_with(".ecproj"))
++        .filter(|p| is_media(p))
 +        .cloned()
 +        .collect()
++}
++
++/// A media file's path as EffectCraft's imports keep it in the page's file table: `/`, then folder and file names
++/// (none empty, `.` or `..`; no `\` or control characters), at most 255 bytes, no saved project. Paths in a shared
++/// document come from other people: nothing else names a file here.
++fn is_media(path: &str) -> bool {
++    path.len() <= 255
++        && !path.to_ascii_lowercase().ends_with(".ecproj")
++        && !path.chars().any(|c| c == '\\' || c.is_control())
++        && path.strip_prefix('/').is_some_and(|rest| rest.split('/').all(|s| !matches!(s, "" | "." | "..")))
 +}
 +
 +/// Which of `paths` this browser has, from listings of their folders (`Services::exists` asks a disk the web lacks).
@@ -792,7 +802,7 @@ index 0000000..bc81c2b
 +    }
 +
 +    fn live_read_asset(&self, id: &str) -> Option<Vec<u8>> {
-+        self.session.services.read_file(id).ok()
++        is_media(id).then(|| self.session.services.read_file(id).ok()).flatten()
 +    }
 +
 +    /// Stores the file as an import does (in the page's file table, which persists it) and hands it to the media pool,
@@ -800,7 +810,7 @@ index 0000000..bc81c2b
 +    /// files is no longer Missing here, and the rendered frames go: neither an undo step nor a change to the document.
 +    fn live_write_asset(&mut self, id: &str, _name: &str, bytes: Vec<u8>) {
 +        let s = &mut self.session;
-+        if !present(&*s.services, &BTreeSet::from([id.to_string()])).is_empty() || s.services.store_file(id, &bytes).is_err() {
++        if !is_media(id) || !present(&*s.services, &BTreeSet::from([id.to_string()])).is_empty() || s.services.store_file(id, &bytes).is_err() {
 +            return;
 +        }
 +        if let Some(importer) = &s.importer {
@@ -1073,6 +1083,10 @@ index 0000000..bc81c2b
 +        a.live_write_asset("/clip.png", "clip.png", b"pixels".to_vec());
 +        a.live_write_asset("/clip.png", "clip.png", b"other".to_vec());
 +        assert_eq!(a.live_read_asset("/clip.png").as_deref(), Some(&b"pixels"[..]), "stored once, never overwritten");
++        for id in ["/../clip.png", "clip.png", "/a\\b.png", "/a//b.png", "/\u{7}.png", "/x.ecproj"] {
++            a.live_write_asset(id, "clip.png", b"other".to_vec());
++        }
++        assert_eq!(table.0.lock().unwrap().len(), 2, "ids that are no media path here name nothing");
 +        assert_eq!(a.live_assets()[0].2, true);
 +        assert!(a.session.project.items.values().all(|i| !matches!(&i.kind, ItemKind::Footage(f) if f.missing)), "no longer Missing");
 +        assert_eq!((canonical(&a.live_document()), a.session.history.undo.len(), a.session.is_dirty()), (doc, steps, false));
