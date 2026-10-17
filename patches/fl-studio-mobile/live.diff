@@ -1,3 +1,8 @@
+Live editing in Playground sessions (web only): Honeydew's adapter (src/app/live.rs), the song merge
+(src/collaboration.rs, src/collaboration/checkpoint.rs) and two call sites, to be merged into upstream Honeydew.
+A channel whose code has it already skips this (it applies in reverse); once a release has it, build.yml deletes it.
+Inert unless the Playground shell attaches.
+
 diff --git a/src/app.rs b/src/app.rs
 index 7e7cd63..78417d6 100644
 --- a/src/app.rs
@@ -43,10 +48,10 @@ index 7e7cd63..78417d6 100644
      mod preview;
 diff --git a/src/app/live.rs b/src/app/live.rs
 new file mode 100644
-index 0000000..6af4877
+index 0000000..2c247d5
 --- /dev/null
 +++ b/src/app/live.rs
-@@ -0,0 +1,353 @@
+@@ -0,0 +1,488 @@
 +//! Live editing in a Playground session. The shell's adapter ([`web`]) drives it; nothing here runs until the shell
 +//! connects. A remote change merges into the live song at the end of a quiet frame, keeping this person's views and
 +//! unsent work, and is no step of the native undo history. While connected, Undo and Redo go to the session, which
@@ -54,7 +59,11 @@ index 0000000..6af4877
 +
 +use super::*;
 +use crate::collaboration::{Conflict, checkpoint, keep_local, merge, shared};
++use crate::flm::chunk::{ContentPath, ContentRoot};
++use crate::project_files::MAX_FILE_BYTES;
++use crate::sample_cache::SampleKey;
 +use std::collections::VecDeque;
++use std::path::{Path, PathBuf};
 +
 +/// A remote change waiting for a quiet frame: `edited` relative to `base`, or with no base the whole shared song.
 +struct Remote {
@@ -77,6 +86,8 @@ index 0000000..6af4877
 +    remote: VecDeque<Remote>,
 +    /// Shared changes reported so far.
 +    changes: u64,
++    /// A sample arrived: the next quiet frame rebuilds the engine, which decodes it.
++    reload: bool,
 +    #[cfg(test)]
 +    undos: Vec<bool>,
 +    #[cfg(target_arch = "wasm32")]
@@ -154,7 +165,81 @@ index 0000000..6af4877
 +    LIVE.with_borrow(|live| live.undos.clone())
 +}
 +
++/// The user files `song` plays (samples, programs, SoundFonts, shapes), as the shell names them: the `@L@` path's
++/// relative part. Built-in (`@R@Built-in`), content-folder (`@R@`) and temporary files are no one's to share.
++pub(crate) fn user_media(song: &Song) -> Vec<String> {
++    let mut ids: Vec<String> = SampleCache::referenced(song)
++        .into_iter()
++        .filter_map(|key| match key {
++            SampleKey::File(ContentPath::Shorthand {
++                root: ContentRoot::User,
++                relative,
++            }) => Some(relative),
++            _ => None,
++        })
++        .collect();
++    ids.sort();
++    ids.dedup();
++    ids
++}
++
++/// [`user_media`] of a shared checkpoint.
++pub(crate) fn assets_of(bytes: &[u8]) -> Result<Vec<String>, Conflict> {
++    Ok(user_media(&checkpoint::decode(bytes)?))
++}
++
++fn media_key(id: &str) -> ContentPath {
++    ContentPath::Shorthand {
++        root: ContentRoot::User,
++        relative: id.into(),
++    }
++}
++
 +impl HoneydewApp {
++    fn media_file(&self, id: &str) -> Option<PathBuf> {
++        self.files.resolve(&media_key(id))
++    }
++
++    /// The live song's user media: (id, file name, whether this tab has the file).
++    pub(crate) fn live_assets(&self) -> Vec<(String, String, bool)> {
++        (user_media(&self.song).into_iter())
++            .map(|id| {
++                let have = (self.media_file(&id)).is_some_and(|p| self.files.user_file_exists(&p));
++                let name = Path::new(&id)
++                    .file_name()
++                    .map(|n| n.to_string_lossy().into_owned());
++                (id, name.unwrap_or_default(), have)
++            })
++            .collect()
++    }
++
++    pub(crate) fn live_read_asset(&self, id: &str) -> Option<Vec<u8>> {
++        self.files.read_user_file(&self.media_file(id)?).ok()
++    }
++
++    /// Keeps a sample that arrived from the session as Import keeps one (this tab's user copies), never over a file
++    /// already here: two people's different files under one path each keep their own. Its missing mark goes and the
++    /// next quiet frame's engine decodes it. No song change, no undo step.
++    pub(crate) fn live_write_asset(&mut self, id: &str, bytes: Vec<u8>) {
++        let Some(path) = self.media_file(id) else {
++            return;
++        };
++        if bytes.len() as u64 > MAX_FILE_BYTES
++            || self.files.user_file_exists(&path)
++            || self.files.write_user_file(&path, bytes).is_err()
++        {
++            return;
++        }
++        self.audio.samples.forget(&SampleKey::File(media_key(id)));
++        LIVE.with_borrow_mut(|live| {
++            live.reload = true;
++            #[cfg(target_arch = "wasm32")]
++            if let Some(ctx) = &live.ctx {
++                ctx.request_repaint();
++            }
++        });
++    }
++
 +    /// The canonical shared song, unless the last frame was busy: then the next quiet frame reports it again.
 +    pub(crate) fn live_checkpoint(&self) -> Result<Vec<u8>, Conflict> {
 +        let busy = LIVE.with_borrow_mut(|live| {
@@ -192,6 +277,9 @@ index 0000000..6af4877
 +                VecDeque::new()
 +            }
 +        });
++        if quiet && LIVE.with_borrow_mut(|live| std::mem::take(&mut live.reload)) {
++            self.rebuild_as(tick, Handover::Undo);
++        }
 +        for remote in waiting {
 +            let result = self.live_apply(tick, remote.base.as_deref(), &remote.edited);
 +            (remote.done)(result);
@@ -232,13 +320,15 @@ index 0000000..6af4877
 +            .then(|| checkpoint::encode(&self.song).ok())
 +            .flatten();
 +        let mut song = match base {
-+            Some(base) => merge(&checkpoint::decode(base)?, &self.song, &edited)?,
-+            None => {
-+                let mut song = edited;
-+                keep_local(&mut song, &self.song);
-+                song
++            // The live song as its checkpoint reads: what the format settles (a new channel's rack place) is no edit
++            // of this person's for the merge to keep.
++            Some(base) => {
++                let settled = checkpoint::decode(&checkpoint::encode(&self.song)?)?;
++                merge(&checkpoint::decode(base)?, &settled, &edited)?
 +            }
++            None => edited,
 +        };
++        keep_local(&mut song, &self.song);
 +        let shifts = tracks::lane_shifts(&self.song, &song);
 +        tracks::carry_current_clips(&self.song, &mut song, &shifts);
 +        let before = std::mem::replace(&mut self.song, song);
@@ -263,14 +353,17 @@ index 0000000..6af4877
 +///   shared song it replaced) at the end of the next quiet frame, or rejects with the conflict;
 +/// - `connect({ changed, undo })`: `changed()` after a quiet frame whose shared song changed, `undo(redo)` instead of
 +///   the native Undo and Redo. Both are called from inside a frame: the shell must defer its calls back;
-+/// - `disconnect()`: native Undo again, from the current song.
++/// - `disconnect()`: native Undo again, from the current song;
++/// - `assets()` → `[{ id, name, have }]`: the user samples the live song plays ([`super::user_media`]), and
++///   `assetsOf(bytes)` → the same ids for a checkpoint; `readAsset(id)` → their bytes; `writeAsset(id, name, bytes)`
++///   keeps one that arrived ([`HoneydewApp::live_write_asset`]). They throw `busy` while the app is not running.
 +#[cfg(target_arch = "wasm32")]
 +pub(crate) mod web {
 +    use super::{HoneydewApp, LIVE};
 +    use crate::collaboration::{Conflict, checkpoint};
 +    use crate::history::History;
 +    use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
-+    use web_sys::js_sys::{Function, Object, Promise, Reflect, Uint8Array, global};
++    use web_sys::js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array, global};
 +
 +    pub(super) struct Hooks {
 +        changed: Function,
@@ -388,6 +481,53 @@ index 0000000..6af4877
 +            "disconnect",
 +            Closure::<dyn Fn()>::new(disconnect).into_js_value(),
 +        )?;
++        let app = runner.clone();
++        let assets = move || -> Result<Array, JsValue> {
++            let app = app.app_mut::<HoneydewApp>().ok_or("busy")?;
++            let list = Array::new();
++            for (id, name, have) in app.live_assets() {
++                let asset = Object::new();
++                Reflect::set(&asset, &"id".into(), &id.into())?;
++                Reflect::set(&asset, &"name".into(), &name.into())?;
++                Reflect::set(&asset, &"have".into(), &have.into())?;
++                list.push(&asset);
++            }
++            Ok(list)
++        };
++        set(
++            "assets",
++            Closure::<dyn Fn() -> _>::new(assets).into_js_value(),
++        )?;
++        let assets_of = |bytes: Uint8Array| -> Result<Array, JsValue> {
++            let ids = super::assets_of(&bytes.to_vec()).map_err(error)?;
++            Ok(ids.into_iter().map(JsValue::from).collect())
++        };
++        set(
++            "assetsOf",
++            Closure::<dyn Fn(_) -> _>::new(assets_of).into_js_value(),
++        )?;
++        let app = runner.clone();
++        let read_asset = move |id: String| -> Result<Uint8Array, JsValue> {
++            let app = app.app_mut::<HoneydewApp>().ok_or("busy")?;
++            let bytes = app
++                .live_read_asset(&id)
++                .ok_or_else(|| format!("No sample {id}"))?;
++            Ok(bytes.as_slice().into())
++        };
++        set(
++            "readAsset",
++            Closure::<dyn Fn(_) -> _>::new(read_asset).into_js_value(),
++        )?;
++        let app = runner.clone();
++        let write_asset = move |id: String, _name: JsValue, bytes: Uint8Array| {
++            let mut app = app.app_mut::<HoneydewApp>().ok_or("busy")?;
++            app.live_write_asset(&id, bytes.to_vec());
++            Ok::<_, JsValue>(())
++        };
++        set(
++            "writeAsset",
++            Closure::<dyn Fn(_, _, _) -> _>::new(write_asset).into_js_value(),
++        )?;
 +        let global = global();
 +        Reflect::set(&global, &"playgroundLiveAdapter".into(), &adapter)?;
 +        let attach = Reflect::get(&global, &"playgroundLive".into())
@@ -402,10 +542,10 @@ index 0000000..6af4877
 +}
 diff --git a/src/app/tests/peer_live.rs b/src/app/tests/peer_live.rs
 new file mode 100644
-index 0000000..2116e76
+index 0000000..79735bc
 --- /dev/null
 +++ b/src/app/tests/peer_live.rs
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,207 @@
 +//! Live editing in a Playground session (`app/live.rs`): a remote change waits for a quiet frame and keeps this
 +//! person's unsent work and views; while connected, Undo and Redo go to the session.
 +
@@ -521,6 +661,97 @@ index 0000000..2116e76
 +        "the session reverts only this person's operations"
 +    );
 +    assert_eq!(live::undos(), [false]);
++}
++
++#[test]
++fn user_samples_are_listed_and_arrive_without_a_song_change() {
++    use crate::flm::chunk::{ContentPath, ContentRoot};
++    use crate::sample_cache::{SampleKey, tests::wav};
++    let (mut rig, _, _session) = connected();
++    rig.app.add_default_drums(0);
++    let id = "My Samples/Kick.wav";
++    let path = |root, relative: &str| {
++        Some(ContentPath::Shorthand {
++            root,
++            relative: relative.into(),
++        })
++    };
++    let slots = &mut rig.app.song.channels[2].drum_kit.as_mut().unwrap().slots;
++    slots[0].file.path = path(ContentRoot::User, id);
++    slots[1].file.path = path(ContentRoot::App, "Drum Samples/Snare.wav");
++    rig.app.song_edited(SongEdit::Final, 0);
++    rig.frame(vec![]);
++    let key = SampleKey::File(path(ContentRoot::User, id).unwrap());
++    assert!(rig.app.audio.samples.missing().any(|k| *k == key));
++    // Only the user's file: no built-in or content-folder sample.
++    assert_eq!(
++        rig.app.live_assets(),
++        [(id.into(), "Kick.wav".into(), false)]
++    );
++    let shared = checkpoint::encode(&rig.app.song).unwrap();
++    assert_eq!(live::assets_of(&shared).unwrap(), [id]);
++
++    let (song, steps, reported) = (
++        rig.app.song.clone(),
++        rig.app.history.steps(),
++        live::changes(),
++    );
++    rig.app.live_write_asset(id, wav(&[1, 2, 3]));
++    rig.app.live_write_asset(id, wav(&[9]));
++    rig.frame(vec![]);
++    assert_eq!(
++        rig.app.live_read_asset(id),
++        Some(wav(&[1, 2, 3])),
++        "never overwritten"
++    );
++    assert!(rig.app.live_assets()[0].2);
++    assert!(
++        rig.app.audio.samples.get(&key).is_some(),
++        "decoded, no longer missing"
++    );
++    assert_eq!(rig.app.song, song);
++    assert_eq!(
++        (rig.app.history.steps(), live::changes()),
++        (steps, reported)
++    );
++}
++
++/// Settles a remote change on `rig` the way the session sends it: `edited` relative to `base`.
++fn apply(rig: &mut Rig, base: &[u8], edited: &[u8]) {
++    let done = Done::default();
++    let to = Rc::clone(&done);
++    let (base, edited) = (base.to_vec(), edited.to_vec());
++    live::queue(
++        Some(base),
++        edited,
++        Box::new(move |r| *to.borrow_mut() = Some(r)),
++    );
++    rig.frame(vec![]);
++    assert!(
++        matches!(*done.borrow(), Some(Ok(None))),
++        "{:?}",
++        done.borrow()
++    );
++}
++
++#[test]
++fn a_channel_added_on_each_side_keeps_the_shared_rack_order() {
++    // Bob's new channel has no rack place yet in his live song (the format settles it); Alice's later one must not
++    // take its place when Bob merges it, or his song differs from the session's and he proposes it again and again.
++    let (mut alice, mut bob) = (Rig::new(), Rig::new());
++    live::connect();
++    let _session = Session;
++    let start = checkpoint::encode(&bob.app.song).unwrap();
++    bob.app
++        .add_channel(ChannelKind::Synth(crate::song::SynthKind::MiniSynth), 0);
++    bob.frame(vec![]);
++    let bobs = checkpoint::encode(&bob.app.song).unwrap();
++    apply(&mut alice, &start, &bobs);
++    alice.app.add_channel(ChannelKind::AudioClip, 0);
++    alice.frame(vec![]);
++    let alices = checkpoint::encode(&alice.app.song).unwrap();
++    apply(&mut bob, &bobs, &alices);
++    assert!(checkpoint::encode(&bob.app.song).unwrap() == alices);
 +}
 diff --git a/src/collaboration.rs b/src/collaboration.rs
 new file mode 100644
