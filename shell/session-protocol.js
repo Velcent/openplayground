@@ -59,18 +59,24 @@ export function readInvite(url) {
   if (value.length > 2048) throw new Error('Invalid invitation')
   return validInvite(JSON.parse(string.decode(decode(value))))
 }
+// An asset ID is the root of a file's chunk hashes: one hash over their ordered list (and the size). File lists carry
+// only the root; the list itself comes from a participant that has the file, and must hash to it before any chunk is used.
 export const assetId = (size, hashes) => digest(text.encode(JSON.stringify([VERSION, CHUNK_SIZE, size, hashes])))
+export const validHashes = async (f, hashes) => Array.isArray(hashes) && hashes.length === Math.ceil(f.size / CHUNK_SIZE) && hashes.every((h) => typeof h === 'string' && HASH.test(h)) && f.asset === await assetId(f.size, hashes)
 export async function validateManifest(files) {
   if (!Array.isArray(files) || files.length > 256 || JSON.stringify(files).length > MAX_MANIFEST) throw new Error('File list is too large')
-  const ids = new Set()
+  const ids = new Set(), sizes = new Map()
   let total = 0
   for (const f of files) {
     if (!f || typeof f.id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(f.id) || ids.has(f.id)) throw new Error('Invalid file ID')
     ids.add(f.id)
     if (typeof f.name !== 'string' || !f.name.trim() || f.name.length > 255 || /[\x00-\x1f\x7f/\\]/.test(f.name) || ['.', '..'].includes(f.name)) throw new Error('Invalid file name')
     if (!Number.isSafeInteger(f.size) || f.size < 0 || f.size > MAX_FILE || (total += f.size) > MAX_TOTAL) throw new Error('File size exceeds session limits')
-    if (!Array.isArray(f.hashes) || f.hashes.length !== Math.ceil(f.size / CHUNK_SIZE) || !f.hashes.every((h) => typeof h === 'string' && HASH.test(h))) throw new Error('Invalid chunk hashes')
-    if (typeof f.asset !== 'string' || !HASH.test(f.asset) || f.asset !== await assetId(f.size, f.hashes)) throw new Error('Invalid asset hash')
+    // The same asset is the same bytes: a second size for it could never verify, only hide the real one.
+    if (typeof f.asset !== 'string' || !HASH.test(f.asset) || (sizes.get(f.asset) ?? f.size) !== f.size) throw new Error('Invalid asset hash')
+    sizes.set(f.asset, f.size)
+    // Lists stored by earlier versions carry each file's chunk hashes (session-store.js moves them beside the chunks).
+    if (f.hashes !== undefined && !await validHashes(f, f.hashes)) throw new Error('Invalid chunk hashes')
   }
   return files
 }

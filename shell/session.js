@@ -1,4 +1,4 @@
-import { CHUNK_SIZE, FRAME_SIZE, MAX_MANIFEST, MAX_SIGNAL, pack, unpack, randomToken, tokenHash, signalKey, seal, open, readInvite, inviteURL, validateManifest } from './session-protocol.js'
+import { CHUNK_SIZE, FRAME_SIZE, HASH, MAX_MANIFEST, MAX_SIGNAL, pack, unpack, randomToken, tokenHash, signalKey, seal, open, readInvite, inviteURL, validateManifest } from './session-protocol.js'
 import { SessionStore, describe } from './session-store.js'
 import { MAX_DOCUMENT } from './document-delta.js'
 
@@ -11,6 +11,8 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 // Document messages by sender: the owner's snapshots (a document and its retained history, see document-history.js),
 // an editor's proposal to the owner (a delta's two spans), anything else small (a resync).
 const MAX_SNAPSHOT = 3 * MAX_DOCUMENT + 8 * 1024 ** 2, MAX_PROPOSAL = 2 * MAX_DOCUMENT + 64 * 1024, MAX_CONTROL = 64 * 1024
+// Hashes (or asset IDs) per files-channel message: 67 characters each in JSON, under its 32 KiB limit.
+const PART = 400
 async function request(room, action, data, token) {
   const response = await fetch(`/api/session/${room}/${action}`, { method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(data), cache: 'no-store' })
   const result = await response.json()
@@ -396,6 +398,18 @@ export class PeerSession extends EventTarget {
     } else if (value.type === 'inventory') {
       if (!Array.isArray(value.assets) || value.assets.length > 256 || !value.assets.every((a) => typeof a === 'string' && /^[a-f0-9]{64}$/.test(a))) throw new Error('Invalid inventory')
       peer.inventory = new Set(value.assets); peer.inventoryKnown = true; await this.pump()
+    } else if (value.type === 'want-hashes') {
+      const hashes = await this.store.hashes(value.asset)
+      if (!hashes || !Number.isSafeInteger(value.at) || value.at < 0 || value.at >= hashes.length) throw new Error('Invalid hash request')
+      await this.send(peer, { type: 'hashes', asset: value.asset, at: value.at, hashes: hashes.slice(value.at, value.at + PART) })
+    } else if (value.type === 'hashes') {
+      const expected = this.requested, entry = this.files.find((f) => f.asset === value.asset)
+      if (!expected?.list || expected.peer !== peer.id || expected.asset !== value.asset || expected.list.length !== value.at || !Array.isArray(value.hashes) || !value.hashes.length || value.hashes.length > PART || !value.hashes.every((h) => typeof h === 'string' && HASH.test(h))) throw new Error('Unexpected chunk hashes')
+      expected.list.push(...value.hashes)
+      if (expected.list.length < Math.ceil(entry.size / CHUNK_SIZE)) return this.ask(peer, expected, { type: 'want-hashes', asset: value.asset, at: expected.list.length })
+      await this.store.putHashes(value.asset, expected.list) // A list that does not hash to the asset ID throws.
+      clearTimeout(this.chunkTimer); this.requested = null
+      await this.pump()
     } else if (value.type === 'want') {
       if (peer.sending || !Number.isInteger(value.index)) throw new Error('Invalid asset request')
       const data = await this.store.chunk(value.asset, value.index)
@@ -483,22 +497,25 @@ export class PeerSession extends EventTarget {
         this.error = 'No connected participant can send these files. Reconnect to retry; verified data is saved.'
       }
       for (const peer of this.peers.values()) if (peer.channel?.readyState === 'open') await this.report(peer)
-      if (job) {
-        const peer = source
-        if (peer) {
-          this.requested = { peer: peer.id, asset: job.asset, index: job.indices[job.at] }
-          clearTimeout(this.chunkTimer)
-          this.chunkTimer = setTimeout(() => {
-            if (this.requested?.peer !== peer.id) return
-            this.error = `Transfer from ${peer.name} stalled. Verified data is saved for retry.`
-            peer.channel.close()
-          }, 15000)
-          await this.send(peer, { type: 'want', asset: job.asset, index: job.indices[job.at] })
-        }
+      // A file's chunk hashes come first, in parts, from the participant that will send its chunks.
+      if (job && source) {
+        if (await this.store.hashes(job.asset)) await this.ask(source, { asset: job.asset, index: job.indices[job.at] }, { type: 'want', asset: job.asset, index: job.indices[job.at] })
+        else await this.ask(source, { asset: job.asset, list: [] }, { type: 'want-hashes', asset: job.asset, at: 0 })
       }
       this.changed()
     } finally { this.pumping = false }
     if (this.scanDownloads && !this.requested) await this.pump()
+  }
+  // One request in flight, to one participant; when it goes unanswered, that channel closes so another can take over.
+  ask(peer, request, message) {
+    this.requested = { ...request, peer: peer.id }
+    clearTimeout(this.chunkTimer)
+    this.chunkTimer = setTimeout(() => {
+      if (this.requested?.peer !== peer.id) return
+      this.error = `Transfer from ${peer.name} stalled. Verified data is saved for retry.`
+      peer.channel.close()
+    }, 15000)
+    return this.send(peer, message)
   }
   leave() {
     this.stopped = true; clearInterval(this.heartbeat); clearTimeout(this.reconnectTimer); clearTimeout(this.chunkTimer)
