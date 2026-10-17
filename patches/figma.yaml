@@ -63,7 +63,7 @@
   before: "            #[cfg(target_arch = \"wasm32\")] crate::live::playground::tab(ui, d.uid, r);\n"
 - live: true
   file: crates/ui-egui/src/home.rs
-  find: '^[ \t]*(?:let\s+recents\s*=\s*app\.session\.prefs\.recent_files\b|if\s+crate::home_recents::listed\(\s*&app\.session\.prefs\.recent_files\b)'
+  find: '^[ \t]*(?:let\s+recents\s*=\s*app\.session\.prefs\.recent_files\b|if\s+crate::home_recents::listed\s*\()'
   before: "    #[cfg(target_arch = \"wasm32\")] crate::live::playground::home(app, ui, t);\n"
 # The web entry keeps its runner for the adapter and wraps its app (web/playground.rs, a child module so it reaches
 # WebShell's fields).
