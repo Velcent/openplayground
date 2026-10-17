@@ -46,4 +46,7 @@ test('asset manifests reject traversal, impossible lengths and forged hashes', a
   const { hashes, ...listed } = file
   assert.deepEqual(await p.validateManifest([listed]), [listed])
   await assert.rejects(() => p.validateManifest([listed, { ...listed, id: 'b', size: 4 }]))
+  const many = Array.from({ length: 10001 }, (_, i) => ({ ...listed, id: `f${i}`, name: `photo-${i}.jpg` }))
+  assert.equal((await p.validateManifest(many.slice(1))).length, 10000)
+  await assert.rejects(() => p.validateManifest(many), /too large/)
 })

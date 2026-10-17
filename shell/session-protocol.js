@@ -4,9 +4,10 @@ export const CHUNK_SIZE = 65536
 export const FRAME_SIZE = 16384
 export const MAX_MEMBERS = 8
 export const MAX_SIGNAL = 196608
+// 10,000 entries with 255-character names are about 7 MB; older stored lists (inline chunk hashes) stay under 16 MiB.
 export const MAX_MANIFEST = 16 * 1024 ** 2
+export const MAX_FILES = 10000
 export const MAX_FILE = 8 * 1024 ** 3
-export const MAX_TOTAL = 32 * 1024 ** 3
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 export const HASH = /^[0-9a-f]{64}$/
 export const TOKEN = /^[A-Za-z0-9_-]{43}$/
@@ -64,14 +65,13 @@ export function readInvite(url) {
 export const assetId = (size, hashes) => digest(text.encode(JSON.stringify([VERSION, CHUNK_SIZE, size, hashes])))
 export const validHashes = async (f, hashes) => Array.isArray(hashes) && hashes.length === Math.ceil(f.size / CHUNK_SIZE) && hashes.every((h) => typeof h === 'string' && HASH.test(h)) && f.asset === await assetId(f.size, hashes)
 export async function validateManifest(files) {
-  if (!Array.isArray(files) || files.length > 256 || JSON.stringify(files).length > MAX_MANIFEST) throw new Error('File list is too large')
+  if (!Array.isArray(files) || files.length > MAX_FILES || JSON.stringify(files).length > MAX_MANIFEST) throw new Error('File list is too large')
   const ids = new Set(), sizes = new Map()
-  let total = 0
   for (const f of files) {
     if (!f || typeof f.id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(f.id) || ids.has(f.id)) throw new Error('Invalid file ID')
     ids.add(f.id)
     if (typeof f.name !== 'string' || !f.name.trim() || f.name.length > 255 || /[\x00-\x1f\x7f/\\]/.test(f.name) || ['.', '..'].includes(f.name)) throw new Error('Invalid file name')
-    if (!Number.isSafeInteger(f.size) || f.size < 0 || f.size > MAX_FILE || (total += f.size) > MAX_TOTAL) throw new Error('File size exceeds session limits')
+    if (!Number.isSafeInteger(f.size) || f.size < 0 || f.size > MAX_FILE) throw new Error('File size exceeds session limits')
     // The same asset is the same bytes: a second size for it could never verify, only hide the real one.
     if (typeof f.asset !== 'string' || !HASH.test(f.asset) || (sizes.get(f.asset) ?? f.size) !== f.size) throw new Error('Invalid asset hash')
     sizes.set(f.asset, f.size)

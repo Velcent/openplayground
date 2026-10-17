@@ -85,6 +85,25 @@ test('interrupted downloads resume verified chunks, including files added during
   assert.equal(await b.evaluate(async () => (await session.store.file(session.files[1].asset)).text()), 'second')
 })
 
+test('a library of more than 256 files arrives whole, each file verified against its fetched chunk hashes', async () => {
+  const a = await site.page(), b = await site.page()
+  const invite = await a.evaluate(async () => {
+    // 450 small files (an inventory in two parts) and one of 401 chunks (its hash list in two parts).
+    const files = Array.from({ length: 450 }, (_, i) => new File([`photo ${i}`], `photo ${i}.jpg`))
+    files.push(new File([new Uint8Array(65536 * 400 + 1).fill(3)], 'video.mp4'))
+    window.session = await PeerSession.create({ app: '/honeydew/', files })
+    return session.invite()
+  })
+  await b.evaluate(async (invite) => { window.session = await PeerSession.join(invite); await session.receive() }, invite)
+  await until(() => b.evaluate(() => session.files.length === 451 && session.status === 'ready'), 120000, 'library transfer')
+  assert.deepEqual(await b.evaluate(async () => {
+    const texts = await Promise.all(session.files.filter((f) => f.name !== 'video.mp4').map(async (f) => await (await session.store.file(f.asset)).text() === f.name.slice(0, -4)))
+    const video = session.files.find((f) => f.name === 'video.mp4')
+    return { files: session.files.length, texts: texts.filter(Boolean).length, video: (await session.store.file(video.asset)).size, done: session.progress.received === session.progress.total }
+  }), { files: 451, texts: 450, video: 65536 * 400 + 1, done: true })
+  for (const page of [a, b]) await page.evaluate(() => session.leave())
+})
+
 test('wrong secrets, mismatched apps and forged viewer manifests cannot change shared files', async () => {
   const a = await site.page(), b = await site.page(), c = await site.page()
   const invite = await a.evaluate(async () => {
