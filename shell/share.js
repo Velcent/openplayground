@@ -201,10 +201,9 @@ export async function mountShare(bar, app, here, groups = []) {
             selection.append(h('label',{},checkbox,h('span',{},entry.name),h('small',{},formatSize(entry.size))))
           }
           const computer=h('input',{type:'file',multiple:true,'aria-label':'Add files from computer'})
-          body.append(h('p',{},liveText('The project open here is shared live once the session starts. You can also add files to send along; your other files stay private.','Choose the saved project and its assets. Your other files stay private.')),selection,computer,button('Create session',()=>attempt(async()=>{
+          body.append(h('p',{},liveText('The project open here is shared live once the session starts. You can also add files to send along; your other files stay private.','Start now and add files any time, or choose some to send along. Your other files stay private.')),selection,computer,button('Create session',()=>attempt(async()=>{
             const files=[...computer.files]
             for(const {entry,checkbox} of picks)if(checkbox.checked)files.push(await store.file(entry.path))
-            if(!files.length && !liveAdapter())throw new Error('Choose at least one file')
             use(await PeerSession.create({app:here.path,name:name.value,files}));live()
           }),true))
           // Sessions this browser was in, to rejoin or clear: auto-resume covers the current one.
