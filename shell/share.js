@@ -9,6 +9,7 @@ import { h, icon, modal, toast, download, confirmIn } from './ui.js'
 const button = (label, run, primary = false) => h('button', { type:'button', class:`pg-btn${primary ? ' pg-primary' : ''}`, onclick:run }, label)
 const color = id => `hsl(${parseInt(id.slice(0, 6), 16) % 360} 65% 60%)`
 const total = files => [...new Map(files.map(f => [f.asset, f])).values()].reduce((n,f)=>n+f.size,0)
+const when = time => new Date(time).toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})
 const LIVE = { live:'Live editing', 'read-only':'Viewing live edits', paused:'Paused: the owner is offline. Your edits stay here until they return.', 'catching up':'Catching up on edits', incompatible:'Not live: another app version' }
 // The session this browser is in: it follows the person from app to app (each app page resumes it).
 const active = {
@@ -43,10 +44,10 @@ export async function mountShare(bar, app, here, groups = []) {
     session?.removeEventListener('change',update); session=next; session.addEventListener('change',update); update()
     active.set(next.room)
     follow(next).then(live => live?.addEventListener('change', () => next.changed())).catch(e => { next.error = e.message; next.changed() })
-    // Removed, or opened in another tab: this page no longer takes part, so Undo is the app's own again.
+    // Removed, ended, or opened in another tab: this page no longer takes part, so Undo is the app's own again.
     next.addEventListener('change', () => {
-      if (['removed','displaced'].includes(next.status)) unfollow(next)
-      if (next.status === 'removed' && active.get() === next.room) active.set(null)
+      if (['removed','displaced','ended'].includes(next.status)) unfollow(next)
+      if (['removed','ended'].includes(next.status) && active.get() === next.room) active.set(null)
     })
   }
   const end = () => { unfollow(session); session.leave(); active.set(null) }
@@ -82,8 +83,16 @@ export async function mountShare(bar, app, here, groups = []) {
           h('label',{},'Your name',name), body, error)
         function live() {
           body.replaceChildren()
-          const status = h('p',{role:'status'}), members = h('div',{class:'pg-share-members'}), files=h('div',{class:'pg-share-files'})
+          const status = h('p',{role:'status'}), members = h('div',{class:'pg-share-members'}), files=h('div',{class:'pg-share-files'}), drafts=h('div',{class:'pg-share-files'})
           const rows=new Map(), fileRows=new Map()
+          // Local work live editing could not keep (session-store.js): opened, it is proposed as this person's edit.
+          let kept=[], opens=[]
+          const showDrafts=()=>{
+            opens=kept.map(d=>[d,button('Open as my version',()=>attempt(async()=>{await session.live.restoreDraft(await session.store.readDraft(d.name));toast('Draft opened as your version')}))])
+            drafts.replaceChildren(...(kept.length?[h('p',{class:'pg-hint'},'Kept drafts')]:[]),...opens.map(([d,open])=>h('div',{class:'pg-share-file'},h('span',{},when(d.time)),h('small',{},[d.app&&`from ${appName(d.app)}`,formatSize(d.size)].filter(Boolean).join(' · ')),h('div',{class:'pg-actions'},open,button('Remove',()=>attempt(async()=>{
+              if (await confirmIn(view,'Remove this draft from this browser? It cannot be recovered.','Remove',{danger:true})) {await session.store.removeDraft(d.name);renderSession()}
+            }))))))
+          }
           const receive=button('Receive files',()=>attempt(()=>session.receive()),true)
           const reconnect=button('Reconnect',()=>attempt(async()=>{ session.leave(); await session.connect() }))
           const leave=button('Leave session',()=>{ end(); invite=null; clearLink(); done() })
@@ -103,10 +112,10 @@ export async function mountShare(bar, app, here, groups = []) {
           const add = h('input',{type:'file',multiple:true,'aria-label':'Share more files'})
           const addLabel = h('label',{},'Add files',add)
           add.onchange=()=>attempt(async()=>{await session.share([...add.files]);add.value=''})
-          body.append(status,warning,members,files,receive,addLabel,h('div',{class:'pg-actions'},forget,reconnect,leave))
+          body.append(status,warning,members,files,drafts,receive,addLabel,h('div',{class:'pg-actions'},forget,reconnect,leave))
           renderSession = () => {
             const away=session.live?.status==='paused' && session.live.ownerElsewhere
-            status.textContent=`${session.live ? `${away ? `Paused: ${away.name} (owner) is in ${appName(away.page)}. Your edits stay here until they open ${app.name}.` : LIVE[session.live.status]} · ` : ''}${session.files.length} ${session.files.length===1?'file':'files'} · ${formatSize(total(session.files))}`
+            status.textContent=`${session.live ? `${away ? `Paused: ${away.name} (owner) is in ${appName(away.page)}. Your edits stay here until they open ${app.name}.` : LIVE[session.live.status]} · ` : ''}${session.files.length} ${session.files.length===1?'file':'files'} · ${formatSize(total(session.files))}${kept.length ? ` · ${kept.length} kept ${kept.length===1?'draft':'drafts'}` : ''}`
             warning.textContent=session.live?.error || session.error || session.relayWarning || (session.peers.size ? '' : 'Waiting for another participant. A person with a local copy must be online to send files.')
             addLabel.hidden=session.role==='viewer' || session.stopped
             receive.hidden=session.accepted; receive.disabled=!session.files.length
@@ -149,6 +158,8 @@ export async function mountShare(bar, app, here, groups = []) {
               }
               for(const b of row.buttons)b.disabled=!session.available.has(entry.asset)
             }
+            for(const [d,open] of opens) open.hidden=!(session.live?.editable && d.app===session.live.app)
+            session.store.drafts().then(list=>{if(list!==kept){kept=list;showDrafts();renderSession()}},()=>{})
           }
           renderSession();session.addEventListener('change',renderSession)
         }
@@ -174,8 +185,7 @@ export async function mountShare(bar, app, here, groups = []) {
           const earlier=(await SessionStore.list()).filter(room=>room.id!==active.get())
           if (earlier.length) body.append(h('p',{class:'pg-hint'},'Earlier sessions in this browser'))
           for(const room of earlier) {
-            const when=new Date(room.modified).toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})
-            const detail=[when, room.app!==here.path ? `started in ${appName(room.app)}` : '', room.files ? `${room.files} ${room.files===1?'file':'files'}` : ''].filter(Boolean).join(' · ')
+            const detail=[when(room.modified), room.app!==here.path ? `started in ${appName(room.app)}` : '', room.files ? `${room.files} ${room.files===1?'file':'files'}` : ''].filter(Boolean).join(' · ')
             const row=h('div',{class:'pg-share-file'},h('span',{},room.owner?'Your session':'Session you joined'),h('small',{},detail),h('div',{class:'pg-actions'},
               button('Rejoin',()=>attempt(async()=>{const s=await PeerSession.restore(room.id);use(s);await s.connect();live()})),
               button('Remove',()=>attempt(async()=>{

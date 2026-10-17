@@ -233,3 +233,18 @@ test('document messages carry nested bytes beside a file transfer, and a stray f
   await until(() => b.evaluate(() => session.status === 'ready'), 20000, 'file transfer unaffected')
   for (const page of [a, b]) await page.evaluate(() => session.leave())
 })
+
+test('a session nobody opens for 30 days ends, and joining or reconnecting says so', async () => {
+  const a = await site.page(), b = await site.page()
+  const { room, invite } = await a.evaluate(async () => {
+    window.session = await PeerSession.create({ app: '/honeydew/' })
+    await new Promise((resolve) => { session.ws.addEventListener('close', resolve, { once: true }); session.leave() })
+    return { room: session.room, invite: session.invite() }
+  })
+  const rooms = await site.worker.getDurableObjectNamespace('ROOMS'), stub = rooms.get(rooms.idFromName(room))
+  await stub.save({ ...await stub.load(), active: Date.now() - 31 * 24 * 3600 * 1000 })
+  // The alarm the owner's socket set (its 10 s to authenticate) comes before the idle one, and finds it due too.
+  await until(async () => await stub.load() === null, 20000, 'idle room deleted')
+  assert.equal(await b.evaluate(async (invite) => { try { await PeerSession.join(invite); return 'joined' } catch (e) { return e.message } }, invite), 'This session has ended')
+  assert.deepEqual(await a.evaluate(async () => [await session.connect().then(() => 'connected', (e) => e.message), session.status]), ['This session has ended: nobody had it open for 30 days. Your local copies are still available.', 'ended'])
+})

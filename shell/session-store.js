@@ -1,5 +1,7 @@
 import { CHUNK_SIZE, MAX_FILE, MAX_MANIFEST, UUID, HASH, assetId, digest, pack, unpack, validateManifest } from './session-protocol.js'
 
+// drafts/<time>-<uuid>[-<app path, URI-encoded>].bin
+const DRAFT = /^([0-9]+)-[0-9a-f-]{36}(?:-((?:%2F|[a-z0-9-])+))?\.bin$/
 const write = async (dir, name, bytes) => {
   const out = await (await dir.getFileHandle(name, { create: true })).createWritable()
   try { await out.write(bytes); await out.close() }
@@ -137,12 +139,33 @@ export class SessionStore {
     try { return unpack(new Uint8Array(await (await (await dir.getFileHandle(`${name}.bin`)).getFile()).arrayBuffer())) }
     catch (e) { if (e.name === 'NotFoundError') return null; throw e }
   }
-  // Local work a live document could not keep: a rejected or conflicting draft, or what a session replaced.
-  // ponytail: drafts accumulate until the session is removed; prune or list them once there is a drafts UI.
-  async draft(bytes) {
-    const dir = await (await this.root()).getDirectoryHandle('drafts', { create: true })
-    await write(dir, `${Date.now()}-${crypto.randomUUID()}.bin`, bytes)
+  // Local work a live document could not keep: a rejected or conflicting draft, or what a session replaced. Named
+  // for when and from which app (its path), kept until the person opens or removes it in the Share panel.
+  async draft(bytes, app) {
+    await write(await this.draftsDir(), `${Date.now()}-${crypto.randomUUID()}${app ? `-${encodeURIComponent(app)}` : ''}.bin`, bytes)
+    this.kept = null
   }
+  // Newest first: [{ name, app, time, size }]. Listed once until a draft is added or removed: the panel asks often.
+  drafts() {
+    return this.kept ??= (async () => {
+      const list = []
+      for await (const [name, handle] of (await this.draftsDir()).entries()) {
+        const m = handle.kind === 'file' && name.match(DRAFT)
+        if (m) list.push({ name, app: m[2] ? decodeURIComponent(m[2]) : null, time: Number(m[1]), size: (await handle.getFile()).size })
+      }
+      return list.sort((a, b) => b.time - a.time)
+    })().catch((e) => { this.kept = null; throw e })
+  }
+  async readDraft(name) {
+    if (!DRAFT.test(name)) throw new Error('Invalid draft')
+    return new Uint8Array(await (await (await (await this.draftsDir()).getFileHandle(name)).getFile()).arrayBuffer())
+  }
+  async removeDraft(name) {
+    if (!DRAFT.test(name)) throw new Error('Invalid draft')
+    await (await this.draftsDir()).removeEntry(name)
+    this.kept = null
+  }
+  async draftsDir() { return (await this.root()).getDirectoryHandle('drafts', { create: true }) }
   async finish(asset) {
     if ((await this.missing(asset)).length) throw new Error('File is still syncing')
     await write(await this.directory(asset), 'complete.json', 'true')

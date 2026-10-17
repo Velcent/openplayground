@@ -139,7 +139,7 @@ export class LiveDocument extends EventTarget {
       this.history = DocumentHistory.restore(record, options)
     } catch {
       // Another build's or an unreadable journal: its document carries over when this build can open it.
-      if (record?.bytes) await this.adapter.apply(null, record.bytes).catch(() => this.store.draft(record.bytes))
+      if (record?.bytes) await this.adapter.apply(null, record.bytes).catch(() => this.store.draft(record.bytes, this.app))
       const bytes = await this.shareable()
       this.history = await DocumentHistory.create({ document: crypto.randomUUID(), format: this.adapter.format, bytes, ...options })
       await this.introduced(null, bytes)
@@ -296,17 +296,29 @@ export class LiveDocument extends EventTarget {
       await this.restore(after)
     }
   }
-  // The live document becomes `document`; what it replaced is kept as a draft when it differs.
-  async restore(document) {
+  // The live document becomes `document`; what it replaced is kept as a draft when it differs from it (and from
+  // `shared`, when given: the shared document needs no draft).
+  async restore(document, shared) {
     const replaced = await this.adapter.apply(null, document)
     if (this.inflight) this.inflight.inLive = false
-    if (!(replaced instanceof Uint8Array) || same(replaced, document)) return
-    try { await this.store.draft(replaced) }
+    if (!(replaced instanceof Uint8Array) || same(replaced, document) || (shared && same(replaced, shared))) return
+    try { await this.store.draft(replaced, this.app) }
     catch (e) {
-      // ponytail: held in memory only; offer it for download once there is a drafts UI.
+      // ponytail: held in memory only; list it with the kept drafts (share.js) if storage failures show up.
       this.unsaved.push(replaced)
       this.report(new Error(`Your replaced work could not be saved as a draft (${e?.message ?? e}). Keep this page open.`))
     }
+  }
+  // A kept draft (session-store.js) becomes this person's live document; the next step proposes it like any local
+  // edit, so it merges or conflicts as usual. Unsent work it replaces is kept as a draft in turn.
+  restoreDraft(bytes) {
+    const done = this.work.then(() => {
+      if (!this.editable || !this.acked || this.incompatible) throw new Error('A draft opens once you can edit this live document')
+      return this.restore(bytes, this.acked.bytes)
+    })
+    this.work = done.catch(() => {})
+    this.kick()
+    return done
   }
   // Shares the media the shared document refers to that nobody shared yet, and installs what this browser lacks once
   // it has arrived. Coalesced: one pass at a time, at most one more queued.

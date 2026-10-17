@@ -145,6 +145,21 @@ test('a conflicting edit keeps one result everywhere and the rejected work as a 
   assert.notEqual(drafts()[0][0], owner.app.doc[0], 'the losing value survives only in the draft')
 })
 
+test('a kept draft opens as this person\'s version, proposed through the journal like any edit', async () => {
+  const hub = new Hub(), [o, e] = ids()
+  const owner = await hub.join(o, 'owner'), editor = await hub.join(e, 'editor')
+  await live(owner, editor)
+  editor.app.edit(0, 2); owner.app.edit(0, 1)
+  await eventually(() => { assert.equal(new Set(values(owner, editor).map(String)).size, 1); assert.equal(owner.store.drafts.length + editor.store.drafts.length, 1) })
+  const loser = owner.store.drafts.length ? owner : editor, [draft] = loser.store.drafts, shared = [...owner.app.doc]
+  await loser.live.restoreDraft(draft)
+  await converge([owner, editor], [...draft])
+  assert.equal(loser.store.drafts.length, 1, 'the shared document it replaced needs no draft')
+  // Undo takes it back out: it is this person's own entry in the journal.
+  loser.app.hooks.undo(false)
+  await converge([owner, editor], shared)
+})
+
 test('remote changes wait for a busy app, in order', async () => {
   const hub = new Hub(), [o, e] = ids()
   const owner = await hub.join(o, 'owner'), editor = await hub.join(e, 'editor')

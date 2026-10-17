@@ -3,6 +3,9 @@ import { HASH, UUID, TOKEN, MAX_MEMBERS, MAX_SIGNAL, randomToken, tokenHash } fr
 
 const json = (value, status = 200) => Response.json(value, { status, headers: { 'cache-control': 'no-store' } })
 const error = (message, status) => json({ error: message }, status)
+// A room nobody has been connected to for this long ends, invitations and all.
+const IDLE = 30 * 24 * 3600 * 1000
+const TABLE = 'CREATE TABLE IF NOT EXISTS room (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL)'
 const bearer = (request) => request.headers.get('authorization')?.replace(/^Bearer /, '') ?? ''
 async function body(request) {
   const reader = request.body?.getReader()
@@ -33,11 +36,13 @@ export async function sessionRequest(request, env) {
 export class SessionRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env)
-    ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS room (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL)')
+    ctx.storage.sql.exec(TABLE)
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'))
   }
   load() { return JSON.parse(this.ctx.storage.sql.exec('SELECT value FROM room WHERE id=1').toArray()[0]?.value ?? 'null') }
   save(room) { this.ctx.storage.sql.exec('INSERT OR REPLACE INTO room(id, value) VALUES(1, ?)', JSON.stringify(room)) }
+  // Someone connected, authenticated or left: the room lasts until IDLE after this (alarm).
+  touch() { const room = this.load(); if (room) { room.active = Date.now(); this.save(room) } return room }
   sockets() { return this.ctx.getWebSockets().filter((ws) => ws.readyState === 1) }
   roster() {
     const room = this.load()
@@ -57,13 +62,14 @@ export class SessionRoom extends DurableObject {
     const action = new URL(request.url).pathname.split('/').pop()
     if (action === 'socket') {
       if (request.method !== 'GET' || request.headers.get('upgrade')?.toLowerCase() !== 'websocket') return error('WebSocket required', 426)
-      if (!this.load()) return error('Session unavailable', 404)
-      if (this.sockets().length >= MAX_MEMBERS * 3) return error('Too many connections', 429)
       const { 0: client, 1: server } = new WebSocketPair()
+      // Ended (or never created): said through the socket, as a browser cannot read why an upgrade failed.
+      if (!this.touch()) { server.accept(); server.close(4005, 'This session has ended'); return new Response(null, { status: 101, webSocket: client }) }
+      if (this.sockets().length >= MAX_MEMBERS * 3) return error('Too many connections', 429)
       this.ctx.acceptWebSocket(server)
-      server.serializeAttachment({ deadline: Date.now() + 10000 })
-      const alarm = await this.ctx.storage.getAlarm()
-      if (!alarm) await this.ctx.storage.setAlarm(Date.now() + 10000)
+      const deadline = Date.now() + 10000, alarm = await this.ctx.storage.getAlarm()
+      server.serializeAttachment({ deadline })
+      if (!alarm || alarm > deadline) await this.ctx.storage.setAlarm(deadline)
       return new Response(null, { status: 101, webSocket: client })
     }
     if (request.method !== 'POST') return error('POST required', 405)
@@ -79,16 +85,18 @@ export class SessionRoom extends DurableObject {
         if (room) return error('Session already exists', 409)
         if (!/^\/(?:head\/)?[a-z0-9-]+\/$/.test(input.app) || /(?:outlook|mailcraft)/.test(input.app) || ![input.owner, input.editor, input.viewer].every((v) => typeof v === 'string' && HASH.test(v)) || new Set([input.owner, input.editor, input.viewer]).size !== 3) return error('Invalid room', 400)
         const id = crypto.randomUUID()
-        this.save({ app: input.app, owner: input.owner, editor: input.editor, viewer: input.viewer, epoch: 1, locked: false, members: { [id]: { hash: memberHash, role: 'owner' } } })
+        this.save({ app: input.app, owner: input.owner, editor: input.editor, viewer: input.viewer, epoch: 1, locked: false, active: Date.now(), members: { [id]: { hash: memberHash, role: 'owner' } } })
+        await this.ctx.storage.setAlarm(Date.now() + IDLE)
         return json({ id, token, role: 'owner', app: input.app }, 201)
       }
-      if (!room) return error('Session unavailable; someone with a local copy must reopen it', 404)
+      if (!room) return error('This session has ended', 404)
       if (action === 'join') {
         const role = hash && !room.locked && (hash === room.editor ? 'editor' : hash === room.viewer ? 'viewer' : null)
         if (!role) return error('Invitation is invalid or locked', 403)
         if (Object.keys(room.members).length >= MAX_MEMBERS) return error('This session is full', 409)
         const id = crypto.randomUUID()
         room.members[id] = { hash: memberHash, role }
+        room.active = Date.now()
         this.save(room)
         return json({ id, token, role, app: room.app }, 201)
       }
@@ -146,7 +154,7 @@ export class SessionRoom extends DurableObject {
         for (const old of this.sockets()) if (old !== ws && old.deserializeAttachment().id === message.id) old.close(4004, 'Reconnected elsewhere')
         a = { id: message.id, generation: crypto.randomUUID(), epoch: room.epoch, count: 0, window: Date.now(), seq: 0 }
         ws.serializeAttachment(a)
-        this.roster()
+        this.touch(); this.roster()
         return
       }
       const room = this.load()
@@ -162,8 +170,10 @@ export class SessionRoom extends DurableObject {
       destination?.send(JSON.stringify({ type: 'signal', from: a.id, generation: a.generation, epoch: room.epoch, seq: message.seq, envelope: { iv: message.envelope.iv, data: message.envelope.data } }))
     } catch { ws.close(4002, 'Invalid session message') }
   }
-  webSocketClose(ws, code, reason) { ws.close(code, reason); this.roster() }
-  webSocketError(ws) { ws.close(1011, 'Connection interrupted'); this.roster() }
+  webSocketClose(ws, code, reason) { ws.close(code, reason); this.touch(); this.roster() }
+  webSocketError(ws) { ws.close(1011, 'Connection interrupted'); this.touch(); this.roster() }
+  // Times out sockets that never authenticated, and ends the room IDLE after the last person left; one alarm, set
+  // for whichever comes first.
   async alarm() {
     let next = Infinity
     for (const ws of this.sockets()) {
@@ -172,6 +182,14 @@ export class SessionRoom extends DurableObject {
       if (a.deadline <= Date.now()) ws.close(4003, 'Authentication timed out')
       else next = Math.min(next, a.deadline)
     }
+    const room = this.load(), here = this.sockets().length > 0
+    if (room && !here && Date.now() >= room.active + IDLE) {
+      await this.ctx.storage.deleteAll()
+      // This instance may serve requests until it is evicted: they find no room, as a new one would.
+      this.ctx.storage.sql.exec(TABLE)
+      return
+    }
+    if (room) next = Math.min(next, (here ? Date.now() : room.active) + IDLE)
     if (Number.isFinite(next)) await this.ctx.storage.setAlarm(next)
   }
 }

@@ -143,9 +143,9 @@ export class PeerSession extends EventTarget {
         clearTimeout(timer); clearInterval(this.heartbeat)
         for (const id of [...this.peers.keys()]) this.drop(id)
         if (this.stopped) return
-        if (event.code === 4003 || event.code === 4004) {
-          this.status = event.code === 4004 ? 'displaced' : 'removed'
-          this.error = event.code === 4004 ? 'This session opened in another tab. Your local copies are still available.' : 'Access was removed or expired. Your local copies are still available.'
+        const end = { 4003: ['removed', 'Access was removed or expired.'], 4004: ['displaced', 'This session opened in another tab.'], 4005: ['ended', 'This session has ended: nobody had it open for 30 days.'] }[event.code]
+        if (end) {
+          this.status = end[0]; this.error = `${end[1]} Your local copies are still available.`
           this.stopped = true
           if (!settled) reject(new Error(this.error))
         } else {
