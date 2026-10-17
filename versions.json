@@ -2,7 +2,7 @@
   "photoshop": "v0.9.0+5c63208a",
   "photoshop@head": "head-a05daee+5c63208a",
   "illustrator": "v0.12.0+dab8d49e",
-  "illustrator@head": "head-49bdc5c+dab8d49e",
+  "illustrator@head": "head-2664485+dab8d49e",
   "indesign": "v0.8.0+4a2246de",
   "indesign@head": "head-fc36957+4a2246de",
   "lightroom": "v0.8.0+3a058110",
@@ -34,6 +34,6 @@
   "fl-studio-mobile": "v0.1.6+e9bad523",
   "fl-studio-mobile@head": "head-168d39a+e9bad523",
   "figma": "v0.6.0+665eea0e",
-  "figma@head": "head-40c744d+665eea0e",
+  "figma@head": "head-69806c9+665eea0e",
   "artcraft-store": "4764a52"
 }
