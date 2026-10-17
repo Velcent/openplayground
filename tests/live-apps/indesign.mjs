@@ -22,6 +22,13 @@ export default {
       return await doc(page) > 1000
     }, 60000, 'the sample magazine to open')
   },
+  // The owner selects the title frame (a click, no edit) and rests the pointer on the cover: the editor sees that
+  // pointer with the owner's name, and the title outlined, in the owner's color.
+  point: async (page) => {
+    await page.mouse.click(TITLE.x, TITLE.y)
+    await page.mouse.move(560, 330)
+    await until(() => page.evaluate(() => { const p = playgroundLiveAdapter.presence(); return !!p?.pointer && p.selection.length > 0 }), 10000, 'the pointer and a selection on the cover')
+  },
   editA: (page) => nudge(page, TITLE),
   editB: (page) => nudge(page, KICKER),
   undo: (page) => page.keyboard.press('Control+z'),

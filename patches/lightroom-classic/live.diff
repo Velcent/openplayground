@@ -1,9 +1,9 @@
 diff --git a/apps/web/src/live.rs b/apps/web/src/live.rs
 new file mode 100644
-index 0000000..2806535
+index 0000000..3731e30
 --- /dev/null
 +++ b/apps/web/src/live.rs
-@@ -0,0 +1,496 @@
+@@ -0,0 +1,606 @@
 +//! Playground live editing (`playground_live`): the shared document is the library's catalog as JSON (every photo's
 +//! develop settings, History, Versions, rating, flag, label and metadata; collections including saved Book, Print,
 +//! Slideshow and Web creations, stacks, the keyword list, folder labels, the Map's saved locations), without what only
@@ -11,14 +11,18 @@ index 0000000..2806535
 +//! the photos seen there) and without views (selection, filter, sort, module, panels live outside the catalog). The
 +//! originals of imported photos travel as session files named by their content hash, and land in this browser's
 +//! storage as if imported here. Native undo history stays local; while connected Undo and Redo go to the session.
++//! Each person sees the others' selections outlined on grid and filmstrip cells and their pointer over a photo both
++//! have open, in their color with their name.
 +//!
 +//! Everything lives in new files: this one, `live_web.rs` (the host's side, a child of `web`) and a `live` module in
 +//! the catalog, engine and UI crates. Playground's patches/lightroom-classic.yaml adds the one-line calls into them.
 +
 +use crate::store::{self, Originals};
-+use lcc_engine::catalog::{Catalog, Source};
++use lcc_engine::catalog::{Catalog, PhotoId, Source};
++use lcc_ui_egui::module::ModuleId;
++use lcc_ui_egui::state::ViewMode;
 +use lcc_ui_egui::{CommandError, LccApp};
-+use playground_live::Live;
++use playground_live::{Live, Presence};
 +use serde::Deserialize as _;
 +use serde_json::Value;
 +use std::cell::{Cell, RefCell};
@@ -50,6 +54,75 @@ index 0000000..2806535
 +    static STALE: RefCell<BTreeSet<u64>> = const { RefCell::new(BTreeSet::new()) };
 +    /// An open command is running under [`command`]'s watch.
 +    static OPENING: Cell<bool> = const { Cell::new(false) };
++    /// Where this person points on the photo they have open, as fractions of its frame.
++    static POINTER: Cell<Option<[f64; 2]>> = const { Cell::new(None) };
++    /// The others in the session, as the shell last gave them.
++    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
++}
++
++/// The shared photo this person has open (the loupe, in Library or Develop).
++fn open_photo(app: &LccApp) -> Option<PhotoId> {
++    let loupe = matches!(app.ui.module, ModuleId::Library | ModuleId::Develop) && matches!(app.ui.view, ViewMode::Detail);
++    let active = app.session.selection.active.filter(|id| app.session.catalog.photo(*id).is_some_and(|p| !p.local));
++    loupe.then_some(active).flatten()
++}
++
++/// The end of a frame in the browser: notes where this person points on the open photo, draws the others' selections
++/// and pointers over the app, then [`frame`].
++#[cfg(target_arch = "wasm32")]
++pub fn end_frame(app: &mut LccApp, ctx: &egui::Context) {
++    let (down, at) = ctx.input(|i| (i.pointer.any_down(), i.pointer.hover_pos()));
++    let on = |r: egui::Rect| at.filter(|p| r.is_positive() && r.contains(*p) && app.canvas_rect.is_some_and(|c| c.contains(*p)));
++    let fraction = |p: egui::Pos2, r: egui::Rect| [(p.x - r.left()) / r.width(), (p.y - r.top()) / r.height()].map(|f| (f64::from(f) * 1e4).round() / 1e4);
++    POINTER.set(open_photo(app).and(app.image_rect).and_then(|r| Some(fraction(on(r)?, r))));
++    OTHERS.with_borrow(|others| show_others(app, ctx, others));
++    frame(app, down);
++}
++
++/// Each other person's selection outlined on grid and filmstrip cells, and their pointer over the photo when this
++/// person has the same one open, in their color with their name. Their states come from other people: what does not
++/// resolve is skipped.
++#[cfg(target_arch = "wasm32")]
++fn show_others(app: &LccApp, ctx: &egui::Context, others: &[Presence]) {
++    use egui::{Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, vec2};
++    fn tag(p: &Painter, at: Pos2, name: &str, color: Color32) {
++        let text = p.layout_no_wrap(name.chars().take(40).collect(), FontId::proportional(11.0), Color32::WHITE);
++        let r = Rect::from_min_size(at, text.size() + vec2(8.0, 4.0));
++        p.rect_filled(r, 3.0, color);
++        p.galley(r.min + vec2(4.0, 2.0), text, Color32::WHITE);
++    }
++    // over the panels, under menus and windows
++    let painter = ctx.layer_painter(egui::LayerId::background());
++    let area = |key: &str| app.widgets.iter().find(|(k, _)| k == key).map(|(_, r)| *r);
++    let (grid, strip) = (area("grid:scroll"), area("filmstrip"));
++    for (i, who) in others.iter().enumerate() {
++        let color = Color32::from_rgb(who.color[0], who.color[1], who.color[2]);
++        let selected: HashSet<u64> = who.state["selection"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
++        for (key, r) in &app.widgets {
++            let clip = match key.split_once(':') {
++                Some(("thumb", id)) if id.parse().is_ok_and(|id| selected.contains(&id)) => grid,
++                Some(("film", id)) if id.parse().is_ok_and(|id| selected.contains(&id)) => strip,
++                _ => continue,
++            };
++            let Some(clip) = clip else { continue };
++            let p = painter.with_clip_rect(clip.intersect(*r));
++            // one inside the other when several people select the same photo
++            let inner = r.shrink(1.0 + 3.0 * i.min(8) as f32);
++            p.rect_stroke(inner, 0.0, Stroke::new(2.0, color), StrokeKind::Inside);
++            tag(&p, inner.min + vec2(3.0, 3.0), &who.name, color);
++        }
++        let pointer = who.state["pointer"].as_array().map(|xy| xy.iter().filter_map(Value::as_f64).collect::<Vec<_>>());
++        if let (Some(photo), Some(image), Some(canvas), Some(&[x, y])) = (open_photo(app), app.image_rect, app.canvas_rect, pointer.as_deref())
++            && who.state["page"].as_u64() == Some(photo.0)
++            && (0.0..=1.0).contains(&x)
++            && (0.0..=1.0).contains(&y)
++        {
++            let at = image.min + vec2(x as f32 * image.width(), y as f32 * image.height());
++            let p = painter.with_clip_rect(canvas);
++            p.add(Shape::convex_polygon(vec![at, at + vec2(0.0, 16.0), at + vec2(11.0, 11.0)], color, Stroke::new(1.0, Color32::WHITE)));
++            tag(&p, at + vec2(10.0, 14.0), &who.name, color);
++        }
++    }
 +}
 +
 +/// The end of a frame.
@@ -313,6 +386,25 @@ index 0000000..2806535
 +        })
 +    }
 +
++    /// `{ page: "library" | the shared photo open in the loupe, pointer: [x, y] on it (fractions of its frame),
++    /// selection: the first 50 selected shared photos }`.
++    fn live_presence(&self) -> Value {
++        let catalog = &self.session.catalog;
++        let shared = self.session.selection.ids.iter().filter(|id| catalog.photo(**id).is_some_and(|p| !p.local));
++        let mut state = serde_json::json!({"page": "library", "selection": shared.take(50).map(|id| id.0).collect::<Vec<_>>()});
++        if let Some(photo) = open_photo(self) {
++            state["page"] = photo.0.into();
++            if let Some(at) = POINTER.get() {
++                state["pointer"] = serde_json::json!(at);
++            }
++        }
++        state
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        OTHERS.set(others);
++    }
++
 +    fn live_assets_of(document: &Value) -> Vec<String> {
 +        let photos = document["photos"].as_object().into_iter().flat_map(|p| p.values()).filter(|p| !own(p));
 +        let paths = photos.filter(|p| p["source"]["type"] == "file").filter_map(|p| p["source"]["path"].as_str());
@@ -395,6 +487,24 @@ index 0000000..2806535
 +        let room = "0f8e7d6c-5b4a-4321-8fed-cba987654321";
 +        assert!(session_library_dir(room).is_some_and(|d| d == format!("library-session-{room}") && crate::backup::valid_library_dir(&d)));
 +        assert!([&room.to_uppercase(), "../library", "", &room[1..]].iter().all(|r| session_library_dir(r).is_none()));
++        Ok(())
++    }
++
++    #[test]
++    fn presence_is_the_open_photo_the_pointer_on_it_and_the_shared_selection() -> Result<(), String> {
++        let mut a = demo();
++        let ids: Vec<u64> = a.session.catalog.photos().map(|p| p.id.0).take(2).collect();
++        // a Local folder's photo is this person's own: the others are not shown it
++        let mut seen = Photo::new(a.session.catalog.alloc_photo_id(), Source::Demo { scene: 1 }, "seen.jpg", "JPEG", 9, 9, "2026-01-01T00:00:00");
++        seen.local = true;
++        a.session.catalog.apply(Op::AddPhoto { photo: Box::new(seen.clone()) }).map_err(|e| e.to_string())?;
++        a.run("library.select", json!({"ids": [ids[0], ids[1], seen.id.0]}))?;
++        POINTER.set(Some([0.25, 0.5]));
++        a.ui.view = ViewMode::PhotoGrid;
++        assert_eq!(a.live_presence(), json!({"page": "library", "selection": ids}), "no pointer outside the loupe");
++        a.ui.view = ViewMode::Detail;
++        let open = a.session.selection.active.ok_or("no active photo")?;
++        assert_eq!(a.live_presence(), json!({"page": open.0, "pointer": [0.25, 0.5], "selection": ids}));
 +        Ok(())
 +    }
 +
@@ -502,13 +612,14 @@ index 0000000..2806535
 +}
 diff --git a/apps/web/src/live_web.rs b/apps/web/src/live_web.rs
 new file mode 100644
-index 0000000..b406de4
+index 0000000..257c670
 --- /dev/null
 +++ b/apps/web/src/live_web.rs
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,68 @@
 +//! Playground live editing in the browser host (Playground's patches/lightroom-classic.yaml declares this module in
 +//! `web.rs`, wraps the app the web entry creates with [`wrap`] and opens [`session_library`]): the app runs inside
-+//! [`Shared`], whose frames end with the session's turn, and the live editing hooks reach it between frames. A
++//! [`Shared`], whose frames end with the others' presence drawn and the session's turn, and the live editing hooks
++//! reach it between frames. A
 +//! Playground invitation's page (`?pg-session=<room id>`) opens a library of its own.
 +
 +use std::cell::RefCell;
@@ -550,7 +661,7 @@ index 0000000..b406de4
 +    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
 +        let mut app = self.0.borrow_mut();
 +        eframe::App::ui(&mut *app, ui, frame);
-+        crate::live::frame(&mut app.app, ui.ctx().input(|i| i.pointer.any_down()));
++        crate::live::end_frame(&mut app.app, ui.ctx());
 +    }
 +
 +    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {

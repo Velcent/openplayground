@@ -321,3 +321,57 @@
                     s.ready.retain(|_, t| t.is_some());
                 }
             }
+
+# Live editing in Playground sessions (patches/illustrator/live.diff + patches/live/playground_live.rs)
+# What it's for: people in a Playground session edit one document together, and see each other's pointer, selected
+#   objects and artboard, in each person's color.
+# How: the adapter lives in new files: crates/ui-egui/live/playground.rs (the shared document, merge checks, adopt,
+#   Undo, presence; it declares the template, copied next to it; outside src/, whose strings i18n's tests read),
+#   crates/doc/src/playground_ids.rs (ids nobody else in the session picks) and apps/vectorcraft-web/src/web/
+#   playground.rs (the shell around WebShell that ends each frame with the session's frame hook, which also draws the
+#   others over the canvas). These rules only declare them and call in, each at the end of a file or right after a
+#   signature.
+# Verify: node scripts/build.mjs check illustrator head|release (and LIVE=0), then the e2e
+#   (tests/live-apps/illustrator.mjs) and `cargo test -p vectorcraft-ui-egui --lib playground::`.
+# If upstream changes: if a function named below is renamed, anchor on its new signature; if WebShell or its `app` or
+#   `host.runner` fields are renamed, follow them in web/playground.rs.
+#
+# The frontend's module (web, and its native tests), and the template's wasm dependencies under a target spelling
+# nobody else uses.
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web only).\n#[cfg(any(target_arch = \"wasm32\", test))]\n#[path = \"../live/playground.rs\"]\npub mod playground;\n"
+- live: true
+  file: crates/ui-egui/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\njs-sys = \"0.3\"\nwasm-bindgen = \"0.2\"\n"
+# VectorcraftApp::run, which every command goes through: Undo and Redo in the shared document go to the session.
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\b[^{]*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if let Some(r) = crate::playground::run(self, id) { return r; }"
+# Document::alloc_id, the one id allocator (objects, slices, assets): while connected, ids no one adding at once picks.
+- live: true
+  file: crates/doc/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web only): new ids nobody else in the session picks.\n#[cfg(target_arch = \"wasm32\")]\npub mod playground_ids;\n"
+- live: true
+  file: crates/doc/src/lib.rs
+  find: 'pub\s+fn\s+alloc_id\s*\(\s*&mut\s+self\s*\)[^{]*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] if let Some(id) = self.playground_alloc_id() { return id; }"
+# Session::refresh_text_bounds made public (whatever its visibility was): an adopted document's type gets its layout
+# bounds, as an opened one's does.
+- live: true
+  file: crates/engine/src/**/*.rs
+  find: '(?:\bpub(?:\([^)]*\))?\s+)?(?=fn\s+refresh_text_bounds\s*\()'
+  replace: 'pub '
+# The web entry wraps its app (web/playground.rs, a child module so it reaches WebShell's fields).
+- live: true
+  file: apps/vectorcraft-web/src/web.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session.\nmod playground;\n"
+- live: true
+  file: apps/vectorcraft-web/src/web.rs
+  find: 'Ok\(Box::new\((?=\s*WebShell\b)'
+  replace: 'Ok(playground::wrap('

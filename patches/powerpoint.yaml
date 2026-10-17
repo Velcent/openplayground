@@ -303,3 +303,57 @@
     playground::receive(&mut self.app);
             $&
             playground::report_unsaved(self.app.session.documents().iter().any(|d| d.is_dirty()));
+
+# Live editing in Playground sessions (patches/powerpoint/live.diff + patches/live/playground_live.rs)
+# The adapter lives in new files: apps/deckcraft-web/src/live.rs (the shared document, merge, Undo, the id allocator and
+# presence; the template is its child module, live/finite.rs writes non-finite numbers as 0) and
+# apps/deckcraft-web/src/web/live.rs (the kept runner, and the shell that ends each frame with the session's frame hook
+# and draws the others' pointers and selections over the slide canvas). These rules only declare them and call in, one
+# line each at the end of a file or after a function's signature, the same on both channels. Verify: node
+# scripts/build.mjs check powerpoint head|release, then the e2e (tests/live-apps/powerpoint.mjs). If upstream renames a
+# function named below, anchor on its new signature; if it renames WebShell or its `app` field, follow it in web/live.rs.
+#
+# The adapter's module (web, and native tests), and serde for it on every target (its tests run natively) under a target
+# spelling nobody else uses.
+- live: true
+  file: apps/deckcraft-web/src/main.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (patches/live/playground_live.rs).\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
+- live: true
+  file: apps/deckcraft-web/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all())'.dependencies]\nserde = { workspace = true }\n"
+# Presentation::alloc_id, the one id allocator (slides, shapes, layouts, masters, media): while connected, a random
+# unused id, so two people adding objects at once do not pick the same one. Returns u32 on v0.7.0, Option<u32> later.
+- live: true
+  file: crates/model/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n/// Live editing in a Playground session: an id allocator used instead of the next id while it gives one.\npub static LIVE_ALLOC: std::sync::OnceLock<fn(&mut Presentation) -> Option<u32>> = std::sync::OnceLock::new();\n"
+- live: true
+  file: crates/model/src/**/*.rs
+  find: 'pub\s+fn\s+alloc_id\s*\(\s*&mut\s+self\s*\)[^{]*\{'
+  after: "\n        if let Some(id) = crate::LIVE_ALLOC.get().and_then(|alloc| alloc(self)) { return id.into(); }"
+# Session::execute, which every Undo and Redo goes through (keys, menus, the QAT): first, the session takes Undo and
+# Redo of the shared presentation.
+- live: true
+  file: crates/engine/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n/// Live editing in a Playground session: runs first in Session::execute and takes the command when it returns true.\npub static LIVE_UNDO: std::sync::OnceLock<fn(&mut Session, &str) -> bool> = std::sync::OnceLock::new();\n"
+- live: true
+  file: crates/engine/src/**/*.rs
+  find: 'pub\s+fn\s+execute\s*\(\s*&mut\s+self\s*,\s*(\w+)\s*:\s*&str\b[^{]*\{'
+  replace: "$&\n        if crate::LIVE_UNDO.get().is_some_and(|undo| undo(self, $1)) { return Ok(Default::default()); }"
+# The web entry keeps its runner for the adapter and wraps its app (web/live.rs, a child module so it reaches
+# WebShell's fields); the browser-storage rules above still insert before the same Ok(…WebShell…).
+- live: true
+  file: apps/deckcraft-web/src/web.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session.\nmod live;\n"
+- live: true
+  file: apps/deckcraft-web/src/web.rs
+  find: 'eframe::WebRunner::new\(\)'
+  replace: 'live::runner()'
+- live: true
+  file: apps/deckcraft-web/src/web.rs
+  find: 'Ok\(Box::new\((?=\s*WebShell\b)'
+  replace: 'Ok(live::wrap('

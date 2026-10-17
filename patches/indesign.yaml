@@ -7,3 +7,60 @@
     let mut app = app;
     let dark = web_sys::window().and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten()).is_some_and(|m| m.matches());
     let _ = app.run("window.brightness", serde_json::json!({"brightness": if dark { "dark" } else { "light" }}));
+
+# Live editing in Playground sessions (patches/indesign/live.diff + patches/live/playground_live.rs)
+# The adapter lives in new files: apps/designcraft-web/src/live.rs (the shared document, adopt, ids, presence; it
+# declares the template), apps/designcraft-web/src/web/live.rs (the kept runner and the app that ends each frame with
+# the session's frame hook) and crates/ui-egui/src/canvas/live.rs (the shared document's uid, Undo's hand-off, and the
+# others' pointers and selections drawn on the canvas). These rules only declare them and call in: most append at the
+# end of a file or follow a function's signature. Verify: node scripts/build.mjs check indesign head|release, then the
+# e2e (tests/live-apps/indesign.mjs). If upstream renames a function named below, anchor on its new signature.
+#
+# The web app's adapter module (with the template), for the browser and the web app's native tests.
+- live: true
+  file: apps/designcraft-web/src/main.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session.\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
+# The web entry keeps its runner for the adapter and wraps its app (web/live.rs, a child module so it reaches
+# WebShell's fields). If upstream renames WebShell or its `app` field, follow it in web/live.rs.
+- live: true
+  file: apps/designcraft-web/src/web.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session.\nmod live;\n"
+- live: true
+  file: apps/designcraft-web/src/web.rs
+  find: 'eframe::WebRunner::new\(\)'
+  replace: 'live::runner()'
+- live: true
+  file: apps/designcraft-web/src/web.rs
+  find: 'Ok\(Box::new\((?=\s*WebShell\b)'
+  replace: 'Ok(live::wrap('
+# Document::alloc, the one id allocator: while connected, an id nobody else adding something at once picks (the web
+# app sets the hook; it raises next_id past each id).
+- live: true
+  file: crates/doc/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session: Document::alloc's ids while connected, set by the web app.\n#[cfg(target_arch = \"wasm32\")]\npub static FRESH_ID: std::sync::OnceLock<fn(&mut u64) -> Option<u64>> = std::sync::OnceLock::new();\n"
+- live: true
+  file: crates/doc/src/lib.rs
+  find: 'pub\s+fn\s+alloc\s*\(\s*&mut\s+self\s*\)\s*->\s*u64\s*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] if let Some(id) = crate::FRESH_ID.get().and_then(|fresh| fresh(&mut self.next_id)) { return id; }"
+# The shared document may be any open tab, not only the active one.
+- live: true
+  file: crates/engine/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session: the shared document may be any open one.\nimpl Session { pub fn live_documents_mut(&mut self) -> &mut [DocState] { &mut self.docs } }\n"
+# The canvas's live module; DesignApp::run's first step (Undo and Redo of the shared document go to the session); the
+# others' pointers and selections, drawn first in the tool overlays (over the document and this person's selection).
+- live: true
+  file: crates/ui-egui/src/canvas.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (used by the web app only).\npub mod live;\n"
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\s*,\s*id\s*:\s*&str\b[^{]*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] if crate::canvas::live::undo(self, id) { return Ok(Default::default()); }"
+- live: true
+  file: crates/ui-egui/src/canvas.rs
+  find: 'fn\s+draw_tool_overlays\s*\([^{]*\{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")] live::draw(app, painter, xf);"

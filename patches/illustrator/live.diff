@@ -1,119 +1,122 @@
-diff --git a/apps/vectorcraft-web/src/web.rs b/apps/vectorcraft-web/src/web.rs
-index cfe8458..083b8c7 100644
---- a/apps/vectorcraft-web/src/web.rs
-+++ b/apps/vectorcraft-web/src/web.rs
-@@ -81,10 +81,27 @@ pub fn start() {
-             restarts: 0,
-         };
-         track_paste(&host.pasted);
-+        attach_live(&host);
-         run(host, canvas, None).await;
-     });
- }
- 
-+/// Offer live editing to the page (a Playground session): on the app the runner has, while it has one.
-+fn attach_live(host: &Host) {
-+    let (runner, pasted) = (host.runner.clone(), host.pasted.clone());
-+    let attached = vectorcraft_ui_egui::live::attach(
-+        move |f| runner.app_mut::<WebShell>().and_then(|mut shell| shell.app.as_mut().map(|app| f(app))).is_some(),
-+        move || {
-+            if let Some(ctx) = pasted.try_borrow().ok().and_then(|p| p.ctx.clone()) {
-+                ctx.request_repaint();
-+            }
-+        },
-+    );
-+    if let Err(e) = attached {
-+        log::error!("vectorcraft-web: no live editing: {}", js_err(e));
-+    }
+diff --git a/apps/vectorcraft-web/src/web/playground.rs b/apps/vectorcraft-web/src/web/playground.rs
+new file mode 100644
+index 0000000..a3f451a
+--- /dev/null
++++ b/apps/vectorcraft-web/src/web/playground.rs
+@@ -0,0 +1,71 @@
++//! Live editing in a Playground session: the shell around [`WebShell`] that offers the app to the page and ends each
++//! frame with the session's frame hook. A child of `web`, so it reaches the runner the page keeps (`Host`).
++
++use std::cell::{Cell, RefCell};
++
++use super::WebShell;
++
++thread_local! {
++    /// The page's runner, kept across graphics restarts (the same one starts again).
++    static RUNNER: RefCell<Option<eframe::WebRunner>> = const { RefCell::new(None) };
++    /// The running app's context, to wake for a remote change.
++    static CONTEXT: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
++    static ATTACHED: Cell<bool> = const { Cell::new(false) };
 +}
 +
- /// An app whose graphics were lost, on its way to new ones.
- struct Moving {
-     app: VectorcraftApp,
-@@ -398,8 +415,14 @@ impl eframe::App for WebShell {
-     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-         if let Some(app) = &mut self.app {
-             app.ui(ui);
-+            vectorcraft_ui_egui::live::frame(app, ui.ctx());
-         }
-     }
++/// The app eframe runs: `shell`, offered to the page for live editing (once: a graphics restart wraps the moved app
++/// again on the same runner).
++pub(super) fn wrap(shell: WebShell) -> Box<dyn eframe::App> {
++    RUNNER.set(Some(shell.host.runner.clone()));
++    if !ATTACHED.replace(true) {
++        let with_app = |f: &mut dyn FnMut(&mut vectorcraft_ui_egui::VectorcraftApp)| {
++            let runner = RUNNER.with_borrow(Clone::clone);
++            runner.and_then(|r| r.app_mut::<Live>().and_then(|mut live| live.0.app.as_mut().map(|app| f(app)))).is_some()
++        };
++        let repaint = || CONTEXT.with_borrow(|ctx| ctx.iter().for_each(egui::Context::request_repaint));
++        if let Err(e) = vectorcraft_ui_egui::playground::attach(with_app, repaint) {
++            log::error!("vectorcraft-web: no live editing: {e:?}");
++        }
++    }
++    Box::new(Live(shell))
++}
 +
-+    // Live editing reaches the app through the runner.
++struct Live(WebShell);
++
++impl eframe::App for Live {
++    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
++        CONTEXT.set(Some(ctx.clone()));
++        self.0.logic(ctx, frame);
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        self.0.ui(ui, frame);
++        if let Some(app) = &mut self.0.app {
++            vectorcraft_ui_egui::playground::frame(app, ui);
++        }
++    }
++
 +    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
 +        Some(self)
 +    }
- }
- 
- fn services(inbox: Inbox, place_inbox: PlaceInbox, ctx: egui::Context, locks: Option<WebLocks>) -> Services {
-diff --git a/crates/doc/src/lib.rs b/crates/doc/src/lib.rs
-index cc4f1c7..30c4b53 100644
---- a/crates/doc/src/lib.rs
-+++ b/crates/doc/src/lib.rs
-@@ -737,6 +737,11 @@ pub struct Document {
-     index: id_index::IdIndex,
- }
- 
-+/// Live editing (web only): where [`Document::alloc_id`] takes ids from once set, from the counter,
-+/// so that people editing a document at once give new objects different ids.
-+#[cfg(target_arch = "wasm32")]
++
++    fn save(&mut self, storage: &mut dyn eframe::Storage) {
++        self.0.save(storage);
++    }
++
++    fn auto_save_interval(&self) -> std::time::Duration {
++        self.0.auto_save_interval()
++    }
++
++    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
++        self.0.clear_color(visuals)
++    }
++
++    fn persist_egui_memory(&self) -> bool {
++        self.0.persist_egui_memory()
++    }
++
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
++        self.0.raw_input_hook(ctx, raw_input);
++    }
++}
+diff --git a/crates/doc/src/playground_ids.rs b/crates/doc/src/playground_ids.rs
+new file mode 100644
+index 0000000..e82d167
+--- /dev/null
++++ b/crates/doc/src/playground_ids.rs
+@@ -0,0 +1,18 @@
++//! Live editing in a Playground session (web only): new ids nobody else in the session picks, so that people adding
++//! objects to one document at once give them different ids.
++
++use crate::{Document, MAX_NEXT_ID, NodeId};
++
++/// Where [`Document::alloc_id`] takes ids from once set (`playground_live::fresh_id`, from the counter).
 +pub static FRESH_ID: std::sync::OnceLock<fn(&mut u64) -> u64> = std::sync::OnceLock::new();
 +
- fn ppi72() -> f64 {
-     72.0
- }
-@@ -829,6 +834,13 @@ impl Document {
- 
-     /// Allocate a fresh node id.
-     pub fn alloc_id(&mut self) -> NodeId {
-+        #[cfg(target_arch = "wasm32")]
-+        if let Some(fresh) = FRESH_ID.get().filter(|_| self.next_id < MAX_NEXT_ID) {
-+            let id = fresh(&mut self.next_id);
-+            // The counter stays above every id, as without it ("from the counter on" is new).
-+            self.next_id = self.next_id.max(id.saturating_add(1));
-+            return NodeId(id);
-+        }
-         let id = NodeId(self.next_id);
-         // Never reached from a counter [`Self::fix_next_id`] has seen (it stays under
-         // [`MAX_NEXT_ID`]); saturating so that no counter can overflow.
-diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index cd59089..8611998 100644
---- a/crates/engine/src/lib.rs
-+++ b/crates/engine/src/lib.rs
-@@ -1273,7 +1273,7 @@ impl Session {
-     /// what is fitted to type's bounds (an envelope warping it) would come out differently. That
-     /// holds for the type in symbol definitions, pattern tiles, graph designs and opacity masks too,
-     /// not only in the layers (#1738).
--    pub(crate) fn refresh_text_bounds(doc: &mut Document) {
-+    pub fn refresh_text_bounds(doc: &mut Document) {
-         // Inline graphics in text take their size from their symbols' art (not saved either).
-         doc.resolve_inline_art();
-         let trees = doc.layers.iter_mut().chain(doc.symbols.iter_mut().map(|s| &mut s.art));
-diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
-index 193832b..3fed07e 100644
---- a/crates/ui-egui/Cargo.toml
-+++ b/crates/ui-egui/Cargo.toml
-@@ -37,6 +37,9 @@ log = { workspace = true }
- # `now_ms` (src/lib.rs) reads the page's `performance.now()` with this crate in the web build. It is
- # MIT OR Apache-2.0 and already in the build through eframe.
- web-time = "1"
-+# Live editing in a Playground session (live/playground_live.rs).
-+js-sys = "0.3"
-+wasm-bindgen = "0.2"
- 
- [dev-dependencies]
- egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
-diff --git a/crates/ui-egui/live/live.rs b/crates/ui-egui/live/live.rs
++impl Document {
++    /// [`Document::alloc_id`]'s id while live editing is offered: none otherwise (the counter as upstream).
++    pub(crate) fn playground_alloc_id(&mut self) -> Option<NodeId> {
++        let fresh = FRESH_ID.get().filter(|_| self.next_id < MAX_NEXT_ID)?;
++        let id = fresh(&mut self.next_id);
++        // The counter stays above every id, as without it ("from the counter on" is new).
++        self.next_id = self.next_id.max(id.saturating_add(1));
++        Some(NodeId(id))
++    }
++}
+diff --git a/crates/ui-egui/live/playground.rs b/crates/ui-egui/live/playground.rs
 new file mode 100644
-index 0000000..2fdf0f9
+index 0000000..cdb11a3
 --- /dev/null
-+++ b/crates/ui-egui/live/live.rs
-@@ -0,0 +1,299 @@
-+//! Live editing in a Playground session (web only): [`crate::playground_live`] is what the page drives.
++++ b/crates/ui-egui/live/playground.rs
+@@ -0,0 +1,391 @@
++//! Live editing in a Playground session (web only): [`playground_live`] is what the page drives.
 +//!
 +//! The shared document is the open document the session started on, as its JSON with the images' bytes and without
 +//! what is this person's: the id counter, the view and Layers rows written at save, the export and print settings. A
 +//! remote change replaces that document at a quiet frame and keeps the selection, tools and views, with no native undo
 +//! step. New ids come from `playground_live::fresh_id` while connected, so additions at once don't collide.
++//!
++//! Presence: while the shared document is the active one, this person's active artboard (its id), pointer (document
++//! points) and selected objects (ids); the others' are drawn over the canvas in their color at the end of each frame.
++
++#[path = "playground_live.rs"]
++pub mod playground_live;
 +
 +use std::cell::{Cell, RefCell};
 +use std::collections::{BTreeMap, HashSet};
@@ -124,7 +127,7 @@ index 0000000..2fdf0f9
 +use vectorcraft_engine::{DocState, Session};
 +
 +use crate::VectorcraftApp;
-+use crate::playground_live::{self, Live};
++use playground_live::{Live, Presence};
 +
 +/// Document fields that are this person's, or written at save only: not shared.
 +const LOCAL: [&str; 5] = ["next_id", "last_view", "layers_open", "export_settings", "print_setup"];
@@ -143,12 +146,17 @@ index 0000000..2fdf0f9
 +    static POINTER: Cell<bool> = const { Cell::new(false) };
 +    /// The document last compared: held, so that any change to it makes a new one.
 +    static SEEN: RefCell<Option<Arc<Document>>> = const { RefCell::new(None) };
++    /// The others in the session, as the shell last gave them.
++    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
 +}
 +
-+/// The end of each frame: applies the remote changes waiting and reports this person's, once quiet.
-+pub fn frame(app: &mut VectorcraftApp, ctx: &egui::Context) {
++/// The end of each frame: draws the others over the canvas, applies the remote changes waiting and reports this
++/// person's, once quiet.
++pub fn frame(app: &mut VectorcraftApp, ui: &egui::Ui) {
++    let ctx = ui.ctx();
 +    let typing = ctx.memory(|m| m.focused()).is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
 +    POINTER.set(typing || ctx.input(|i| i.pointer.any_down()));
++    draw_presence(app, ui);
 +    playground_live::frame(app);
 +}
 +
@@ -159,13 +167,63 @@ index 0000000..2fdf0f9
 +    with_app: impl Fn(&mut dyn FnMut(&mut VectorcraftApp)) -> bool + 'static,
 +    repaint: impl Fn() + 'static,
 +) -> Result<(), wasm_bindgen::JsValue> {
-+    let _ = vectorcraft_doc::FRESH_ID.set(playground_live::fresh_id);
++    let _ = vectorcraft_doc::playground_ids::FRESH_ID.set(playground_live::fresh_id);
 +    playground_live::web::attach::<VectorcraftApp>(concat!("illustrator:1:", env!("CARGO_PKG_VERSION")), with_app, repaint)
 +}
 +
-+/// Undo or Redo (`redo`) for the session, while it shares the active document: whether it took it.
-+pub fn undo(app: &VectorcraftApp, redo: bool) -> bool {
-+    BOUND.get().is_none_or(|uid| app.session.active().is_some_and(|d| d.uid == uid)) && playground_live::undo(redo)
++/// [`VectorcraftApp::run`]'s first step: Undo and Redo go to the session while it shares the active document.
++pub fn run(app: &VectorcraftApp, id: &str) -> Option<Result<Value, String>> {
++    let redo = match id {
++        "edit.undo" => false,
++        "edit.redo" => true,
++        _ => return None,
++    };
++    let shared = BOUND.get().is_none_or(|uid| app.session.active().is_some_and(|d| d.uid == uid));
++    (shared && playground_live::undo(redo)).then_some(Ok(Value::Null))
++}
++
++/// The shared document, when it is the one on the canvas here.
++fn shown(app: &VectorcraftApp) -> Option<&DocState> {
++    let st = app.session.active().filter(|_| !crate::menus::home_showing(app))?;
++    BOUND.get().is_none_or(|uid| uid == st.uid).then_some(st)
++}
++
++/// The others' pointers (an arrow with their name) and their selected objects' bounds, in their colors, over the
++/// canvas (the last thing drawn in its layer). Their numbers come from other people: what doesn't resolve is skipped.
++fn draw_presence(app: &VectorcraftApp, ui: &egui::Ui) {
++    use egui::{Color32, Shape, Stroke, vec2};
++    OTHERS.with_borrow(|others| {
++        let (Some(st), Some(rect), Some(view)) = (shown(app).filter(|_| !others.is_empty()), app.canvas_rect, app.view()) else {
++            return;
++        };
++        let xf = crate::canvas::Xf::new(rect, view);
++        let painter = ui.painter_at(rect);
++        let symbols = st.doc.symbol_boxes();
++        let pad = 2.0 / xf.zoom;
++        for other in others {
++            let color = Color32::from_rgb(other.color[0], other.color[1], other.color[2]);
++            let ids = other.state["selection"].as_array().into_iter().flatten().take(50).filter_map(Value::as_u64);
++            for bounds in ids.filter_map(|id| st.doc.node(vectorcraft_doc::NodeId(id))?.geometric_bounds_with(&symbols)) {
++                painter.add(Shape::closed_line(xf.quad(bounds.inflate(pad, pad)), Stroke::new(1.5, color)));
++            }
++            let pointer = &other.state["pointer"];
++            let Some(tip) = pointer[0].as_f64().zip(pointer[1].as_f64()).map(|(x, y)| xf.to_screen(vectorcraft_geom::Point::new(x, y))) else {
++                continue;
++            };
++            // NaN, infinite and far-off points fail this.
++            if !(tip.x.abs() < 1e6 && tip.y.abs() < 1e6) {
++                continue;
++            }
++            painter.add(Shape::convex_polygon(vec![tip, tip + vec2(0.0, 15.0), tip + vec2(10.5, 10.5)], color, Stroke::new(1.0, Color32::WHITE)));
++            let name: String = other.name.chars().take(32).collect();
++            if !name.is_empty() {
++                let text = painter.layout_no_wrap(name, egui::FontId::proportional(11.0), Color32::WHITE);
++                let tag = egui::Rect::from_min_size(tip + vec2(8.0, 15.0), text.size() + vec2(8.0, 4.0));
++                painter.rect_filled(tag, 3.0, color);
++                painter.galley(tag.min + vec2(4.0, 2.0), text, Color32::WHITE);
++            }
++        }
++    });
 +}
 +
 +/// The shared document: the bound one, else the active one (bound by `bind`).
@@ -294,6 +352,22 @@ index 0000000..2fdf0f9
 +        SEEN.with_borrow(|d| d.as_ref().map(|d| Arc::as_ptr(d) as usize as u64))
 +    }
 +
++    fn live_presence(&self) -> Value {
++        let Some(st) = shown(self) else { return Value::Null };
++        let artboard = st.doc.artboards.get(crate::panels::artboards::selected(self, st.doc.artboards.len())).map(|a| a.id);
++        let selection: Vec<u64> = st.selection.objects.iter().take(50).map(|id| id.0).collect();
++        let mut presence = serde_json::json!({ "artboard": artboard, "selection": selection });
++        if let Some(p) = self.hover_doc.filter(|p| p.x.is_finite() && p.y.is_finite()) {
++            let round = |v: f64| (v * 100.0).round() / 100.0;
++            presence["pointer"] = serde_json::json!([round(p.x), round(p.y)]);
++        }
++        presence
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        OTHERS.set(others);
++    }
++
 +    fn live_disconnected(&mut self) {
 +        // Native Undo starts again from here: its steps are from before the others' changes.
 +        if let Some(st) = BOUND.take().and_then(|uid| self.session.document_mut(uid)) {
@@ -309,7 +383,7 @@ index 0000000..2fdf0f9
 +    use serde_json::json;
 +
 +    use super::*;
-+    use crate::playground_live::{activity, canonical, connect, disconnect, queue};
++    use super::playground_live::{activity, canonical, connect, disconnect, queue};
 +
 +    fn app_with_rect() -> VectorcraftApp {
 +        let mut app = VectorcraftApp::new(Session::new(), crate::Services::default());
@@ -406,35 +480,19 @@ index 0000000..2fdf0f9
 +        app.live_disconnected();
 +        assert!(app.session.active().unwrap().history.undo.is_empty(), "native Undo starts again");
 +    }
++
++    #[test]
++    fn presence_is_the_pointer_in_document_points_and_the_selection_while_the_shared_document_shows() {
++        let mut app = app_with_rect();
++        app.live_document();
++        app.run("select.all", json!({})).unwrap();
++        app.hover_doc = Some(vectorcraft_geom::Point::new(12.345, 67.0));
++        let ids: Vec<u64> = app.session.active().unwrap().selection.objects.iter().map(|id| id.0).collect();
++        let presence = app.live_presence();
++        assert!(!ids.is_empty() && presence["selection"] == json!(ids));
++        assert_eq!(presence["pointer"], json!([12.35, 67.0]));
++        assert_eq!(presence["artboard"], json!(app.session.active().unwrap().doc.artboards[0].id));
++        app.run("file.new", json!({})).unwrap();
++        assert!(app.live_presence().is_null(), "another document shown");
++    }
 +}
-diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index 95af996..8bfc5bd 100644
---- a/crates/ui-egui/src/lib.rs
-+++ b/crates/ui-egui/src/lib.rs
-@@ -34,6 +34,14 @@ pub mod i18n;
- pub mod icon_data;
- pub mod icons;
- pub mod io;
-+// Live editing in a Playground session (web only). Outside src/: its strings are for the page, not
-+// status-bar messages to translate (`i18n::tests::message_literals` reads src/).
-+#[cfg(any(target_arch = "wasm32", test))]
-+#[path = "../live/live.rs"]
-+pub mod live;
-+#[cfg(any(target_arch = "wasm32", test))]
-+#[path = "../live/playground_live.rs"]
-+pub mod playground_live;
- pub mod menus;
- pub mod native_menu;
- pub mod opening;
-@@ -656,6 +664,11 @@ impl VectorcraftApp {
- 
-     /// Run a UI or engine command by id. The single entry point for every frontend path.
-     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
-+        // Live editing: Undo and Redo are the session's (they revert only this person's changes).
-+        #[cfg(any(target_arch = "wasm32", test))]
-+        if matches!(id, "edit.undo" | "edit.redo") && live::undo(self, id == "edit.redo") {
-+            return Ok(Value::Null);
-+        }
-         // A file dialog it shows off the UI thread runs it again with the path picked.
-         if self.picks.is_entry_free() {
-             let entry = picks::Entry::Command(id.to_string(), params.clone());

@@ -1,18 +1,24 @@
 diff --git a/apps/designcraft-web/src/live.rs b/apps/designcraft-web/src/live.rs
 new file mode 100644
-index 0000000..92ebc1b
+index 0000000..49fb241
 --- /dev/null
 +++ b/apps/designcraft-web/src/live.rs
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,363 @@
 +//! Playground live editing (`playground_live`): the shared document is one open document's model as JSON with its
 +//! embedded files' bytes, without this person's views (selection, zoom, spread rotation on screen, a Data Merge
-+//! preview). Native undo history stays local; while connected, Undo and Redo of the shared document go to the session.
++//! preview). Native undo history stays local; while connected, Undo and Redo of the shared document go to the session
++//! (`designcraft_ui_egui::canvas::live`, which also draws the others' presence).
++#![cfg_attr(test, allow(dead_code))]
 +
-+use crate::playground_live::{self, Live};
++#[path = "playground_live.rs"]
++pub mod playground_live;
++
 +use designcraft_engine::DocState;
 +use designcraft_engine::cmd::{base64_decode, base64_encode};
 +use designcraft_engine::doc::{Document, Selection};
 +use designcraft_ui_egui::DesignApp;
++use designcraft_ui_egui::canvas::live::{self as canvas, SHARED};
++use playground_live::{Live, Presence};
 +use serde_json::Value;
 +use std::cell::{Cell, RefCell};
 +use std::collections::BTreeMap;
@@ -21,8 +27,6 @@ index 0000000..92ebc1b
 +pub const FORMAT: &str = concat!("indesign:1:", env!("CARGO_PKG_VERSION"));
 +
 +thread_local! {
-+    /// The shared document's `uid`: the document active when the session first read it, for the whole session.
-+    static SHARED: Cell<Option<u64>> = const { Cell::new(None) };
 +    /// The shared model as last seen, with a counter of its changes: still reported once its tab is closed.
 +    static SEEN: RefCell<Option<(Arc<Document>, u64)>> = const { RefCell::new(None) };
 +    /// The pointer is down or a text field has the keyboard.
@@ -35,23 +39,21 @@ index 0000000..92ebc1b
 +    BUSY.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
 +    CTX.with_borrow_mut(|c| _ = c.get_or_insert_with(|| ctx.clone()));
 +    playground_live::frame(app);
++    canvas::end_frame();
 +}
 +
 +pub fn repaint() {
 +    CTX.with_borrow(|c| c.iter().for_each(egui::Context::request_repaint));
 +}
 +
-+/// Undo or Redo of the `active` document goes to the session when that is the shared one.
-+pub fn undo(active: Option<u64>, redo: bool) -> bool {
-+    active.is_some() && active == SHARED.get() && playground_live::undo(redo)
-+}
-+
-+/// [`Document::alloc`]'s ids: unique among peers while connected, with `next_id` raised past each so it stays above
-+/// every id (`Document::check`).
-+pub fn fresh_id(next: &mut u64) -> u64 {
-+    let id = playground_live::fresh_id(&mut next.clone());
-+    *next = (*next).max(id);
-+    id
++/// [`Document::alloc`] while connected: an id unique among peers, with `next_id` raised to it so it stays above every
++/// id (`Document::check`). None: the document's own.
++pub fn fresh_id(next: &mut u64) -> Option<u64> {
++    playground_live::connected().then(|| {
++        let id = playground_live::fresh_id(&mut next.clone());
++        *next = (*next).max(id);
++        id
++    })
 +}
 +
 +/// The shared document's index while its tab is open; the active one until a session binds it.
@@ -162,7 +164,6 @@ index 0000000..92ebc1b
 +    sel.items.retain(|i| doc.item(*i).is_some());
 +    sel.anchors.retain(|a| doc.item(a.0).is_some());
 +    sel.key = sel.key.filter(|k| doc.item(*k).is_some());
-+    sel.page = sel.page.filter(|p| *p < doc.page_count());
 +    sel.cells = sel.cells.filter(|c| same(c.story));
 +    sel.text = sel.text.and_then(|mut t| {
 +        if same(t.story) {
@@ -212,7 +213,7 @@ index 0000000..92ebc1b
 +            self.after_engine();
 +            return Ok(());
 +        };
-+        let st = &mut self.session.documents_mut()[i];
++        let st = &mut self.session.live_documents_mut()[i];
 +        (st.preview_stash, st.preview_record) = (None, None);
 +        prune(&mut st.selection, &doc, old.as_deref());
 +        st.doc = Arc::new(doc);
@@ -220,7 +221,6 @@ index 0000000..92ebc1b
 +        if st.doc.layer(st.active_layer).is_none() {
 +            st.active_layer = st.doc.default_layer();
 +        }
-+        self.session.reset_find_scope();
 +        Ok(())
 +    }
 +
@@ -233,7 +233,7 @@ index 0000000..92ebc1b
 +    }
 +
 +    fn live_disconnected(&mut self) {
-+        let docs = self.session.documents_mut();
++        let docs = self.session.live_documents_mut();
 +        SEEN.take();
 +        if let Some(st) = SHARED.take().and_then(|uid| docs.iter_mut().find(|d| d.uid == uid)) {
 +            st.history.undo.clear();
@@ -245,6 +245,14 @@ index 0000000..92ebc1b
 +    /// side and deleted on the other).
 +    fn live_check(document: &Value) -> Result<(), String> {
 +        serde_json::from_value::<Document>(document.clone()).map_err(invalid)?.check().map_err(|e| format!("Conflict: {e}"))
++    }
++
++    fn live_presence(&self) -> Value {
++        canvas::presence(self)
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        canvas::show(others.into_iter().map(|p| (p.name, p.color, p.state)).collect());
 +    }
 +}
 +
@@ -308,8 +316,8 @@ index 0000000..92ebc1b
 +        assert_eq!(st.doc.spreads[0].pages[0].view_rotation, 1, "the spread stays rotated here");
 +
 +        // New objects get ids unique to this peer, and the counter stays above them.
-+        let mut next = a.session.doc().map_err(|e| e.to_string())?.doc.next_id + 1;
-+        let id = fresh_id(&mut next);
++        let mut next = a.session.doc().map_err(|e| e.to_string())?.doc.next_id;
++        let id = fresh_id(&mut next).ok_or("connected")?;
 +        assert!(id >> 52 == 1 && next == id);
 +        playground_live::disconnect();
 +        Ok(())
@@ -319,11 +327,13 @@ index 0000000..92ebc1b
 +    fn another_documents_undo_stays_native_and_a_closed_shared_document_is_still_shared_and_reopens() -> Result<(), String> {
 +        let mut app = sample()?;
 +        playground_live::connect();
++        let _ = canvas::UNDO.set(playground_live::undo);
 +        let shared = canonical(&app.live_document());
 +        let uid = app.session.active().map(|d| d.uid);
 +        app.run("file.new", json!({}))?;
-+        assert!(!undo(app.session.active().map(|d| d.uid), false), "a private document's Undo stays its own");
-+        assert!(undo(uid, false));
++        assert!(!canvas::undo(&app, "edit.undo"), "a private document's Undo stays its own");
++        app.session.set_active(0);
++        assert!(canvas::undo(&app, "edit.undo"));
 +
 +        // Closing the shared document's tab shares no other document; the next remote change opens it again.
 +        let i = app.session.documents().iter().position(|d| Some(d.uid) == uid).ok_or("no shared document")?;
@@ -335,130 +345,238 @@ index 0000000..92ebc1b
 +        playground_live::frame(&mut app);
 +        let reopened = app.session.active().ok_or("no document")?;
 +        assert_eq!((app.session.documents().len(), reopened.doc.title.as_str()), (2, "Renamed"));
-+        assert!(undo(Some(reopened.uid), false));
++        assert!(canvas::undo(&app, "edit.redo"));
 +        playground_live::disconnect();
 +        Ok(())
 +    }
-+}
-diff --git a/apps/designcraft-web/src/main.rs b/apps/designcraft-web/src/main.rs
-index 1b28064..bb4bae7 100644
---- a/apps/designcraft-web/src/main.rs
-+++ b/apps/designcraft-web/src/main.rs
-@@ -25,6 +25,13 @@ mod web;
- #[cfg(any(target_arch = "wasm32", test))]
- mod graphics;
- 
-+#[cfg(any(target_arch = "wasm32", test))]
-+#[cfg_attr(test, allow(dead_code))]
-+mod live;
-+#[cfg(any(target_arch = "wasm32", test))]
-+#[cfg_attr(test, allow(dead_code))]
-+mod playground_live;
 +
- #[cfg(target_arch = "wasm32")]
- fn main() {
-     web::start();
-diff --git a/apps/designcraft-web/src/web.rs b/apps/designcraft-web/src/web.rs
-index c532b5d..c6175a9 100644
---- a/apps/designcraft-web/src/web.rs
-+++ b/apps/designcraft-web/src/web.rs
-@@ -82,6 +82,13 @@ pub fn start() {
-             .await;
-         match result {
-             Ok(()) => {
-+                // Playground live editing (inert until its shell connects).
-+                let _ = designcraft_engine::doc::FRESH_ID.set(crate::live::fresh_id);
-+                let live = runner.clone();
-+                let with_app = move |f: &mut dyn FnMut(&mut DesignApp)| live.app_mut::<WebShell>().map(|mut shell| f(&mut shell.app)).is_some();
-+                if let Err(e) = crate::playground_live::web::attach::<DesignApp>(crate::live::FORMAT, with_app, crate::live::repaint) {
-+                    log::error!("live editing unavailable: {e:?}");
-+                }
-                 if let Err(e) = install_recovery_controls(&runner, &canvas, &graphics) {
-                     graphics_failed(&graphics, GRAPHICS_TITLE, GRAPHICS_MESSAGE, &format!("Couldn't install graphics recovery controls: {e:?}"));
-                     if let Some(shell) = runner.app_mut::<WebShell>()
-@@ -379,7 +386,10 @@ impl eframe::App for WebShell {
-     }
- 
-     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
--        let _ = self.graphics.run_if_healthy(|| self.app.ui(ui));
-+        let _ = self.graphics.run_if_healthy(|| {
-+            self.app.ui(ui);
-+            crate::live::frame(&mut self.app, ui.ctx());
-+        });
-     }
- 
-     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-@@ -418,6 +428,7 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
-             }
-         })),
-         inbox: Some(inbox),
-+        undo: Some(Box::new(crate::live::undo)),
-         ..Default::default()
-     }
- }
-diff --git a/crates/doc/src/lib.rs b/crates/doc/src/lib.rs
-index c0fdc8f..3bf51d0 100644
---- a/crates/doc/src/lib.rs
-+++ b/crates/doc/src/lib.rs
-@@ -633,10 +633,19 @@ pub struct Bookmark {
-     pub children: Vec<Bookmark>,
- }
- 
-+/// Set by the web app for live editing: hands out the ids [`Document::alloc`] counts, unique among the people editing at
-+/// once (it raises `next_id` past each).
-+#[cfg(target_arch = "wasm32")]
-+pub static FRESH_ID: std::sync::OnceLock<fn(&mut u64) -> u64> = std::sync::OnceLock::new();
-+
- impl Document {
-     /// Allocate a fresh id.
-     pub fn alloc(&mut self) -> u64 {
-         self.next_id += 1;
-+        #[cfg(target_arch = "wasm32")]
-+        if let Some(fresh) = FRESH_ID.get() {
-+            return fresh(&mut self.next_id);
-+        }
-         self.next_id
-     }
- 
-diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 745e456..6780fff 100644
---- a/crates/engine/src/lib.rs
-+++ b/crates/engine/src/lib.rs
-@@ -346,6 +346,9 @@ impl Session {
-     pub fn documents(&self) -> &[DocState] {
-         &self.docs
-     }
-+    pub fn documents_mut(&mut self) -> &mut [DocState] {
-+        &mut self.docs
++    #[test]
++    fn a_pointer_reaches_its_spread_and_comes_back_through_a_turned_zoomed_view_and_bad_numbers_draw_nothing() -> Result<(), String> {
++        use designcraft_engine::doc::geom::Point;
++        let app = sample()?;
++        let doc = &app.session.doc().map_err(|e| e.to_string())?.doc;
++        let layout = designcraft_engine::tools::CanvasLayout::new(doc, false);
++        let xf = designcraft_ui_egui::canvas::Xf { min: egui::pos2(10.0, 20.0), origin: Point::new(-300.0, 700.0), zoom: 1.5, rot: 1, pivot: egui::pos2(400.0, 300.0) };
++        let screen = egui::pos2(380.0, 520.0);
++        let (spread, p) = canvas::to_spread(doc, &layout, &xf, screen).ok_or("no spread")?;
++        assert_ne!(spread, doc.spreads[0].id.0, "the second spread, not the first");
++        let back = canvas::to_screen(doc, &layout, &xf, spread, p).ok_or("off screen")?;
++        assert!((back - screen).length() < 0.05, "{back:?}");
++        assert_eq!(canvas::to_screen(doc, &layout, &xf, u64::MAX, p), None);
++        assert_eq!(canvas::to_screen(doc, &layout, &xf, spread, [1e300, 0.0]), None);
++        Ok(())
 +    }
-     pub fn active_index(&self) -> Option<usize> {
-         self.active
-     }
-diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index 59c7ebb..78d907d 100644
---- a/crates/ui-egui/src/lib.rs
-+++ b/crates/ui-egui/src/lib.rs
-@@ -79,6 +79,10 @@ pub struct Services {
-     /// The system clipboard's text, for Paste chosen from a menu (egui only delivers it with the
-     /// paste keys, which a native menu bar takes first).
-     pub clipboard_text: Option<ClipboardFn>,
-+    /// Takes Undo (false) or Redo (true) of the active document (its uid) instead of its history when it returns true
-+    /// (live editing).
-+    #[cfg(target_arch = "wasm32")]
-+    pub undo: Option<Box<dyn Fn(Option<u64>, bool) -> bool>>,
- }
- 
- #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-@@ -667,6 +671,12 @@ impl DesignApp {
- 
-     /// THE entry point for every action (menus, shortcuts, palette, panels, control channel).
-     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
-+        #[cfg(target_arch = "wasm32")]
-+        if matches!(id, "edit.undo" | "edit.redo")
-+            && self.services.undo.as_ref().is_some_and(|undo| undo(self.session.active().map(|d| d.uid), id == "edit.redo"))
-+        {
-+            return Ok(Value::Null);
++}
+diff --git a/apps/designcraft-web/src/web/live.rs b/apps/designcraft-web/src/web/live.rs
+new file mode 100644
+index 0000000..2e29273
+--- /dev/null
++++ b/apps/designcraft-web/src/web/live.rs
+@@ -0,0 +1,68 @@
++//! Live editing in a Playground session: the page's runner, kept for the session to reach the app, and the app eframe
++//! runs: [`WebShell`], then the session's end-of-frame hook.
++
++use super::WebShell;
++use crate::live::{self, playground_live};
++use designcraft_ui_egui::DesignApp;
++use std::cell::OnceCell;
++
++thread_local! {
++    static RUNNER: OnceCell<eframe::WebRunner> = const { OnceCell::new() };
++}
++
++/// A new web runner, kept for [`wrap`].
++pub(super) fn runner() -> eframe::WebRunner {
++    let runner = eframe::WebRunner::new();
++    RUNNER.with(|kept| kept.get_or_init(|| runner.clone()).clone())
++}
++
++/// The app eframe runs: `shell`, offered to the page for live editing.
++pub(super) fn wrap(shell: WebShell) -> Box<dyn eframe::App> {
++    let _ = designcraft_engine::doc::FRESH_ID.set(live::fresh_id);
++    let _ = designcraft_ui_egui::canvas::live::UNDO.set(playground_live::undo);
++    let with_app = |f: &mut dyn FnMut(&mut DesignApp)| {
++        RUNNER.with(|runner| runner.get().and_then(|r| r.app_mut::<WebShell>()).map(|mut shell| f(&mut shell.app)).is_some())
++    };
++    if let Err(e) = playground_live::web::attach::<DesignApp>(live::FORMAT, with_app, live::repaint) {
++        log::error!("live editing unavailable: {e:?}");
++    }
++    Box::new(Live(shell))
++}
++
++struct Live(WebShell);
++
++impl eframe::App for Live {
++    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
++        self.0.logic(ctx, frame);
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        self.0.ui(ui, frame);
++        live::frame(&mut self.0.app, ui.ctx());
++    }
++
++    /// The shell itself, which the web entry and the session reach through the runner.
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(&mut self.0)
++    }
++
++    fn save(&mut self, storage: &mut dyn eframe::Storage) {
++        self.0.save(storage);
++    }
++
++    fn auto_save_interval(&self) -> std::time::Duration {
++        self.0.auto_save_interval()
++    }
++
++    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
++        self.0.clear_color(visuals)
++    }
++
++    fn persist_egui_memory(&self) -> bool {
++        self.0.persist_egui_memory()
++    }
++
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
++        self.0.raw_input_hook(ctx, raw_input);
++    }
++}
+diff --git a/crates/ui-egui/src/canvas/live.rs b/crates/ui-egui/src/canvas/live.rs
+new file mode 100644
+index 0000000..b0a3ffd
+--- /dev/null
++++ b/crates/ui-egui/src/canvas/live.rs
+@@ -0,0 +1,133 @@
++//! Live editing in a Playground session (used by the web app only): the shared document's uid, Undo's hand-off to the
++//! session, and presence. This person's presence is the spread under their pointer (or at their view's centre) by id,
++//! the pointer in that spread's coordinates while it is over the canvas, and the selected frames' ids; the others'
++//! are drawn on the canvas in their color: a pointer arrow with their name, and outlines around their selection.
++
++use super::{Xf, current_slot, item_canvas_xf, path_screen};
++use crate::DesignApp;
++use designcraft_doc::{Document, ItemId};
++use designcraft_geom::Point;
++use designcraft_tools::CanvasLayout;
++use egui::{Color32, FontId, Pos2, Rect, Shape, Stroke, StrokeKind, vec2};
++use serde_json::{Value, json};
++use std::cell::{Cell, RefCell};
++use std::sync::OnceLock;
++
++thread_local! {
++    /// The shared document's `uid`, bound by the web app's adapter while a session is connected.
++    pub static SHARED: Cell<Option<u64>> = const { Cell::new(None) };
++    /// The others in the session: name, color and the state their [`presence`] gave.
++    static OTHERS: RefCell<Vec<(String, [u8; 3], Value)>> = const { RefCell::new(Vec::new()) };
++    /// This person's pointer over the canvas (spread id, point in that spread): seen this frame, and in the last one.
++    static POINTER: Cell<[Option<(u64, [f64; 2])>; 2]> = const { Cell::new([None; 2]) };
++}
++
++/// Passes Undo (false) or Redo (true) to the session: whether it took it. Set by the web app.
++pub static UNDO: OnceLock<fn(bool) -> bool> = OnceLock::new();
++
++fn shared_active(app: &DesignApp) -> bool {
++    app.session.active().is_some_and(|d| SHARED.get() == Some(d.uid))
++}
++
++/// [`DesignApp::run`]'s first step: Undo and Redo of the shared document go to the session (true when it took them).
++pub fn undo(app: &DesignApp, id: &str) -> bool {
++    matches!(id, "edit.undo" | "edit.redo") && shared_active(app) && UNDO.get().is_some_and(|undo| undo(id == "edit.redo"))
++}
++
++/// This person's presence while the shared document is the active one (see the module docs).
++pub fn presence(app: &DesignApp) -> Value {
++    let Some(st) = app.session.active().filter(|_| shared_active(app)) else { return Value::Null };
++    let pointer = POINTER.get()[1];
++    let page = pointer.map(|p| p.0).or_else(|| {
++        let layout = CanvasLayout::new(&st.doc, st.editing_parents);
++        Some(st.doc.spread(layout.slots.get(current_slot(app, &layout)?)?.spread)?.id.0)
++    });
++    let editing = st.selection.text.and_then(|t| t.frame);
++    let selection: Vec<u64> = st.selection.items.iter().chain(&editing).take(50).map(|i| i.0).collect();
++    let mut state = json!({ "page": page, "selection": selection });
++    if let Some((_, p)) = pointer {
++        state["pointer"] = json!(p);
++    }
++    state
++}
++
++/// The others to draw (all of them each time; none once the session ends).
++pub fn show(others: Vec<(String, [u8; 3], Value)>) {
++    OTHERS.set(others);
++}
++
++/// The end of a frame: the pointer seen in it is the one [`presence`] gives.
++pub fn end_frame() {
++    POINTER.set([None, POINTER.get()[0]]);
++}
++
++/// `screen` in the spread under (or nearest to) it: (spread id, point in that spread, to 0.01 pt).
++pub fn to_spread(doc: &Document, layout: &CanvasLayout, xf: &Xf, screen: Pos2) -> Option<(u64, [f64; 2])> {
++    let (r, p) = layout.spread_at(xf.to_canvas(screen))?;
++    Some((doc.spread(r)?.id.0, [p.x, p.y].map(|c| (c * 100.0).round() / 100.0)))
++}
++
++/// Where point `p` of spread `spread` is on this screen; None when that spread is not on this canvas or the numbers
++/// are not sane (they come from other people).
++pub fn to_screen(doc: &Document, layout: &CanvasLayout, xf: &Xf, spread: u64, p: [f64; 2]) -> Option<Pos2> {
++    if !p.iter().all(|c| c.abs() < 1e7) {
++        return None;
++    }
++    let slot = layout.slots.iter().find(|s| doc.spread(s.spread).is_some_and(|sp| sp.id.0 == spread))?;
++    let at = xf.to_screen(slot.to_canvas(Point::new(p[0], p[1])));
++    at.is_finite().then_some(at)
++}
++
++/// In the canvas painter, after the document and this person's selection: notes this person's pointer and draws the
++/// others' selections and pointers (shared document only).
++pub fn draw(app: &DesignApp, painter: &egui::Painter, xf: &Xf) {
++    let Some(st) = app.session.active().filter(|_| shared_active(app)) else { return };
++    let ctx = painter.ctx();
++    let hover = ctx
++        .input(|i| i.pointer.hover_pos())
++        .filter(|p| painter.clip_rect().contains(*p) && ctx.layer_id_at(*p).is_none_or(|l| l == painter.layer_id()));
++    if hover.is_none() && OTHERS.with_borrow(Vec::is_empty) {
++        return;
++    }
++    let (doc, layout) = (&st.doc, CanvasLayout::new(&st.doc, st.editing_parents));
++    if let Some(p) = hover.and_then(|p| to_spread(doc, &layout, xf, p)) {
++        POINTER.set([Some(p), POINTER.get()[1]]);
++    }
++    OTHERS.with_borrow(|others| {
++        for (name, [r, g, b], state) in others {
++            let color = Color32::from_rgb(*r, *g, *b);
++            for id in state["selection"].as_array().into_iter().flatten().take(50).filter_map(Value::as_u64) {
++                outline(painter, xf, doc, &layout, ItemId(id), color);
++            }
++            let p = &state["pointer"];
++            if let (Some(page), Some(x), Some(y)) = (state["page"].as_u64(), p[0].as_f64(), p[1].as_f64())
++                && let Some(at) = to_screen(doc, &layout, xf, page, [x, y])
++            {
++                arrow(painter, at, name, color);
++            }
 +        }
-         if let Some(r) = menus::run_ui(self, id, &params) {
-             return r;
-         }
++    });
++}
++
++/// An item's edges and bounding box (as this person's own selection draws them) in `color`.
++fn outline(painter: &egui::Painter, xf: &Xf, doc: &Document, layout: &CanvasLayout, id: ItemId, color: Color32) {
++    let (Some(it), Some(loc)) = (doc.item(id), doc.find(id)) else { return };
++    let Some((a, _)) = item_canvas_xf(doc, layout, id).filter(|_| layout.slot(loc.spread).is_some()) else { return };
++    for poly in path_screen(it, xf, a) {
++        painter.add(Shape::line(poly, Stroke::new(1.5, color)));
++    }
++    painter.rect_stroke(xf.rect(a.transform_rect_bbox(it.bounds())), 0.0, Stroke::new(1.0, color), StrokeKind::Middle);
++}
++
++/// A pointer arrow at `at` with a name tag.
++fn arrow(painter: &egui::Painter, at: Pos2, name: &str, color: Color32) {
++    painter.add(Shape::convex_polygon(vec![at, at + vec2(0.0, 16.0), at + vec2(11.0, 11.5)], color, Stroke::new(1.0, Color32::WHITE)));
++    let name: String = name.chars().take(32).collect();
++    if name.is_empty() {
++        return;
++    }
++    let galley = painter.layout_no_wrap(name, FontId::proportional(11.0), Color32::WHITE);
++    let tag = Rect::from_min_size(at + vec2(10.0, 15.0), galley.size() + vec2(8.0, 4.0));
++    painter.rect_filled(tag, 3.0, color);
++    painter.galley(tag.min + vec2(4.0, 2.0), galley, Color32::WHITE);
++}
