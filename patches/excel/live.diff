@@ -1,9 +1,9 @@
 diff --git a/apps/gridcraft-web/src/web/live.rs b/apps/gridcraft-web/src/web/live.rs
 new file mode 100644
-index 0000000..f95415e
+index 0000000..98bdd39
 --- /dev/null
 +++ b/apps/gridcraft-web/src/web/live.rs
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,87 @@
 +//! Live editing in a Playground session: the page's runner, kept for the session to reach the app, and the shell
 +//! around [`WebShell`] that ends each frame with the session's frame hook.
 +
@@ -39,7 +39,17 @@ index 0000000..f95415e
 +    if let Err(e) = attached {
 +        log::error!("live editing: {e:?}");
 +    }
++    pointer_passes_text_agent();
 +    Box::new(Live(shell))
++}
++
++/// eframe's text agent, the 1-pixel `<input>` it moves to the caret while someone types, lets the pointer through: under
++/// a still mouse it made the canvas see the pointer leave, so the others lost this person's arrow while they typed.
++fn pointer_passes_text_agent() -> Option<()> {
++    let doc = web_sys::window()?.document()?;
++    let style = doc.create_element("style").ok()?;
++    style.set_text_content(Some("canvas + input { pointer-events: none; }"));
++    doc.body()?.append_child(&style).ok().map(drop)
 +}
 +
 +struct Live(WebShell);
@@ -83,10 +93,10 @@ index 0000000..f95415e
 +}
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..4c23264
+index 0000000..a1f83df
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,1092 @@
+@@ -0,0 +1,1181 @@
 +//! Live editing in a Playground session (web only): the shared document is the session's workbooks as JSON, keyed by a
 +//! session id: the one active when the session started (or that a joiner's active window takes) and each one opened,
 +//! created or imported since by anyone, which opens behind the others' own. Closing one is personal: the session goes on
@@ -107,7 +117,7 @@ index 0000000..4c23264
 +
 +use egui::epaint::PathShape;
 +use egui::text::LayoutJob;
-+use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, pos2, vec2};
++use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2, pos2, vec2};
 +use gridcraft_engine::core::{CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value as CellValue};
 +use gridcraft_engine::model::{
 +    Anchor, Cell, CellStore, Formula, PatternType, Shape, ShapeKind, Sheet, Style, StyleId, StyleTable, Workbook,
@@ -161,16 +171,26 @@ index 0000000..4c23264
 +    (0..steps).all(|_| playground_live::undo(redo)).then_some(Ok(Value::Null))
 +}
 +
-+/// The cell under this person's pointer in the grid, and where in it (fractions of its width and height).
-+fn pointer(app: &SheetApp, sh: &Sheet) -> Option<(CellRef, f32, f32)> {
++/// Where this person's pointer is on the grid: the cell under it, or over the headings the column's or the row's
++/// heading (a whole column or row; every cell for the corner), and where in it (fractions of its width and height; in a
++/// heading strip, of the strip's height or width).
++fn pointer(app: &SheetApp, sh: &Sheet) -> Option<(RangeRef, f32, f32)> {
 +    let geo = app.grid.geo.as_ref().filter(|_| app.backstage.is_none())?;
 +    let p = geo.mirror_pos(POINTER.get()?);
-+    if !geo.in_cells(p) {
++    let cells = geo.cells;
++    if !Rect::from_min_max(pos2(geo.head_left(), geo.head_top()), cells.max).contains(p) || (cells.contains(p) && !geo.in_cells(p)) {
 +        return None;
 +    }
 +    let at = geo.cell_at(sh, p);
 +    let r = geo.cell_rect(sh, at);
-+    Some((at, (p.x - r.left()) / r.width().max(1.0), (p.y - r.top()) / r.height().max(1.0)))
++    let f = |v: f32, size: f32| v / size.max(1.0);
++    let (col, x) = if p.x < cells.left() { (None, f(p.x - geo.head_left(), geo.header_w)) } else { (Some(at.col), f(p.x - r.left(), r.width())) };
++    let (row, y) = if p.y < cells.top() { (None, f(p.y - geo.head_top(), geo.header_h)) } else { (Some(at.row), f(p.y - r.top(), r.height())) };
++    let range = RangeRef::new(
++        CellRef::new(row.unwrap_or(0), col.unwrap_or(0)),
++        CellRef::new(row.unwrap_or(MAX_ROWS - 1), col.unwrap_or(MAX_COLS - 1)),
++    );
++    Some((range, x, y))
 +}
 +
 +/// The most ranges, stroke points and typed characters a presence carries.
@@ -264,13 +284,16 @@ index 0000000..4c23264
 +}
 +
 +impl Peer {
-+    /// One frame on toward this person's latest state on `sh` (`k`: the share of the way, `z`: screen points a sheet point,
-+    /// `far`: the jump in screen points that goes at once). Whether a mark is still on its way.
-+    fn step(&mut self, sh: &Sheet, k: f64, z: f64, far: f64) -> bool {
++    /// One frame on toward this person's latest state on `sh` laid out by `geo` (`k`: the share of the way, `far`: the
++    /// jump in screen points that goes at once). Whether a mark is still on its way.
++    fn step(&mut self, sh: &Sheet, geo: &Geo, k: f64, far: f64) -> bool {
 +        let state = &self.who.state;
-+        let mut moving = false;
-+        match (&mut self.pointer, pointer_at(sh, &state["pointer"])) {
-+            (Some(s), Some(t)) => moving |= ease(s, &t, k, z, far),
++        let (z, mut moving) = (f64::from(geo.z), false);
++        let head = [geo.header_w, geo.header_h].map(|size| f64::from(size / geo.z));
++        // Between a heading strip and the cells it goes at once: sheet points do not run on across that edge.
++        let side = |at: &[f64; 2]| at.map(|v| v < 0.0);
++        match (&mut self.pointer, pointer_at(sh, &state["pointer"], &state["drag"], head)) {
++            (Some(s), Some(t)) if side(s) == side(&t) => moving |= ease(s, &t, k, z, far),
 +            (s, t) => *s = t,
 +        }
 +        match (&mut self.ghost, ghost(sh, &state["drag"])) {
@@ -311,11 +334,35 @@ index 0000000..4c23264
 +    v.as_str().and_then(CellRef::parse).filter(CellRef::is_valid)
 +}
 +
-+/// The sheet point of a pointer `[cell, x, y]` (fractions of the cell's width and height) on `sh`.
-+fn pointer_at(sh: &Sheet, at: &Value) -> Option<[f64; 2]> {
-+    let c = cell(&at[0])?;
++/// The sheet point of a pointer `[range, x, y]` (see [`pointer`]) on `sh`. Over a heading it is in that heading strip, at
++/// negative points (`head`: the strips' width and height here, in sheet points; none when this grid hides them). While
++/// the person drags a column's or row's edge (`drag`, see [`drag`]), that line has its new size, as on their screen.
++fn pointer_at(sh: &Sheet, at: &Value, drag: &Value, head: [f64; 2]) -> Option<[f64; 2]> {
++    let r = at[0].as_str().and_then(RangeRef::parse).filter(|r| r.start.is_valid() && r.end.is_valid())?;
 +    let f = |i: usize| at[i].as_f64().filter(|f| f.is_finite()).map(|f| f.clamp(0.0, 1.0));
-+    Some([sh.col_left(c.col) + f(1)? * f64::from(sh.col_width(c.col)), sh.row_top(c.row) + f(2)? * f64::from(sh.row_height(c.row))])
++    let resized = |line: &str, size: &str, max: u32| {
++        let i = drag[line].as_u64().filter(|&i| i < u64::from(max))?;
++        Some((i as u32, drag[size].as_f64().filter(|f| (0.0..=1e4).contains(f))?))
++    };
++    // One axis: the heading strip when the range spans every line, else its one line at its start and size.
++    let along = |every: bool, (a, b): (u32, u32), f: f64, strip: f64, line: &dyn Fn(u32) -> (f64, f64), resized: Option<(u32, f64)>| {
++        if every {
++            return (strip > 0.0).then(|| (f.min(0.99) - 1.0) * strip);
++        }
++        let (mut start, mut size) = line(a);
++        match resized {
++            Some((i, new)) if i == a => size = new,
++            Some((i, new)) if i < a => start += new - line(i).1,
++            _ => {}
++        }
++        (a == b).then_some(start + f * size)
++    };
++    let col = |c: u32| (sh.col_left(c), f64::from(sh.col_width(c)));
++    let row = |r: u32| (sh.row_top(r), f64::from(sh.row_height(r)));
++    Some([
++        along(r.is_full_rows(), (r.start.col, r.end.col), f(1)?, head[0], &col, resized("col", "width", MAX_COLS))?,
++        along(r.is_full_cols(), (r.start.row, r.end.row), f(2)?, head[1], &row, resized("row", "height", MAX_ROWS))?,
++    ])
 +}
 +
 +/// Where a drag (see [`drag`]) has its items on `sh`. What does not resolve or fit is left out.
@@ -352,10 +399,12 @@ index 0000000..4c23264
 +    stroke.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum()
 +}
 +
-+/// Sheet point `at` on this person's grid (through its panes, zoom and scroll).
++/// Sheet point `at` on this person's grid (through its panes, zoom and scroll); negative points are in the heading
++/// strips, left of and above the cells.
 +fn screen(geo: &Geo, sh: &Sheet, at: &[f64]) -> Pos2 {
-+    let (c, r) = (sh.col_at(at[0]), sh.row_at(at[1]));
-+    pos2(geo.x(sh, c) + (at[0] - sh.col_left(c)) as f32 * geo.z, geo.y(sh, r) + (at[1] - sh.row_top(r)) as f32 * geo.z)
++    let (c, r) = (sh.col_at(at[0].max(0.0)), sh.row_at(at[1].max(0.0)));
++    let along = |v: f64, strip_end: f32, line: f32, start: f64| if v < 0.0 { strip_end + v as f32 * geo.z } else { line + (v - start) as f32 * geo.z };
++    pos2(along(at[0], geo.cells.left(), geo.x(sh, c), sh.col_left(c)), along(at[1], geo.cells.top(), geo.y(sh, r), sh.row_top(r)))
 +}
 +
 +/// The ghost of a drag in `color`: the area translucent with its edge, or the edge's line across the grid.
@@ -411,13 +460,13 @@ index 0000000..4c23264
 +}
 +
 +/// What a person is typing, where it goes: over the cell as GridCraft's cell editor shows a draft (in the cell's font,
-+/// growing to the right) or over the text box, outlined in their color, with their caret at its end.
-+fn paint_typing(p: &Painter, geo: &Geo, wb: &Workbook, sh: &Sheet, typing: &Value, color: Color32) {
-+    let Some(text) = typing["text"].as_str() else { return };
++/// growing to the right) or over the text box, outlined in their color, with their caret at its end. Where it is drawn.
++fn paint_typing(p: &Painter, geo: &Geo, wb: &Workbook, sh: &Sheet, typing: &Value, color: Color32) -> Option<Rect> {
++    let text = typing["text"].as_str()?;
 +    let text: String = text.chars().take(MAX_TEXT).collect();
 +    let (p, rect, galley, at, fill) = if let Some(c) = cell(&typing["cell"]) {
 +        let range = sh.merge_at(c).unwrap_or(RangeRef::cell(c));
-+        let Some(pane) = geo.range_panes(range).first().copied().filter(|_| !geo.hidden_under_frozen(sh, c)) else { return };
++        let pane = geo.range_panes(range).first().copied().filter(|_| !geo.hidden_under_frozen(sh, c))?;
 +        let cell = geo.range_rect(sh, range);
 +        let st = wb.styles.get(sh.style_id(c));
 +        let font = FontId::new(st.font.size * 96.0 / 72.0 * geo.z, theme::cell_family(&st.font.name, st.font.bold, st.font.italic));
@@ -436,13 +485,14 @@ index 0000000..4c23264
 +        let g = p.layout_job(LayoutJob::simple(text, font, ink, (rect.width() - 8.0).max(1.0)));
 +        (p.clone(), rect, g, rect.min + vec2(4.0, 4.0), sp.fill.resolve(&wb.theme).map(theme::color32))
 +    } else {
-+        return;
++        return None;
 +    };
 +    p.rect_filled(rect, 0.0, fill.unwrap_or(Color32::WHITE));
 +    let caret = galley.pos_from_cursor(galley.end()).translate(at.to_vec2());
 +    p.galley(at, galley, Color32::BLACK);
 +    p.line_segment([caret.left_top(), caret.left_bottom()], Stroke::new(1.5, color));
 +    p.rect_stroke(rect.expand(1.0), 0.0, Stroke::new(2.0, color), StrokeKind::Middle);
++    Some(rect)
 +}
 +
 +/// A person's selection in `color`: each range outlined (2 points) and faintly filled but for the active cell, as
@@ -475,21 +525,21 @@ index 0000000..4c23264
 +    }
 +}
 +
-+/// A pointer: the arrow, its tip at `tip`, in `color` with a white edge and a soft shadow.
-+fn paint_arrow(p: &Painter, tip: Pos2, color: Color32, rtl: bool) {
-+    let mut points: Vec<Pos2> = ARROW.iter().map(|&[x, y]| tip + vec2(x, y)).collect();
-+    // A right-to-left sheet flips painted paths and reverses them: the tip comes first again.
-+    if rtl {
-+        points.rotate_left(1);
++/// A pointer on `p`, which paints on screen: the arrow, its tip at `tip` (logical, mirrored on a right-to-left sheet), in
++/// `color` with a white edge and a soft shadow.
++fn paint_arrow(p: &Painter, geo: &Geo, tip: Pos2, color: Color32) {
++    let mut points: Vec<Pos2> = ARROW.iter().map(|&[x, y]| geo.mirror_pos(tip + vec2(x, y))).collect();
++    // Mirrored, the outline runs the other way round: the same way again, tip first.
++    if geo.rtl {
++        points[1..].reverse();
 +    }
 +    let shadow = points.iter().map(|q| *q + vec2(0.0, 1.0)).collect();
 +    p.add(PathShape::convex_polygon(shadow, Color32::from_black_alpha(64), Stroke::NONE));
 +    p.add(PathShape::convex_polygon(points, color, Stroke::new(1.5, Color32::WHITE)));
 +}
 +
-+/// A name tag in `color`, its top left at `at`; or, given the top of a place to go `below` instead when the grid's top
-+/// would cut it, its bottom left at `at`. Dark text on light colors.
-+fn paint_tag(p: &Painter, at: Pos2, below: f32, name: &str, color: Color32) {
++/// A name tag in `color` where `place` puts a tag of the size it is given. Dark text on light colors.
++fn paint_tag(p: &Painter, name: &str, color: Color32, place: impl FnOnce(Vec2) -> Rect) {
 +    if name.is_empty() {
 +        return;
 +    }
@@ -498,31 +548,40 @@ index 0000000..4c23264
 +    let luminance = 0.2126 * lin(color.r()) + 0.7152 * lin(color.g()) + 0.0722 * lin(color.b());
 +    let ink = if luminance > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE };
 +    let text = p.layout_no_wrap(name, theme::ui_bold(12.0), ink);
-+    let size = text.size() + vec2(14.0, 6.0);
-+    let r = match below.is_nan() {
-+        true => Rect::from_min_size(at, size),
-+        false if at.y - size.y >= p.clip_rect().top() => Rect::from_min_size(at - vec2(0.0, size.y), size),
-+        false => Rect::from_min_size(pos2(at.x, below), size),
-+    };
++    let r = place(text.size() + vec2(14.0, 6.0));
 +    p.rect_filled(r, 6.0, color);
 +    p.galley(r.min + vec2(7.0, 3.0), text, ink);
 +}
 +
++/// Where a name of `size` goes without a pointer to go by: in the row of `at` (the active cell, or the draft over it),
++/// beside it where it covers no other cell's text, else inside it along its far edge; never over the cells above.
++fn parked(geo: &Geo, sh: &Sheet, at: Rect, size: Vec2) -> Rect {
++    let beside = Rect::from_min_size(pos2(at.right() + 2.0, at.top() + ((at.height() - size.y) / 2.0).max(0.0)), size);
++    let lines = |a: u32, b: u32| (a..=b).take(8);
++    let text = |r: u32| lines(geo.col_at(sh, beside.left()), geo.col_at(sh, beside.right())).any(|c| sh.cell(CellRef::new(r, c)).is_some_and(|c| !c.value.is_empty()));
++    if beside.right() > geo.cells.right() || lines(geo.row_at(sh, beside.top()), geo.row_at(sh, beside.bottom())).any(text) {
++        beside.translate(vec2(-4.0 - size.x, 0.0))
++    } else {
++        beside
++    }
++}
++
 +/// The others on this person's workbook and sheet, in their colors: first what they are dragging, then their
-+/// selections and drafts, then their pointers with their names (a name by the active cell for whoever's pointer is off
-+/// the grid). The grid's overlays call it first: `p` paints over the cells of `sh`, the active sheet, laid out by `geo`,
-+/// left to right. Marks ease toward where they were last shown, repainting until they get there.
++/// selections and drafts, then their pointers with their names, over the cells and the headings (a name by the active
++/// cell or draft for whoever's pointer is off the grid). The grid's overlays call it first: `p` paints over the cells of
++/// `sh`, the active sheet, laid out by `geo`, left to right. Marks ease toward where they were last shown, repainting
++/// until they get there.
 +pub(crate) fn draw_presence(app: &SheetApp, p: &Painter, geo: &Geo, sh: &Sheet) {
 +    OTHERS.with_borrow_mut(|others| {
 +        let (Some(doc), Some(d)) = (active_id(&app.session).filter(|_| !others.is_empty()), app.session.active()) else { return };
 +        let here = |s: &Value| s["doc"].as_u64() == Some(doc) && s["sheet"].as_str() == Some(sh.name.as_str());
 +        let mut here: Vec<&mut Peer> = others.iter_mut().filter(|o| here(&o.who.state)).collect();
 +        let dt = p.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
-+        let (k, z) = (1.0 - (-f64::from(dt) / EASE).exp(), f64::from(geo.z));
++        let k = 1.0 - (-f64::from(dt) / EASE).exp();
 +        let far = 0.25 * f64::from(geo.cells.width().max(geo.cells.height()));
 +        let mut moving = false;
 +        for o in &mut here {
-+            moving |= o.step(sh, k, z, far);
++            moving |= o.step(sh, geo, k, far);
 +        }
 +        if moving {
 +            p.ctx().request_repaint();
@@ -534,18 +593,31 @@ index 0000000..4c23264
 +            }
 +            paint_stroke(p, geo, sh, &stroke_at(&o.who.state["stroke"]), o.ink[1], color(o));
 +        }
-+        for o in &here {
++        let drafts: Vec<Option<Rect>> = here.iter().map(|o| {
 +            paint_selection(p, geo, sh, &o.who.state, color(o));
-+            paint_typing(p, geo, &d.wb, sh, &o.who.state["typing"], color(o));
-+        }
-+        for o in &here {
-+            let shown = |at: &[f64; 2]| !geo.hidden_under_frozen(sh, CellRef::new(sh.row_at(at[1]), sh.col_at(at[0])));
-+            if let Some(tip) = o.pointer.filter(shown).map(|at| screen(geo, sh, &at)) {
-+                paint_arrow(p, tip, color(o), geo.rtl);
-+                paint_tag(p, tip + vec2(12.0, 15.0), f32::NAN, &o.who.name, color(o));
++            paint_typing(p, geo, &d.wb, sh, &o.who.state["typing"], color(o))
++        }).collect();
++        // Pointers on a layer of their own just above the grid's, so they show over the headings too (menus, popups and
++        // dialogs stay above), painted on screen.
++        let layer = egui::LayerId::new(p.layer_id().order, egui::Id::new("live_presence"));
++        p.ctx().set_sublayer(p.layer_id(), layer);
++        let top = Painter::new(p.ctx().clone(), layer, geo.rect);
++        let heads = Rect::from_min_max(pos2(geo.head_left(), geo.head_top()), geo.cells.max);
++        // A pointer shows where it lands as what it is (a cell scrolled away is not over the headings), unless frozen
++        // panes cover it.
++        let shown = |at: [f64; 2]| {
++            let tip = screen(geo, sh, &at);
++            let agrees = (at[0] < 0.0) == (tip.x < geo.cells.left()) && (at[1] < 0.0) == (tip.y < geo.cells.top());
++            let frozen = geo.hidden_under_frozen(sh, CellRef::new(sh.row_at(at[1].max(0.0)), sh.col_at(at[0].max(0.0))));
++            (heads.contains(tip) && agrees && !frozen).then_some(tip)
++        };
++        for (o, draft) in here.iter().zip(drafts) {
++            if let Some(tip) = o.pointer.and_then(shown) {
++                paint_arrow(&top, geo, tip, color(o));
++                paint_tag(&top, &o.who.name, color(o), |size| geo.mirror_rect(Rect::from_min_size(tip + vec2(12.0, 15.0), size)));
 +            } else if let Some(active) = cell(&o.who.state["active"]).filter(|&c| !geo.hidden_under_frozen(sh, c)) {
-+                let r = geo.range_rect(sh, sh.merge_at(active).unwrap_or(RangeRef::cell(active)));
-+                paint_tag(p, r.left_top(), r.bottom() + 2.0, &o.who.name, color(o));
++                let at = draft.unwrap_or_else(|| geo.range_rect(sh, sh.merge_at(active).unwrap_or(RangeRef::cell(active))));
++                paint_tag(p, &o.who.name, color(o), |size| parked(geo, sh, at, size));
 +            }
 +        }
 +    });
@@ -915,9 +987,9 @@ index 0000000..4c23264
 +        Some(h.finish())
 +    }
 +
-+    /// `{ doc: session id, sheet, active, selection: [ranges], pointer?: [cell, x, y] (see [`pointer`]), object?: selected
-+    /// id, drag?, stroke?, typing? }` (see [`drag`], [`stroke`], [`typing`]), on the session's workbooks only. A row or column edge
-+    /// being dragged moves the cells after it in this copy only: the pointer is left out meanwhile.
++    /// `{ doc: session id, sheet, active, selection: [ranges], pointer?: [cell or heading's column or row, x, y] (see
++    /// [`pointer`]), object?: selected id, drag?, stroke?, typing? }` (see [`drag`], [`stroke`], [`typing`]), on the
++    /// session's workbooks only.
 +    fn live_presence(&self) -> Value {
 +        let (Some(doc), Some(d)) = (active_id(&self.session), self.session.active()) else { return Value::Null };
 +        let Some(sh) = d.wb.active() else { return Value::Null };
@@ -928,9 +1000,7 @@ index 0000000..4c23264
 +            "active": sel.active.a1(),
 +            "selection": sel.ranges.iter().take(MAX_SHOWN).map(RangeRef::a1).collect::<Vec<_>>(),
 +        });
-+        if !matches!(grid.drag, Drag::ResizeCol { .. } | Drag::ResizeRow { .. })
-+            && let Some((at, x, y)) = pointer(self, sh)
-+        {
++        if let Some((at, x, y)) = pointer(self, sh) {
 +            let round = |f: f32| (f64::from(f) * 100.0).round() / 100.0;
 +            state["pointer"] = json!([at.a1(), round(x), round(y)]);
 +        }
@@ -1157,6 +1227,35 @@ index 0000000..4c23264
 +        assert!((ghost.min - geo.range_rect(sh, d4).min).length() + (ghost.max - geo.range_rect(sh, d4).max).length() < 0.01);
 +        a.session.set_active(1);
 +        assert_eq!(a.live_presence(), Value::Null, "nothing from a workbook outside the session");
++    }
++
++    #[test]
++    fn a_pointer_over_the_headings_comes_back_where_it_was_and_follows_a_column_edge_being_dragged() {
++        let mut a = app();
++        a.live_document();
++        let wb = a.session.active().unwrap().wb.clone();
++        let sh = wb.active().unwrap();
++        let geo = Geo::new(sh, Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)), egui::Vec2::ZERO);
++        let head = [geo.header_w, geo.header_h].map(|size| f64::from(size / geo.z));
++        let c3 = geo.cell_rect(sh, CellRef::parse("C3").unwrap());
++        a.grid.geo = Some(geo.clone());
++        let strips = [
++            (pos2(c3.center().x, geo.head_top() + 5.0), "C:C"),
++            (pos2(geo.head_left() + 6.0, c3.center().y), "3:3"),
++            (pos2(geo.head_left() + 3.0, geo.head_top() + 3.0), "A1:XFD1048576"),
++        ];
++        for (at, heading) in strips {
++            POINTER.set(Some(at));
++            let pointer = a.live_presence()["pointer"].clone();
++            assert_eq!(pointer[0], heading);
++            let back = screen(&geo, sh, &pointer_at(sh, &pointer, &Value::Null, head).unwrap());
++            assert!((back - at).length() < 0.5, "{heading}: {at:?} came back at {back:?}");
++        }
++        // Column B dragged 30 points wider: C's heading goes 30 points on, as on the dragger's screen.
++        let pointer = json!(["C:C", 0.5, 0.5]);
++        let wider = json!({"col": 1, "width": f64::from(sh.col_width(1)) + 30.0});
++        let [x, _] = pointer_at(sh, &pointer, &Value::Null, head).unwrap();
++        assert_eq!(pointer_at(sh, &pointer, &wider, head).unwrap()[0], x + 30.0);
 +    }
 +
 +    #[test]
