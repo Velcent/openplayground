@@ -1,5 +1,5 @@
 import { CHUNK_SIZE, FRAME_SIZE, HASH, MAX_FILES, MAX_MANIFEST, MAX_SIGNAL, pack, unpack, randomToken, tokenHash, signalKey, seal, open, readInvite, inviteURL, validateManifest } from './session-protocol.js'
-import { SessionStore, describe } from './session-store.js'
+import { NO_SPACE, SessionStore, describe } from './session-store.js'
 import { MAX_DOCUMENT } from './document-delta.js'
 
 const cleanName = (name) => String(name || 'Guest').replace(/[\x00-\x1f\x7f]/g, '').slice(0, 40)
@@ -508,7 +508,7 @@ export class PeerSession extends EventTarget {
       const disconnected = this.peers.size && [...this.peers.values()].every(p => ['closed', 'failed'].includes(p.pc.connectionState) || p.channel?.readyState === 'closed')
       if (disconnected || (job && !source && !pending)) {
         this.status = 'failed'
-        this.error = 'No connected participant can send these files. Reconnect to retry; verified data is saved.'
+        if (this.error !== NO_SPACE) this.error = 'No connected participant can send these files. Reconnect to retry; verified data is saved.'
       }
       for (const peer of this.peers.values()) if (peer.channel?.readyState === 'open') await this.report(peer)
       // A file's chunk hashes come first, in parts, from the participant that will send its chunks.

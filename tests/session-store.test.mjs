@@ -70,7 +70,7 @@ test('a failed completion write never reports a partially stored asset as comple
       return original.apply(this, args)
     }
     let failed = false, hidden = false
-    try { await store.putChunk(entry.asset, 0, new TextEncoder().encode('safe')) } catch { failed = true }
+    try { await store.putChunk(entry.asset, 0, new TextEncoder().encode('safe')) } catch (e) { failed = e.message.startsWith('Not enough storage in this browser') }
     try { await store.file(entry.asset) } catch { hidden = true }
     FileSystemFileHandle.prototype.createWritable = original
     await store.putChunk(entry.asset, 0, new TextEncoder().encode('safe'))

@@ -2,10 +2,13 @@ import { CHUNK_SIZE, MAX_FILE, MAX_MANIFEST, UUID, HASH, assetId, digest, pack, 
 
 // drafts/<time>-<uuid>[-<app path, URI-encoded>].bin
 const DRAFT = /^([0-9]+)-[0-9a-f-]{36}(?:-((?:%2F|[a-z0-9-])+))?\.bin$/
+export const NO_SPACE = 'Not enough storage in this browser. Free up space and try again; verified data is saved.'
 const write = async (dir, name, bytes) => {
-  const out = await (await dir.getFileHandle(name, { create: true })).createWritable()
-  try { await out.write(bytes); await out.close() }
-  catch (e) { await out.abort().catch(() => {}); throw e }
+  try {
+    const out = await (await dir.getFileHandle(name, { create: true })).createWritable()
+    try { await out.write(bytes); await out.close() }
+    catch (e) { await out.abort().catch(() => {}); throw e }
+  } catch (e) { throw e.name === 'QuotaExceededError' ? new Error(NO_SPACE) : e }
 }
 const readJSON = async (dir, name) => {
   try {
