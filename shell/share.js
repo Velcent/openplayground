@@ -44,7 +44,15 @@ export async function mountShare(bar, app, here, groups = []) {
   const use = next => {
     session?.removeEventListener('change',update); session=next; session.addEventListener('change',update); update()
     active.set(next.room)
-    follow(next).then(live => live?.addEventListener('change', () => next.changed())).catch(e => { next.error = e.message; next.changed() })
+    // Its notices (an edit kept as a draft, a save that failed) also show outside the panel, once each.
+    follow(next).then(live => {
+      let shown = null
+      live?.addEventListener('change', () => {
+        next.changed()
+        if (live.error && live.error !== shown && !dialogOpen) toast(live.error, [{ label: 'Show', run: show }])
+        shown = live.error
+      })
+    }).catch(e => { next.error = e.message; next.changed() })
     // Removed, ended, or opened in another tab: this page no longer takes part, so Undo is the app's own again.
     next.addEventListener('change', () => {
       if (['removed','displaced','ended'].includes(next.status)) unfollow(next)
