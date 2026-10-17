@@ -1,7 +1,7 @@
 Live editing in Playground sessions (web only): Honeydew's adapter (src/app/live.rs), the song merge
-(src/collaboration.rs, src/collaboration/checkpoint.rs) and two call sites, to be merged into upstream Honeydew.
-A channel whose code has it already skips this (it applies in reverse); once a release has it, build.yml deletes it.
-Inert unless the Playground shell attaches.
+(src/collaboration.rs, src/collaboration/checkpoint.rs) and two call sites. Upstream Honeydew has it since 6ba92c2
+(after v0.1.6), so the newest commit skips it (live.head.diff is empty) and only the release channel applies it; once
+a release has it, it applies in reverse there and build.yml deletes both. Inert unless the Playground shell attaches.
 
 diff --git a/src/app.rs b/src/app.rs
 index 7e7cd63..78417d6 100644
