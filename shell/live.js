@@ -66,6 +66,8 @@ export function unfollow(session) {
 export class LiveDocument extends EventTarget {
   static async start({ session, adapter, store = session.store }) {
     const live = new LiveDocument(session, adapter, store)
+    // What this page showed before the session: untouched, it needs no draft when the shared document replaces it.
+    try { live.pristine = adapter.checkpoint() } catch {}
     // Connected first: hosting may need the app to apply a stored document.
     adapter.connect({ changed: () => queueMicrotask(() => live.kick()), undo: (redo) => queueMicrotask(() => live.undo(redo)) })
     live.mine = new Set(await store.media?.(undefined, `media-${live.slug}`).catch(() => null) ?? [])
@@ -331,6 +333,7 @@ export class LiveDocument extends EventTarget {
     } else {
       this.inflight = null
       await this.restore(record.bytes)
+      this.pristine = null
       this.acked = { document: record.document, revision: record.revision, bytes: record.bytes }
       this.entries = record.entries.slice(-RETAINED)
     }
@@ -397,6 +400,7 @@ export class LiveDocument extends EventTarget {
     const replaced = await this.adapter.apply(null, document)
     if (this.inflight) this.inflight.inLive = false
     if (!(replaced instanceof Uint8Array) || same(replaced, document) || (shared && same(replaced, shared))) return
+    if (this.pristine && same(replaced, this.pristine)) return
     try { await this.store.draft(replaced, this.app) }
     catch (e) {
       // ponytail: held in memory only; list it with the kept drafts (share.js) if storage failures show up.

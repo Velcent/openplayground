@@ -395,3 +395,16 @@ test('media an app turns down is not handed to it again on every change', async 
   for (let i = 0; i < 5; i++) { editor.session.dispatchEvent(new Event('change')); await sleep(20) }
   assert.equal(offered, 1)
 })
+
+test('a joiner whose page was untouched keeps no draft of it; one with its own changes does', async () => {
+  for (const edited of [false, true]) {
+    const hub = new Hub(), [o, e] = ids()
+    const owner = await hub.join(o, 'owner', new App([1, 2, 3]))
+    const release = hub.hold(o, e)
+    const editor = await hub.join(e, 'editor', new App([0, 0, 0]))
+    if (edited) editor.app.doc[1] = 7 // changed on this page before the shared document arrived
+    release()
+    await eventually(() => assert.deepEqual([...editor.app.doc], [1, 2, 3]))
+    assert.equal(editor.store.drafts.length, edited ? 1 : 0)
+  }
+})

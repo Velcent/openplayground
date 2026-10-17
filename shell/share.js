@@ -27,7 +27,8 @@ export async function mountShare(bar, app, here, groups = []) {
   catch(e) { issue = e.message; invite = null }
   const config = await fetch('/api/session/config', {cache:'no-store'}).then(r=>r.ok?r.json():{}).catch(()=>({}))
   if (!config.enabled && !invite && !issue && !active.get() && !(await SessionStore.list().catch(()=>[])).length) return
-  let session, dialogOpen = false
+  let session, dialogOpen = false, joining = null
+  const JOINING = 'Joining the session: the shared document opens here as soon as it arrives.'
   const count = h('span', {class:'pg-share-count'}, 'Share')
   const progress = h('progress', {class:'pg-share-progress',max:'1',value:'0',hidden:true,'aria-label':'File sync progress'})
   const control = h('button', {class:'pg-bar-btn pg-share',type:'button','aria-label':'Share files',onclick:()=>show()}, icon('people'), count, progress)
@@ -47,12 +48,16 @@ export async function mountShare(bar, app, here, groups = []) {
     // Its notices (an edit kept as a draft, a save that failed) also show outside the panel, once each.
     follow(next).then(live => {
       let shown = null
+      // A joiner sees its own page until the shared document arrives: say it is on its way (from the Join click on).
+      let loading = live && !next.config.owner && !live.acked ? joining ?? toast(JOINING, [{ label: 'Hide', run: () => {} }]) : (joining?.(), null)
+      joining = null
       live?.addEventListener('change', () => {
+        if (loading && (live.acked || live.stopped)) { loading(); loading = null }
         next.changed()
         if (live.error && live.error !== shown && !dialogOpen) toast(live.error, [{ label: 'Show', run: show }])
         shown = live.error
       })
-    }).catch(e => { next.error = e.message; next.changed() })
+    }).catch(e => { joining?.(); joining = null; next.error = e.message; next.changed() })
     // Removed, ended, or opened in another tab: this page no longer takes part, so Undo is the app's own again.
     next.addEventListener('change', () => {
       if (['removed','displaced','ended'].includes(next.status)) unfollow(next)
@@ -192,7 +197,10 @@ export async function mountShare(bar, app, here, groups = []) {
         async function start() {
           if (session) {live();return}
           if (invite) {
-            body.append(h('p',{},liveText('Joining opens the shared project here, live, with the media it uses. Other shared files wait until you accept them.','Join to see the shared file list and download size. Nothing is received until you accept.')),button('Join session',()=>attempt(async()=>{use(await PeerSession.join(invite,{name:name.value}));live()}),true))
+            body.append(h('p',{},liveText('Joining opens the shared project here, live, with the media it uses. Other shared files wait until you accept them.','Join to see the shared file list and download size. Nothing is received until you accept.')),button('Join session',()=>attempt(async()=>{
+              joining ??= toast(JOINING,[{label:'Hide',run:()=>{}}])
+              try { use(await PeerSession.join(invite,{name:name.value})); live() } catch(e) { joining?.(); joining=null; throw e }
+            }),true))
             return
           }
           const selection=h('div',{class:'pg-share-pick'}), picks=[]
