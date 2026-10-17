@@ -305,10 +305,14 @@
             playground::report_unsaved(self.app.session.documents().iter().any(|d| d.is_dirty()));
 
 # Live editing in Playground sessions (patches/powerpoint/live.diff + patches/live/playground_live.rs)
-# The adapter lives in new files: apps/deckcraft-web/src/live.rs (the shared document, merge, Undo, the id allocator and
-# presence; the template is its child module, live/finite.rs writes non-finite numbers as 0) and
-# apps/deckcraft-web/src/web/live.rs (the kept runner, and the shell that ends each frame with the session's frame hook
-# and draws the others' pointers and selections over the slide canvas). These rules only declare them and call in, one
+# What it's for: people in a Playground session edit the session's presentations together (the one open when it started
+#   and every one opened since, which reaches the others behind their own) and see each other's presentation, slide,
+#   pointer, selection and gestures under way (moves, resizes and rotations as ghosts, shapes and text boxes being drawn,
+#   ink and freeform paths), in each person's color.
+# The adapter lives in new files: apps/deckcraft-web/src/live.rs (the shared document, merge, Undo, the id allocator,
+# presence and its drawing, File › Home's session list; the template is its child module, live/finite.rs writes
+# non-finite numbers as 0) and apps/deckcraft-web/src/web/live.rs (the kept runner, and the shell that ends each frame
+# with the session's frame hook). These rules only declare them and call in, one
 # line each at the end of a file or after a function's signature, the same on both channels. Verify: node
 # scripts/build.mjs check powerpoint head|release, then the e2e (tests/live-apps/powerpoint.mjs). If upstream renames a
 # function named below, anchor on its new signature; if it renames WebShell or its `app` field, follow it in web/live.rs.
@@ -357,3 +361,20 @@
   file: apps/deckcraft-web/src/web.rs
   find: 'Ok\(Box::new\((?=\s*WebShell\b)'
   replace: 'Ok(live::wrap('
+# The canvas and File › Home call the adapter through two hooks on the UI crate (it cannot name the web crate): the
+# others' marks are drawn first thing in the canvas's overlays (under this person's own selection, handles and previews,
+# below menus and dialogs), and Home lists the session's presentations ("In this session", with dots for who is on each),
+# the way to one the others opened (DeckCraft shows one presentation at a time and lists no windows). The parameter
+# names are in the anchors so a rename fails here, not in the compiler.
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n/// Live editing in a Playground session: draws the others' marks on the canvas, under this person's own overlays.\npub static LIVE_PAINT: std::sync::OnceLock<fn(&SlideApp, &egui::Painter, canvas::Xf)> = std::sync::OnceLock::new();\n/// Live editing in a Playground session: lists the session's presentations on File › Home; true when one was chosen.\npub static LIVE_HOME: std::sync::OnceLock<fn(&mut SlideApp, &mut egui::Ui) -> bool> = std::sync::OnceLock::new();\n"
+- live: true
+  file: crates/ui-egui/src/canvas.rs
+  find: '\bfn\s+overlays\s*\(\s*app\b[^{]*\bpainter\b[^{]*\bxf\b[^{]*\{'
+  after: "\n    if let Some(paint) = crate::LIVE_PAINT.get() { paint(app, painter, xf); }"
+- live: true
+  file: crates/ui-egui/src/backstage.rs
+  find: '\bfn\s+home\s*\(\s*app\b[^{]*\bui\b[^{]*\bout\b[^{]*\{'
+  after: "\n    if crate::LIVE_HOME.get().is_some_and(|list| list(app, ui)) { out.close = true; }"

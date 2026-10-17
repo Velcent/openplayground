@@ -1,19 +1,26 @@
 diff --git a/apps/deckcraft-web/src/live.rs b/apps/deckcraft-web/src/live.rs
 new file mode 100644
-index 0000000..502dc6f
+index 0000000..ab51e92
 --- /dev/null
 +++ b/apps/deckcraft-web/src/live.rs
-@@ -0,0 +1,478 @@
-+//! Playground live editing (`playground_live`): the shared document is one presentation's model as JSON (written as
-+//! the native save writes it, non-finite numbers as 0) with its media's bytes and without the id counter, the drawing
-+//! guides or this person's views (selection, current slide, zoom, panes). Native undo history stays local; while
-+//! connected, Undo and Redo of the shared presentation go to the session.
+@@ -0,0 +1,1038 @@
++//! Playground live editing (`playground_live`): the shared document is the session's presentations, `{documents: [{id,
++//! name, ...presentation}]}`: the one active when the session started (or that a joiner's active window takes) and each
++//! one opened, created or imported since by anyone, which opens behind the others' own. Each is its model as JSON
++//! (written as the native save writes it, non-finite numbers as 0) with its media's bytes and without the id counter, the
++//! drawing guides or this person's views (selection, current slide, zoom, panes). Closing one is personal: the session
++//! goes on with it, and File › Home lists the session's presentations to go to or open again. Native undo history stays
++//! local; while connected, Undo and Redo of the session's presentations go to the session.
 +//!
-+//! Presence: each person shares the slide they show, their pointer on it (slide points) and their selected shapes; the
-+//! others on the same slide are drawn over the canvas in their color (`web/live.rs` calls [`frame`] after each frame).
++//! Presence: the presentation and slide each person shows, their pointer on it (slide points), their selected shapes and
++//! what they are doing before it reaches the document (shapes moved, resized or rotated, a shape or text box being drawn,
++//! ink or a freeform path), drawn over the others' slides in their color and eased toward where they are. Typing needs
++//! nothing of its own: each keystroke edits the document (between keystrokes the app is quiet), so it reaches the others
++//! at once.
 +//!
-+//! Upstream calls in through two hooks (rules in patches/powerpoint.yaml): `deckcraft_engine::LIVE_UNDO` at the top of
-+//! `Session::execute` and `deckcraft_model::LIVE_ALLOC` at the top of `Presentation::alloc_id`.
++//! Upstream calls in through hooks (rules in patches/powerpoint.yaml): `deckcraft_engine::LIVE_UNDO` at the top of
++//! `Session::execute`, `deckcraft_model::LIVE_ALLOC` at the top of `Presentation::alloc_id`, `deckcraft_ui_egui::LIVE_PAINT`
++//! at the top of the canvas's overlays and `deckcraft_ui_egui::LIVE_HOME` at the top of File › Home.
 +
 +// The frame hook and drawing run in the browser only.
 +#![cfg_attr(test, allow(dead_code))]
@@ -23,12 +30,16 @@ index 0000000..502dc6f
 +pub mod playground_live;
 +mod finite;
 +
-+use deckcraft_engine::geom::Point;
-+use deckcraft_engine::model::{Presentation, ShapeId, Slide, find_shape_mut, walk};
 +use deckcraft_engine::cmd::{base64_decode, base64_encode, xfrm_of};
-+use deckcraft_engine::{DocState, Session, Target};
++use deckcraft_engine::geom::{PathEl, Point, Xfrm, preset::is_line_like, preset_flatten};
++use deckcraft_engine::model::{Presentation, ShapeId, Slide, find_shape, find_shape_mut, walk};
++use deckcraft_engine::{DocState, Session, Target, ToolKind};
 +use deckcraft_ui_egui::SlideApp;
-+use egui::{Color32, FontId, Pos2, Rect, Shape, Stroke, vec2};
++use deckcraft_ui_egui::canvas::Xf;
++use deckcraft_ui_egui::icons::{self, Icon};
++use deckcraft_ui_egui::theme::{self, Tokens};
++use egui::epaint::PathShape;
++use egui::{Align2, Color32, Painter, Pos2, Rect, RichText, Sense, Shape, Stroke, pos2, vec2};
 +use finite::Finite;
 +use playground_live::{Live, Presence};
 +use serde::Deserialize as _;
@@ -36,25 +47,64 @@ index 0000000..502dc6f
 +use std::cell::{Cell, RefCell};
 +use std::sync::Arc;
 +
-+pub const FORMAT: &str = concat!("powerpoint:1:", env!("CARGO_PKG_VERSION"));
++pub const FORMAT: &str = concat!("powerpoint:2:", env!("CARGO_PKG_VERSION"));
++
++/// The most selected ids, moved shapes and stroke points a presence carries.
++const MAX_SHOWN: usize = 50;
++const MAX_GHOSTS: usize = 24;
++const MAX_STROKE: usize = 200;
++/// The shell sends no presence over 4 KiB.
++const MAX_PRESENCE: usize = 4000;
++/// Names in tags are cut to this many characters.
++const MAX_NAME: usize = 24;
++/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
++const EASE: f64 = 0.08;
++/// A pointer's arrow, tip first: egui fills a closed path as a fan from its first point, which this shape allows.
++const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [12.5, 11.0], [7.3, 11.0], [10.4, 17.3], [7.6, 18.6], [4.5, 12.2], [0.0, 16.0]];
 +
 +thread_local! {
-+    /// The shared presentation, bound when the session first reads it: the active one's `uid` (None: nothing was open)
-+    /// and its last document, which stays the shared one after its window closes.
-+    static SHARED: RefCell<Option<(Option<u64>, Arc<Presentation>)>> = const { RefCell::new(None) };
++    /// The session's presentations as this page knows them.
++    static SHARED: RefCell<Shared> = RefCell::new(Shared::default());
 +    /// A pointer is down or a text field (the notes, a ribbon box) has the keyboard.
 +    static UI_BUSY: Cell<bool> = const { Cell::new(false) };
 +    static CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
 +    /// This person's pointer over the canvas, in slide points, as of the last frame.
 +    static POINTER: Cell<Option<[f64; 2]>> = const { Cell::new(None) };
-+    /// The others in the session, as the shell last gave them.
-+    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
++    /// The others in the session, as they last showed themselves.
++    static OTHERS: RefCell<Vec<Peer>> = const { RefCell::new(Vec::new()) };
++    /// When the others' marks were last drawn (egui's clock): easing goes by the time that passed, however slow frames are.
++    static DRAWN: Cell<f64> = const { Cell::new(0.0) };
 +}
 +
-+/// Hooks the engine's Undo and Redo and the model's id allocator.
++/// The session's presentations on this page: the one active when it started (or that it joined into), and every one
++/// opened, created or imported here or by the others since.
++#[derive(Default)]
++struct Shared {
++    docs: Vec<Doc>,
++    /// Windows that stay this person's own: open before the session started (but its first presentation), or whose
++    /// presentation left the session (an Undo of its opening).
++    own: Vec<u64>,
++    /// For [`playground_live::fresh_id`].
++    next: u64,
++}
++
++/// A presentation of the session.
++struct Doc {
++    /// Its id in the session.
++    id: u64,
++    /// Its window here (`DocState::uid`); none once this person closed it.
++    uid: Option<u64>,
++    /// As last seen: what the session goes on with while it is closed here.
++    doc: Arc<Presentation>,
++    title: String,
++}
++
++/// Hooks the engine's Undo and Redo, the model's id allocator, the canvas and File › Home.
 +pub fn install() {
 +    let _ = deckcraft_engine::LIVE_UNDO.set(undo);
 +    let _ = deckcraft_engine::model::LIVE_ALLOC.set(alloc_id);
++    let _ = deckcraft_ui_egui::LIVE_PAINT.set(paint);
++    let _ = deckcraft_ui_egui::LIVE_HOME.set(session_list);
 +}
 +
 +/// The end of a frame. `kept`: the slide rect from before the frame, put back when the canvas was not drawn (the
@@ -70,12 +120,9 @@ index 0000000..502dc6f
 +    let hover = ctx.input(|i| i.pointer.hover_pos());
 +    POINTER.set(canvas.and_then(|(rect, origin, scale)| {
 +        let p = hover.filter(|p| rect.contains(*p))?;
-+        let at = |v: f32, o: f32| (f64::from((v - o) / scale) * 10.0).round() / 10.0;
++        let at = |v: f32, o: f32| round(f64::from((v - o) / scale));
 +        Some([at(p.x, origin.x), at(p.y, origin.y)])
 +    }));
-+    if let Some(canvas) = canvas {
-+        draw_presence(app, ui, canvas);
-+    }
 +    playground_live::frame(app);
 +}
 +
@@ -83,19 +130,56 @@ index 0000000..502dc6f
 +    CTX.with_borrow(|c| c.iter().for_each(egui::Context::request_repaint));
 +}
 +
-+/// The uid of the shared presentation, once bound.
-+fn shared_uid() -> Option<u64> {
-+    SHARED.with_borrow(|s| s.as_ref().and_then(|s| s.0))
++/// The session id of the active presentation when it is one of the session's (its Undo and Redo go to the session).
++fn active_id(s: &Session) -> Option<u64> {
++    let uid = s.active()?.uid;
++    SHARED.with_borrow(|sh| sh.docs.iter().find(|d| d.uid == Some(uid)).map(|d| d.id))
 +}
 +
-+/// `Session::execute`'s first step: the session takes Undo and Redo while the shared presentation is the active one.
++/// Brings the session's presentations up to date with this page's windows: the active one when nothing is shared yet,
++/// each one opened since (a new presentation of the session), the latest of each that is open, and which were closed.
++fn sync(s: &Session) {
++    SHARED.with_borrow_mut(|sh| {
++        if sh.docs.is_empty() {
++            let Some(d) = s.active() else { return };
++            sh.own = s.documents().iter().map(|o| o.uid).filter(|&uid| uid != d.uid).collect();
++            let id = playground_live::fresh_id(&mut sh.next);
++            sh.docs.push(Doc { id, uid: Some(d.uid), doc: d.doc.clone(), title: d.title.clone() });
++        }
++        for doc in &mut sh.docs {
++            match s.documents().iter().find(|d| Some(d.uid) == doc.uid) {
++                Some(d) => (doc.doc, doc.title) = (d.doc.clone(), d.title.clone()),
++                None => doc.uid = None,
++            }
++        }
++        for d in s.documents() {
++            if !sh.own.contains(&d.uid) && !sh.docs.iter().any(|doc| doc.uid == Some(d.uid)) {
++                let id = playground_live::fresh_id(&mut sh.next);
++                sh.docs.push(Doc { id, uid: Some(d.uid), doc: d.doc.clone(), title: d.title.clone() });
++            }
++        }
++    });
++}
++
++/// Runs `f` with window `i` active (the session lends out only the active one), then puts the active window back.
++fn with_doc<R>(s: &mut Session, i: usize, f: impl FnOnce(&mut Session) -> R) -> R {
++    let active = s.active_index();
++    s.set_active(i);
++    let r = f(s);
++    if let Some(active) = active {
++        s.set_active(active);
++    }
++    r
++}
++
++/// `Session::execute`'s first step: the session takes Undo and Redo while one of its presentations is the active one.
 +pub fn undo(session: &mut Session, command: &str) -> bool {
 +    let redo = match command {
 +        "edit.undo" => false,
 +        "edit.redo" => true,
 +        _ => return false,
 +    };
-+    if shared_uid().is_none() || session.active().map(|d| d.uid) != shared_uid() {
++    if active_id(session).is_none() {
 +        return false;
 +    }
 +    // As before any Undo, an input method's composition settles first.
@@ -138,26 +222,12 @@ index 0000000..502dc6f
 +    used
 +}
 +
-+/// The shared presentation's uid, its index while open, and its document.
-+fn shared(app: &SlideApp) -> (Option<u64>, Option<usize>, Arc<Presentation>) {
-+    let docs = app.session.documents();
-+    SHARED.with_borrow_mut(|s| {
-+        let (uid, last) = s.get_or_insert_with(|| match app.session.active() {
-+            Some(d) => (Some(d.uid), d.doc.clone()),
-+            None => (None, Arc::new(Presentation::default())),
-+        });
-+        let i = uid.and_then(|uid| docs.iter().position(|d| d.uid == uid));
-+        if let Some(i) = i {
-+            *last = docs[i].doc.clone();
-+        }
-+        (*uid, i, last.clone())
-+    })
-+}
-+
 +fn json<T: serde::Serialize + ?Sized>(value: &T) -> Value {
 +    serde_json::to_value(Finite(value)).unwrap_or_default()
 +}
 +
++/// One presentation as shared.
++// ponytail: serializes every presentation of the session when one changes; cache by Arc if big sessions lag.
 +fn project(doc: &Presentation) -> Value {
 +    let mut v = json(doc);
 +    v.as_object_mut().map(|o| (o.remove("nextId"), o.remove("guides")));
@@ -196,105 +266,82 @@ index 0000000..502dc6f
 +    format!("Invalid shared document: {e}")
 +}
 +
-+/// A number from another person's presence, if it is one worth drawing.
-+fn coordinate(v: &Value) -> Option<f32> {
-+    v.as_f64().filter(|v| v.abs() < 1e6).map(|v| v as f32)
-+}
-+
-+/// The others on the slide this person shows: their selected shapes outlined and their pointer with their name, in
-+/// their color. `canvas`: the canvas rect and the slide's screen origin and scale this frame.
-+fn draw_presence(app: &SlideApp, ui: &egui::Ui, (canvas, origin, scale): (Rect, Pos2, f32)) {
-+    OTHERS.with_borrow(|others| {
-+        let Some(st) = app.session.active().filter(|d| others.len() > 0 && Some(d.uid) == shared_uid()) else { return };
-+        let Some(slide) = st.doc.slides.get(st.selection.slide).filter(|_| st.selection.target == Target::Slides) else { return };
-+        let painter = ui.painter().with_clip_rect(canvas);
-+        let screen = |p: Point| Pos2::new(origin.x + p.x as f32 * scale, origin.y + p.y as f32 * scale);
-+        for other in others.iter().filter(|o| o.state["slide"].as_u64() == Some(u64::from(slide.id.0))) {
-+            let [r, g, b] = other.color;
-+            let color = Color32::from_rgb(r, g, b);
-+            let stroke = Stroke::new(2.0, color);
-+            let ids = other.state["selection"].as_array().into_iter().flatten().take(50);
-+            for sh in ids.filter_map(|id| st.shape(ShapeId(u32::try_from(id.as_u64()?).ok()?))) {
-+                let x = xfrm_of(&st.doc, &st.selection, sh);
-+                let a = x.affine();
-+                let corner = |cx: f64, cy: f64| screen(a * Point::new(cx, cy));
-+                if sh.is_line() {
-+                    painter.line_segment([corner(0.0, 0.0), corner(x.w, x.h)], stroke);
-+                } else {
-+                    let c = [corner(0.0, 0.0), corner(x.w, 0.0), corner(x.w, x.h), corner(0.0, x.h)];
-+                    painter.add(Shape::closed_line(c.to_vec(), stroke));
-+                }
-+            }
-+            let pointer = &other.state["pointer"];
-+            let (Some(x), Some(y)) = (coordinate(&pointer[0]), coordinate(&pointer[1])) else { continue };
-+            let tip = Pos2::new(origin.x + x * scale, origin.y + y * scale);
-+            painter.add(Shape::convex_polygon(vec![tip, tip + vec2(0.0, 16.0), tip + vec2(11.0, 11.0)], color, Stroke::new(1.0, Color32::WHITE)));
-+            let name: String = other.name.chars().take(32).collect();
-+            let text = painter.layout_no_wrap(name, FontId::proportional(11.0), Color32::WHITE);
-+            let tag = Rect::from_min_size(tip + vec2(10.0, 14.0), text.size() + vec2(8.0, 4.0));
-+            painter.rect_filled(tag, 3.0, color);
-+            painter.galley(tag.min + vec2(4.0, 2.0), text, Color32::WHITE);
-+        }
-+    });
-+}
-+
-+impl Live for SlideApp {
-+    fn live_document(&self) -> Value {
-+        project(&shared(self).2)
++/// A shared presentation (`document`, without its id and name) as this page installs it, keeping from `old` (this page's
++/// copy) the drawing guides, the id counter and every part whose JSON did not change.
++fn installed(old: &Presentation, mut document: Value) -> Result<Presentation, String> {
++    let was = json(old);
++    // The drawing guides stay this person's own (newer upstream only).
++    if let Some(guides) = was.get("guides") {
++        document["guides"] = guides.clone();
 +    }
++    let mut doc = Presentation::deserialize(&document).map_err(invalid)?;
++    reuse(&mut doc.slides, &document["slides"], &was["slides"], &old.slides);
++    for s in &mut doc.slides {
++        if let Some(o) = old.slides.iter().find(|o| o.id == s.id && !Arc::ptr_eq(o, s)) {
++            keep_shapes(s, o);
++        }
++    }
++    reuse(&mut doc.masters, &document["masters"], &was["masters"], &old.masters);
++    for (extra, kept, key) in [(&mut doc.notes_master, &old.notes_master, "notesMaster"), (&mut doc.handout_master, &old.handout_master, "handoutMaster")] {
++        if was[key] == document[key] {
++            extra.clone_from(kept);
++        }
++    }
++    for (item, v) in doc.media.iter_mut().zip(document["media"].as_array().into_iter().flatten()) {
++        let data = v["data"].as_str().and_then(base64_decode).unwrap_or_default();
++        item.data = old.media.iter().find(|o| o.id == item.id && *o.data == data).map_or_else(|| Arc::new(data), |o| o.data.clone());
++    }
++    doc.next_id = old.next_id;
++    doc.fix_next_id();
++    Ok(doc)
++}
 +
-+    fn live_adopt(&mut self, mut document: Value) -> Result<(), String> {
-+        Self::live_check(&document)?;
-+        let (uid, i, old) = shared(self);
-+        let was = json(&*old);
-+        // The drawing guides stay this person's own (newer upstream only).
-+        if let Some(guides) = was.get("guides") {
-+            document["guides"] = guides.clone();
-+        }
-+        let mut doc = Presentation::deserialize(&document).map_err(invalid)?;
-+        reuse(&mut doc.slides, &document["slides"], &was["slides"], &old.slides);
-+        for s in &mut doc.slides {
-+            if let Some(o) = old.slides.iter().find(|o| o.id == s.id && !Arc::ptr_eq(o, s)) {
-+                keep_shapes(s, o);
-+            }
-+        }
-+        reuse(&mut doc.masters, &document["masters"], &was["masters"], &old.masters);
-+        for (extra, kept, key) in [(&mut doc.notes_master, &old.notes_master, "notesMaster"), (&mut doc.handout_master, &old.handout_master, "handoutMaster")] {
-+            if was[key] == document[key] {
-+                extra.clone_from(kept);
-+            }
-+        }
-+        for (item, v) in doc.media.iter_mut().zip(document["media"].as_array().into_iter().flatten()) {
-+            let data = v["data"].as_str().and_then(base64_decode).unwrap_or_default();
-+            item.data = old.media.iter().find(|o| o.id == item.id && *o.data == data).map_or_else(|| Arc::new(data), |o| o.data.clone());
-+        }
-+        doc.next_id = old.next_id;
-+        doc.fix_next_id();
-+        let doc = Arc::new(doc);
-+        SHARED.with_borrow_mut(|s| s.as_mut().map(|s| s.1 = doc.clone()));
-+        let i = match (uid, i) {
-+            (_, Some(i)) => i,
-+            // Its window was closed: the session's document lives on here, unseen.
-+            (Some(_), None) => return Ok(()),
-+            // Nothing was open: it opens.
-+            (None, None) => {
-+                let title = self.session.next_untitled();
-+                let i = self.session.add_document(DocState::new((*doc).clone(), None, title));
-+                let st = &self.session.documents()[i];
-+                SHARED.set(Some((Some(st.uid), st.doc.clone())));
-+                return Ok(());
-+            }
++/// The session's presentations in a shared document: (id, name, presentation).
++fn entries(document: &Value) -> Result<Vec<(u64, String, Value)>, String> {
++    let list = document["documents"].as_array().ok_or("no list of presentations")?;
++    let entry = |v: &Value| {
++        let id = v["id"].as_u64().ok_or("a presentation without an id")?;
++        let name = v["name"].as_str().ok_or("a presentation without a name")?.to_owned();
++        let mut doc = v.clone();
++        doc.as_object_mut().ok_or("not a presentation")?.retain(|k, _| k != "id" && k != "name");
++        Ok((id, name, doc))
++    };
++    list.iter().map(entry).collect()
++}
++
++/// What adopting the session's presentations does to each, worked out before anything changes: (id, name, this page's
++/// copy as (window, presentation) if it has one, the presentation to install if it changed).
++type Plan = Vec<(u64, String, Option<(Option<u64>, Arc<Presentation>)>, Option<Presentation>)>;
++
++/// The plan, and whether this page is joining (it knows none of the session's presentations yet).
++fn plan(docs: &[Doc], incoming: Vec<(u64, String, Value)>) -> Result<(bool, Plan), String> {
++    // Joining: the session's first presentation goes into the window this page offered (its active one).
++    let joining = !incoming.iter().any(|(id, ..)| docs.iter().any(|d| d.id == *id));
++    let blank = Presentation::default();
++    let mut plan = Vec::new();
++    for (i, (id, title, document)) in incoming.into_iter().enumerate() {
++        let old = if joining && i == 0 { docs.first() } else { docs.iter().find(|d| d.id == id) };
++        let doc = match old.filter(|d| project(&d.doc) == document) {
++            Some(_) => None,
++            None => Some(installed(old.map_or(&blank, |d| &d.doc), document)?),
 +        };
-+        let active = self.session.active_index();
-+        self.session.set_active(i);
-+        let st = self.session.active_mut().ok_or("No presentation")?;
-+        // The same slide stays current, and text being edited stays so unless it changed.
-+        let slide = old.slides.get(st.selection.slide).map(|s| s.id);
++        plan.push((id, title, old.map(|d| (d.uid, d.doc.clone())), doc));
++    }
++    Ok((joining, plan))
++}
++
++/// Installs `doc` (when it changed) and `title` in the active window, keeping this person's slide and, unless it
++/// changed, the text being edited. Its window and presentation after.
++fn put(s: &mut Session, doc: Option<Presentation>, title: String) -> Option<(u64, Arc<Presentation>)> {
++    let st = s.active_mut()?;
++    st.title = title;
++    if let Some(doc) = doc {
++        let slide = st.doc.slides.get(st.selection.slide).map(|s| s.id);
 +        let text = |st: &DocState| {
 +            st.selection.text.as_ref().map(|t| (t.notes.then(|| st.current_slide().map(|s| s.notes.clone())), st.shape(t.shape).cloned()))
 +        };
 +        let editing = text(st);
-+        st.doc = doc;
++        st.doc = Arc::new(doc);
 +        st.revision += 1;
 +        if let Some(at) = slide.and_then(|id| st.doc.slide_index(id)) {
 +            st.selection.slide = at;
@@ -302,9 +349,435 @@ index 0000000..502dc6f
 +        if text(st) != editing {
 +            st.selection.text = None;
 +        }
-+        let _ = self.session.select(|_, _| {});
-+        if let Some(active) = active {
-+            self.session.set_active(active);
++        let _ = s.select(|_, _| {});
++    }
++    s.active().map(|st| (st.uid, st.doc.clone()))
++}
++
++fn round(v: f64) -> f64 {
++    (v * 10.0).round() / 10.0
++}
++
++/// A geometry's flags in presence: 1 flipped horizontally, 2 vertically, 4 a line (its box's corner to corner).
++fn flags(x: &Xfrm, line: bool) -> u8 {
++    u8::from(x.flip_h) | u8::from(x.flip_v) << 1 | u8::from(line) << 2
++}
++
++/// The shapes a move, resize or rotation under way has somewhere new, read from the app's own drag (it writes the
++/// presentation as it goes; the interaction keeps it from before): `[id, x, y, w, h, rot, flags]` each, slide points.
++fn ghosts(s: &Session, st: &DocState) -> Option<Value> {
++    let i = st.interaction.as_ref().filter(|_| s.tool.dragging())?;
++    let before = i.doc.slides.get(i.selection.slide).filter(|_| i.selection.target == Target::Slides);
++    let moved = st.selection.shapes.iter().filter_map(|&id| {
++        let sh = st.shape(id)?;
++        let x = xfrm_of(&st.doc, &st.selection, sh);
++        let was = before.and_then(|b| find_shape(&b.shapes, id)).map(|o| xfrm_of(&i.doc, &i.selection, o));
++        (was != Some(x)).then(|| json!([id.0, round(x.x), round(x.y), round(x.w), round(x.h), round(x.rot), flags(&x, sh.is_line())]))
++    });
++    let list: Vec<Value> = moved.take(MAX_GHOSTS).collect();
++    (!list.is_empty()).then(|| list.into())
++}
++
++/// A shape, line, text box or table being drawn: its rubber band `[x, y, w, h, flags]`.
++fn band(s: &Session) -> Option<Value> {
++    let x = s.tool.preview.filter(|_| s.tool.dragging())?;
++    let line = matches!(&s.tool.kind, ToolKind::Shape { preset } if is_line_like(preset));
++    Some(json!([round(x.x), round(x.y), round(x.w), round(x.h), flags(&x, line)]))
++}
++
++/// Ink being drawn (pen or highlighter) or a freeform path: its points at least a pixel apart at this person's zoom
++/// `z`, the newest [`MAX_STROKE`], as one flat list, and the pen's width (points; 0 for a path's hairline).
++fn stroke(s: &Session, z: f32) -> Option<(Value, f64)> {
++    let t = &s.tool;
++    let (points, width): (Vec<[f64; 2]>, f64) = match &t.kind {
++        ToolKind::Ink { mode, width, .. } if mode != "eraser" && t.ink_preview.len() > 1 => (t.ink_preview.iter().map(|p| [p.0, p.1]).collect(), *width),
++        _ if t.drawing_freeform() && t.path_preview.len() > 1 => (t.path_preview.iter().map(|p| [p.x, p.y]).collect(), 0.0),
++        _ => return None,
++    };
++    let mut kept: Vec<[f64; 2]> = Vec::new();
++    for p in points {
++        if kept.last().is_none_or(|q| (p[0] - q[0]).hypot(p[1] - q[1]) * f64::from(z) >= 1.0) {
++            kept.push(p);
++        }
++    }
++    let kept = &kept[kept.len().saturating_sub(MAX_STROKE)..];
++    (kept.len() >= 2).then(|| (kept.iter().flatten().map(|v| round(*v)).collect(), round(width)))
++}
++
++/// Another person as they last showed themselves, with their moving marks where this canvas last drew them (slide
++/// points), eased toward where they are: the pointer, the moved shapes' ghosts, the rubber band, and the stroke ([its
++/// length, how far its shown end is behind its newest point]; a length of infinity: not seen yet, shown whole at once).
++struct Peer {
++    who: Presence,
++    pointer: Option<[f64; 2]>,
++    ghosts: Vec<Ghost>,
++    band: Option<([f64; 4], u8)>,
++    ink: [f64; 2],
++}
++
++/// A moved shape's ghost: (id, [x, y, w, h, rot], flags).
++type Ghost = (u32, [f64; 5], u8);
++
++impl Peer {
++    /// One frame on toward this person's latest state (`k`: the share of the way, `z`: screen points a slide point,
++    /// `far`: the jump in screen points that goes at once). Whether a mark is still on its way.
++    fn step(&mut self, k: f64, z: f64, far: f64) -> bool {
++        let state = &self.who.state;
++        let mut moving = false;
++        match (&mut self.pointer, pointer_at(&state["pointer"])) {
++            (Some(s), Some(t)) => moving |= ease(s, &t, k, z, far),
++            (s, t) => *s = t,
++        }
++        let mut ghosts = ghosts_at(&state["drag"]);
++        for (id, t, _) in &mut ghosts {
++            if let Some((_, s, _)) = self.ghosts.iter().find(|g| g.0 == *id) {
++                // A rotation goes the short way round.
++                t[4] = s[4] + (t[4] - s[4] + 540.0).rem_euclid(360.0) - 180.0;
++                let mut at = *s;
++                moving |= ease(&mut at, t, k, z, far);
++                *t = at;
++            }
++        }
++        self.ghosts = ghosts;
++        match (&mut self.band, band_at(&state["create"])) {
++            (Some((s, f)), Some((t, g))) if *f == g => moving |= ease(s, &t, k, z, far),
++            (s, t) => *s = t,
++        }
++        let stroke = stroke_at(&state["stroke"]);
++        if stroke.is_empty() {
++            self.ink = [0.0; 2];
++        } else {
++            let [seen, behind] = &mut self.ink;
++            let length = length(&stroke);
++            *behind = (*behind + length - *seen).max(0.0);
++            *seen = length;
++            moving |= ease(std::slice::from_mut(behind), &[0.0], k, z, far);
++        }
++        moving
++    }
++}
++
++/// `s` moved `k` of the way to `t` (slide points, `z` screen points each), all of it after a jump of more than `far`
++/// screen points or once under half a point remains. Whether it is still on its way.
++fn ease(s: &mut [f64], t: &[f64], k: f64, z: f64, far: f64) -> bool {
++    let off = |s: &[f64]| s.iter().zip(t).map(|(s, t)| (t - s).abs() * z).fold(0.0, f64::max);
++    let k = if off(s) > far { 1.0 } else { k };
++    s.iter_mut().zip(t).for_each(|(s, t)| *s += (t - *s) * k);
++    let moving = off(s) >= 0.5;
++    if !moving {
++        s.copy_from_slice(t);
++    }
++    moving
++}
++
++/// A number from another person's presence, if it is one worth drawing.
++fn number(v: &Value) -> Option<f64> {
++    v.as_f64().filter(|v| v.abs() < 1e6)
++}
++
++fn pointer_at(v: &Value) -> Option<[f64; 2]> {
++    Some([number(&v[0])?, number(&v[1])?])
++}
++
++/// The ghosts of a move (see [`ghosts`]); what does not resolve is left out.
++fn ghosts_at(v: &Value) -> Vec<Ghost> {
++    let ghost = |g: &Value| {
++        let id = u32::try_from(g[0].as_u64()?).ok()?;
++        let [x, y, w, h, rot] = [1, 2, 3, 4, 5].map(|i| number(&g[i]));
++        Some((id, [x?, y?, w?.max(0.0), h?.max(0.0), rot?], u8::try_from(g[6].as_u64()?).ok()?))
++    };
++    v.as_array().into_iter().flatten().take(MAX_GHOSTS).filter_map(ghost).collect()
++}
++
++/// A rubber band (see [`band`]).
++fn band_at(v: &Value) -> Option<([f64; 4], u8)> {
++    let [x, y, w, h] = [0, 1, 2, 3].map(|i| number(&v[i]));
++    Some(([x?, y?, w?.max(0.0), h?.max(0.0)], u8::try_from(v[4].as_u64()?).ok()?))
++}
++
++/// A stroke's points from its flat list; none unless every number is one worth drawing.
++fn stroke_at(v: &Value) -> Vec<[f64; 2]> {
++    let numbers = v.as_array().into_iter().flatten().take(2 * MAX_STROKE).map(number);
++    numbers.collect::<Option<Vec<f64>>>().unwrap_or_default().chunks_exact(2).map(|p| [p[0], p[1]]).collect()
++}
++
++fn length(stroke: &[[f64; 2]]) -> f64 {
++    stroke.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum()
++}
++
++fn xfrm(at: [f64; 4], rot: f64, flags: u8) -> Xfrm {
++    Xfrm { x: at[0], y: at[1], w: at[2], h: at[3], rot, flip_h: flags & 1 != 0, flip_v: flags & 2 != 0 }
++}
++
++/// A shape's outline at size `w` × `h` (shape-local points) when it is one convex path (rectangles, ellipses, rounded
++/// rectangles, triangles…), so it fills as it is drawn.
++fn convex_outline(sh: &deckcraft_engine::model::Shape, w: f64, h: f64) -> Option<Vec<Point>> {
++    let mut points: Vec<Point> = Vec::new();
++    let mut paths = 0;
++    preset_flatten(&deckcraft_engine::render::shape_geometry(sh, w, h).outline(), &mut |el| match el {
++        PathEl::MoveTo(q) => {
++            paths += 1;
++            points.push(q);
++        }
++        PathEl::LineTo(q) if points.last().is_none_or(|p| (*p - q).hypot() > 1e-6) => points.push(q),
++        _ => {}
++    });
++    let n = points.len();
++    let turn = |i: usize| (points[(i + 1) % n] - points[i]).cross(points[(i + 2) % n] - points[(i + 1) % n]);
++    let convex = (0..n).all(|i| turn(i) >= -1e-6) || (0..n).all(|i| turn(i) <= 1e-6);
++    (paths == 1 && n >= 3 && convex).then_some(points)
++}
++
++/// A shape moved, resized or rotated, where it is going: its own outline when this page has it and it is convex, else
++/// its box, filled faintly with an edge; a line as a band along it.
++fn paint_ghost(p: &Painter, xf: Xf, st: &DocState, &(id, at, f): &Ghost, color: Color32) {
++    let x = xfrm([at[0], at[1], at[2], at[3]], at[4], f);
++    let a = x.affine();
++    let edge = Stroke::new(1.5, color.gamma_multiply(0.85));
++    if f & 4 != 0 {
++        let ends = [xf.to_screen(a * Point::new(0.0, 0.0)), xf.to_screen(a * Point::new(x.w, x.h))];
++        p.line_segment(ends, Stroke::new(6.0, color.gamma_multiply(0.28)));
++        p.line_segment(ends, edge);
++        return;
++    }
++    let corners = || vec![Point::new(0.0, 0.0), Point::new(x.w, 0.0), Point::new(x.w, x.h), Point::new(0.0, x.h)];
++    let local = st.shape(ShapeId(id)).and_then(|sh| convex_outline(sh, x.w, x.h)).unwrap_or_else(corners);
++    p.add(PathShape::convex_polygon(local.into_iter().map(|q| xf.to_screen(a * q)).collect(), color.gamma_multiply(0.28), edge));
++}
++
++/// A rubber band: its box (or line) dashed.
++fn paint_band(p: &Painter, xf: Xf, (at, f): ([f64; 4], u8), color: Color32) {
++    let x = xfrm(at, 0.0, f);
++    let a = x.affine();
++    let corners: &[(f64, f64)] = if f & 4 != 0 { &[(0.0, 0.0), (1.0, 1.0)] } else { &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)] };
++    let line: Vec<Pos2> = corners.iter().map(|&(u, v)| xf.to_screen(a * Point::new(u * x.w, v * x.h))).collect();
++    p.extend(Shape::dashed_line(&line, Stroke::new(1.5, color), 4.0, 3.0));
++}
++
++/// A stroke being drawn, up to `behind` slide points short of its newest point: translucent, as wide as the pen.
++fn paint_stroke(p: &Painter, xf: Xf, stroke: &[[f64; 2]], width: f64, behind: f64, color: Color32) {
++    let Some(&first) = stroke.first() else { return };
++    let at = |q: [f64; 2]| xf.to_screen(Point::new(q[0], q[1]));
++    let mut left = length(stroke) - behind;
++    let mut line = vec![at(first)];
++    for w in stroke.windows(2) {
++        let d = (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
++        if d >= left {
++            let f = if d > 0.0 { (left / d).max(0.0) } else { 0.0 };
++            line.push(at([w[0][0] + (w[1][0] - w[0][0]) * f, w[0][1] + (w[1][1] - w[0][1]) * f]));
++            break;
++        }
++        left -= d;
++        line.push(at(w[1]));
++    }
++    let width = (width.clamp(0.0, 200.0) as f32 * xf.scale).max(2.0);
++    // ponytail: egui's own joins and butt caps; round ones would show only on wide highlighter strokes.
++    p.add(PathShape::line(line, Stroke::new(width, color.gamma_multiply(0.7))));
++}
++
++/// A person's selected shapes outlined in `color`: the box DeckCraft outlines its own selection with, or the line.
++fn paint_selection(p: &Painter, xf: Xf, st: &DocState, state: &Value, color: Color32) {
++    let stroke = Stroke::new(2.0, color);
++    let ids = state["selection"].as_array().into_iter().flatten().take(MAX_SHOWN);
++    for sh in ids.filter_map(|id| st.shape(ShapeId(u32::try_from(id.as_u64()?).ok()?))) {
++        let x = xfrm_of(&st.doc, &st.selection, sh);
++        let a = x.affine();
++        let corner = |cx: f64, cy: f64| xf.to_screen(a * Point::new(cx, cy));
++        if sh.is_line() {
++            p.line_segment([corner(0.0, 0.0), corner(x.w, x.h)], stroke);
++        } else {
++            p.add(Shape::closed_line(vec![corner(0.0, 0.0), corner(x.w, 0.0), corner(x.w, x.h), corner(0.0, x.h)], stroke));
++        }
++    }
++}
++
++/// A pointer: the arrow, its tip at `tip`, in `color` with a white edge and a soft shadow.
++fn paint_arrow(p: &Painter, tip: Pos2, color: Color32) {
++    let points: Vec<Pos2> = ARROW.iter().map(|&[x, y]| tip + vec2(x, y)).collect();
++    let shadow = points.iter().map(|q| *q + vec2(0.0, 1.0)).collect();
++    p.add(PathShape::convex_polygon(shadow, Color32::from_black_alpha(64), Stroke::NONE));
++    p.add(PathShape::convex_polygon(points, color, Stroke::new(1.5, Color32::WHITE)));
++}
++
++/// A name tag in `color`, its top left at `at`. Dark text on light colors.
++fn paint_tag(p: &Painter, at: Pos2, name: &str, color: Color32) {
++    if name.is_empty() {
++        return;
++    }
++    let name: String = if name.chars().count() > MAX_NAME { name.chars().take(MAX_NAME - 1).chain(['…']).collect() } else { name.into() };
++    let lin = egui::ecolor::linear_f32_from_gamma_u8;
++    let luminance = 0.2126 * lin(color.r()) + 0.7152 * lin(color.g()) + 0.0722 * lin(color.b());
++    let ink = if luminance > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE };
++    let text = p.layout_no_wrap(name, theme::bold(12.0), ink);
++    let r = Rect::from_min_size(at, text.size() + vec2(14.0, 6.0));
++    p.rect_filled(r, 6.0, color);
++    p.galley(r.min + vec2(7.0, 3.0), text, ink);
++}
++
++fn color(o: &Peer) -> Color32 {
++    let [r, g, b] = o.who.color;
++    Color32::from_rgb(r, g, b)
++}
++
++/// The canvas's overlays call it first: the others on this person's presentation and slide, in their colors, under this
++/// person's own overlays: what they are moving or drawing, then their selections, then their pointers with their names.
++/// Marks ease toward where they were last shown, repainting until they get there.
++fn paint(app: &SlideApp, p: &Painter, xf: Xf) {
++    OTHERS.with_borrow_mut(|others| {
++        let (Some(doc), Some(st)) = (active_id(&app.session).filter(|_| !others.is_empty()), app.session.active()) else { return };
++        let Some(slide) = st.doc.slides.get(st.selection.slide).filter(|_| st.selection.target == Target::Slides) else { return };
++        let on = |s: &Value| s["doc"].as_u64() == Some(doc) && s["slide"].as_u64() == Some(u64::from(slide.id.0));
++        let mut here: Vec<&mut Peer> = others.iter_mut().filter(|o| on(&o.who.state)).collect();
++        let now = p.ctx().input(|i| i.time);
++        let dt = (now - DRAWN.replace(now)).clamp(0.0, 0.1);
++        let (k, z) = (1.0 - (-dt / EASE).exp(), f64::from(xf.scale));
++        let far = 0.25 * f64::from(p.clip_rect().width().max(p.clip_rect().height()));
++        let mut moving = false;
++        for o in &mut here {
++            moving |= o.step(k, z, far);
++        }
++        if moving {
++            p.ctx().request_repaint();
++        }
++        for o in &here {
++            for g in &o.ghosts {
++                paint_ghost(p, xf, st, g, color(o));
++            }
++            if let Some(band) = o.band {
++                paint_band(p, xf, band, color(o));
++            }
++            let width = number(&o.who.state["width"]).unwrap_or(0.0);
++            paint_stroke(p, xf, &stroke_at(&o.who.state["stroke"]), width, o.ink[1], color(o));
++        }
++        for o in &here {
++            paint_selection(p, xf, st, &o.who.state, color(o));
++        }
++        for o in &here {
++            if let Some(at) = o.pointer {
++                let tip = xf.to_screen(Point::new(at[0], at[1]));
++                paint_arrow(p, tip, color(o));
++                paint_tag(p, tip + vec2(12.0, 15.0), &o.who.name, color(o));
++            }
++        }
++    });
++}
++
++/// File › Home in a session: the session's presentations, a row each with dots in the colors of the others on it; a
++/// click goes to one, opening it again if this person closed it. Whether it did (the File view then closes).
++fn session_list(app: &mut SlideApp, ui: &mut egui::Ui) -> bool {
++    if !playground_live::connected() {
++        return false;
++    }
++    sync(&app.session);
++    let rows: Vec<(u64, String, Option<u64>)> = SHARED.with_borrow(|sh| sh.docs.iter().map(|d| (d.id, d.title.clone(), d.uid)).collect());
++    if rows.is_empty() {
++        return false;
++    }
++    let (t, here) = (Tokens::get(ui.ctx()), active_id(&app.session));
++    ui.label(RichText::new("In this session").font(theme::bold(16.0)).color(t.text));
++    ui.add_space(6.0);
++    let width = ui.available_width().min(720.0);
++    let mut chosen = None;
++    for (id, title, uid) in rows {
++        let (rect, resp) = ui.allocate_exact_size(vec2(width, 44.0), Sense::click());
++        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &title));
++        let p = ui.painter();
++        if resp.hovered() || here == Some(id) {
++            p.rect_filled(rect, 3.0, t.hover);
++        }
++        let note = match (here == Some(id), uid) {
++            (true, _) => "You are here",
++            (false, Some(_)) => "Open",
++            (false, None) => "Closed here: click to open it again",
++        };
++        icons::paint(p, Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(22.0, 22.0)), Icon::Slide, t.text, false);
++        p.text(pos2(rect.left() + 44.0, rect.center().y - 8.0), Align2::LEFT_CENTER, &title, theme::font(13.0), t.text);
++        p.text(pos2(rect.left() + 44.0, rect.center().y + 9.0), Align2::LEFT_CENTER, note, theme::font(11.0), t.text_dim);
++        let names = OTHERS.with_borrow(|others| {
++            let on = others.iter().filter(|o| o.who.state["doc"].as_u64() == Some(id));
++            on.enumerate()
++                .map(|(k, o)| {
++                    p.circle(pos2(rect.right() - 16.0 - 16.0 * k as f32, rect.center().y), 5.0, color(o), Stroke::new(1.5, Color32::WHITE));
++                    o.who.name.clone()
++                })
++                .collect::<Vec<_>>()
++        });
++        let resp = if names.is_empty() { resp } else { resp.on_hover_text(names.join(", ")) };
++        if resp.clicked() {
++            chosen = Some((id, uid));
++        }
++    }
++    ui.add_space(22.0);
++    let Some((id, uid)) = chosen else { return false };
++    let s = &mut app.session;
++    match uid.and_then(|uid| s.documents().iter().position(|d| d.uid == uid)) {
++        Some(i) => s.set_active(i),
++        None => {
++            // Open again: a window of its own with the session's copy.
++            let found = SHARED.with_borrow(|sh| sh.docs.iter().find(|d| d.id == id).map(|d| ((*d.doc).clone(), d.title.clone())));
++            let Some((doc, title)) = found else { return false };
++            let i = s.add_document(DocState::new(doc, None, title));
++            let uid = s.documents()[i].uid;
++            SHARED.with_borrow_mut(|sh| sh.docs.iter_mut().filter(|d| d.id == id).for_each(|d| d.uid = Some(uid)));
++        }
++    }
++    true
++}
++
++impl Live for SlideApp {
++    /// `{ documents: [{ id, name, ...presentation }] }`: every presentation of the session, open here or not.
++    fn live_document(&self) -> Value {
++        sync(&self.session);
++        SHARED.with_borrow(|sh| {
++            let docs = sh.docs.iter().map(|d| {
++                let mut v = project(&d.doc);
++                (v["id"], v["name"]) = (d.id.into(), d.title.clone().into());
++                v
++            });
++            json!({"documents": docs.collect::<Vec<_>>()})
++        })
++    }
++
++    /// Each presentation goes into its window here; one new to the session opens behind this person's, one they closed
++    /// stays closed.
++    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
++        let incoming = entries(&document)?;
++        sync(&self.session);
++        let (joining, plan) = SHARED.with_borrow(|sh| plan(&sh.docs, incoming))?;
++        let s = &mut self.session;
++        let mut active = s.active_index();
++        let (mut docs, mut opened) = (Vec::new(), None);
++        for (id, title, old, doc) in plan {
++            let at = old.as_ref().and_then(|o| o.0).and_then(|uid| s.documents().iter().position(|d| d.uid == uid));
++            docs.push(match (at, old) {
++                (Some(i), _) => {
++                    let Some((uid, doc)) = with_doc(s, i, |s| put(s, doc, title.clone())) else { continue };
++                    Doc { id, uid: Some(uid), doc, title }
++                }
++                (None, Some((_, last))) => Doc { id, uid: None, doc: doc.map_or(last, Arc::new), title },
++                (None, None) => {
++                    let i = s.add_document(DocState::new(doc.unwrap_or_default(), None, title.clone()));
++                    match active {
++                        Some(a) => s.set_active(a),
++                        None => active = Some(i),
++                    }
++                    if !joining {
++                        opened = Some(title.clone());
++                    }
++                    let d = &s.documents()[i];
++                    Doc { id, uid: Some(d.uid), doc: d.doc.clone(), title }
++                }
++            });
++        }
++        SHARED.with_borrow_mut(|sh| {
++            // A window whose presentation left the session (an Undo of its opening) stays, as this person's own.
++            let gone: Vec<u64> = sh.docs.iter().filter_map(|d| d.uid).filter(|uid| !docs.iter().any(|d| d.uid == Some(*uid))).collect();
++            sh.own.extend(gone);
++            sh.docs = docs;
++        });
++        if let Some(title) = opened {
++            let text = format!("“{title}” was opened in this session. File › Home lists the session's presentations.");
++            self.toast = Some(deckcraft_ui_egui::toast::Toast { text, at: deckcraft_ui_egui::now_ms() });
 +        }
 +        Ok(())
 +    }
@@ -316,49 +789,87 @@ index 0000000..502dc6f
 +            && self.session.documents().iter().all(|d| d.interaction.is_none() && d.composition.is_none())
 +    }
 +
-+    /// The shared document's address: a new one for every change, and none is reused while it is held here.
++    /// Every window's presentation (a new `Arc` and revision for every change) and the session's presentations.
 +    fn live_generation(&self) -> Option<u64> {
-+        Some(Arc::as_ptr(&shared(self).2) as u64)
++        use std::hash::{Hash, Hasher};
++        let mut h = std::hash::DefaultHasher::new();
++        for d in self.session.documents() {
++            (d.uid, d.revision, Arc::as_ptr(&d.doc) as usize, &d.title).hash(&mut h);
++        }
++        SHARED.with_borrow(|sh| sh.docs.iter().for_each(|d| (d.id, d.uid, Arc::as_ptr(&d.doc) as usize).hash(&mut h)));
++        Some(h.finish())
 +    }
 +
 +    fn live_disconnected(&mut self) {
-+        let Some((Some(uid), _)) = SHARED.take() else { return };
-+        let Some(i) = self.session.documents().iter().position(|d| d.uid == uid) else { return };
-+        let active = self.session.active_index();
-+        self.session.set_active(i);
-+        if let Some(st) = self.session.active_mut() {
-+            st.history.undo.clear();
-+            st.history.redo.clear();
-+        }
-+        if let Some(active) = active {
-+            self.session.set_active(active);
++        let shared = SHARED.take();
++        let s = &mut self.session;
++        for i in 0..s.documents().len() {
++            if shared.docs.iter().any(|d| d.uid == Some(s.documents()[i].uid)) {
++                // Their steps hold other people's edits.
++                with_doc(s, i, |s| {
++                    if let Some(st) = s.active_mut() {
++                        st.history.undo.clear();
++                        st.history.redo.clear();
++                    }
++                });
++            }
 +        }
 +    }
 +
-+    /// Only a presentation every peer can open is recorded.
++    /// Only presentations every peer can open are recorded, each id once.
 +    fn live_check(document: &Value) -> Result<(), String> {
-+        if !document.is_object() {
-+            return Err("Conflict: not a presentation".into());
++        let docs = entries(document).map_err(|e| format!("Conflict: {e}"))?;
++        for (i, (id, _, doc)) in docs.iter().enumerate() {
++            if docs[..i].iter().any(|d| d.0 == *id) {
++                return Err("Conflict: two presentations with one id".into());
++            }
++            Presentation::deserialize(doc).map_err(invalid)?;
 +        }
-+        Presentation::deserialize(document).map(drop).map_err(invalid)
++        Ok(())
 +    }
 +
-+    /// `{slide, pointer?, selection}` on a slide of the shared presentation (`{}` on its masters and layouts).
++    /// `{doc, slide, pointer?, selection, drag?, create?, stroke?, width?}` on a slide of the session's presentations
++    /// (`{doc}` on their masters and layouts): see [`ghosts`], [`band`] and [`stroke`].
 +    fn live_presence(&self) -> Value {
-+        let Some(st) = self.session.active().filter(|d| shared_uid() == Some(d.uid)) else { return Value::Null };
++        let (Some(doc), Some(st)) = (active_id(&self.session), self.session.active()) else { return Value::Null };
 +        let Some(slide) = st.doc.slides.get(st.selection.slide).filter(|_| st.selection.target == Target::Slides) else {
-+            return json!({});
++            return json!({"doc": doc});
 +        };
-+        let selection: Vec<u32> = st.selection.shapes.iter().take(50).map(|id| id.0).collect();
-+        let mut v = json!({"slide": slide.id.0, "selection": selection});
++        let selection: Vec<u32> = st.selection.shapes.iter().take(MAX_SHOWN).map(|id| id.0).collect();
++        let mut v = json!({"doc": doc, "slide": slide.id.0, "selection": selection});
 +        if let Some(p) = POINTER.get() {
 +            v["pointer"] = json!(p);
++        }
++        for (key, mark) in [("drag", ghosts(&self.session, st)), ("create", band(&self.session))] {
++            if let Some(mark) = mark {
++                v[key] = mark;
++            }
++        }
++        if let Some((points, width)) = stroke(&self.session, self.canvas_scale) {
++            (v["stroke"], v["width"]) = (points, width.into());
++        }
++        // The shell sends nothing bigger: the stroke's oldest points go first.
++        while v.to_string().len() > MAX_PRESENCE
++            && let Some(s) = v.get_mut("stroke").and_then(Value::as_array_mut).filter(|s| s.len() > 4)
++        {
++            s.drain(..s.len() / 4 * 2);
 +        }
 +        v
 +    }
 +
++    /// Who is still on the same presentation and slide keeps their marks where they were drawn, to ease on from there.
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        OTHERS.set(others);
++        OTHERS.with_borrow_mut(|old| {
++            *old = (others.into_iter())
++                .map(|who| {
++                    let place = |s: &Value| (s["doc"].clone(), s["slide"].clone());
++                    let same = |o: &&Peer| o.who.id == who.id && place(&o.who.state) == place(&who.state);
++                    let kept = old.iter().find(same).map(|o| (o.pointer, o.ghosts.clone(), o.band, o.ink));
++                    let (pointer, ghosts, band, ink) = kept.unwrap_or((None, Vec::new(), None, [f64::INFINITY, 0.0]));
++                    Peer { who, pointer, ghosts, band, ink }
++                })
++                .collect();
++        });
 +    }
 +}
 +
@@ -367,7 +878,7 @@ index 0000000..502dc6f
 +    use super::*;
 +    use deckcraft_engine::model::chart::ChartPart;
 +    use deckcraft_engine::model::{DrawGuide, ShapeKind};
-+    use deckcraft_engine::{EngineError, Interaction, Mods};
++    use deckcraft_engine::{EngineError, Interaction, Mods, PointerEvent, PointerKind};
 +    use deckcraft_ui_egui::Services;
 +    use playground_live::canonical;
 +
@@ -381,9 +892,19 @@ index 0000000..502dc6f
 +        e.to_string()
 +    }
 +
++    /// Switches the test to another page: the session as this page knows it goes into `page`, `page`'s comes in.
++    fn switch(page: &mut Shared) {
++        SHARED.with_borrow_mut(|s| std::mem::swap(s, page));
++    }
++
++    fn parse(bytes: &[u8]) -> Result<Value, String> {
++        serde_json::from_slice(bytes).map_err(|e| e.to_string())
++    }
++
 +    #[test]
 +    fn shares_the_deck_without_views_adopts_it_without_an_undo_step_and_waits_for_a_gesture() -> Result<(), String> {
 +        install();
++        SHARED.take();
 +        let mut a = sample()?;
 +        // A chart with package parts from a file, which the JSON leaves out.
 +        let chart = a.session.execute("insert.chart", &json!({})).map_err(e)?["id"].as_u64().unwrap_or_default();
@@ -405,9 +926,21 @@ index 0000000..502dc6f
 +        playground_live::connect();
 +        assert_eq!(a.live_presence(), Value::Null, "nothing is shared before the session reads it");
 +        let start = canonical(&a.live_document());
++        let doc = parse(&start)?["documents"][0]["id"].clone();
 +        let ids: Vec<u32> = a.session.doc().map_err(e)?.doc.slides[0].shapes.iter().map(|s| s.id.0).collect();
-+        a.session.execute("edit.select", &json!({"ids": [ids[0]]})).map_err(e)?;
-+        assert_eq!(a.live_presence(), json!({"slide": a.session.doc().map_err(e)?.doc.slides[0].id.0, "selection": [ids[0]]}));
++        a.session.execute("edit.select", &json!({"ids": [ids[2]]})).map_err(e)?;
++        let slide = a.session.doc().map_err(e)?.doc.slides[0].id.0;
++        assert_eq!(a.live_presence(), json!({"doc": doc, "slide": slide, "selection": [ids[2]]}));
++
++        // The band at the bottom moved, held mid-way (dragged with Ctrl: no snapping): the others see its ghost there.
++        let at = |kind, x, y| PointerEvent { kind, x, y, mods: Mods { cmd: kind == PointerKind::Drag, ..Mods::default() }, ..Default::default() };
++        a.session.pointer(at(PointerKind::Down, 30.0, 505.0)).map_err(e)?;
++        a.session.pointer(at(PointerKind::Drag, 50.0, 465.0)).map_err(e)?;
++        assert_eq!(ghosts_at(&a.live_presence()["drag"]), [(ids[2], [20.0, 430.0, 960.0, 70.0, 0.0], 0)]);
++        a.session.pointer(at(PointerKind::Drag, 30.0, 505.0)).map_err(e)?;
++        a.session.pointer(at(PointerKind::Up, 30.0, 505.0)).map_err(e)?;
++        assert!(a.live_presence().get("drag").is_none(), "no ghost at rest");
++
 +        a.session.execute("slide.next", &json!({})).map_err(e)?;
 +        a.ui.zoom = Some(2.0);
 +        a.session.edit(|d, _| Ok(d.guides.push(DrawGuide { vertical: true, pos: 100.0 }))).map_err(e)?;
@@ -415,14 +948,13 @@ index 0000000..502dc6f
 +        let text = String::from_utf8_lossy(&start).into_owned();
 +        assert!(!text.contains("\"nextId\"") && !text.contains("\"guides\""));
 +
-+        // A joiner adopts it whole and shares the same bytes (each peer has its own binding: swapped while B acts).
-+        let mut other = None;
-+        let switch = |other: &mut Option<_>| SHARED.with_borrow_mut(|s| std::mem::swap(s, other));
-+        switch(&mut other);
++        // A joiner adopts it whole into its window and shares the same bytes.
++        let mut page = Shared::default();
++        switch(&mut page);
 +        let mut b = sample()?;
 +        b.session.execute("slide.new", &json!({})).map_err(e)?;
-+        b.live_adopt(serde_json::from_slice(&start).map_err(|e| e.to_string())?)?;
-+        assert_eq!(canonical(&b.live_document()), start);
++        b.live_adopt(parse(&start)?)?;
++        assert_eq!((canonical(&b.live_document()), b.session.documents().len()), (start.clone(), 1));
 +
 +        // B types into the subtitle; A merges it at a quiet frame, keeping its views, its guides, its undo history,
 +        // the slides that did not change and the chart's parts.
@@ -432,7 +964,7 @@ index 0000000..502dc6f
 +        b.session.key("Escape", Mods::default()).map_err(e)?;
 +        let edited = canonical(&b.live_document());
 +        assert_ne!(edited, start);
-+        switch(&mut other);
++        switch(&mut page);
 +        let st = a.session.doc().map_err(e)?;
 +        let (undo_steps, selection, second) = (st.history.undo.len(), st.selection.clone(), st.doc.slides[1].clone());
 +        let done = std::rc::Rc::new(Cell::new(false));
@@ -457,27 +989,55 @@ index 0000000..502dc6f
 +        let id = a.session.edit(|d, _| Ok(d.alloc_id())).map_err(e)?.unwrap_or_default();
 +        assert!((0x4000_0000..0x8000_0000).contains(&id) && a.session.doc().map_err(e)?.doc.next_id >= id);
 +
-+        // Another presentation becomes active: it is not shared, its Undo is its own and it shows no presence.
-+        a.session.execute("file.new", &json!({})).map_err(e)?;
-+        a.session.execute("slide.new", &json!({})).map_err(e)?;
-+        assert_eq!((canonical(&a.live_document()), a.live_presence()), (edited.clone(), Value::Null));
-+        let slides = a.session.doc().map_err(e)?.doc.slides.len();
-+        a.session.execute("edit.undo", &json!({})).map_err(e)?;
-+        assert_eq!((a.session.doc().map_err(e)?.doc.slides.len(), playground_live::activity().1.len()), (slides - 1, 1));
-+
-+        // The shared one closes: it stays the shared document, and remote changes still reach it.
-+        a.session.close_document(0);
-+        assert_eq!(canonical(&a.live_document()), edited);
-+        let mut later: Value = serde_json::from_slice(&edited).map_err(|e| e.to_string())?;
-+        later["firstSlideNumber"] = json!(5);
-+        a.live_adopt(later.clone())?;
-+        assert_eq!((canonical(&a.live_document()), a.session.documents().len()), (canonical(&later), 1));
-+
-+        // Only presentations are recorded or installed.
-+        for bad in [json!(null), json!([1]), json!({"slides": 5})] {
++        // Only the session's presentations, each id once, are recorded or installed.
++        for bad in [json!(null), json!([1]), json!({"slides": 5}), json!({"documents": [{"id": 1, "name": "x", "slides": 5}]})] {
 +            assert!(SlideApp::live_check(&bad).is_err() && a.live_adopt(bad).is_err());
 +        }
-+        assert!(SlideApp::live_check(&later).is_ok());
++        let one = parse(&edited)?["documents"][0].clone();
++        assert!(SlideApp::live_check(&json!({"documents": [one.clone(), one]})).is_err());
++        assert!(SlideApp::live_check(&parse(&edited)?).is_ok());
++        playground_live::disconnect();
++        Ok(())
++    }
++
++    #[test]
++    fn a_presentation_opened_in_a_session_reaches_the_others_behind_their_own_and_stays_closed_where_closed() -> Result<(), String> {
++        install();
++        SHARED.take();
++        let mut a = sample()?;
++        // Open before the session: this person's own.
++        a.session.execute("file.new", &json!({})).map_err(e)?;
++        a.session.set_active(0);
++        playground_live::connect();
++        let base = a.live_document();
++        assert_eq!(base["documents"].as_array().map(Vec::len), Some(1));
++        let mut page = Shared::default();
++        switch(&mut page);
++        let mut b = sample()?;
++        b.live_adopt(base)?;
++        switch(&mut page);
++
++        a.session.execute("file.new", &json!({})).map_err(e)?;
++        a.session.execute("slide.new", &json!({})).map_err(e)?;
++        let opened = a.live_document();
++        assert_eq!(opened["documents"].as_array().map(Vec::len), Some(2), "it joins the session");
++        assert!(active_id(&a.session).is_some(), "its Undo goes to the session");
++        a.session.set_active(1);
++        assert!(active_id(&a.session).is_none(), "but not the one open before");
++
++        switch(&mut page);
++        b.live_adopt(opened.clone())?;
++        assert_eq!((b.session.documents().len(), b.session.active_index()), (2, Some(0)), "a window behind b's own");
++        assert!(b.toast.is_some(), "and a word about it");
++        assert_eq!(canonical(&b.live_document()), canonical(&opened));
++        b.session.close_document(1);
++        assert_eq!(canonical(&b.live_document()), canonical(&opened), "closing is personal");
++        let mut edited = opened.clone();
++        edited["documents"][1]["firstSlideNumber"] = json!(5);
++        b.live_adopt(edited.clone())?;
++        assert_eq!(b.session.documents().len(), 1, "a change does not open it again");
++        assert_eq!(canonical(&b.live_document()), canonical(&edited));
++        switch(&mut page);
 +        playground_live::disconnect();
 +        Ok(())
 +    }
