@@ -1599,10 +1599,10 @@ index 0000000..2ada60a
 +}
 diff --git a/crates/ui/src/app/live/peers.rs b/crates/ui/src/app/live/peers.rs
 new file mode 100644
-index 0000000..d08b8ae
+index 0000000..c44f01e
 --- /dev/null
 +++ b/crates/ui/src/app/live/peers.rs
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,460 @@
 +//! The others in a live session, in their colour. In the 3D view, through this person's camera: the strokes they are
 +//! painting (the surface points so far, at their brush width) and the pen paths they are editing, then their pointers
 +//! with a "Name · Layer" tag; what the model hides is drawn faint. In the 2D view: their pen paths under way. In the
@@ -1745,81 +1745,93 @@ index 0000000..d08b8ae
 +    path[..end].to_vec()
 +}
 +
-+/// A translucent stroke `w` wide along `path` (screen points), as one mesh so that no part of it covers another: round
-+/// caps, mitred joins (at most twice as long), its edges feathered over `aa` points as egui feathers its own shapes.
-+fn stroke(path: &[Pos2], w: f32, ink: Color32, aa: f32) -> Shape {
-+    let mut pts: Vec<Pos2> = Vec::with_capacity(path.len());
-+    for &p in path {
-+        if pts.last().is_none_or(|q| q.distance(p) > 0.01) {
-+            pts.push(p);
-+        }
-+    }
-+    let n = pts.len();
-+    let (inner, outer) = ((w - aa).max(0.0) / 2.0, (w + aa) / 2.0);
-+    let clear = Color32::TRANSPARENT;
-+    let dir = |i: usize| (pts[i + 1] - pts[i]).normalized();
-+    let mut mesh = egui::Mesh::default();
-+    // Per point, along its normal: the left edge's feather and inside, the right edge's inside and feather.
-+    let normals: Vec<V2> = (0..n)
-+        .map(|i| match i {
-+            _ if n == 1 => V2::Y,
-+            0 => dir(0).rot90(),
-+            _ if i == n - 1 => dir(n - 2).rot90(),
-+            _ => {
-+                let (a, b) = (dir(i - 1).rot90(), dir(i).rot90());
-+                let m = (a + b).normalized();
-+                m / m.dot(a).max(0.5)
-+            }
-+        })
-+        .collect();
-+    for (p, normal) in pts.iter().zip(&normals) {
-+        for (off, c) in [(outer, clear), (inner, ink), (-inner, ink), (-outer, clear)] {
-+            mesh.colored_vertex(*p + *normal * off, c);
-+        }
-+    }
-+    for a in (0..n.saturating_sub(1) as u32).map(|i| 4 * i) {
-+        for k in 0..3 {
-+            mesh.add_triangle(a + k, a + k + 1, a + 4 + k);
-+            mesh.add_triangle(a + k + 1, a + 5 + k, a + 4 + k);
-+        }
-+    }
-+    // Half a disc out of each end (a whole one around a single point), from the end's left edge to its right.
-+    let mut cap = |i: usize, out: V2| {
-+        let (p, left) = (pts[i], normals[i]);
-+        let at = 4 * i as u32;
-+        let centre = mesh.vertices.len() as u32;
-+        mesh.colored_vertex(p, ink);
-+        let (mut last_in, mut last_out) = (at + 1, at);
-+        for k in 1..=12 {
-+            let (sin, cos) = (std::f32::consts::PI * k as f32 / 12.0).sin_cos();
-+            let (inside, edge) = match k {
-+                12 => (at + 2, at + 3),
-+                _ => {
-+                    let u = left * cos + out * sin;
-+                    let v = mesh.vertices.len() as u32;
-+                    mesh.colored_vertex(p + u * inner, ink);
-+                    mesh.colored_vertex(p + u * outer, clear);
-+                    (v, v + 1)
-+                }
++/// The coverage (0..=1) of a `w` × `h` grid of cells by `segments` (in cells, each with a strength): what lies within
++/// `r` of a segment, so round at its ends and wherever two meet, its edge antialiased over a cell. A cell takes the most
++/// any segment gives it, so a path that turns back or crosses itself is still one coat.
++pub(super) fn coverage([w, h]: [usize; 2], segments: &[(Pos2, Pos2, f32)], r: f32) -> Vec<f32> {
++    let mut cov = vec![0.0f32; w * h];
++    let reach = r + 1.0;
++    for &(a, b, strength) in segments {
++        let ab = b - a;
++        let len2 = ab.length_sq();
++        let rows = (a.y.min(b.y) - reach).max(0.0) as usize..((a.y.max(b.y) + reach).ceil().max(0.0) as usize).min(h);
++        for y in rows {
++            let yc = y as f32 + 0.5;
++            // The part of the segment within reach of this row, and the cells within reach of that part.
++            let (t0, t1) = if ab.y.abs() > 1e-6 {
++                let (u, v) = ((yc - reach - a.y) / ab.y, (yc + reach - a.y) / ab.y);
++                (u.min(v).clamp(0.0, 1.0), u.max(v).clamp(0.0, 1.0))
++            } else {
++                (0.0, 1.0)
 +            };
-+            mesh.add_triangle(centre, last_in, inside);
-+            mesh.add_triangle(last_in, last_out, inside);
-+            mesh.add_triangle(last_out, edge, inside);
-+            (last_in, last_out) = (inside, edge);
-+        }
-+    };
-+    match n {
-+        0 => {}
-+        1 => {
-+            cap(0, V2::X);
-+            cap(0, -V2::X);
-+        }
-+        _ => {
-+            cap(0, -dir(0));
-+            cap(n - 1, dir(n - 2));
++            let (x0, x1) = (a.x + ab.x * t0, a.x + ab.x * t1);
++            let cols = (x0.min(x1) - reach).max(0.0) as usize..((x0.max(x1) + reach).ceil().max(0.0) as usize).min(w);
++            for x in cols {
++                let p = Pos2::new(x as f32 + 0.5, yc);
++                let t = if len2 > 0.0 { ((p - a).dot(ab) / len2).clamp(0.0, 1.0) } else { 0.0 };
++                let c = &mut cov[y * w + x];
++                *c = c.max((r + 0.5 - (a + ab * t).distance(p)).clamp(0.0, 1.0) * strength);
++            }
 +        }
 +    }
-+    Shape::mesh(mesh)
++    cov
++}
++
++/// A stroke's ink as last drawn: what from (segments, radius, clip, pixels per point), its mask and where it went.
++struct Ink {
++    from: (Vec<(Pos2, Pos2, f32)>, f32, Rect, f32),
++    mask: egui::TextureHandle,
++    at: Rect,
++    pass: u64,
++}
++
++thread_local! {
++    static INK: RefCell<HashMap<String, Ink>> = RefCell::default();
++}
++
++/// `segments` (screen points, each with a strength) `w` wide with round ends and joins, in `color` at 70%, from one
++/// coverage mask (a pixel each, coarser for a wide brush) so that no part of the stroke darkens another. Each stroke
++/// (`key`) keeps its mask while it doesn't change.
++fn ink(painter: &egui::Painter, key: String, segments: Vec<(Pos2, Pos2, f32)>, w: f32, color: Color32) {
++    let ctx = painter.ctx();
++    let (ppp, pass) = (ctx.pixels_per_point(), ctx.cumulative_pass_nr());
++    let from = (segments, w / 2.0, painter.clip_rect(), ppp);
++    INK.with_borrow_mut(|inks| {
++        inks.retain(|_, ink| ink.pass + 2 >= pass);
++        if inks.get(&key).is_none_or(|ink| ink.from != from) {
++            let (segments, r, clip, _) = &from;
++            // In pixels: the box within reach of the segments (and their antialiased edge, a cell), in the view.
++            let bounds = segments.iter().fold(Rect::NOTHING, |bounds, (a, b, _)| bounds.union(Rect::from_two_pos(*a, *b)));
++            let px = (bounds * ppp).expand(r * ppp * 1.1 + 2.0).intersect(*clip * ppp);
++            if !px.is_positive() {
++                inks.remove(&key);
++                return;
++            }
++            let (min, size) = (px.min.floor(), px.max.ceil() - px.min.floor());
++            // A cell a pixel wide; a radius at most 16 cells, the mask at most 4M cells.
++            let cell = (r * ppp / 16.0).floor().max((size.x * size.y / 4194304.0).sqrt().ceil()).max(1.0);
++            let dims = [(size.x / cell).ceil() as usize, (size.y / cell).ceil() as usize];
++            let to_cell = |p: Pos2| (p * ppp - min.to_vec2()) / cell;
++            let cells: Vec<_> = segments.iter().map(|&(a, b, s)| (to_cell(a), to_cell(b), s)).collect();
++            let pixels = coverage(dims, &cells, r * ppp / cell).iter().map(|c| Color32::from_white_alpha((c * 255.0).round() as u8)).collect();
++            let image = egui::ColorImage::new(dims, pixels);
++            let at = Rect::from_min_size(min, vec2(dims[0] as f32, dims[1] as f32) * cell) / ppp;
++            match inks.get_mut(&key) {
++                Some(ink) => {
++                    ink.mask.set(image, egui::TextureOptions::LINEAR);
++                    (ink.from, ink.at) = (from, at);
++                }
++                None => {
++                    let mask = ctx.load_texture(key.clone(), image, egui::TextureOptions::LINEAR);
++                    inks.insert(key.clone(), Ink { from, mask, at, pass });
++                }
++            }
++        }
++        if let Some(ink) = inks.get_mut(&key) {
++            ink.pass = pass;
++            painter.image(ink.mask.id(), ink.at, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), color.gamma_multiply(0.7));
++        }
++    });
 +}
 +
 +/// Relative luminance (sRGB) of `c`.
@@ -1875,30 +1887,26 @@ index 0000000..d08b8ae
 +    tag(painter, tip + vec2(12.0, 15.0), tag_text(painter, name, color, alpha), color.gamma_multiply(alpha));
 +}
 +
-+/// A stroke on the model: its points in object space (`None` breaks it), at `w` points wide; where the model hides it,
-+/// faint.
-+fn surface_stroke(state: &UiState, painter: &egui::Painter, camera: &Camera, rect: Rect, points: &[Option<Vec3>], w: f32, color: Color32) {
++/// A path on the model (`key`): its points in object space (`None` breaks it), at `w` points wide; where the model
++/// hides it, faint (from halfway to the first hidden point).
++fn surface_stroke(state: &UiState, painter: &egui::Painter, camera: &Camera, rect: Rect, key: String, points: &[Option<Vec3>], w: f32, color: Color32) {
 +    let ppp = painter.pixels_per_point();
-+    // Runs of points alike (shown or hidden), each starting where the last one ended.
-+    let mut runs: Vec<(bool, Vec<Pos2>)> = Vec::new();
-+    let mut last: Option<(Pos2, bool)> = None;
-+    for p in points {
-+        let Some((at, hidden)) = p.and_then(|p| on_screen(state, camera, rect, ppp, p)) else {
-+            last = None;
-+            continue;
-+        };
-+        match (last, runs.last_mut()) {
-+            (Some((_, was)), Some((h, run))) if was == hidden && *h == hidden => run.push(at),
-+            (Some((from, _)), _) => runs.push((hidden, vec![from, at])),
-+            (None, _) => runs.push((hidden, vec![at])),
++    let on: Vec<Option<(Pos2, f32)>> = points
++        .iter()
++        .map(|p| p.and_then(|p| on_screen(state, camera, rect, ppp, p)).map(|(at, hidden)| (at, if hidden { 0.45 } else { 1.0 })))
++        .collect();
++    let mut segments = Vec::new();
++    for (i, &p) in on.iter().enumerate() {
++        let Some((a, s)) = p else { continue };
++        match on.get(i + 1).copied().flatten() {
++            Some((b, t)) if s == t => segments.push((a, b, s)),
++            Some((b, t)) => segments.extend([(a, a.lerp(b, 0.5), s), (a.lerp(b, 0.5), b, t)]),
++            // A point on its own: a dot.
++            None if i == 0 || on[i - 1].is_none() => segments.push((a, a, s)),
++            None => {}
 +        }
-+        last = Some((at, hidden));
 +    }
-+    let aa = 1.0 / ppp;
-+    for (hidden, run) in runs {
-+        let ink = color.gamma_multiply(if hidden { 0.7 * 0.45 } else { 0.7 });
-+        painter.add(stroke(&run, w, ink, aa));
-+    }
++    ink(painter, key, segments, w, color);
 +}
 +
 +/// Points on screen per object unit at `p`.
@@ -1939,7 +1947,7 @@ index 0000000..d08b8ae
 +                moving |= s.behind > 0.0;
 +                let shown: Vec<_> = cut(&points, s.behind).into_iter().map(Some).collect();
 +                let w = (2.0 * r * unit).clamp(2.0, far);
-+                surface_stroke(state, painter, camera, rect, &shown, w, color);
++                surface_stroke(state, painter, camera, rect, format!("{}/stroke", o.id), &shown, w, color);
 +            } else {
 +                (s.tip, s.behind) = (None, 0.0);
 +            }
@@ -1957,7 +1965,7 @@ index 0000000..d08b8ae
 +                    let near = [Vec2::X, -Vec2::X, Vec2::Y, -Vec2::Y].into_iter().filter_map(|d| at(uv + d * r)).map(|q| q.distance(p));
 +                    near.filter(|d| *d > 0.0).min_by(f32::total_cmp).map(|d| 2.0 * d * per_unit(camera, ppp, p))
 +                });
-+                surface_stroke(state, painter, camera, rect, &on, w.unwrap_or(2.0).clamp(2.0, far), color);
++                surface_stroke(state, painter, camera, rect, format!("{}/pen", o.id), &on, w.unwrap_or(2.0).clamp(2.0, far), color);
 +            }
 +            // Their pointer, eased in object space; whether the model hides it is decided where it is going.
 +            let target = point(&o.state["pointer"]);
@@ -1994,7 +2002,11 @@ index 0000000..d08b8ae
 +        if let (Some(points), Some(r)) = (path::<2>(&pen["points"]), size(&pen["size"])) {
 +            let on: Vec<Pos2> = points.iter().map(|[u, v]| image.min + vec2(*u, *v) * image.width()).collect();
 +            let w = (2.0 * r * image.width()).clamp(2.0, image.width());
-+            painter.add(stroke(&on, w, color(o).gamma_multiply(0.7), 1.0 / painter.pixels_per_point()));
++            let mut segments: Vec<_> = on.windows(2).map(|p| (p[0], p[1], 1.0)).collect();
++            if let [p] = on[..] {
++                segments.push((p, p, 1.0));
++            }
++            ink(painter, format!("{}/uv", o.id), segments, w, color(o));
 +        }
 +    }
 +}
@@ -2053,10 +2065,10 @@ index 0000000..d08b8ae
 +}
 diff --git a/crates/ui/src/app/live/tests.rs b/crates/ui/src/app/live/tests.rs
 new file mode 100644
-index 0000000..311e4df
+index 0000000..45cbcf0
 --- /dev/null
 +++ b/crates/ui/src/app/live/tests.rs
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,351 @@
 +use std::collections::HashSet;
 +use std::sync::Arc;
 +
@@ -2375,4 +2387,36 @@ index 0000000..311e4df
 +        assert_eq!(point(&junk), None);
 +    }
 +    assert_eq!(on_screen(&a.state, &camera, rect, ppp, glam::Vec3::splat(1e6)).filter(|(at, _)| rect.contains(*at)), None);
++}
++
++#[test]
++fn a_live_stroke_is_one_coat_rounded_at_every_turn_with_its_hidden_part_faint() {
++    use super::peers::coverage;
++    use egui::pos2;
++    // A hairpin, then a zigzag across it, 3 cells either side; its last piece is hidden.
++    let path = [pos2(5.0, 20.0), pos2(40.0, 20.0), pos2(8.0, 23.0), pos2(30.0, 5.0), pos2(30.0, 35.0), pos2(44.0, 6.0)];
++    let segments: Vec<_> = path.windows(2).enumerate().map(|(i, p)| (p[0], p[1], if i == 4 { 0.45 } else { 1.0 })).collect();
++    let ([w, h], r) = ([50, 40], 3.0);
++    let cov = coverage([w, h], &segments, r);
++    for (i, c) in cov.iter().enumerate() {
++        let p = pos2((i % w) as f32 + 0.5, (i / w) as f32 + 0.5);
++        // How far the cell is from the shown pieces and from the hidden one.
++        let far = |hidden: bool| {
++            let near = segments.iter().filter(|g| (g.2 < 1.0) == hidden).map(|&(a, b, _)| {
++                let ab = b - a;
++                (a + ab * ((p - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0)).distance(p)
++            });
++            near.fold(f32::INFINITY, f32::min)
++        };
++        let (inside, outside) = (|d: f32| d <= r - 0.5, |d: f32| d >= r + 0.5);
++        // Within the radius: one coat (no gap at the hairpin's outer side, no darker spot where it crosses itself),
++        // faint where only the hidden piece is; beyond it, nothing (no flap); in between, the antialiased edge.
++        match (far(false), far(true)) {
++            (d, _) if inside(d) => assert_eq!(*c, 1.0, "{p:?}"),
++            (d, e) if outside(d) && inside(e) => assert_eq!(*c, 0.45, "{p:?}"),
++            (d, e) if outside(d) && outside(e) => assert_eq!(*c, 0.0, "{p:?}"),
++            _ => assert!((0.0..=1.0).contains(c), "{p:?} {c}"),
++        }
++    }
++    assert!(cov.iter().any(|c| *c == 0.45) && cov.iter().filter(|c| **c == 1.0).count() > 300);
 +}
