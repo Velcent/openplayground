@@ -92,35 +92,45 @@ index 0000000..8b1acdc
 +}
 diff --git a/crates/engine/src/live_playground.rs b/crates/engine/src/live_playground.rs
 new file mode 100644
-index 0000000..eee840c
+index 0000000..1506d91
 --- /dev/null
 +++ b/crates/engine/src/live_playground.rs
-@@ -0,0 +1,412 @@
-+//! Playground live editing of one open document (the web build; [`playground_live`] is the adapter the Playground shell
-+//! drives). The shared document is the collaboration core's snapshot of the file ([`Replica::snapshot`]: layers with
-+//! their properties, styles, variables, comments, images) without its name and opening page, which stay this person's
-+//! like the selection, page and view. Merges are the core's three-way branch merge ([`merge::plan`]), strict: a
-+//! property both sides wrote is a conflict, even when they wrote the same value. Derived data (auto layout, instances)
-+//! is recomputed after a merge.
+@@ -0,0 +1,900 @@
++//! Playground live editing (the web build; [`playground_live`] is the adapter the Playground shell drives).
 +//!
-+//! The session edits the document in front when it connects. Once its tab is closed, or a native live session
-+//! (`collab.*`) has the document, the session keeps the last one it saw, and the others' next change opens it in a tab.
++//! The shared document is the set of design files open in the session, `{ "documents": [{ "id", "name", "changes" }] }`:
++//! each one as the collaboration core's snapshot of the file ([`Replica::snapshot`]: layers with their properties,
++//! styles, variables, comments, images) without its name and opening page, under an id of its own in the session, with
++//! its name (renaming is shared). The opening page stays this person's, like the selection, page and view. The owner
++//! shares the files open when the session starts; one anyone opens, creates or imports while connected joins them, and
++//! opens for the others as a tab they are not switched to (someone joining is shown the session's first, in place of a
++//! new untouched file). Closing a tab hides that file here only: changes to it are kept, and Home lists it to open
++//! again. Files in a native live session (`collab.*`) and branch tabs stay out. Merges are, per file, the core's
++//! three-way branch merge ([`merge::plan`]), strict: a property both sides wrote is a conflict, even when they wrote the
++//! same value. Derived data (auto layout, instances) is recomputed after a merge.
 +//!
-+//! Presence: each person shares the page they look at, their pointer on it (page coordinates) and their selection
-+//! (ids as strings: JavaScript numbers lose the low bits of client-space ids); the canvas draws the others'
-+//! (`figcraft_ui_egui::live::playground`).
++//! Typing reaches the others as it is typed: on-canvas text editing (one gesture while the caret stays) counts as quiet
++//! unless an IME composition is open, and a remote change goes in under it.
++//!
++//! Presence: on one of the session's files, which one (`doc`, its id in the session), the page in front, the pointer
++//! on it (page coordinates), the selection (ids as strings: JavaScript numbers lose the low bits of client-space ids)
++//! and the gesture in progress ([`gestures`]); the canvas draws the others on the same page of the same file, and the
++//! tabs show dots for the others on theirs (`figcraft_ui_egui::live::playground`).
 +
 +use std::cell::{Cell, RefCell};
 +use std::collections::BTreeSet;
++use std::hash::{Hash, Hasher};
 +use std::sync::Arc;
 +
 +use figcraft_collab::merge::{self, Key, Side};
-+use figcraft_collab::{Change, DocProp, Entry, Prop, Recompute as _, Replica};
-+use figcraft_doc::{Document, NodeId};
++use figcraft_collab::{Change, DocProp, Entry as DocEntry, Prop, Recompute as _, Replica};
++use figcraft_doc::{Document, NodeId, NodeKind};
++use figcraft_geom::{BezPath, Point};
 +use serde::Deserialize as _;
-+use serde_json::Value;
++use serde_json::{Value, json};
 +
 +use crate::collab::EngineRecompute;
++use crate::tools::Gesture;
 +use crate::{DocState, EngineError, Result as EngineResult, Session};
 +use playground_live::{Error, Live, Presence};
 +
@@ -128,16 +138,40 @@ index 0000000..eee840c
 +#[path = "playground_live.rs"]
 +pub mod playground_live;
 +
-+/// Most selected ids a presence carries.
-+const MAX_SELECTION: usize = 50;
++/// Most selected ids, layers moved and outlines a presence carries.
++const MAX_ITEMS: usize = 50;
++/// Most outline points a presence carries (the shell sends at most 4 KiB of it).
++const MAX_POINTS: usize = 200;
++/// Remote coordinates this far off (page units), or no numbers, are not drawn.
++const FAR: f64 = 1e7;
++/// The gesture on-canvas text editing is ([`crate::textedit::begin`]).
++const TYPING: &str = "Edit text";
++
++/// One of the session's files.
++struct Entry {
++    /// Its id in the session.
++    id: u64,
++    /// The tab showing it here ([`DocState::uid`]); none once closed here.
++    uid: Option<u64>,
++    /// It as last seen in its tab (as last received, while closed here).
++    doc: Arc<Document>,
++    /// Its shared form for `doc` (by address) and that form's digest: one adopted with the same digest installs nothing.
++    shared: Option<(usize, Value, u64)>,
++}
 +
 +thread_local! {
-+    /// The document the connected session edits (`None`: none yet, the one in front).
-+    static BOUND: Cell<Option<u64>> = const { Cell::new(None) };
++    /// The session's files, from its first look at this person's.
++    static DOCS: RefCell<Option<Vec<Entry>>> = const { RefCell::new(None) };
++    /// The newest [`DocState::uid`] open when the session's files were last brought up to date: a file opened after
++    /// that joins them.
++    static OPENED: Cell<u64> = const { Cell::new(0) };
++    /// A change from the session was installed (the first one shows someone joining the session's files).
++    static JOINED: Cell<bool> = const { Cell::new(false) };
++    /// The next of the session's file ids, natively (tests).
++    #[cfg(not(target_arch = "wasm32"))]
++    static NEXT: Cell<u64> = const { Cell::new(1) };
 +    /// A pointer button was down, or a text field had the keyboard, in the last frame.
 +    static HELD: Cell<bool> = const { Cell::new(false) };
-+    /// The shared document last seen in its tab.
-+    static SEEN: RefCell<Option<Arc<Document>>> = const { RefCell::new(None) };
 +    /// The pointer over the canvas this frame, and in the last frame (page coordinates).
 +    static POINTED: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
 +    static POINTER: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
@@ -157,72 +191,174 @@ index 0000000..eee840c
 +    POINTED.set(at);
 +}
 +
-+/// Someone else on the page in front of the session's document: their pointer and the selected layers there.
++/// Someone else on the page in front of one of the session's files.
 +pub struct Other {
++    /// Who (the session's id for them).
++    pub id: String,
 +    pub name: String,
 +    pub color: [u8; 3],
 +    pub pointer: Option<(f64, f64)>,
 +    pub selection: Vec<NodeId>,
++    /// Layers being moved, resized or turned, where they are so far.
++    pub ghosts: Vec<Ghost>,
++    /// Shapes, frames or text boxes being drawn, and a selection box being dragged (page coordinates).
++    pub bands: Vec<Vec<Point>>,
++    /// What the Pencil or the Pen is drawing, and its stroke weight.
++    pub strokes: Vec<Vec<Point>>,
++    pub width: f64,
++    /// Where a layer dragged in auto layout would go.
++    pub line: Option<[Point; 2]>,
 +}
 +
-+/// The others on the page in front, when it is the session's document (what does not resolve is left out).
++/// A layer being moved, resized or turned: its page transform and size so far (`id`: none when it is not one here).
++pub struct Ghost {
++    pub key: String,
++    pub id: Option<NodeId>,
++    pub m: [f64; 6],
++    pub w: f64,
++    pub h: f64,
++}
++
++/// A remote node id (a string of digits).
++fn node_id(v: &Value) -> Option<NodeId> {
++    v.as_str()?.parse().ok().map(NodeId)
++}
++
++/// A remote number, unless it is none or too far off.
++fn number(v: &Value) -> Option<f64> {
++    v.as_f64().filter(|c| c.abs() < FAR)
++}
++
++/// Remote polylines (flat `[x0, y0, …]` arrays); one with a point that is no number or too far off is skipped.
++fn lines(v: &Value) -> Vec<Vec<Point>> {
++    let line = |l: &Value| -> Option<Vec<Point>> { l.as_array()?.chunks_exact(2).map(|c| Some(Point::new(number(&c[0])?, number(&c[1])?))).collect() };
++    v.as_array().into_iter().flatten().take(MAX_ITEMS).filter_map(line).filter(|l| l.len() >= 2).collect()
++}
++
++/// The others on the page in front, when its file is one of the session's (what does not resolve is left out).
 +pub fn others(s: &Session) -> Vec<Other> {
-+    let Some(ds) = in_front(s) else { return Vec::new() };
-+    let id = |v: &Value| v.as_str()?.parse().ok().map(NodeId);
-+    let coordinate = |v: &Value| v.as_f64().filter(|c| c.abs() < 1e9);
++    let Some((ds, doc)) = s.ds().ok().and_then(|ds| Some((ds, session_id(ds.uid)?))) else { return Vec::new() };
++    let on_page = |id: &NodeId| ds.doc.page_of(*id) == Some(ds.page);
++    let ghost = |g: &Value| -> Option<Ghost> {
++        let g = g.as_array().filter(|g| g.len() == 9)?;
++        let n: Vec<f64> = g[1..].iter().map(number).collect::<Option<_>>()?;
++        let key: String = g[0].as_str()?.chars().take(24).collect();
++        Some(Ghost { id: node_id(&g[0]).filter(on_page), key, m: [n[0], n[1], n[2], n[3], n[4], n[5]], w: n[6].abs(), h: n[7].abs() })
++    };
++    let at = |v: &Value| Some(Point::new(number(&v[0])?, number(&v[1])?));
 +    OTHERS.with_borrow(|others| {
 +        others
 +            .iter()
-+            .filter(|p| id(&p.state["page"]) == Some(ds.page))
-+            .map(|p| Other {
-+                name: p.name.clone(),
-+                color: p.color,
-+                pointer: coordinate(&p.state["pointer"][0]).zip(coordinate(&p.state["pointer"][1])),
-+                selection: p.state["selection"]
-+                    .as_array()
-+                    .into_iter()
-+                    .flatten()
-+                    .take(MAX_SELECTION)
-+                    .filter_map(id)
-+                    .filter(|n| ds.doc.page_of(*n) == Some(ds.page))
-+                    .collect(),
++            .filter(|p| p.state["doc"].as_u64() == Some(doc) && node_id(&p.state["page"]) == Some(ds.page))
++            .map(|p| {
++                let state = &p.state;
++                let selection = state["selection"].as_array().into_iter().flatten().take(MAX_ITEMS).filter_map(node_id);
++                Other {
++                    id: p.id.clone(),
++                    name: p.name.clone(),
++                    color: p.color,
++                    pointer: at(&state["pointer"]).map(|p| (p.x, p.y)),
++                    selection: selection.filter(on_page).collect(),
++                    ghosts: state["ghosts"].as_array().into_iter().flatten().take(MAX_ITEMS).filter_map(ghost).collect(),
++                    bands: lines(&state["bands"]),
++                    strokes: lines(&state["strokes"]),
++                    width: number(&state["width"]).filter(|w| *w > 0.0).unwrap_or(1.0),
++                    line: lines(&json!([state["line"]])).first().filter(|l| l.len() == 2).map(|l| [l[0], l[1]]),
++                }
 +            })
 +            .collect()
 +    })
 +}
 +
-+/// The session's document in its tab, unless a native live session has it.
-+fn bound(s: &Session) -> Option<&DocState> {
-+    let uid = BOUND.get().or_else(|| s.ds().ok().map(|d| d.uid))?;
-+    s.docs.iter().find(|d| d.uid == uid).filter(|_| !s.live.iter().any(|l| l.doc_uid == Some(uid)))
++/// The colors of the others on open file `uid`, when it is one of the session's (a tab's dots).
++pub fn here(uid: u64) -> Vec<[u8; 3]> {
++    let Some(doc) = session_id(uid) else { return Vec::new() };
++    OTHERS.with_borrow(|others| others.iter().filter(|p| p.state["doc"].as_u64() == Some(doc)).take(8).map(|p| p.color).collect())
 +}
 +
-+/// The session's document: in its tab, else the last one seen there. Binds it while connected.
-+fn current(s: &Session) -> Option<Arc<Document>> {
-+    let Some(ds) = bound(s) else { return SEEN.with_borrow(Clone::clone) };
-+    if playground_live::connected() {
-+        BOUND.set(Some(ds.uid));
-+        SEEN.set(Some(ds.doc.clone()));
-+    }
-+    Some(ds.doc.clone())
++/// The session's id of open file `uid`, when it is one of the session's files.
++pub fn session_id(uid: u64) -> Option<u64> {
++    DOCS.with_borrow(|docs| docs.iter().flatten().find(|e| e.uid == Some(uid)).map(|e| e.id))
 +}
 +
-+/// Undo or Redo (`redo`) of the document in front goes to the Playground session while it edits that document.
++/// The session's files closed here: (id, name), for Home.
++pub fn closed() -> Vec<(u64, String)> {
++    DOCS.with_borrow(|docs| docs.iter().flatten().filter(|e| e.uid.is_none()).map(|e| (e.id, e.doc.name.clone())).collect())
++}
++
++/// Opens the session's file `id` again (closed here), in front.
++pub fn reopen(s: &mut Session, id: u64) {
++    let Some(doc) = DOCS.with_borrow(|docs| docs.iter().flatten().find(|e| e.id == id && e.uid.is_none()).map(|e| e.doc.clone())) else {
++        return;
++    };
++    let ds = DocState::new(Arc::unwrap_or_clone(doc), None);
++    DOCS.with_borrow_mut(|docs| {
++        if let Some(e) = docs.iter_mut().flatten().find(|e| e.id == id) {
++            (e.uid, e.doc, e.shared) = (Some(ds.uid), ds.doc.clone(), None);
++        }
++    });
++    OPENED.set(OPENED.get().max(ds.uid));
++    s.active = s.docs.len();
++    s.docs.push(ds);
++}
++
++/// Undo or Redo (`redo`) go to the Playground session while connected, unless the file in front is this person's own
++/// (not one of the session's).
 +pub(crate) fn undo(s: &Session, redo: bool) -> bool {
-+    in_front(s).is_some() && playground_live::undo(redo)
++    let own = s.ds().is_ok_and(|d| DOCS.with_borrow(Option::is_some) && session_id(d.uid).is_none());
++    !own && playground_live::undo(redo)
 +}
 +
-+/// The session's document, when its tab is the one in front.
-+fn in_front(s: &Session) -> Option<&DocState> {
-+    bound(s).filter(|d| s.ds().is_ok_and(|a| a.uid == d.uid))
-+}
-+
-+/// Document `uid` is the session's: it takes no branches (their id spaces are per file, the same on every peer).
-+pub(crate) fn refuse_branches(s: &Session, cmd: &str, uid: u64) -> EngineResult<()> {
-+    if playground_live::connected() && bound(s).is_some_and(|d| d.uid == uid) {
++/// File `uid` is one of the session's: it takes no branches (their id spaces are per file, the same on every peer).
++pub(crate) fn refuse_branches(_s: &Session, cmd: &str, uid: u64) -> EngineResult<()> {
++    if playground_live::connected() && session_id(uid).is_some() {
 +        return Err(EngineError::Disabled(cmd.into(), "branches aren't available in a live session".into()));
 +    }
 +    Ok(())
++}
++
++/// Open file `ds` can be one of the session's: no branch tab, not in a native live session.
++fn shareable(s: &Session, ds: &DocState) -> bool {
++    ds.branch_of.is_none() && !s.live.iter().any(|l| l.doc_uid == Some(ds.uid))
++}
++
++/// The session's files brought up to date with the ones open here: at the session's first look all of them (the
++/// owner's; someone joining has theirs left out by the session's), then each one opened since. A closed one keeps its
++/// last state.
++fn sync(s: &Session) {
++    DOCS.with_borrow_mut(|docs| {
++        let all = docs.is_none();
++        let docs = docs.get_or_insert_with(Vec::new);
++        let open = |uid: u64| s.docs.iter().any(|d| d.uid == uid && shareable(s, d));
++        for e in docs.iter_mut() {
++            e.uid = e.uid.filter(|uid| open(*uid));
++        }
++        for ds in s.docs.iter().filter(|d| shareable(s, d)) {
++            match docs.iter_mut().find(|e| e.uid == Some(ds.uid)) {
++                Some(e) => e.doc.clone_from(&ds.doc),
++                None if all || ds.uid > OPENED.get() => docs.push(Entry { id: new_id(), uid: Some(ds.uid), doc: ds.doc.clone(), shared: None }),
++                None => {}
++            }
++        }
++    });
++    OPENED.set(s.docs.iter().map(|d| d.uid).fold(OPENED.get(), u64::max));
++}
++
++/// A new id for one of the session's files: 2^52 and 52 random bits in the browser (a page looks at its files before
++/// it connects, so a count would repeat another person's), counted natively.
++fn new_id() -> u64 {
++    #[cfg(target_arch = "wasm32")]
++    let id = (1 << 52) | (js_sys::Math::random() * (1u64 << 52) as f64) as u64;
++    #[cfg(not(target_arch = "wasm32"))]
++    let id = NEXT.with(|n| n.replace(n.get() + 1));
++    id
++}
++
++/// The digest of a shared value.
++fn digest(v: &Value) -> u64 {
++    let mut hasher = std::collections::hash_map::DefaultHasher::new();
++    playground_live::canonical(v).hash(&mut hasher);
++    hasher.finish()
 +}
 +
 +/// `doc` as shared: its snapshot without the file name and opening page.
@@ -238,6 +374,65 @@ index 0000000..eee840c
 +    Ok(Replica::from_snapshot(&changes).map_err(|e| invalid(e.to_string()))?.document().clone())
 +}
 +
++/// The session's files in a shared value: (id, file); `null` is none.
++fn documents(v: &Value) -> Result<Vec<(u64, Value)>, Error> {
++    if v.is_null() {
++        return Ok(Vec::new());
++    }
++    let list = v["documents"].as_array().ok_or("The shared document is not a set of FigCraft files")?;
++    list.iter().map(|d| Ok((d["id"].as_u64().ok_or("A shared file has no id")?, d.clone()))).collect()
++}
++
++/// One of the session's files, `v`, as a document.
++fn decode(v: &Value) -> Result<Document, Error> {
++    let mut doc = document(&v["changes"])?;
++    doc.name = v["name"].as_str().ok_or("A shared file has no name")?.into();
++    Ok(doc)
++}
++
++/// One of the session's files, `v`, as the next state of `current` (none: new here): the opening page and published
++/// library kept, new ids from this person's own space ([`Document::set_client_id`]).
++fn install(v: &Value, current: Option<&Document>) -> Result<Document, Error> {
++    let mut doc = decode(v)?;
++    if let Some(m) = current {
++        doc.current_page = m.current_page;
++        doc.published.clone_from(&m.published);
++    }
++    // 32 of the session's random bits.
++    let client = match current.map_or(0, Document::client_id) {
++        0 => (playground_live::fresh_id(&mut 0) as u32).max(1),
++        c => c,
++    };
++    doc.set_client_id(client);
++    Ok(doc)
++}
++
++/// Installs `doc` in open file `uid` as others' edits are ([`Session::apply_remote`]): no undo step, the page,
++/// selection and view stay. Typing goes on from it.
++fn install_in(s: &mut Session, uid: u64, doc: Arc<Document>) {
++    s.apply_remote(uid, doc);
++    let Some(ds) = s.docs.iter_mut().find(|d| d.uid == uid) else { return };
++    match ds.text_edit.as_mut() {
++        Some(t) => {
++            let n = match ds.doc.node(t.id).map(|n| &n.kind) {
++                Some(NodeKind::Text(text)) => text.char_count(),
++                _ => 0,
++            };
++            (t.caret, t.anchor) = (t.caret.min(n), t.anchor.min(n));
++            if let Some(it) = ds.interaction.as_mut() {
++                it.doc = ds.doc.clone();
++            }
++        }
++        // Its text layer went away: nothing is typed any more.
++        None => ds.interaction = None,
++    }
++}
++
++/// A new untouched file (someone joining sees the session's first one in its place).
++fn untouched(ds: &DocState) -> bool {
++    !ds.is_dirty() && ds.path.is_none() && ds.versions.is_empty() && ds.branches.is_empty() && ds.history.undo.is_empty() && ds.history.redo.is_empty()
++}
++
 +/// What a change writes, as the core's merge names conflicts (creations write nothing another side can: ids are per
 +/// client; images are content-addressed).
 +fn written(c: &Change) -> Option<Key> {
@@ -246,84 +441,181 @@ index 0000000..eee840c
 +        Change::Set { id, prop, .. } => Key::Node(*id, *prop),
 +        Change::Delete { id } => Key::Layer(*id),
 +        Change::SetDoc { prop, .. } => Key::Doc(*prop),
-+        Change::Create { .. } | Change::Put { entry: Entry::Image(_), .. } | Change::Remove { entry: Entry::Image(_) } => return None,
++        Change::Create { .. } | Change::Put { entry: DocEntry::Image(_), .. } | Change::Remove { entry: DocEntry::Image(_) } => return None,
 +        Change::Put { entry, .. } | Change::Remove { entry } => Key::Entry(entry.clone()),
 +    })
 +}
 +
++/// The three-way merge of one file's snapshots.
++fn merge_changes(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
++    if edited == base {
++        return Ok(current.clone());
++    }
++    if current == base {
++        return Ok(edited.clone());
++    }
++    let (base, current, edited) = (document(base)?, document(current)?, document(edited)?);
++    let plan = merge::plan(&base, &edited, &current).map_err(|e| e.to_string())?;
++    let theirs: BTreeSet<Key> = plan.main.iter().filter_map(written).collect();
++    let both = plan.branch.iter().filter_map(written).find(|k| theirs.contains(k));
++    if let Some(key) = plan.conflicts.first().map(|c| c.key.clone()).or(both) {
++        return Err(format!("Conflict at {key}"));
++    }
++    let (mut doc, touched) = plan.merge(&current, Side::Branch, &|_| None).map_err(|e| e.to_string())?;
++    EngineRecompute.recompute(&mut doc, &current, &touched);
++    shared(&doc)
++}
++
 +impl Live for Session {
 +    fn live_document(&self) -> Value {
-+        current(self).and_then(|doc| shared(&doc).ok()).unwrap_or(Value::Null)
++        sync(self);
++        DOCS.with_borrow_mut(|docs| {
++            let mut documents = Vec::new();
++            for e in docs.iter_mut().flatten() {
++                let at = Arc::as_ptr(&e.doc) as usize;
++                if e.shared.as_ref().is_none_or(|(p, ..)| *p != at) {
++                    let Ok(changes) = shared(&e.doc) else { return Value::Null };
++                    let v = json!({ "id": e.id, "name": e.doc.name, "changes": changes });
++                    let d = digest(&v);
++                    e.shared = Some((at, v, d));
++                }
++                documents.extend(e.shared.as_ref().map(|(_, v, _)| v.clone()));
++            }
++            json!({ "documents": documents })
++        })
 +    }
 +
-+    /// Installs the shared document as others' edits are ([`Session::apply_remote`]): no undo step, the page,
-+    /// selection and view stay; with its tab closed it opens in a new one. New ids come from this person's own space
-+    /// ([`Document::set_client_id`]).
++    /// Installs the session's files: changed ones as others' edits are ([`install_in`]), new ones as tabs behind the
++    /// one in front (someone joining is shown the first, in place of a new untouched file), closed ones only kept.
 +    fn live_adopt(&mut self, shared: Value) -> Result<(), Error> {
-+        let mut doc = document(&shared)?;
-+        let mine = current(self);
-+        doc.name = mine.as_ref().map_or_else(|| "Untitled".into(), |m| m.name.clone());
-+        if let Some(m) = &mine {
-+            doc.current_page = m.current_page;
-+            doc.published.clone_from(&m.published);
-+        }
-+        // 32 of the session's random bits.
-+        let client = match mine.map_or(0, |m| m.client_id()) {
-+            0 => (playground_live::fresh_id(&mut 0) as u32).max(1),
-+            c => c,
-+        };
-+        doc.set_client_id(client);
-+        match bound(self).map(|ds| ds.uid) {
-+            Some(uid) => self.apply_remote(uid, Arc::new(doc)),
-+            None => {
-+                let ds = DocState::new(doc, None);
-+                BOUND.set(Some(ds.uid));
-+                SEEN.set(Some(ds.doc.clone()));
-+                self.active = self.docs.len();
-+                self.docs.push(ds);
++        let given = documents(&shared)?;
++        sync(self);
++        // Each file's next state (none: the same as last shared), read before anything changes.
++        let next: Vec<(u64, Option<Document>)> = DOCS.with_borrow(|docs| {
++            let entry = |id: u64| docs.iter().flatten().find(|e| e.id == id);
++            let same = |e: &Entry, v: &Value| e.shared.as_ref().is_some_and(|(p, _, d)| *p == Arc::as_ptr(&e.doc) as usize && *d == digest(v));
++            let next = |(id, v): &(u64, Value)| {
++                let old = entry(*id);
++                Ok((*id, if old.is_some_and(|e| same(e, v)) { None } else { Some(install(v, old.map(|e| &*e.doc))?) }))
++            };
++            given.iter().map(next).collect::<Result<_, Error>>()
++        })?;
++        let mut docs = DOCS.take().unwrap_or_default();
++        let joining = !JOINED.replace(true) && !next.is_empty() && docs.iter().all(|e| next.iter().all(|(id, _)| *id != e.id));
++        let mut first = None;
++        let mut kept = Vec::new();
++        for (id, doc) in next {
++            let mut entry = docs.iter().position(|e| e.id == id).map(|i| docs.swap_remove(i));
++            if let Some(doc) = doc {
++                let (uid, now) = match entry.as_ref().map(|e| e.uid) {
++                    // Closed here: only kept.
++                    Some(None) => (None, Arc::new(doc)),
++                    Some(Some(uid)) => {
++                        let doc = Arc::new(doc);
++                        install_in(self, uid, doc.clone());
++                        (Some(uid), doc)
++                    }
++                    // Someone joining sees the session's first file in place of a new untouched one.
++                    None if joining && first.is_none() && self.ds().is_ok_and(untouched) => {
++                        let ds = self.ds_mut().map_err(|e| e.to_string())?;
++                        ds.path = None;
++                        let (uid, doc) = (ds.uid, Arc::new(doc));
++                        install_in(self, uid, doc.clone());
++                        first = Some(uid);
++                        (Some(uid), doc)
++                    }
++                    // New here: a tab behind the one in front.
++                    None => {
++                        let ds = DocState::new(doc, None);
++                        let (uid, doc) = (ds.uid, ds.doc.clone());
++                        self.docs.push(ds);
++                        first.get_or_insert(uid);
++                        (Some(uid), doc)
++                    }
++                };
++                match &mut entry {
++                    Some(e) => (e.doc, e.shared) = (now, None),
++                    None => entry = Some(Entry { id, uid, doc: now, shared: None }),
++                }
 +            }
++            kept.extend(entry);
++        }
++        // A file no longer in the session (its opening undone) stays open here as this person's own.
++        DOCS.set(Some(kept));
++        OPENED.set(self.docs.iter().map(|d| d.uid).fold(OPENED.get(), u64::max));
++        if let Some(i) = first.filter(|_| joining).and_then(|uid| self.docs.iter().position(|d| d.uid == uid)) {
++            self.active = i;
 +        }
 +        Ok(())
 +    }
 +
++    /// No gesture under way on the session's files (typing aside, while no IME composition is open), no version or
++    /// text style shown in place of one.
 +    fn live_quiet(&self) -> bool {
-+        !HELD.get() && bound(self).is_none_or(|ds| ds.interaction.is_none() && ds.preview.is_none() && ds.text_preview.is_none())
++        let typing = |ds: &DocState| ds.interaction.as_ref().is_some_and(|it| it.label == TYPING) && ds.text_edit.as_ref().is_some_and(|t| t.preedit.is_none());
++        let shared = |ds: &&DocState| DOCS.with_borrow(Option::is_none) || session_id(ds.uid).is_some() || ds.uid > OPENED.get();
++        !HELD.get()
++            && self.docs.iter().filter(shared).all(|ds| (ds.interaction.is_none() || typing(ds)) && ds.preview.is_none() && ds.text_preview.is_none())
 +    }
 +
 +    fn live_generation(&self) -> Option<u64> {
-+        current(self).map(|doc| bound(self).map_or(0, |ds| ds.revision) ^ (Arc::as_ptr(&doc) as usize as u64).rotate_left(32))
++        sync(self);
++        let mut hasher = std::collections::hash_map::DefaultHasher::new();
++        DOCS.with_borrow(|docs| docs.iter().flatten().for_each(|e| (e.id, e.uid, Arc::as_ptr(&e.doc) as usize).hash(&mut hasher)));
++        self.docs.iter().for_each(|d| (d.uid, d.revision).hash(&mut hasher));
++        Some(hasher.finish())
 +    }
 +
 +    /// Native undo steps from the session would take back others' edits.
 +    fn live_disconnected(&mut self) {
-+        SEEN.set(None);
-+        let Some(uid) = BOUND.take() else { return };
-+        if let Some(ds) = self.docs.iter_mut().find(|d| d.uid == uid) {
-+            ds.history.undo.clear();
-+            ds.history.redo.clear();
++        for uid in DOCS.take().into_iter().flatten().filter_map(|e| e.uid) {
++            if let Some(ds) = self.docs.iter_mut().find(|d| d.uid == uid) {
++                ds.history.undo.clear();
++                ds.history.redo.clear();
++            }
 +        }
++        JOINED.set(false);
 +    }
 +
-+    /// What every peer installs reads as a document.
++    /// What every peer installs reads as a set of files: ids of their own, each a name and a document.
 +    fn live_check(shared: &Value) -> Result<(), Error> {
-+        document(shared).map(drop)
++        let mut ids = BTreeSet::new();
++        if !shared.is_object() {
++            return Err("Conflict: not a set of files".into());
++        }
++        for (id, d) in documents(shared)? {
++            if !ids.insert(id) {
++                return Err("Conflict: two files with one id".into());
++            }
++            decode(&d)?;
++        }
++        Ok(())
 +    }
 +
-+    /// The page in front, the pointer on it and the selection, while the session's document is in front.
++    /// The file and page in front, the pointer on it, the selection and the gesture in progress, while one of the
++    /// session's files is in front.
 +    fn live_presence(&self) -> Value {
-+        let Some(ds) = in_front(self) else { return Value::Null };
-+        let selection: Vec<String> = ds.selection.iter().take(MAX_SELECTION).map(|n| n.0.to_string()).collect();
-+        let mut state = serde_json::json!({ "page": ds.page.0.to_string(), "selection": selection });
++        let Some((ds, doc)) = self.ds().ok().and_then(|ds| Some((ds, session_id(ds.uid)?))) else { return Value::Null };
++        let selection: Vec<String> = ds.selection.iter().take(MAX_ITEMS).map(|n| n.0.to_string()).collect();
++        let mut state = json!({ "doc": doc, "page": ds.page.0.to_string(), "selection": selection });
 +        if let Some((x, y)) = POINTER.get().filter(|(x, y)| x.is_finite() && y.is_finite()) {
-+            state["pointer"] = serde_json::json!([x, y]);
++            state["pointer"] = json!([fine(x), fine(y)]);
 +        }
-+        state
++        // The gesture in progress, with fewer items while the whole is over what the shell sends (4 KiB).
++        let with = |(points, items)| {
++            let mut p = state.clone();
++            gestures(self, ds, points, items, &mut p);
++            p
++        };
++        [(MAX_POINTS, MAX_ITEMS), (MAX_POINTS / 4, 12), (0, 0)].into_iter().map(with).find(|p| p.to_string().len() <= 4000).unwrap_or(state)
 +    }
 +
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
 +        OTHERS.set(others);
 +    }
 +
++    /// Per file: the core's merge of its snapshot, and its name, both strict; a file one side added, or removed while
++    /// the other left it alone, follows that side. The current side's order, then the edited side's additions.
 +    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
 +        if edited == base {
 +            return Ok(current.clone());
@@ -331,26 +623,200 @@ index 0000000..eee840c
 +        if current == base {
 +            return Ok(edited.clone());
 +        }
-+        let (base, current, edited) = (document(base)?, document(current)?, document(edited)?);
-+        let plan = merge::plan(&base, &edited, &current).map_err(|e| e.to_string())?;
-+        let theirs: BTreeSet<Key> = plan.main.iter().filter_map(written).collect();
-+        let both = plan.branch.iter().filter_map(written).find(|k| theirs.contains(k));
-+        if let Some(key) = plan.conflicts.first().map(|c| c.key.clone()).or(both) {
-+            return Err(format!("Conflict at {key}"));
++        let (b, c, e) = (documents(base)?, documents(current)?, documents(edited)?);
++        let find = |list: &[(u64, Value)], id: u64| list.iter().find(|(i, _)| *i == id).map(|(_, v)| v.clone());
++        let mut ids: Vec<u64> = Vec::new();
++        for (id, _) in c.iter().chain(&e).chain(&b) {
++            if !ids.contains(id) {
++                ids.push(*id);
++            }
 +        }
-+        let (mut doc, touched) = plan.merge(&current, Side::Branch, &|_| None).map_err(|e| e.to_string())?;
-+        EngineRecompute.recompute(&mut doc, &current, &touched);
-+        shared(&doc)
++        let mut documents = Vec::new();
++        for id in ids {
++            let merged = match (find(&b, id), find(&c, id), find(&e, id)) {
++                (b, c, e) if e == b => c,
++                (b, c, e) if c == b => e,
++                (Some(b), Some(c), Some(e)) => {
++                    let name = match (c["name"] == b["name"], e["name"] == b["name"]) {
++                        (_, true) => c["name"].clone(),
++                        (true, false) => e["name"].clone(),
++                        (false, false) => return Err(format!("Conflict at file {id} name")),
++                    };
++                    Some(json!({ "id": id, "name": name, "changes": merge_changes(&b["changes"], &c["changes"], &e["changes"])? }))
++                }
++                _ => return Err(format!("Conflict at file {id}")),
++            };
++            documents.extend(merged);
++        }
++        Ok(json!({ "documents": documents }))
 +    }
++}
++
++/// `x` in hundredths: finer than a pixel up to 100× zoom, and short in JSON.
++fn fine(x: f64) -> f64 {
++    (x * 100.0).round() / 100.0
++}
++
++/// This person's gesture in progress on `ds` into presence `out`, with at most `points` outline points and `items`
++/// layers moved:
++/// - `ghosts`: layers moved, resized or turned (the selection, outermost), `[id, a, b, c, d, e, f, width, height]`:
++///   their page transform and size so far;
++/// - `bands`: the shape, frame or text box being drawn, or the selection box being dragged, as outlines;
++/// - `strokes` and `width`: what the Pencil or the Pen is drawing, and its stroke weight;
++/// - `line`: where a layer dragged in auto layout would go, `[x0, y0, x1, y1]`.
++///
++/// Outlines are flat `[x0, y0, x1, y1, …]` arrays in page coordinates (a closed one ends where it starts).
++fn gestures(s: &Session, ds: &DocState, points: usize, items: usize, out: &mut Value) {
++    let zoom = ds.view.zoom.max(1e-9);
++    let mut left = points;
++    let tool = &s.tool;
++    match &tool.gesture {
++        Gesture::Pencil { points, .. } => {
++            out["strokes"] = flat(vec![points.clone()], zoom, &mut left, true);
++            out["width"] = json!(2.0);
++            return;
++        }
++        Gesture::Marquee { .. } => {
++            if let Some([x0, y0, x1, y1]) = tool.overlay.marquee {
++                let ring = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)].map(Point::from).to_vec();
++                out["bands"] = flat(vec![ring], zoom, &mut left, false);
++            }
++            return;
++        }
++        _ => {}
++    }
++    if let Some(pen) = &tool.pen {
++        let mut path = BezPath::new();
++        for (k, (p, i, _)) in pen.points.iter().enumerate() {
++            match k.checked_sub(1).and_then(|j| pen.points.get(j)) {
++                Some((q, _, o)) => path.curve_to(*q + *o, *p + *i, *p),
++                None => path.move_to(*p),
++            }
++        }
++        let mut line = rings(&path, zoom).into_iter().next().unwrap_or_default();
++        line.extend(tool.overlay.rubber.map(|[_, _, x, y]| Point::new(x, y)));
++        let width = pen.id.and_then(|id| ds.doc.node(id)).map_or(1.0, |n| n.stroke.weight);
++        out["strokes"] = flat(vec![line], zoom, &mut left, true);
++        out["width"] = json!(fine(width));
++        return;
++    }
++    let Some(it) = ds.interaction.as_ref() else { return };
++    let drawn = match &tool.gesture {
++        Gesture::Draw { id: Some(id), .. } => Some(*id),
++        Gesture::None => None,
++        // A text box being dragged out (the Text tool, still pressed): typing starts in it.
++        _ => ds.text_edit.as_ref().filter(|t| t.created && it.label == TYPING).map(|t| t.id),
++    };
++    if let Some(n) = drawn.and_then(|id| ds.doc.node(id)) {
++        let mut path = figcraft_doc::geometry::shape_path(n).unwrap_or_else(|| figcraft_geom::rounded_rect(n.width, n.height, [0.0; 4], 0.0));
++        path.apply_affine(ds.doc.world_transform(n.id));
++        out["bands"] = flat(rings(&path, zoom), zoom, &mut left, false);
++    }
++    if it.label == TYPING {
++        return;
++    }
++    let sel = &ds.selection;
++    let outermost = |id: &&NodeId| Some(**id) != drawn && !sel.iter().any(|s| s != *id && ds.doc.is_ancestor(*s, **id)) && ds.doc.page_of(**id) == Some(ds.page);
++    let ghosts: Vec<Value> = sel
++        .iter()
++        .filter(outermost)
++        .filter_map(|id| {
++            let n = ds.doc.node(*id)?;
++            let m = ds.doc.world_transform(*id);
++            let was = it.doc.node(*id).map(|o| (it.doc.world_transform(*id), o.width, o.height));
++            (was != Some((m, n.width, n.height))).then(|| {
++                let [a, b, c, d, e, f] = m.as_coeffs();
++                let r = |v: f64| (v * 1e4).round() / 1e4;
++                json!([id.0.to_string(), r(a), r(b), r(c), r(d), fine(e), fine(f), fine(n.width), fine(n.height)])
++            })
++        })
++        .take(items)
++        .collect();
++    if !ghosts.is_empty() {
++        out["ghosts"] = json!(ghosts);
++    }
++    if let Some([x0, y0, x1, y1]) = tool.overlay.insert_line {
++        out["line"] = json!([fine(x0), fine(y0), fine(x1), fine(y1)]);
++    }
++}
++
++/// `path` flattened (to a tenth of a pixel at `zoom`) into polylines of page coordinates, a closed one ending where it
++/// starts.
++pub fn rings(path: &BezPath, zoom: f64) -> Vec<Vec<Point>> {
++    use figcraft_geom::kurbo::PathEl;
++    let mut out: Vec<Vec<Point>> = Vec::new();
++    figcraft_geom::kurbo::flatten(path.iter(), 0.1 / zoom, |el| match el {
++        PathEl::MoveTo(p) => out.push(vec![p]),
++        PathEl::LineTo(p) => out.last_mut().into_iter().for_each(|r| r.push(p)),
++        PathEl::ClosePath => out.last_mut().into_iter().filter(|r| r.last() != r.first()).for_each(|r| r.push(r[0])),
++        _ => {}
++    });
++    out
++}
++
++/// `rings` as flat `[x0, y0, …]` arrays: each point a pixel (at `zoom`) or more from the one before, at most `left`
++/// points in all (it goes down by what they take), the newest (`newest`, the last ones) or the first when cut.
++fn flat(rings: Vec<Vec<Point>>, zoom: f64, left: &mut usize, newest: bool) -> Value {
++    let mut rings: Vec<Vec<Point>> = rings
++        .into_iter()
++        .map(|r| {
++            let mut kept: Vec<Point> = Vec::new();
++            for (i, p) in r.iter().enumerate() {
++                if kept.last().is_none_or(|q| (*p - *q).hypot() * zoom >= 1.0 || i + 1 == r.len()) {
++                    kept.push(*p);
++                }
++            }
++            kept
++        })
++        .filter(|r| r.len() >= 2)
++        .collect();
++    if newest {
++        rings.reverse();
++    }
++    let mut out = Vec::new();
++    for mut r in rings.into_iter().take(MAX_ITEMS) {
++        if *left < 2 {
++            break;
++        }
++        if r.len() > *left {
++            match newest {
++                true => drop(r.drain(..r.len() - *left)),
++                false => r.truncate(*left),
++            }
++        }
++        *left -= r.len();
++        out.push(r.iter().flat_map(|p| [fine(p.x), fine(p.y)]).collect::<Vec<f64>>());
++    }
++    if newest {
++        out.reverse();
++    }
++    json!(out)
 +}
 +
 +#[cfg(test)]
 +mod tests {
 +    use super::playground_live::{activity, canonical, connect, disconnect, frame, queue};
 +    use super::*;
-+    use serde_json::json;
-+    use std::cell::RefCell;
++    use figcraft_geom::Affine;
 +    use std::rc::Rc;
++
++    thread_local! {
++        /// The other person's files in the session (the session's files are per thread: one person per page).
++        static THEIRS: RefCell<(Option<Vec<Entry>>, u64, bool)> = const { RefCell::new((None, 0, false)) };
++    }
++
++    /// `f` as the other person.
++    fn as_them<T>(f: impl FnOnce() -> T) -> T {
++        let swap = || THEIRS.with_borrow_mut(|t| (t.0, t.1, t.2) = (DOCS.replace(t.0.take()), OPENED.replace(t.1), JOINED.replace(t.2)));
++        swap();
++        let out = f();
++        swap();
++        out
++    }
++
++    fn theirs(s: &Session) -> Value {
++        as_them(|| s.live_document())
++    }
 +
 +    fn rect(s: &mut Session, x: f64) -> NodeId {
 +        let made = s.execute("node.create", &json!({"type": "rectangle", "x": x, "y": 0, "width": 50, "height": 50})).unwrap();
@@ -361,50 +827,37 @@ index 0000000..eee840c
 +        s.execute("node.set", &json!({"id": id, "props": {"name": name}})).unwrap();
 +    }
 +
-+    /// Another person's document (the binding is per thread: one session per page).
-+    fn theirs(s: &Session) -> Value {
-+        let mine = (BOUND.take(), SEEN.take());
-+        let shared = s.live_document();
-+        (BOUND.set(mine.0), SEEN.set(mine.1));
-+        shared
-+    }
-+
 +    fn name(s: &Session, id: NodeId) -> String {
 +        s.doc().unwrap().node(id).unwrap().name.clone()
 +    }
 +
 +    #[test]
-+    fn the_shared_document_leaves_out_the_name_page_and_views() {
-+        let mut s = Session::new();
-+        let r = rect(&mut s, 0.0);
-+        let shared = canonical(&s.live_document());
-+        let ds = s.ds_mut().unwrap();
++    fn the_shared_document_leaves_out_the_page_and_views_and_adopting_keeps_them_without_an_undo_step() {
++        let mut a = Session::new();
++        let r = rect(&mut a, 0.0);
++        let shared = canonical(&theirs(&a));
++        let ds = a.ds_mut().unwrap();
 +        ds.view.zoom = 4.0;
 +        ds.selection = vec![r];
-+        let doc = Arc::make_mut(&mut ds.doc);
-+        doc.name = "Mine".into();
-+        doc.current_page = None;
-+        assert_eq!(canonical(&s.live_document()), shared);
-+        rename(&mut s, r, "Card");
-+        assert_ne!(canonical(&s.live_document()), shared);
-+    }
++        Arc::make_mut(&mut ds.doc).current_page = None;
++        assert_eq!(canonical(&theirs(&a)), shared);
++        rename(&mut a, r, "Card");
++        assert_ne!(canonical(&theirs(&a)), shared);
 +
-+    #[test]
-+    fn adopting_keeps_this_persons_views_and_adds_no_undo_step() {
-+        let mut a = Session::new();
-+        rect(&mut a, 0.0);
++        // Someone joining with a new untouched file sees the session's in its place, with their view.
 +        let mut b = Session::new();
 +        b.ds_mut().unwrap().view.zoom = 2.0;
-+        let page = b.ds().unwrap().page;
++        b.live_document();
++        let tab = b.ds().unwrap().uid;
 +        b.live_adopt(theirs(&a)).unwrap();
 +        assert_eq!(canonical(&b.live_document()), canonical(&theirs(&a)));
 +        let ds = b.ds().unwrap();
-+        assert_eq!((ds.view.zoom, ds.page, ds.history.undo.len(), ds.doc.name.as_str()), (2.0, page, 0, "Untitled"));
++        assert_eq!((b.docs.len(), ds.uid, ds.view.zoom, ds.history.undo.len()), (1, tab, 2.0, 0));
 +        assert_ne!(ds.doc.client_id(), 0, "new ids come from this person's space");
 +    }
 +
 +    #[test]
-+    fn remote_changes_wait_for_gestures_merge_by_layer_and_undo_goes_to_the_session() {
++    fn remote_changes_wait_for_gestures_merge_by_layer_typing_is_quiet_and_undo_goes_to_the_session() {
 +        let mut a = Session::new();
 +        let (r1, r2) = (rect(&mut a, 0.0), rect(&mut a, 100.0));
 +        let base = theirs(&a);
@@ -426,6 +879,18 @@ index 0000000..eee840c
 +        // Both sides writing one property conflict, even with the same value.
 +        let renamed = theirs(&a);
 +        assert!(Session::live_merge(&base, &renamed, &renamed).unwrap_err().contains("Conflict"));
++        // Typing is quiet: what is typed goes out as it is typed, and a remote change goes in under it.
++        let t = NodeId(b.execute("node.create", &json!({"type": "text", "x": 0, "y": 200, "text": "Hi"})).unwrap()["id"].as_u64().unwrap());
++        crate::textedit::begin(&mut b, t, None, false).unwrap();
++        crate::textedit::insert(&mut b, "Hello").unwrap();
++        assert!(b.live_quiet() && b.live_document().to_string().contains("Hello"));
++        let shared = canonical(&b.live_document());
++        let mut remote: Value = serde_json::from_slice(&shared).unwrap();
++        remote["documents"][0]["name"] = json!("Shared");
++        queue(Some(shared), canonical(&remote), Box::new(|_| {}));
++        frame(&mut b);
++        assert_eq!(b.ds().unwrap().doc.name, "Shared", "renaming is shared");
++        crate::textedit::end(&mut b).unwrap();
 +        assert!(b.undo().unwrap());
 +        assert_eq!(name(&b, r2), "B", "Undo is the session's");
 +        assert_eq!(activity().1, [false]);
@@ -439,7 +904,8 @@ index 0000000..eee840c
 +        let mut a = Session::new();
 +        rect(&mut a, 0.0);
 +        let base = theirs(&a);
-+        for garbage in [Value::Null, json!([]), json!({"pages": []}), json!([{"create": {"id": 1}}])] {
++        let bad = |changes: Value| json!({"documents": [{"id": 1, "name": "x", "changes": changes}]});
++        for garbage in [Value::Null, json!([]), json!({"documents": [{"id": 1}]}), bad(json!([{"create": {"id": 1}}]))] {
 +            assert!(Session::live_check(&garbage).is_err(), "{garbage}");
 +        }
 +        assert_eq!(Session::live_check(&base), Ok(()));
@@ -457,90 +923,385 @@ index 0000000..eee840c
 +    }
 +
 +    #[test]
-+    fn presence_is_the_page_pointer_and_selection_and_shows_only_what_resolves_here() {
++    fn presence_is_the_file_page_pointer_selection_and_gesture_and_shows_only_what_resolves_here() {
 +        let mut a = Session::new();
 +        let r = rect(&mut a, 0.0);
 +        a.ds_mut().unwrap().selection = vec![r];
-+        point(Some((12.5, -3.0)));
-+        super::frame(&mut a, false);
-+        let mine = Live::live_presence(&a);
++        let mine = as_them(|| {
++            a.live_document();
++            point(Some((12.5, -3.0)));
++            super::frame(&mut a, false);
++            Live::live_presence(&a)
++        });
 +        assert_eq!(mine["selection"], json!([r.0.to_string()]));
++        // A move under way: the layer where it is so far.
++        a.begin_interaction("Move").unwrap();
++        a.preview(|doc, _| {
++            doc.get_mut(r).unwrap().transform = Affine::translate((40.0, 0.0));
++            Ok(())
++        })
++        .unwrap();
++        let moving = as_them(|| Live::live_presence(&a));
++        assert_eq!(moving["ghosts"], json!([[r.0.to_string(), 1.0, 0.0, 0.0, 1.0, 40.0, 0.0, 50.0, 50.0]]));
++        a.cancel_interaction().unwrap();
 +        let mut b = Session::new();
 +        b.live_adopt(theirs(&a)).unwrap();
 +        let ann = |state: Value| Presence::list(&json!([{"id": "a", "name": "Ann", "color": "#e6194b", "state": state}]));
-+        b.live_show_presence(ann(mine.clone()));
++        b.live_show_presence(ann(moving.clone()));
 +        let shown = others(&b);
 +        assert_eq!((shown[0].name.as_str(), shown[0].pointer, shown[0].selection.clone()), ("Ann", Some((12.5, -3.0)), vec![r]));
-+        b.live_show_presence(ann(json!({"page": mine["page"], "pointer": [1e300, 1], "selection": ["999", 7, "x", null]})));
++        assert_eq!((shown[0].ghosts[0].id, shown[0].ghosts[0].m[4]), (Some(r), 40.0), "the ghost where it is so far");
++        b.live_show_presence(ann(json!({"doc": mine["doc"], "page": mine["page"], "pointer": [1e300, 1], "selection": ["999", 7, "x", null], "ghosts": [["1", "x"]]})));
 +        let shown = others(&b);
-+        assert_eq!((shown[0].pointer, shown[0].selection.len()), (None, 0));
-+        b.live_show_presence(ann(json!({"page": "424242", "pointer": [1, 2]})));
++        assert_eq!((shown[0].pointer, shown[0].selection.len(), shown[0].ghosts.len()), (None, 0, 0));
++        b.live_show_presence(ann(json!({"doc": mine["doc"], "page": "424242", "pointer": [1, 2]})));
 +        assert!(others(&b).is_empty(), "another page");
++        b.live_show_presence(ann(json!({"doc": 7, "page": mine["page"], "pointer": [1, 2]})));
++        assert!(others(&b).is_empty(), "another file");
 +        b.live_show_presence(Vec::new());
 +        assert!(others(&b).is_empty());
 +    }
 +
 +    #[test]
-+    fn a_closed_tab_keeps_its_document_and_the_others_next_change_reopens_it() {
++    fn files_opened_join_the_session_as_tabs_behind_and_closing_one_is_personal() {
 +        let mut a = Session::new();
-+        let r = rect(&mut a, 0.0);
-+        let base = theirs(&a);
++        rect(&mut a, 0.0);
 +        let mut b = Session::new();
-+        b.live_adopt(base.clone()).unwrap();
++        b.live_adopt(theirs(&a)).unwrap();
 +        connect();
-+        let shared = canonical(&b.live_document());
-+        let uid = b.ds().unwrap().uid;
++        // A file opened while connected joins the session.
++        b.execute("file.new", &json!({})).unwrap();
++        let mut set = b.live_document();
++        assert_eq!(set["documents"].as_array().unwrap().len(), 2);
++        // Someone else's opens here behind the one in front.
++        let mut new = set["documents"][0].clone();
++        (new["id"], new["name"]) = (json!(77), json!("Theirs"));
++        set["documents"].as_array_mut().unwrap().push(new);
++        let front = b.ds().unwrap().uid;
++        b.live_adopt(set.clone()).unwrap();
++        assert_eq!((b.docs.len(), b.ds().unwrap().uid), (3, front), "no switch to it");
++        assert_eq!(canonical(&b.live_document()), canonical(&set));
++        // Closing it hides it here only: a change to it is kept, and does not open it again.
++        b.docs.remove(2);
++        assert_eq!(canonical(&b.live_document()), canonical(&set));
++        set["documents"][2]["name"] = json!("Renamed");
++        b.live_adopt(set.clone()).unwrap();
++        assert_eq!(b.docs.len(), 2);
++        assert_eq!(canonical(&b.live_document()), canonical(&set));
++        assert_eq!(closed(), [(77, "Renamed".to_string())]);
 +        let branch = b.execute("branch.create", &json!({})).unwrap_err().to_string();
 +        assert!(branch.contains("live session"), "branch id spaces would be the same on every peer: {branch}");
-+        b.docs.clear();
-+        assert_eq!(canonical(&b.live_document()), shared, "the last document, not none");
-+        assert!(b.live_quiet());
-+        rename(&mut a, r, "A");
-+        let done = Rc::new(RefCell::new(None));
-+        let to = done.clone();
-+        queue(Some(shared), canonical(&theirs(&a)), Box::new(move |r| *to.borrow_mut() = Some(r)));
-+        super::frame(&mut b, true);
-+        assert!(done.borrow().is_none(), "a held pointer holds others' changes back");
-+        super::frame(&mut b, false);
-+        assert_eq!(*done.borrow(), Some(Ok(None)));
-+        assert_eq!((b.docs.len(), name(&b, r), b.ds().unwrap().doc.name.as_str()), (1, "A".into(), "Untitled"));
-+        assert_ne!(b.ds().unwrap().uid, uid);
++        reopen(&mut b, 77);
++        assert_eq!((b.docs.len(), b.ds().unwrap().doc.name.as_str()), (3, "Renamed"));
 +        disconnect();
 +    }
 +}
 diff --git a/crates/ui-egui/src/live/playground.rs b/crates/ui-egui/src/live/playground.rs
 new file mode 100644
-index 0000000..73eef1b
+index 0000000..a3a8bcc
 --- /dev/null
 +++ b/crates/ui-egui/src/live/playground.rs
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,303 @@
 +//! Live editing in a Playground session (`figcraft_engine::live_playground`): this person's pointer over the canvas
-+//! for the others, and the others' pointers, names and selections on the page in front, drawn like a live session's.
++//! for the others, and the others on the page in front, in their colors: the layers they move, resize or turn (ghosts
++//! in the layers' own shape), the shapes and selection boxes they drag out (dashed), what they draw with the Pencil or
++//! the Pen, then their selections, then their pointers with their names, under this person's own selection and tool
++//! overlays; each easing toward its latest state. The tabs show dots for the others on each file, and Home lists the
++//! session's files closed here.
 +
-+use super::{MAX_OUTLINES, name_tag, pointer};
++use std::cell::RefCell;
++use std::collections::HashMap;
++
++use egui::{Color32, CornerRadius, Mesh, Painter, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2, pos2, vec2};
++use figcraft_doc::{Document, NodeKind};
++use figcraft_engine::live_playground::{self as live, Ghost, rings};
++use figcraft_geom::{Affine, BezPath, Point};
++
 +use crate::FigApp;
-+use egui::{Align2, Color32, Shape, Stroke, vec2};
-+use figcraft_engine::live_playground as live;
++use crate::theme::{ACCENT, Tokens, semibold};
 +
-+/// On the canvas, over the document: the others' selection outlines, then their pointers with their names.
-+pub(super) fn draw(app: &FigApp, painter: &egui::Painter) {
-+    let at = painter.ctx().input(|i| i.pointer.hover_pos()).filter(|p| app.canvas.rect.contains(*p)).map(|p| app.to_page(p));
++/// How long the others' marks take to go most (1 - 1/e) of the way to their latest state, in seconds.
++const EASE: f64 = 0.08;
++
++thread_local! {
++    /// The others' marks as last drawn, by person: they ease on from there.
++    static SHOWN: RefCell<HashMap<String, Shown>> = RefCell::new(HashMap::new());
++}
++
++/// A person's moving marks as last drawn, in page coordinates.
++#[derive(Default)]
++struct Shown {
++    pointer: Option<[f64; 2]>,
++    /// The layers moved: their page transform and size, by key.
++    ghosts: Vec<(String, [f64; 8])>,
++    /// The box the bands are drawn into (their own box, as last received).
++    frame: Option<[f64; 4]>,
++    /// The newest point of the strokes.
++    head: Option<[f64; 2]>,
++}
++
++/// `s` `k` of the way on toward `t`, all of it after a jump of more than `far` pixels or once under half a pixel
++/// remains (`px`: pixels a unit of each part). Whether it is still on its way.
++fn ease<const N: usize>(s: &mut [f64; N], t: [f64; N], k: f64, px: [f64; N], far: f64) -> bool {
++    let off = |s: &[f64; N]| s.iter().zip(t).zip(px).map(|((s, t), px)| ((t - s) * px).abs()).fold(0.0, f64::max);
++    if off(s) > far {
++        *s = t;
++    }
++    s.iter_mut().zip(t).for_each(|(s, t)| *s += (t - *s) * k);
++    let moving = off(s) >= 0.5;
++    if !moving {
++        *s = t;
++    }
++    moving
++}
++
++/// [`ease`] for a mark that may come and go: it shows at once where it first does.
++fn step<const N: usize>(s: &mut Option<[f64; N]>, t: Option<[f64; N]>, k: f64, px: [f64; N], far: f64) -> bool {
++    match (s.as_mut(), t) {
++        (Some(s), Some(t)) => ease(s, t, k, px, far),
++        _ => {
++            *s = t;
++            false
++        }
++    }
++}
++
++/// The box around `lines`, as `[x0, y0, x1, y1]`.
++fn bounds(lines: &[Vec<Point>]) -> Option<[f64; 4]> {
++    let mut points = lines.iter().flatten();
++    let first = points.next()?;
++    Some(points.fold([first.x, first.y, first.x, first.y], |b, p| [b[0].min(p.x), b[1].min(p.y), b[2].max(p.x), b[3].max(p.y)]))
++}
++
++/// The affine taking box `from` onto box `to`; a side with no extent keeps its size.
++fn fit(from: [f64; 4], to: [f64; 4]) -> Affine {
++    let scale = |a: f64, b: f64| if a > 1e-9 { b / a } else { 1.0 };
++    let (sx, sy) = (scale(from[2] - from[0], to[2] - to[0]), scale(from[3] - from[1], to[3] - to[1]));
++    Affine::translate((to[0], to[1])) * Affine::scale_non_uniform(sx, sy) * Affine::translate((-from[0], -from[1]))
++}
++
++fn rgb([r, g, b]: [u8; 3]) -> Color32 {
++    Color32::from_rgb(r, g, b)
++}
++
++/// `color` at `alpha` (0–1).
++fn alpha(color: Color32, alpha: f32) -> Color32 {
++    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), (alpha * 255.0).round() as u8)
++}
++
++/// A layer being moved (`v`: its page transform and size so far) in its own shape when it is one here, else its box.
++fn outline(doc: &Document, g: &Ghost, v: [f64; 8]) -> BezPath {
++    let (w, h) = (v[6], v[7]);
++    let own = g.id.and_then(|id| doc.node(id)).and_then(|n| match &n.kind {
++        NodeKind::Vector { .. } => {
++            let scale = |to: f64, from: f64| if from > 1e-9 { to / from } else { 1.0 };
++            let mut path = figcraft_doc::geometry::shape_path(n)?;
++            path.apply_affine(Affine::scale_non_uniform(scale(w, n.width), scale(h, n.height)));
++            Some(path)
++        }
++        _ => {
++            let mut n = n.clone();
++            (n.width, n.height) = (w, h);
++            figcraft_doc::geometry::shape_path(&n)
++        }
++    });
++    let mut path = own.unwrap_or_else(|| figcraft_geom::rounded_rect(w, h, [0.0; 4], 0.0));
++    path.apply_affine(Affine::new([v[0], v[1], v[2], v[3], v[4], v[5]]));
++    path
++}
++
++/// On the canvas, after the document and before this person's own selection and tool overlays: the others' gestures in
++/// progress, their selections, their pointers with their names. Hands this person's pointer to the session first.
++pub(crate) fn draw(app: &FigApp, painter: &Painter) {
++    let ctx = painter.ctx();
++    let at = ctx.input(|i| i.pointer.hover_pos()).filter(|p| app.canvas.rect.contains(*p)).map(|p| app.to_page(p));
 +    live::point(at.map(|p| (p.x, p.y)));
++    let others = live::others(&app.session);
 +    let Ok(ds) = app.session.ds() else { return };
-+    for other in live::others(&app.session) {
-+        let [r, g, b] = other.color;
-+        let fill = Color32::from_rgb(r, g, b);
-+        for id in other.selection.iter().take(MAX_OUTLINES) {
-+            if let Some(q) = crate::canvas::node_quad(app, &ds.doc, *id) {
-+                painter.add(Shape::closed_line(q.to_vec(), Stroke::new(1.5, fill)));
++    SHOWN.with_borrow_mut(|shown| {
++        // Someone back on this page shows at once where they are.
++        shown.retain(|id, _| others.iter().any(|o| o.id == *id));
++        if others.is_empty() {
++            return;
++        }
++        let dt = f64::from(ctx.input(|i| i.stable_dt).clamp(0.0, 0.1));
++        let k = if app.reduce_motion() { 1.0 } else { 1.0 - (-dt / EASE).exp() };
++        let far = f64::from(app.canvas.rect.width().min(app.canvas.rect.height())) / 4.0;
++        let px = ds.view.zoom.max(1e-9);
++        let screen = |p: &Point| app.to_screen(p.x, p.y);
++        let mut moving = false;
++        for o in &others {
++            let (s, color) = (shown.entry(o.id.clone()).or_default(), rgb(o.color));
++            // Layers moved, resized or turned: in their own shape where they are so far.
++            let mut ghosts = Vec::new();
++            for g in &o.ghosts {
++                let t = [g.m[0], g.m[1], g.m[2], g.m[3], g.m[4], g.m[5], g.w, g.h];
++                let mut v = s.ghosts.iter().find(|(key, _)| *key == g.key).map_or(t, |(_, v)| *v);
++                let size = g.w.max(g.h).max(1.0) * px;
++                moving |= ease(&mut v, t, k, [size, size, size, size, px, px, px, px], far);
++                ghost(painter, rings(&outline(&ds.doc, g, v), px).iter().map(|r| r.iter().map(screen).collect()).collect(), color);
++                ghosts.push((g.key.clone(), v));
++            }
++            s.ghosts = ghosts;
++            // Shapes being drawn and selection boxes: dashed, drawn into their box as it eases.
++            let target = bounds(&o.bands);
++            moving |= step(&mut s.frame, target, k, [px; 4], far);
++            if let Some((from, to)) = target.zip(s.frame) {
++                let at = fit(from, to);
++                for band in &o.bands {
++                    let band: Vec<Pos2> = band.iter().map(|p| screen(&(at * *p))).collect();
++                    painter.extend(Shape::dashed_line(&band, Stroke::new(1.5, color), 4.0, 3.0));
++                }
++            }
++            // Strokes: their newest point eases.
++            let mut strokes = o.strokes.clone();
++            let head = strokes.last().and_then(|l| l.last()).map(|p| [p.x, p.y]);
++            moving |= step(&mut s.head, head, k, [px; 2], far);
++            if let (Some(last), Some([x, y])) = (strokes.last_mut().and_then(|l| l.last_mut()), s.head) {
++                *last = Point::new(x, y);
++            }
++            for l in &strokes {
++                stroke(painter, l.iter().map(screen).collect(), (o.width * px).clamp(2.0, 400.0) as f32, color);
++            }
++            // Where a layer dragged in auto layout would go.
++            if let Some([a, b]) = o.line {
++                painter.line_segment([screen(&a), screen(&b)], Stroke::new(2.0, color));
 +            }
 +        }
-+        if let Some((x, y)) = other.pointer {
-+            let tip = app.to_screen(x, y);
-+            pointer(painter, tip, fill);
-+            if !other.name.is_empty() {
-+                name_tag(painter, tip + vec2(12.0, 16.0), Align2::LEFT_TOP, &other.name, fill);
++        // Selected layers, outlined as the canvas outlines this person's own.
++        for o in &others {
++            for q in o.selection.iter().filter_map(|id| crate::canvas::node_quad(app, &ds.doc, *id)) {
++                painter.add(Shape::closed_line(q.to_vec(), Stroke::new(2.0, rgb(o.color))));
 +            }
++        }
++        // Pointers, with their names.
++        for o in &others {
++            let s = shown.entry(o.id.clone()).or_default();
++            moving |= step(&mut s.pointer, o.pointer.map(|(x, y)| [x, y]), k, [px; 2], far);
++            if let Some([x, y]) = s.pointer {
++                pointer(painter, app.to_screen(x, y), rgb(o.color), &o.name);
++            }
++        }
++        if moving {
++            ctx.request_repaint();
++        }
++    });
++}
++
++/// Outlines being moved or changed (screen points): the closed ones filled with `color` at 28%, all edged at 85%.
++fn ghost(painter: &Painter, rings: Vec<Vec<Pos2>>, color: Color32) {
++    let closed = |r: &&Vec<Pos2>| r.len() > 3 && r.first() == r.last();
++    fill(painter, rings.iter().filter(closed), alpha(color, 0.28));
++    let edge = Stroke::new(1.5, alpha(color, 0.85));
++    for r in rings.into_iter().filter(|r| r.len() >= 2) {
++        match closed(&&r) {
++            true => painter.add(Shape::closed_line(r[..r.len() - 1].to_vec(), edge)),
++            false => painter.add(Shape::line(r, edge)),
++        };
++    }
++}
++
++/// The inside of closed polylines (screen points, even-odd), in rows a point high across what the painter shows.
++fn fill<'a>(painter: &Painter, rings: impl Iterator<Item = &'a Vec<Pos2>>, color: Color32) {
++    let edges: Vec<(Pos2, Pos2)> = rings.flat_map(|r| r.windows(2).map(|w| (w[0], w[1]))).collect();
++    // ponytail: every edge per row; an active-edge table if ghosts of many complex layers get slow.
++    if edges.is_empty() || edges.len() > 4_000 {
++        return;
++    }
++    let clip = painter.clip_rect();
++    let (top, bottom) = edges.iter().fold((f32::MAX, f32::MIN), |(t, b), (p, q)| (t.min(p.y).min(q.y), b.max(p.y).max(q.y)));
++    let (mut y, bottom) = (top.max(clip.top()).floor() + 0.5, bottom.min(clip.bottom()));
++    let (mut mesh, mut xs) = (Mesh::default(), Vec::new());
++    while y < bottom {
++        xs.clear();
++        xs.extend(edges.iter().filter(|(p, q)| (p.y <= y) != (q.y <= y)).map(|(p, q)| p.x + (y - p.y) / (q.y - p.y) * (q.x - p.x)));
++        xs.sort_by(f32::total_cmp);
++        for span in xs.chunks_exact(2) {
++            let (x0, x1) = (span[0].max(clip.left()), span[1].min(clip.right()));
++            if x1 > x0 {
++                mesh.add_colored_rect(Rect::from_min_max(pos2(x0, y - 0.5), pos2(x1, y + 0.5)), color);
++            }
++        }
++        y += 1.0;
++    }
++    painter.add(mesh);
++}
++
++/// A stroke being drawn (screen points): `color` at 70%, `width` wide, with round ends.
++fn stroke(painter: &Painter, line: Vec<Pos2>, width: f32, color: Color32) {
++    let color = alpha(color, 0.7);
++    let ends = [(line[0], line[1]), (line[line.len() - 1], line[line.len() - 2])];
++    painter.add(Shape::line(line, Stroke::new(width, color)));
++    for (end, next) in ends {
++        let d = (end - next).normalized();
++        if d.is_finite() && width > 3.0 {
++            let half = (0..=12).map(|i| std::f32::consts::PI * i as f32 / 12.0);
++            painter.add(Shape::convex_polygon(half.map(|a| end + (d.rot90() * a.cos() + d * a.sin()) * width / 2.0).collect(), color, Stroke::NONE));
++        }
++    }
++}
++
++/// The pointer arrow, tip at (0, 0), in points; and the triangles that fill it.
++const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
++const ARROW_FILL: [[u32; 3]; 5] = [[0, 1, 2], [0, 2, 5], [0, 5, 6], [2, 3, 4], [2, 4, 5]];
++/// The most characters of a name tag, its ellipsis included.
++const MAX_NAME: usize = 24;
++
++/// Another person's pointer at `tip`: an arrow in their color with a white edge and a soft shadow, and a tag with
++/// their name.
++fn pointer(painter: &Painter, tip: Pos2, color: Color32, name: &str) {
++    let at = |offset: Vec2| ARROW.map(|[x, y]| tip + offset + vec2(x, y)).to_vec();
++    let filled = |points: Vec<Pos2>, color: Color32| {
++        let mut mesh = Mesh::default();
++        points.into_iter().for_each(|p| mesh.colored_vertex(p, color));
++        ARROW_FILL.into_iter().for_each(|[a, b, c]| mesh.add_triangle(a, b, c));
++        mesh
++    };
++    painter.add(filled(at(vec2(0.0, 1.0)), Color32::from_black_alpha(64)));
++    painter.add(filled(at(Vec2::ZERO), color));
++    painter.add(Shape::closed_line(at(Vec2::ZERO), Stroke::new(1.5, Color32::WHITE)));
++    let name: String = match name.chars().nth(MAX_NAME) {
++        Some(_) => name.chars().take(MAX_NAME - 1).chain(['…']).collect(),
++        None => name.into(),
++    };
++    if name.is_empty() {
++        return;
++    }
++    // Relative luminance: dark ink on light colors.
++    let c = egui::Rgba::from(color);
++    let ink = if 0.2126 * c.r() + 0.7152 * c.g() + 0.0722 * c.b() > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE };
++    let text = painter.layout_no_wrap(name, semibold(12.0), ink);
++    let tag = Rect::from_min_size(tip + vec2(12.0, 15.0), text.size() + vec2(14.0, 6.0));
++    painter.rect_filled(tag, CornerRadius::same(6), color);
++    painter.galley(tag.min + vec2(7.0, 3.0), text, ink);
++}
++
++/// Dots at the bottom of a tab (`r`, of open file `uid`) in the colors of the others on its file.
++pub(crate) fn tab(ui: &Ui, uid: u64, r: Rect) {
++    let here = live::here(uid);
++    let left = r.center().x - 4.0 * (here.len().max(1) - 1) as f32;
++    for (k, color) in here.into_iter().enumerate() {
++        ui.painter().circle(pos2(left + 8.0 * k as f32, r.bottom() - 6.0), 3.0, rgb(color), Stroke::new(1.0, Color32::WHITE));
++    }
++}
++
++/// Home's "In this session": the session's files closed here, a row each that opens it again.
++pub(crate) fn home(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
++    let closed = live::closed();
++    if closed.is_empty() {
++        return;
++    }
++    ui.add_space(28.0);
++    ui.label(egui::RichText::new("In this session").font(semibold(12.0)).color(t.text_secondary));
++    ui.add_space(12.0);
++    for (id, name) in closed {
++        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width().min(640.0), 36.0), Sense::hover());
++        let resp = ui.interact(r, ui.id().with(("in this session", id)), Sense::click());
++        let row = crate::home::FileRow { mark: Some((crate::icons::Icon::Logo, ACCENT)), name: &name, ink: t.text, detail: "", detail_size: 11.0, detail_ink: t.text_secondary };
++        crate::home::file_row(ui, t, r, &resp, &row);
++        if resp.clicked() {
++            live::reopen(&mut app.session, id);
++            app.ui.home = false;
 +        }
 +    }
 +}

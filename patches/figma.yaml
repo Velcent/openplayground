@@ -7,18 +7,20 @@
     session.prefs.theme = if dark { "dark" } else { "light" }.into();
 
 # Live editing in Playground sessions (patches/figma/live.diff + patches/live/playground_live.rs)
-# What it's for: people in a Playground session edit one design together and see each other's pointer and selected
-#   layers on the page they look at, in each person's color.
-# How: the adapter lives in new files: crates/engine/src/live_playground.rs (the shared document, which is the
-#   collaboration core's snapshot, merge, adopt, Undo, presence; it declares the template, copied next to it),
-#   crates/ui-egui/src/live/playground.rs (this person's pointer, and the others' drawn with a native live session's
-#   pointer, name tag and outline) and apps/figcraft-web/src/web/playground.rs (the kept runner and the app that ends
-#   each frame with the session's frame hook). These rules only declare them and call in, each one line at the end of
-#   a file or right after a function's signature.
+# What it's for: people in a Playground session edit the design files open in it together (each one a tab, renaming
+#   shared, closing personal), typing as it is typed, and see each other's pointer, selected layers and gestures in
+#   progress (moves, resizes, shapes being drawn, pencil and pen strokes) on the page they look at, in each person's
+#   color, with dots on the tabs for who is on each file.
+# How: the adapter lives in new files: crates/engine/src/live_playground.rs (the shared files, each the collaboration
+#   core's snapshot, merge, adopt, Undo, presence with the gesture in progress; it declares the template, copied next to
+#   it), crates/ui-egui/src/live/playground.rs (this person's pointer, the others' marks over the canvas in the shared
+#   look, tab dots, Home's "In this session") and apps/figcraft-web/src/web/playground.rs (the kept runner and the app
+#   that ends each frame with the session's frame hook). These rules only declare them and call in, each one line at
+#   the end of a file, right after a function's signature, or before a stable line of the canvas, tab strip and Home.
 # Verify: node scripts/build.mjs check figma head|release (and LIVE=0), then the e2e (tests/live-apps/figma.mjs) and
 #   `cargo test -p figcraft-engine --lib live_playground`.
 # If upstream changes: if a function named below is renamed, anchor on its new signature; if WebShell or its `fig`
-#   field is renamed, follow it in web/playground.rs.
+#   field is renamed, follow it in web/playground.rs; if a line anchored on moves, anchor on its new place (same role).
 #
 # The engine's adapter module (web, and its native tests), and the template's wasm dependencies under a target
 # spelling nobody else uses.
@@ -44,16 +46,25 @@
   file: crates/engine/src/branches.rs
   find: 'fn\s+refuse_live\s*\([^{]*\{'
   after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] crate::live_playground::refuse_branches(s, cmd, uid)?;"
-# The canvas's live drawing (others' cursors and selections), which first hands this person's pointer to the session
-# and draws the others in it.
+# The Playground drawing (crates/ui-egui/src/live/playground.rs): the others' marks on the canvas, after the document
+# and before this person's own selection and tool overlays (it first hands this person's pointer to the session); dots
+# on each tab for the others on its file; Home's "In this session" (the session's files closed here) after Open files.
 - live: true
   file: crates/ui-egui/src/live.rs
   find: '(?![\s\S])'
-  after: "\n// Live editing in a Playground session (web only).\n#[cfg(target_arch = \"wasm32\")]\nmod playground;\n"
+  after: "\n// Live editing in a Playground session (web only).\n#[cfg(target_arch = \"wasm32\")]\npub(crate) mod playground;\n"
 - live: true
-  file: crates/ui-egui/src/live.rs
-  find: 'pub\s+fn\s+draw\s*\([^{]*\{'
-  after: "\n    #[cfg(target_arch = \"wasm32\")] playground::draw(app, painter);"
+  file: crates/ui-egui/src/canvas.rs
+  find: '^[ \t]*(?:app\.session\.tool\.labels\s*=\s*)?overlays\(\s*app\b'
+  before: "    #[cfg(target_arch = \"wasm32\")] crate::live::playground::draw(app, &painter);\n"
+- live: true
+  file: crates/ui-egui/src/tabs.rs
+  find: '^[ \t]*x\s*\+=\s*w;'
+  before: "            #[cfg(target_arch = \"wasm32\")] crate::live::playground::tab(ui, d.uid, r);\n"
+- live: true
+  file: crates/ui-egui/src/home.rs
+  find: '^[ \t]*let\s+recents\s*=\s*app\.session\.prefs\.recent_files\b'
+  before: "    #[cfg(target_arch = \"wasm32\")] crate::live::playground::home(app, ui, t);\n"
 # The web entry keeps its runner for the adapter and wraps its app (web/playground.rs, a child module so it reaches
 # WebShell's fields).
 - live: true
