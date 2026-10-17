@@ -1,12 +1,12 @@
 diff --git a/apps/soundcraft-web/src/web/live.rs b/apps/soundcraft-web/src/web/live.rs
 new file mode 100644
-index 0000000..ad9191a
+index 0000000..67aa2cc
 --- /dev/null
 +++ b/apps/soundcraft-web/src/web/live.rs
 @@ -0,0 +1,79 @@
 +//! Live editing in a Playground session: the page's runner, kept for the session to reach the app, and the shell
-+//! around [`WebShell`] that ends each frame with the others drawn over the Mix window and plug-in windows, then the
-+//! session's frame hook.
++//! around [`WebShell`] that ends each frame with the others drawn over the Mix window, plug-in windows and the MIDI
++//! Editor's velocity lane, then the session's frame hook.
 +
 +use super::WebShell;
 +use soundcraft_model::playground_live;
@@ -85,10 +85,10 @@ index 0000000..ad9191a
 +}
 diff --git a/crates/ui-egui/src/edit_window/live.rs b/crates/ui-egui/src/edit_window/live.rs
 new file mode 100644
-index 0000000..c22a64c
+index 0000000..aa2e055
 --- /dev/null
 +++ b/crates/ui-egui/src/edit_window/live.rs
-@@ -0,0 +1,1008 @@
+@@ -0,0 +1,1243 @@
 +//! Live editing in a Playground session (web only). The shared document is the session without anyone's views: no
 +//! Edit-window state (`edit`: selection, playhead, zoom, tools, modes, view flags), and per track no height, lane view,
 +//! folder state, pin, record arm or input monitor. Audio reaches everyone as session files, one per source id (the
@@ -99,22 +99,24 @@ index 0000000..c22a64c
 +//! their own zoom and scroll, eased toward where they last were. Over the Edit window's tracks: clips being moved or
 +//! trimmed as ghosts, a fade being drawn or bent, a MIDI clip being drawn as a rubber band, a Pencil stroke on an
 +//! automation lane, a time selection being dragged, the playhead while playing or scrubbing. In the MIDI Editor: the
-+//! selected notes and those being dragged. Over the Mix window's strips and over plug-in windows: the pointer. A value
-+//! being set (a fader, pan, trim, send, plug-in parameter, clip gain or velocity) is tagged under the person's name.
++//! selected notes and those being dragged, and over its velocity lane the pointer and the stalks being dragged. Over the
++//! Mix window's strips and over plug-in windows: the pointer. A value being set (a fader, pan, trim, send, plug-in
++//! parameter, clip gain or velocity) is tagged under the person's name; a fader, pan knob or send level also shows as a
++//! ghost on this person's own, its value beside it. Tags go where they show whole.
 +//! A child of the Edit window's module, for its drag preview and lane geometry.
 +
 +use super::{clip_name_height, clip_preview_fades, drag_plan, fade_curve_points, midi_clip_span, ops, plugin_range, rect, sample_at, x_of};
-+use crate::widgets::{db_text, pan_text};
++use crate::widgets::{db_text, fader_slot, pan_text};
 +use crate::{Gesture, MainWindow, SoundApp};
 +use egui::emath::GuiRounding as _;
-+use egui::{Color32, Context, Id, LayerId, Order, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
++use egui::{Color32, Context, Galley, Id, LayerId, Order, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
 +use serde::Deserialize as _;
 +use serde_json::{Value, json};
 +use soundcraft_audio_io::{BitDepth, EncodeOptions, FileFormat, SampleFormat};
 +use soundcraft_model::playground_live::{self, Live, Presence};
-+use soundcraft_model::{AutoParam, ClipContent, ClipId, EditState, Fade, Session, Source, SourceAudio, SourceId, Track, TrackId};
++use soundcraft_model::{AutoParam, ClipContent, ClipId, EditState, Fade, Session, Source, SourceAudio, SourceId, Track, TrackId, fader_db_to_pos};
 +use std::cell::{Cell, RefCell};
-+use std::collections::HashMap;
++use std::collections::{BTreeMap, HashMap};
 +use std::sync::Arc;
 +
 +thread_local! {
@@ -139,11 +141,17 @@ index 0000000..c22a64c
 +const GHOST: f32 = 0.28;
 +const GHOST_EDGE: f32 = 0.85;
 +const STROKE: f32 = 0.7;
++/// A tag's padding.
++const PAD: Vec2 = vec2(7.0, 3.0);
++/// How long a control's ghost stays after they let go (seconds): until the change itself has most likely arrived.
++const LINGER: f64 = 0.6;
 +
-+/// Another person, with their marks as drawn last by kind (see [`ease`]): the pass and where.
++/// Another person, with their marks as drawn last by kind (see [`ease`]): the pass and where; and the control they set
++/// last (`[command, params]`, its value's tag and when it was last seen).
 +struct Other {
 +    p: Presence,
 +    marks: HashMap<&'static str, (u64, Vec<[f64; 3]>)>,
++    held: Option<(Value, String, f64)>,
 +}
 +
 +impl Other {
@@ -187,22 +195,28 @@ index 0000000..c22a64c
 +    }
 +}
 +
-+/// A Mix-window strip as drawn: its track, its rect, the area it shows in and its layer.
++/// A Mix-window strip as drawn: its track, its rect, the area it shows in, its layer and its Ui's id (its widgets' ids
++/// derive from it).
 +#[derive(Clone, Copy)]
 +struct Strip {
 +    track: u64,
 +    rect: Rect,
 +    clip: Rect,
 +    layer: LayerId,
++    ui: Id,
 +}
 +
-+/// The MIDI Editor's piano roll as drawn ([`midi`]): the pass, the clip, the roll, and where tick 0 and pitch 0 are with
-+/// the points a tick and a pitch take (pitches go up, so `ky` is below zero: a row is `-ky` tall from `y(pitch)` down).
++/// The MIDI Editor's piano roll as drawn ([`midi`]): the pass, the clip, the roll, its velocity lane (as last laid out),
++/// the layer and area they show in, and where tick 0 and pitch 0 are with the points a tick and a pitch take (pitches
++/// go up, so `ky` is below zero: a row is `-ky` tall from `y(pitch)` down).
 +#[derive(Clone, Copy)]
 +struct Roll {
 +    pass: u64,
 +    clip: u64,
 +    rect: Rect,
++    vel: Option<Rect>,
++    layer: LayerId,
++    area: Rect,
 +    x0: f32,
 +    kx: f32,
 +    y0: f32,
@@ -218,6 +232,16 @@ index 0000000..c22a64c
 +    fn note(&self, [tick, pitch, len]: [f64; 3]) -> Rect {
 +        let (a, b) = (self.at([tick, pitch]), self.at([tick + len, pitch]));
 +        Rect::from_min_max(a + vec2(0.0, 1.0), pos2(b.x.max(a.x + 3.0), a.y - self.ky - 1.0))
++    }
++
++    /// `[tick, velocity]` in velocity lane `vel`, where the editor puts the top of a stalk (a point right of it).
++    fn vel_pos(&self, vel: Rect, [tick, v]: [f64; 2]) -> Pos2 {
++        pos2(self.x0 + tick as f32 * self.kx, vel.max.y - 2.0 - (vel.height() - 4.0) * v as f32 / 127.0)
++    }
++
++    /// `p` in velocity lane `vel` as `[tick, velocity]` (see [`Self::vel_pos`]).
++    fn vel_at(&self, vel: Rect, p: Pos2) -> [f64; 2] {
++        [f64::from((p.x - self.x0) / self.kx).round(), f64::from((vel.max.y - 2.0 - p.y) / (vel.height() - 4.0) * 127.0)]
 +    }
 +}
 +
@@ -262,28 +286,67 @@ index 0000000..c22a64c
 +    painter.extend(Shape::dashed_line(&corners, Stroke::new(1.5, color), 4.0, 3.0));
 +}
 +
++/// The text on a tag in `color`: white, or near black on a light colour.
++fn ink(color: Color32) -> Color32 {
++    let l = egui::Rgba::from(color);
++    if 0.2126 * l.r() + 0.7152 * l.g() + 0.0722 * l.b() > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE }
++}
++
++/// `text` laid out for a tag in `color`, cut to [`MAX_TAG`] characters.
++fn label(painter: &Painter, text: &str, color: Color32) -> Arc<Galley> {
++    let text: String = match text.chars().count() > MAX_TAG {
++        true => text.chars().take(MAX_TAG - 1).chain(['…']).collect(),
++        false => text.to_owned(),
++    };
++    painter.layout_no_wrap(text, crate::theme::bold(12.0), ink(color))
++}
++
++/// A tag of `galley` from `at` (its top left), filled with `color`; its rect.
++fn tag(painter: &Painter, at: Pos2, galley: Arc<Galley>, color: Color32) -> Rect {
++    let r = Rect::from_min_size(at.round_to_pixels(painter.pixels_per_point()), galley.size() + 2.0 * PAD);
++    painter.rect_filled(r, 6.0, color);
++    painter.galley(r.min + PAD, galley, ink(color));
++    r
++}
++
++/// The first of `spots` (top left corners) where a box of `size` shows whole in `area` without covering `avoid`, else
++/// the first where it shows whole, else the first moved as far inside as it goes.
++fn place(area: Rect, size: Vec2, spots: &[Pos2], avoid: Option<Rect>) -> Pos2 {
++    let fits = |p: &&Pos2| area.contains_rect(Rect::from_min_size(**p, size));
++    let clear = |p: &&Pos2| avoid.is_none_or(|a| !a.intersects(Rect::from_min_size(**p, size)));
++    let first = spots.first().copied().unwrap_or(area.min);
++    let inside = || pos2(first.x.min(area.max.x - size.x).max(area.min.x), first.y.min(area.max.y - size.y).max(area.min.y));
++    spots.iter().filter(fits).find(clear).or_else(|| spots.iter().find(fits)).copied().unwrap_or_else(inside)
++}
++
++/// A tag of `text` beside `anchor` (right of it, else left), vertically centred on it; its rect.
++fn tag_beside(painter: &Painter, anchor: Rect, text: &str, color: Color32) -> Option<Rect> {
++    let galley = label(painter, text, color);
++    let size = galley.size() + 2.0 * PAD;
++    let y = anchor.center().y - size.y / 2.0;
++    let at = place(painter.clip_rect(), size, &[pos2(anchor.max.x + 6.0, y), pos2(anchor.min.x - 6.0 - size.x, y)], None);
++    (!text.is_empty()).then(|| tag(painter, at, galley, color))
++}
++
 +/// A pointer at `tip` with a tag of `name` and, under it, one of a `value` being set (the look every Playground app
-+/// shares).
-+fn cursor(painter: &Painter, tip: Pos2, color: Color32, name: &str, value: Option<&str>) {
++/// shares). The tags go below and right of the tip, else (when they would not show whole in the painter's area, or
++/// would cover `avoid`) above it, left of it or both, else as far inside as they go.
++fn cursor(painter: &Painter, tip: Pos2, color: Color32, name: &str, value: Option<&str>, avoid: Option<Rect>) {
 +    const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
 +    // Star-shaped around the tip (its first point), which is what a filled path's triangle fan needs.
 +    let arrow = |d: Vec2| ARROW.iter().map(|&[x, y]| tip + d + vec2(x, y)).collect::<Vec<_>>();
 +    painter.add(Shape::convex_polygon(arrow(vec2(0.0, 1.0)), Color32::from_black_alpha(64), Stroke::NONE));
 +    painter.add(Shape::convex_polygon(arrow(Vec2::ZERO), color, Stroke::new(1.5, Color32::WHITE)));
-+    let l = egui::Rgba::from(color);
-+    let ink = if 0.2126 * l.r() + 0.7152 * l.g() + 0.0722 * l.b() > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE };
-+    let mut at = tip + vec2(12.0, 15.0);
-+    for text in [Some(name), value].into_iter().flatten().filter(|t| !t.is_empty()) {
-+        let text: String = match text.chars().count() > MAX_TAG {
-+            true => text.chars().take(MAX_TAG - 1).chain(['…']).collect(),
-+            false => text.to_owned(),
-+        };
-+        let galley = painter.layout_no_wrap(text, crate::theme::bold(12.0), ink);
-+        let pad = vec2(7.0, 3.0);
-+        let tag = Rect::from_min_size(at.round_to_pixels(painter.pixels_per_point()), galley.size() + 2.0 * pad);
-+        painter.rect_filled(tag, 6.0, color);
-+        painter.galley(tag.min + pad, galley, ink);
-+        at.y = tag.max.y + 2.0;
++    let tags: Vec<_> = [Some(name), value].into_iter().flatten().filter(|t| !t.is_empty()).map(|t| label(painter, t, color)).collect();
++    let width = tags.iter().map(|g| g.size().x + 2.0 * PAD.x).fold(0.0, f32::max);
++    let size = vec2(width, tags.iter().map(|g| g.size().y + 2.0 * PAD.y + 2.0).sum::<f32>() - 2.0);
++    let (right, left, below, above) = (tip.x + 12.0, tip.x - 4.0 - size.x, tip.y + 15.0, tip.y - 4.0 - size.y);
++    let at = place(painter.clip_rect(), size, &[pos2(right, below), pos2(right, above), pos2(left, below), pos2(left, above)], avoid);
++    let mut y = at.y;
++    for galley in tags {
++        // Left of the tip, they line up at their right ends.
++        let x = if at.x < tip.x { at.x + width - galley.size().x - 2.0 * PAD.x } else { at.x };
++        y = tag(painter, pos2(x, y), galley, color).max.y + 2.0;
 +    }
 +}
 +
@@ -355,6 +418,19 @@ index 0000000..c22a64c
 +    tl.contains(p).then_some(p)
 +}
 +
++/// The name of the clip at time `at` on row `row` (as [`pointer_target`] has them), where the Edit window writes it.
++fn clip_name(app: &SoundApp, painter: &Painter, at: f64, row: f64) -> Option<Rect> {
++    let s = app.engine.session();
++    let (id, r) = app.edit_layout.rows.get(row.max(0.0) as usize)?;
++    let t = s.track(TrackId(*id))?;
++    let c = t.clips().iter().find(|c| c.range().contains(at.round() as i64))?;
++    let tl = rect(app.edit_layout.timeline);
++    let lane = Rect::from_min_size(pos2(tl.min.x, r[1]), vec2(tl.width(), t.height.points().min(r[3] - r[1])));
++    let h = clip_name_height(s, lane);
++    let w = painter.layout_no_wrap(c.name.clone(), crate::theme::bold(10.5), Color32::WHITE).size().x;
++    (h > 0.0).then(|| Rect::from_min_size(pos2(x_of(s, tl, c.start).max(tl.min.x) + 4.0, lane.min.y + 1.0), vec2(w, h)))
++}
++
 +/// The value range an automation lane draws `p` over (as `draw_automation` does).
 +fn value_range(track: &Track, p: &AutoParam) -> (f32, f32) {
 +    match p {
@@ -411,7 +487,8 @@ index 0000000..c22a64c
 +                    (points, y, (hi - lo).max(1e-6), lane)
 +                });
 +            let fade = &st["fade"];
-+            let fade = s.find_clip(ClipId(fade["clip"].as_u64().unwrap_or_default())).zip(Fade::deserialize(&fade["fade"]).ok()).zip(fade["in"].as_bool());
++            let fade =
++                s.find_clip(ClipId(fade["clip"].as_u64().unwrap_or_default())).zip(Fade::deserialize(&fade["fade"]).ok()).zip(fade["in"].as_bool());
 +            let ghosts = o.ease("edit.ghosts", ghosts, ctx, px, far, &mut moving);
 +            let rubber = o.ease("edit.band", rubber, ctx, px, far, &mut moving);
 +            let playhead = o.ease("edit.playhead", playhead, ctx, px, far, &mut moving);
@@ -458,7 +535,8 @@ index 0000000..c22a64c
 +            if let Some((mut points, y, span, lane)) = stroke {
 +                // The newest point eases; the others are where the stroke has them.
 +                if let Some(tip) = points.pop() {
-+                    let tip = o.ease("edit.stroke", vec![[tip[0], tip[1], 0.0]], ctx, [px[0], f64::from(lane.height() / span), 0.0], far, &mut moving);
++                    let tip =
++                        o.ease("edit.stroke", vec![[tip[0], tip[1], 0.0]], ctx, [px[0], f64::from(lane.height() / span), 0.0], far, &mut moving);
 +                    points.extend(tip.iter().map(|&[t, v, _]| [t, v]));
 +                }
 +                let line: Vec<Pos2> = points.iter().map(|&[t, v]| pos2(x(t), y(v))).collect();
@@ -492,8 +570,10 @@ index 0000000..c22a64c
 +        for o in others.iter_mut() {
 +            let to: Vec<_> = pointer_target(app, &o.p.state["pointer"]).into_iter().collect();
 +            let tip = o.ease("edit.pointer", to, ctx, px, far, &mut moving);
-+            if let Some(tip) = tip.first().and_then(|&[at, v, _]| edit_pos(app, at, v)) {
-+                cursor(&painter, tip, o.color(), &o.p.name, o.value());
++            if let Some(&[at, v, _]) = tip.first()
++                && let Some(tip) = edit_pos(app, at, v)
++            {
++                cursor(&painter, tip, o.color(), &o.p.name, o.value(), clip_name(app, &painter, at, v));
 +            }
 +        }
 +    });
@@ -508,7 +588,11 @@ index 0000000..c22a64c
 +pub(crate) fn midi(ui: &Ui, clip: ClipId, roll: Rect, x_of: &dyn Fn(i64) -> f32, y_of: &dyn Fn(i32) -> f32) {
 +    let ctx = ui.ctx();
 +    let (x0, y0) = (x_of(0), y_of(0));
-+    let r = Roll { pass: ctx.cumulative_pass_nr(), clip: clip.0, rect: roll, x0, kx: (x_of(960) - x0) / 960.0, y0, ky: y_of(1) - y0 };
++    // The velocity lane comes after this (as the editor laid it out the pass before): end_frame draws over it.
++    let vel = ctx.read_response(ui.id().with(("vel", clip.0))).map(|r| r.rect).filter(|v| v.height() > 4.0 && v.width() > 0.0);
++    let (layer, area) = (ui.layer_id(), ui.clip_rect());
++    let r =
++        Roll { pass: ctx.cumulative_pass_nr(), clip: clip.0, rect: roll, vel, layer, area, x0, kx: (x_of(960) - x0) / 960.0, y0, ky: y_of(1) - y0 };
 +    ROLL.set(Some(r));
 +    if !(r.kx > 0.0 && r.ky < 0.0) {
 +        return;
@@ -543,7 +627,7 @@ index 0000000..c22a64c
 +                .into_iter()
 +                .collect();
 +            if let Some(&[tick, pitch, _]) = o.ease("midi.pointer", to, ctx, px, far, &mut moving).first() {
-+                cursor(&painter, r.at([tick, pitch]), o.color(), &o.p.name, o.value());
++                cursor(&painter, r.at([tick, pitch]), o.color(), &o.p.name, o.value(), None);
 +            }
 +        }
 +    });
@@ -559,22 +643,98 @@ index 0000000..c22a64c
 +        if *at != pass {
 +            (*at, *strips) = (pass, Vec::new());
 +        }
-+        strips.push(Strip { track: track.0, rect, clip: ui.clip_rect(), layer: ui.layer_id() });
++        strips.push(Strip { track: track.0, rect, clip: ui.clip_rect(), layer: ui.layer_id(), ui: ui.id() });
 +    });
 +}
 +
++/// A control another person sets (`[command, params]`, see [`Live::live_presence`]) when it is on strip `s`: which (0 the
++/// fader, 1 + n pan knob n, 100 + n send n), its widget's rect as the strip laid it out (by the id the strip gives it)
++/// and how far along it the value is (0 to 1: the fader's taper, hard left to hard right).
++fn control(ctx: &Context, s: &Strip, c: &Value) -> Option<(f64, Rect, f64)> {
++    let p = &c[1];
++    let widget = |salt: (&str, u64, usize)| ctx.read_response(s.ui.with(salt)).map(|r| r.rect);
++    let num = |k: &str| p[k].as_f64().filter(|v| v.is_finite()).map(|v| v as f32);
++    let n = |k: &str, most: u64| p[k].as_u64().filter(|n| *n < most).map(|n| n as usize);
++    if p["track"].as_u64() != Some(s.track) {
++        return None;
++    }
++    match c[0].as_str()? {
++        "mix.volume" => Some((0.0, ctx.read_response(s.ui.with(("fader", s.track)))?.rect, f64::from(fader_db_to_pos(num("db")?)))),
++        "mix.pan" => {
++            let i = n("index", 2)?;
++            Some((1.0 + i as f64, widget(("pan-value", s.track, i))?, f64::from(num("pan")?.clamp(-1.0, 1.0) + 1.0) / 2.0))
++        }
++        "mix.send_level" => {
++            let slot = n("slot", 10)?;
++            Some((100.0 + slot as f64, widget(("send-value", s.track, slot))?, f64::from(fader_db_to_pos(num("db")?))))
++        }
++        _ => None,
++    }
++}
++
++/// The ghost of a control ([`control`]: `which`, its widget `w`, at `pos`) in `color`: a fader's cap, a pan knob with its
++/// pointer, a send's level mark; the rect to tag (none on a short track's send square, which shows no level).
++fn control_ghost(painter: &Painter, which: f64, w: Rect, pos: f64, color: Color32) -> Option<Rect> {
++    let pos = pos.clamp(0.0, 1.0) as f32;
++    if which == 0.0 {
++        // As widgets::fader draws its cap.
++        let slot = fader_slot(w);
++        let cap = Rect::from_center_size(
++            pos2(slot.center().x, slot.max.y - slot.height() * pos),
++            vec2((w.width() * 0.4).clamp(16.0, 18.0), w.height() - slot.height()),
++        );
++        ghost(painter, cap, 3.0, color);
++        Some(cap)
++    } else if which < 100.0 {
++        // `w` is the knob's readout; the knob (widgets::pan_knob) is centred 25 points above it, 8 narrower.
++        let (c, rad) = (w.center() - vec2(0.0, 25.0), (w.width() - 8.0) * 0.42);
++        let at = std::f32::consts::PI * (0.75 + 1.5 * pos);
++        let d = vec2(at.cos(), at.sin());
++        painter.circle(c, rad, color.gamma_multiply(GHOST), Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE)));
++        painter.line_segment([c + d * rad * 0.15, c + d * (rad - 2.5)], Stroke::new(2.0, color.gamma_multiply(GHOST_EDGE)));
++        Some(Rect::from_center_size(c, Vec2::splat(2.0 * rad)))
++    } else {
++        // `w` is the level icon's hit area (mix_window::send_slot): 3 points either side of the icon, 1 above and below.
++        let well = w.shrink2(vec2(3.0, 1.0)).shrink(1.0);
++        let mark = Rect::from_center_size(pos2(well.center().x, well.max.y - well.height() * pos), vec2(well.width() + 6.0, 4.0));
++        (w.width() < 16.0).then(|| ghost(painter, mark, 1.0, color)).map(|()| well.union(mark))
++    }
++}
++
 +/// The end of a frame (the web app's shell calls it): the others' pointers over the Mix window's strips and over the
-+/// plug-in windows open here too, drawn over them; and where the gesture under way starts in the command journal.
++/// plug-in windows open here too, drawn over them, with ghosts of the faders, pan knobs and send levels they set; their
++/// pointers and the stalks they drag over the MIDI Editor's velocity lane; and where the gesture under way starts in the
++/// command journal.
 +pub fn end_frame(app: &SoundApp, ctx: &Context) {
 +    if !ctx.input(|i| i.pointer.any_down()) {
 +        PRESSED_AT.set(app.engine.journal.len());
 +    }
 +    let strips = STRIPS.with_borrow(|(pass, strips)| if fresh(ctx, *pass) { strips.clone() } else { Vec::new() });
++    let roll = ROLL.get().filter(|r| fresh(ctx, r.pass) && r.kx > 0.0);
++    let now = ctx.input(|i| i.time);
 +    let mut moving = false;
 +    OTHERS.with_borrow_mut(|others| {
 +        for o in others.iter_mut() {
 +            let p = o.p.state["pointer"].clone();
 +            let (x, y) = (fraction(&p["x"]), fraction(&p["y"]));
++            // A fader, pan knob or send level they set (and for a moment after they let go: until the change arrives), as
++            // a ghost on this person's strip for it, its value beside it.
++            if o.p.state["control"].is_array() {
++                o.held = Some((o.p.state["control"].clone(), o.value().unwrap_or_default().to_owned(), now));
++            }
++            o.held = o.held.take().filter(|h| now - h.2 < LINGER);
++            let mut value_tag = None;
++            if let Some((c, value, seen)) = o.held.clone()
++                && let Some((s, (which, w, pos))) = strips.iter().find_map(|s| Some((s, control(ctx, s, &c)?)))
++                && let Some(&[_, _, pos]) = (o
++                    .ease("mix.control", vec![[s.track as f64, which, pos]], ctx, [1.0, 1.0, 100.0], [0.0, 0.0, f64::INFINITY], &mut moving)
++                    .first())
++            {
++                let painter = ctx.layer_painter(s.layer).with_clip_rect(s.clip);
++                value_tag = control_ghost(&painter, which, w, pos, o.color()).and_then(|g| tag_beside(&painter, g, &value, o.color()));
++                moving |= seen < now;
++            }
++            let value = o.value().filter(|_| value_tag.is_none()).map(str::to_owned);
 +            // Over a strip: its place among this person's strips, plus how far across and down it.
 +            let on = p["strip"].as_u64().and_then(|t| strips.iter().position(|s| s.track == t));
 +            let to: Vec<_> = on.zip(x).zip(y).map(|((i, x), y)| [i as f64 + x, y, 0.0]).into_iter().collect();
@@ -585,7 +745,33 @@ index 0000000..c22a64c
 +                    let i = (v.max(0.0) as usize).min(strips.len() - 1);
 +                    let s = strips[i];
 +                    let tip = pos2(s.rect.min.x + (v - i as f64) as f32 * s.rect.width(), s.rect.min.y + y as f32 * s.rect.height());
-+                    cursor(&ctx.layer_painter(s.layer).with_clip_rect(s.clip), tip, o.color(), &o.p.name, o.value());
++                    cursor(&ctx.layer_painter(s.layer).with_clip_rect(s.clip), tip, o.color(), &o.p.name, value.as_deref(), value_tag);
++                }
++            }
++            // Over the MIDI Editor's velocity lane when they edit its clip too: the stalks they drag, and their pointer.
++            if let Some(r) = roll
++                && let Some(vel) = r.vel
++                && o.p.state["midi"]["clip"].as_u64() == Some(r.clip)
++            {
++                let (painter, color) = (ctx.layer_painter(r.layer).with_clip_rect(r.area), o.color());
++                let px = [f64::from(r.kx), f64::from((vel.height() - 4.0) / 127.0), 0.0];
++                let far = [f64::from(r.rect.width()) / 4.0, f64::INFINITY, 0.0];
++                let stalks: Vec<_> = (items(&o.p.state["midi"]["vel"]))
++                    .filter_map(|s| Some([time(&s[0])?, s[1].as_u64().filter(|v| *v <= 127)? as f64, 0.0]))
++                    .collect();
++                for [tick, v, _] in o.ease("midi.vel", stalks, ctx, px, far, &mut moving) {
++                    // As the editor draws a stalk: 3 points wide from the lane's foot, a dot on top.
++                    let top = r.vel_pos(vel, [tick, v]) + vec2(1.0, 0.0);
++                    ghost(&painter.with_clip_rect(vel), Rect::from_min_max(top - vec2(2.0, 0.0), pos2(top.x + 2.0, vel.max.y - 2.0)), 2.0, color);
++                    painter.with_clip_rect(vel).circle(top, 3.5, color.gamma_multiply(GHOST), Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE)));
++                }
++                let to: Vec<_> = (p["clip"].as_u64() == Some(r.clip))
++                    .then(|| Some([time(&p["tick"])?, p["vel"].as_f64().filter(|v| (-10.0..=140.0).contains(v))?, 0.0]))
++                    .flatten()
++                    .into_iter()
++                    .collect();
++                if let Some(&[tick, v, _]) = o.ease("midi.vel.pointer", to, ctx, px, [far[0], f64::from(vel.height()), 0.0], &mut moving).first() {
++                    cursor(&painter, r.vel_pos(vel, [tick, v]), color, &o.p.name, o.value(), None);
 +                }
 +            }
 +            // Over a plug-in window this person has open too: how far across and down it.
@@ -599,7 +785,7 @@ index 0000000..c22a64c
 +                let px = [f64::from(r.width()), f64::from(r.height()), 0.0];
 +                if let Some(&[x, y, _]) = o.ease("plugin.pointer", to, ctx, px, px.map(|p| p / 4.0), &mut moving).first() {
 +                    let tip = r.min + vec2(x as f32 * r.width(), y as f32 * r.height());
-+                    cursor(&ctx.layer_painter(LayerId::new(Order::Middle, id)).with_clip_rect(r), tip, o.color(), &o.p.name, o.value());
++                    cursor(&ctx.layer_painter(LayerId::new(Order::Middle, id)).with_clip_rect(r), tip, o.color(), &o.p.name, value.as_deref(), None);
 +                }
 +            }
 +        }
@@ -610,7 +796,8 @@ index 0000000..c22a64c
 +}
 +
 +/// Where `p` is, in the session's terms: over a plug-in window (`{plugin: [track, slot], x, y}`), a Mix-window strip
-+/// (`{strip: track, x, y}`), the MIDI Editor's roll (`{clip, tick, pitch}`) or the Edit window's tracks ([`pointer_at`]).
++/// (`{strip: track, x, y}`), the MIDI Editor's roll (`{clip, tick, pitch}`) or velocity lane (`{clip, tick, vel}`) or the
++/// Edit window's tracks ([`pointer_at`]).
 +fn pointer(app: &SoundApp, ctx: &Context, p: Pos2) -> Option<Value> {
 +    let across = |r: Rect| [fine((p.x - r.min.x) / r.width()), fine((p.y - r.min.y) / r.height())];
 +    let layer = ctx.layer_id_at(p);
@@ -631,9 +818,15 @@ index 0000000..c22a64c
 +        let [x, y] = across(s.rect);
 +        return Some(json!({"strip": s.track, "x": x, "y": y}));
 +    }
-+    if let Some(r) = ROLL.get().filter(|r| fresh(ctx, r.pass) && r.rect.contains(p) && r.kx > 0.0 && r.ky < 0.0) {
-+        let pitch = (f64::from((p.y - r.y0) / r.ky) * 100.0).round() / 100.0;
-+        return Some(json!({"clip": r.clip, "tick": f64::from((p.x - r.x0) / r.kx).round() as i64, "pitch": pitch}));
++    if let Some(r) = ROLL.get().filter(|r| fresh(ctx, r.pass) && r.kx > 0.0 && r.ky < 0.0) {
++        if r.rect.contains(p) {
++            let pitch = (f64::from((p.y - r.y0) / r.ky) * 100.0).round() / 100.0;
++            return Some(json!({"clip": r.clip, "tick": f64::from((p.x - r.x0) / r.kx).round() as i64, "pitch": pitch}));
++        }
++        if let Some(vel) = r.vel.filter(|v| v.contains(p)) {
++            let [tick, v] = r.vel_at(vel, p);
++            return Some(json!({"clip": r.clip, "tick": tick as i64, "vel": (v * 10.0).round() / 10.0}));
++        }
 +    }
 +    (app.ui.window == MainWindow::Edit || app.ui.mix_separate).then(|| pointer_at(app, p)).flatten()
 +}
@@ -692,8 +885,9 @@ index 0000000..c22a64c
 +    }
 +}
 +
-+/// The MIDI Editor's clip when it shows one: `{clip, notes, ghosts?}`, the selected notes and those being dragged, as
-+/// [tick, pitch, length] (where the editor draws a drag: a move takes the selection along with the grabbed note).
++/// The MIDI Editor's clip when it shows one: `{clip, notes, ghosts?, vel?}`, the selected notes and those being dragged,
++/// as [tick, pitch, length] (where the editor draws a drag: a move takes the selection along with the grabbed note), and
++/// the notes whose velocity the gesture under way set, as [tick, velocity].
 +fn midi_marks(app: &SoundApp, ctx: &Context, state: &mut Value) {
 +    let Some(r) = ROLL.get().filter(|r| fresh(ctx, r.pass)) else { return };
 +    let Some((_, c)) = app.engine.session().find_clip(ClipId(r.clip)) else { return };
@@ -710,6 +904,22 @@ index 0000000..c22a64c
 +            })
 +            .collect();
 +        state["midi"]["ghosts"] = ghosts.into();
++    }
++    if ctx.input(|i| i.pointer.any_down()) {
++        let mut set = BTreeMap::new();
++        for (id, p) in app.engine.journal.get(PRESSED_AT.get()..).into_iter().flatten() {
++            if id == "midi.note_edit"
++                && p["clip"].as_u64() == Some(r.clip)
++                && let (Some(i), Some(v)) = (p["index"].as_u64(), p["velocity"].as_u64())
++            {
++                set.insert(i, v);
++            }
++        }
++        let vel: Vec<_> =
++            set.into_iter().filter_map(|(i, v)| Some(json!([sequence.notes.get(usize::try_from(i).ok()?)?.start, v]))).take(MAX_ITEMS).collect();
++        if !vel.is_empty() {
++            state["midi"]["vel"] = vel.into();
++        }
 +    }
 +}
 +
@@ -746,7 +956,7 @@ index 0000000..c22a64c
 +
 +/// Halves the longest list a gesture grows until the state fits the shell's 4 KiB (a stroke keeps its newest points).
 +fn fit(state: &mut Value) {
-+    const LISTS: [&str; 6] = ["/stroke/points", "/ghosts", "/midi/ghosts", "/midi/notes", "/selection/clips", "/selection/tracks"];
++    const LISTS: [&str; 7] = ["/stroke/points", "/ghosts", "/midi/ghosts", "/midi/notes", "/midi/vel", "/selection/clips", "/selection/tracks"];
 +    while state.to_string().len() > 4000 {
 +        let len = |p: &str| state.pointer(p).and_then(Value::as_array).map_or(0, Vec::len);
 +        let Some(longest) = LISTS.into_iter().max_by_key(|p| len(p)).filter(|p| len(p) > 0) else { return };
@@ -847,9 +1057,9 @@ index 0000000..c22a64c
 +        self.engine.history_limit = limit;
 +    }
 +
-+    /// `{ selection: { tracks, clips, range: [start, end] }, pointer?, playhead?, value?, midi?, ...the Edit window's
-+    /// gesture }` (see [`pointer`], [`edit_gesture`], [`midi_marks`], [`value_text`]; an empty range is the insertion
-+    /// point; the playhead while playing or scrubbing).
++    /// `{ selection: { tracks, clips, range: [start, end] }, pointer?, playhead?, value?, control?, midi?, ...the Edit
++    /// window's gesture }` (see [`pointer`], [`edit_gesture`], [`midi_marks`], [`value_text`]; an empty range is the
++    /// insertion point; the playhead while playing or scrubbing; `control` the command setting a fader, pan or send).
 +    fn live_presence(&self) -> Value {
 +        let s = self.engine.session();
 +        let ctx = self.docking_context.as_ref();
@@ -866,9 +1076,13 @@ index 0000000..c22a64c
 +            midi_marks(self, ctx, &mut state);
 +            let since = PRESSED_AT.get();
 +            if ctx.input(|i| i.pointer.any_down())
-+                && let Some(value) = self.engine.journal.get(since..).and_then(|j| j.iter().rev().find_map(|c| value_text(s, c)))
++                && let Some((c, value)) = self.engine.journal.get(since..).and_then(|j| j.iter().rev().find_map(|c| Some((c, value_text(s, c)?))))
 +            {
 +                state["value"] = value.into();
++                // A fader, pan knob or send level: the others show it on theirs (end_frame).
++                if matches!(c.0.as_str(), "mix.volume" | "mix.pan" | "mix.send_level") {
++                    state["control"] = json!([c.0, c.1]);
++                }
 +            }
 +        }
 +        if self.is_playing() || matches!(self.gesture, Some(Gesture::Scrub { .. })) {
@@ -882,9 +1096,9 @@ index 0000000..c22a64c
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
 +        OTHERS.with_borrow_mut(|was| {
 +            let now = (others.into_iter())
-+                .map(|p| {
-+                    let marks = was.iter_mut().find(|o| o.p.id == p.id).map(|o| std::mem::take(&mut o.marks));
-+                    Other { p, marks: marks.unwrap_or_default() }
++                .map(|p| match was.iter().position(|o| o.p.id == p.id) {
++                    Some(i) => Other { p, ..was.swap_remove(i) },
++                    None => Other { p, marks: HashMap::new(), held: None },
 +                })
 +                .collect();
 +            *was = now;
@@ -894,7 +1108,11 @@ index 0000000..c22a64c
 +    fn live_assets(&self) -> Vec<(String, String, bool)> {
 +        let (s, demo) = (self.engine.session(), soundcraft_engine::demo::cached_demo_session());
 +        let built_in = |id| matches!((s.pool.get(id), demo.pool.get(id)), (Some(a), Some(b)) if Arc::ptr_eq(a, b));
-+        s.sources.iter().filter(|src| !built_in(src.id)).map(|src| (src.id.0.to_string(), format!("{}.wav", src.name), s.pool.contains(src.id))).collect()
++        s.sources
++            .iter()
++            .filter(|src| !built_in(src.id))
++            .map(|src| (src.id.0.to_string(), format!("{}.wav", src.name), s.pool.contains(src.id)))
++            .collect()
 +    }
 +
 +    /// Every source id (the demo's too, which `live_assets` leaves out: nobody shares it).
@@ -1065,6 +1283,23 @@ index 0000000..c22a64c
 +        let (from_track, to_track) = (TrackId(ids[0]), TrackId(ids[1]));
 +        app.gesture = Some(Gesture::MoveClips { clips: vec![ClipId(10)], grab_at: 1000, delta: 480, from_track, to_track });
 +        assert_eq!(app.live_presence()["ghosts"], json!([[ids[1], 1480, 1980]]));
++    }
++
++    #[test]
++    fn a_velocity_lane_pointer_travels_as_tick_and_velocity_and_lands_where_that_stalk_tops_out() {
++        let app = two_tracks();
++        let roll = |x0: f32, kx: f32, vel: Rect| {
++            let rect = Rect::from_min_max(pos2(x0, 40.0), pos2(vel.max.x, vel.min.y - 4.0));
++            Roll { pass: 0, clip: 7, rect, vel: Some(vel), layer: LayerId::background(), area: Rect::EVERYTHING, x0, kx, y0: 1000.0, ky: -9.0 }
++        };
++        // Half a point a tick from x 100, a 64-point lane: velocity 100 tops out 2 + 60 * 100 / 127 points above its foot.
++        ROLL.set(Some(roll(100.0, 0.5, Rect::from_min_max(pos2(100.0, 500.0), pos2(900.0, 564.0)))));
++        let p = pointer(&app, &egui::Context::default(), pos2(340.0, 562.0 - 60.0 * 100.0 / 127.0)).unwrap();
++        assert_eq!(p, json!({"clip": 7, "tick": 480, "vel": 100.0}));
++        // Another person's editor, a point a tick from x 50 with a 100-point lane.
++        let vel = Rect::from_min_max(pos2(50.0, 600.0), pos2(1250.0, 700.0));
++        let lands = roll(50.0, 1.0, vel).vel_pos(vel, [p["tick"].as_f64().unwrap(), p["vel"].as_f64().unwrap()]);
++        assert!((lands - pos2(530.0, 698.0 - 96.0 * 100.0 / 127.0)).length() < 0.01, "{lands:?}");
 +    }
 +
 +    #[test]

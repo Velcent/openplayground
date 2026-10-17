@@ -3,7 +3,7 @@
 # Live editing in Playground sessions (patches/pro-tools/live.diff + patches/live/playground_live.rs)
 # The adapter lives in new files: crates/ui-egui/src/edit_window/live.rs (the shared document, merge, media, presence,
 # Undo and the session-switch guard) and apps/soundcraft-web/src/web/live.rs (the kept runner and the shell that ends
-# each frame with the session's frame hook and the others drawn over the Mix window and plug-in windows). These rules only declare them and call in; most append at the end of a file or
+# each frame with the session's frame hook and the others drawn over the Mix window, plug-in windows and the MIDI Editor's velocity lane). These rules only declare them and call in; most append at the end of a file or
 # follow a function's signature. Verify: node scripts/build.mjs check pro-tools head|release, then the e2e
 # (tests/live-apps/pro-tools.mjs). If upstream renames a function named below, anchor on its new signature.
 #
