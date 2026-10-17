@@ -9,12 +9,17 @@
     let _ = app.run("window.brightness", serde_json::json!({"brightness": if dark { "dark" } else { "light" }}));
 
 # Live editing in Playground sessions (patches/indesign/live.diff + patches/live/playground_live.rs)
-# The adapter lives in new files: apps/designcraft-web/src/live.rs (the shared document, adopt, ids, presence; it
-# declares the template), apps/designcraft-web/src/web/live.rs (the kept runner and the app that ends each frame with
-# the session's frame hook) and crates/ui-egui/src/canvas/live.rs (the shared document's uid, Undo's hand-off, and the
-# others' pointers and selections drawn on the canvas). These rules only declare them and call in: most append at the
-# end of a file or follow a function's signature. Verify: node scripts/build.mjs check indesign head|release, then the
-# e2e (tests/live-apps/indesign.mjs). If upstream renames a function named below, anchor on its new signature.
+# What it's for: people in a Playground session edit the documents open in it together (every tab opened in the session
+#   is shared; closing one is personal), and see each other's pointer, selected frames and gestures in progress (moves,
+#   resizes, rotations, frames being drawn, Pencil and Pen strokes), in each person's color.
+# How: the adapter lives in new files: apps/designcraft-web/src/live.rs (the session's documents, adopt, ids; it
+#   declares the template), apps/designcraft-web/src/web/live.rs (the kept runner and the app that ends each frame with
+#   the session's frame hook) and crates/ui-egui/src/canvas/live.rs (the session's documents as this person has them,
+#   Undo's hand-off, presence, and the others' marks on the canvas, the tabs and the start screen). These rules only
+#   declare them and call in: most append at the end of a file or follow a function's signature.
+# Verify: node scripts/build.mjs check indesign head|release (and LIVE=0), then the e2e (tests/live-apps/indesign.mjs)
+#   and `cargo test -p designcraft-web live::`.
+# If upstream changes: if a function or line named below is renamed or rewritten, anchor on its new form.
 #
 # The web app's adapter module (with the template), for the browser and the web app's native tests.
 - live: true
@@ -45,13 +50,13 @@
   file: crates/doc/src/lib.rs
   find: 'pub\s+fn\s+alloc\s*\(\s*&mut\s+self\s*\)\s*->\s*u64\s*\{'
   after: "\n        #[cfg(target_arch = \"wasm32\")] if let Some(id) = crate::FRESH_ID.get().and_then(|fresh| fresh(&mut self.next_id)) { return id; }"
-# The shared document may be any open tab, not only the active one.
+# The session's documents may be any open tabs, not only the active one.
 - live: true
   file: crates/engine/src/lib.rs
   find: '(?![\s\S])'
   after: "\n// Live editing in a Playground session: the shared document may be any open one.\nimpl Session { pub fn live_documents_mut(&mut self) -> &mut [DocState] { &mut self.docs } }\n"
-# The canvas's live module; DesignApp::run's first step (Undo and Redo of the shared document go to the session); the
-# others' pointers and selections, drawn first in the tool overlays (over the document and this person's selection).
+# The canvas's live module; DesignApp::run's first step (Undo and Redo of the session's documents go to the session);
+# the others' marks, drawn over the document and under this person's selection (draw_selection's first step).
 - live: true
   file: crates/ui-egui/src/canvas.rs
   find: '(?![\s\S])'
@@ -62,5 +67,15 @@
   after: "\n        #[cfg(target_arch = \"wasm32\")] if crate::canvas::live::undo(self, id) { return Ok(Default::default()); }"
 - live: true
   file: crates/ui-egui/src/canvas.rs
-  find: 'fn\s+draw_tool_overlays\s*\([^{]*\{'
+  find: 'fn\s+draw_selection\s*\([^{]*\{'
   after: "\n    #[cfg(target_arch = \"wasm32\")] live::draw(app, painter, xf);"
+# Each document tab shows dots for the others on its document (before the tab strip moves on to the next tab); the
+# start screen lists the session's documents closed here, to open again (after its community card).
+- live: true
+  file: crates/ui-egui/src/chrome.rs
+  find: '^[ \t]*x\s*\+=\s*w;'
+  before: "        #[cfg(target_arch = \"wasm32\")] crate::canvas::live::tab(app, ui, i, r);\n"
+- live: true
+  file: crates/ui-egui/src/chrome.rs
+  find: '^[ \t]*community_card\(app,\s*ui\);'
+  after: "\n            #[cfg(target_arch = \"wasm32\")] crate::canvas::live::home(app, ui);"
