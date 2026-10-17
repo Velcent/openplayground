@@ -67,7 +67,7 @@ export async function mountShare(bar, app, here) {
         const body = h('div', {class:'pg-share-body'})
         const view = h('div', {class:'pg-choice pg-sharing'},
           h('div', {class:'pg-share-heading'}, h('h2', {class:'pg-title'}, liveAdapter() ? 'Live session' : 'File sharing'), button('Close',()=>done())),
-          h('p', {class:'pg-hint'}, liveAdapter() ? `${app.name} · Edits to this project are shared live. Added samples are not shared yet; Undo reverts only your own edits.` : `${app.name} · Files are copied between participants. Live edits are not shared in this build.`),
+          h('p', {class:'pg-hint'}, liveAdapter() ? `${app.name} · Edits to this project are shared live, with the media they use; Undo reverts only your own edits.` : `${app.name} · Files are copied between participants. Live edits are not shared in this build.`),
           h('label',{},'Your name',name), body, error)
         function live() {
           body.replaceChildren()

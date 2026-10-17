@@ -16,3 +16,12 @@ test('the dedicated web crate wins over the root workspace; root-only apps still
     assert.equal(webDir(src), web)
   } finally { rmSync(src, { recursive: true, force: true }) }
 })
+
+test("a tool's builds and failures leave out a longer slug's that start with its own (lightroom, lightroom-classic)", async () => {
+  const { channelAssets, tools } = await import('../scripts/releases.mjs')
+  const lightroom = tools.find((t) => t.slug === 'lightroom')
+  const assets = ['lightroom-v0.8.0-aaaa.zip', 'lightroom-classic-v0.9.1-bbbb.zip', 'lightroom-head-1234567-cccc.zip', 'lightroom-classic-head-7654321-dddd.zip']
+    .map((name, i) => ({ name, created_at: `2026-10-1${i}T00:00:00Z` }))
+  assert.deepEqual(channelAssets(assets, lightroom, 'release').map((a) => a.name), ['lightroom-v0.8.0-aaaa.zip'])
+  assert.deepEqual(channelAssets(assets, lightroom, 'head').map((a) => a.name), ['lightroom-head-1234567-cccc.zip'])
+})

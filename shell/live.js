@@ -18,7 +18,10 @@ import { applyDelta, delta } from './document-delta.js'
 const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i])
 const busy = (e) => e === 'busy' || e?.message === 'busy'
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-const RETAINED = 100, MAX_WANTED = 8, PRESENCE_MS = 100, MAX_PRESENCE = 4096
+const RETAINED = 100, MAX_WANTED = 8, PRESENCE_MS = 100, MAX_PRESENCE = 4096, MAX_DEPTH = 16
+// The largest media file installed: the browser holds it about twice while the app takes it.
+const MAX_ASSET = 1024 ** 3
+const depth = (v, d = 0) => d > MAX_DEPTH || !v || typeof v !== 'object' ? d : Math.max(d, ...Object.values(v).map((x) => depth(x, d + 1)))
 const COLORS = ['#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4', '#0fa5b5', '#f032e6', '#9a6324']
 const color = (id) => COLORS[parseInt(id.replaceAll('-', '').slice(-8), 16) % COLORS.length]
 const fileIds = new Map()
@@ -58,11 +61,14 @@ export class LiveDocument extends EventTarget {
     const live = new LiveDocument(session, adapter, store)
     // Connected first: the owner's coordinate() may need the app to apply a stored document.
     adapter.connect({ changed: () => queueMicrotask(() => live.kick()), undo: (redo) => queueMicrotask(() => live.undo(redo)) })
+    live.mine = new Set(await store.media?.().catch(() => null) ?? [])
     if (session.config.owner) await live.coordinate()
     for (const [type, handler] of Object.entries(live.handlers)) session.addEventListener(type, handler)
     for (const peer of session.peers.values()) if (peer.document?.readyState === 'open') live.opened(peer)
     // A snapshot the owner sent before this document listened is gone: ask again.
     live.resync()
+    // The first presence asks the others for theirs: a page whose app attached late missed them.
+    live.presenceHello = true
     if (adapter.presence || adapter.showPresence) live.presenceTimer = setInterval(() => live.presenceTick(), PRESENCE_MS)
     return live
   }
@@ -167,7 +173,8 @@ export class LiveDocument extends EventTarget {
     this.changed()
   }
   closed(peer) {
-    if (this.others.delete(peer.id)) this.presenceDirty = true
+    // A late close from a peer that has reconnected since leaves the new one's presence alone.
+    if (this.session.peers.get(peer.id) === peer && this.others.delete(peer.id)) this.presenceDirty = true
     if (peer.role === 'owner') this.changed()
   }
   resync() {
@@ -180,7 +187,7 @@ export class LiveDocument extends EventTarget {
   // Client. `peer` is null for the coordinator in this browser.
   receive(peer, value) {
     if (this.stopped) return
-    if (peer && value?.type === 'presence') return this.presence(peer, value.state)
+    if (peer && value?.type === 'presence') return this.presence(peer, value.state, value.hello === true)
     if (this.history && peer) {
       if (value?.type === 'propose') this.coordinateProposal(peer.id, value.proposal, (reply) => this.session.sendDocument(peer, reply).catch(() => {}))
       else if (value?.type === 'resync') this.snapshot(peer)
@@ -200,7 +207,8 @@ export class LiveDocument extends EventTarget {
       this.inflight = null
       // Only an edit still in the live document is undone here; a conflict already kept it as a draft.
       if (proposal.kind === 'edit' && inLive) await this.restore(this.acked.bytes)
-      this.report(new Error(`${proposal.kind === 'edit' ? 'Edit kept as a draft' : 'Cannot ' + proposal.kind}: ${value.error}`))
+      // An edit the merge reduced to nothing needs no message: the shared document is what it wanted.
+      if (value.error !== 'No change') this.report(new Error(`${proposal.kind === 'edit' ? 'Edit kept as a draft' : 'Cannot ' + proposal.kind}: ${value.error}`))
     }
     this.kick()
   }
@@ -249,9 +257,16 @@ export class LiveDocument extends EventTarget {
   }
   async introduced(before, after) {
     if (!this.adapter.assetsOf) return
+    // Most apps keep no media: one look at the live document spares parsing both documents.
+    if (before) {
+      const list = await Promise.resolve().then(() => this.adapter.assets?.()).catch(() => null)
+      if (Array.isArray(list) && !list.length) return
+    }
     try {
-      const old = new Set(before ? await this.adapter.assetsOf(before) : [])
+      const old = new Set(before ? await this.adapter.assetsOf(before) : []), size = this.mine.size
       for (const id of await this.adapter.assetsOf(after)) if (!old.has(id)) this.mine.add(id)
+      // Kept with the session, so a reload before they are shared still shares them.
+      if (this.mine.size > size) await this.store.media?.([...this.mine])
     } catch (e) { this.report(e) }
   }
   async merge(before, after) {
@@ -277,27 +292,34 @@ export class LiveDocument extends EventTarget {
   // it has arrived. Coalesced: one pass at a time, at most one more queued.
   syncAssets() {
     if (!this.adapter.assets || this.stopped || this.assetsQueued) return
+    if (Date.now() < this.assetsRetry) return
     this.assetsQueued = true
-    this.assetWork = this.assetWork.then(() => { this.assetsQueued = false; return this.exchangeAssets() })
-      .catch((e) => busy(e) ? setTimeout(() => this.syncAssets(), 100) : this.report(e))
+    this.assetWork = this.assetWork.then(() => { this.assetsQueued = false; return this.exchangeAssets() }).catch((e) => {
+      if (busy(e)) return void setTimeout(() => this.syncAssets(), 100)
+      // Not through report(): its change would start the next pass at once. A failing pass waits a few seconds.
+      this.error = `Shared media: ${e?.message ?? e}`; this.dispatchEvent(new Event('change'))
+      this.assetsRetry = Date.now() + 5000; setTimeout(() => this.syncAssets(), 5000)
+    })
   }
   async exchangeAssets() {
     if (this.status !== 'live' && this.status !== 'read-only') return
-    const files = new Map(this.session.files.map((f) => [f.id, f])), share = [], ids = []
+    const files = new Map(this.session.files.map((f) => [f.id, f]))
     for (const { id, name, have } of await this.adapter.assets()) {
       const file = files.get(await fileId(id))
-      if (have && !file && this.editable && this.mine.has(id)) { share.push(new File([await this.adapter.readAsset(id)], fileName(name))); ids.push(await fileId(id)) }
-      else if (!have && file) {
-        if (!this.session.accepted) await this.session.receive()
+      // One at a time, so a large catalog is never in memory at once.
+      if (have && !file && this.editable && this.mine.has(id)) await this.session.share([new File([await this.adapter.readAsset(id)], fileName(name))], [await fileId(id)])
+      else if (!have && file && file.size <= MAX_ASSET) {
+        // Only this file: the session's other files still wait for the person to accept them.
+        if (!this.session.accepted) await this.session.receiveFiles([file.id])
         if (this.session.available.has(file.asset)) await this.adapter.writeAsset(id, file.name, new Uint8Array(await (await this.session.store.file(file.asset)).arrayBuffer()))
       }
     }
-    if (share.length) await this.session.share(share, ids)
   }
   // Presence, ten times a second at most: this person's, when it changed (to everyone again when someone arrives), and
   // the others' as the app shows them.
-  presence(peer, state) {
-    if (JSON.stringify(state ?? null).length > MAX_PRESENCE) return
+  presence(peer, state, hello) {
+    if (hello) this.presenceSent = null
+    if (JSON.stringify(state ?? null).length > MAX_PRESENCE || depth(state) > MAX_DEPTH) return
     this.others.set(peer.id, state ?? null); this.presenceDirty = true
   }
   presenceTick() {
@@ -306,10 +328,14 @@ export class LiveDocument extends EventTarget {
       const text = JSON.stringify(this.adapter.presence?.() ?? null)
       if (text !== this.presenceSent && text.length <= MAX_PRESENCE) {
         this.presenceSent = text
+        const hello = this.presenceHello === true
+        this.presenceHello = false
         for (const peer of this.session.peers.values()) {
-          if (peer.document?.readyState === 'open') this.session.sendDocument(peer, { type: 'presence', state: JSON.parse(text) }).catch(() => {})
+          if (peer.document?.readyState === 'open') this.session.sendDocument(peer, { type: 'presence', state: JSON.parse(text), hello }).catch(() => {})
         }
       }
+      // Someone whose connection dropped without a close event goes too.
+      for (const id of this.others.keys()) if (this.session.peers.get(id)?.document?.readyState !== 'open') { this.others.delete(id); this.presenceDirty = true }
       if (this.presenceDirty) {
         this.adapter.showPresence?.([...this.others].map(([id, state]) => ({ id, name: this.session.peers.get(id)?.name ?? '', color: color(id), state })))
         this.presenceDirty = false

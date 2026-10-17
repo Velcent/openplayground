@@ -87,9 +87,10 @@ class Hub {
       for (const s of this.sessions.values()) { if (s.accepted) for (const f of s.files) s.available.add(f.asset); s.dispatchEvent(new Event('change')) }
     }
     session.receive = async () => { session.accepted = true; for (const f of session.files) session.available.add(f.asset); session.dispatchEvent(new Event('change')) }
+    session.receiveFiles = async (wanted) => { for (const f of session.files) if (wanted.includes(f.id)) session.available.add(f.asset); session.dispatchEvent(new Event('change')) }
     this.sessions.set(id, session)
     const others = () => [...this.sessions.values()].filter((other) => other !== session)
-    if (linkFirst) { for (const other of others()) this.link(session, other); await sleep(50) }
+    if (linkFirst) { for (const other of others()) this.link(session, other); await sleep(250) }
     const live = session.live = await LiveDocument.start({ session, adapter: app, store })
     if (!linkFirst) for (const other of others()) this.link(session, other)
     return { session, app, live, store }
@@ -295,6 +296,7 @@ test('media reach the people who lack them, shared only by whoever added them to
   const owner = await hub.join(o, 'owner', ownerApp), editor = await hub.join(e, 'editor', editorApp)
   await live(owner, editor)
   await eventually(async () => assert.deepEqual(await bytes(editorApp, 'photo-1'), [1, 2, 3]))
+  assert.equal(editor.session.accepted, false, 'the session\'s other files still wait for the editor to accept them')
   editorApp.edit(0, 1)
   editorApp.media.set('photo-2', new Blob([Uint8Array.of(9)]))
   editorApp.edit(2, 1)
@@ -314,5 +316,8 @@ test('presence reaches the others, stays out of the document, and goes when they
   assert.deepEqual(values(owner, editor), [[0, 0, 0], [0, 0, 0]])
   hub.drop(e)
   await eventually(() => assert.deepEqual(ownerApp.shown, []))
+  // A page whose app attached late still gets the others' presence (its first one asks for theirs).
+  const late = await hub.join(crypto.randomUUID(), 'viewer', Object.assign(new App(), { here: null }), undefined, { linkFirst: true })
+  await eventually(() => assert.deepEqual(late.app.shown?.map((p) => p.state), [{ cursor: [1, 2] }]))
   owner.live.stop()
 })

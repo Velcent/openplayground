@@ -178,9 +178,14 @@ jobs:
       # is retried daily and reported after a day.
       - id: fallback
         name: Build without live editing
-        if: steps.build.outcome == 'failure' && steps.rebuild.outcome != 'success' && steps.build.outputs.live == 'true'
+        # Not on push runs: those record no failure, so a build without live editing would never be retried; the
+        # run deploy starts for them gets here instead. It builds the committed patches, not a failed repair's.
+        if: steps.build.outcome == 'failure' && steps.rebuild.outcome != 'success' && steps.build.outputs.live == 'true' && github.event_name != 'push'
         continue-on-error: true
-        run: LIVE=0 node scripts/build.mjs build "$SLUG" "$CHANNEL"
+        run: |
+          git reset -q -- patches && git checkout -q -- patches && git clean -fdq patches
+          rm -f out/*.zip
+          LIVE=0 node scripts/build.mjs build "$SLUG" "$CHANNEL"
 
       - name: Commit the repaired patches
         if: steps.rebuild.outcome == 'success'
@@ -199,8 +204,7 @@ jobs:
           node scripts/build.mjs prune "$SLUG" "$CHANNEL" | xargs -r -n1 gh release delete-asset builds -y
           # Builds again (in full: a build without live editing still counts as failing): clear its failures.
           if [ "${{ steps.fallback.outcome }}" != success ]; then
-            gh release view builds --json assets -q '.assets[].name' | grep -E "^$SLUG-.*\.failed$" | grep -E "^$SLUG-head-" $([ "$CHANNEL" = head ] || echo -v) \
-              | xargs -r -n1 gh release delete-asset builds -y
+            node scripts/build.mjs failures "$SLUG" "$CHANNEL" | xargs -r -n1 gh release delete-asset builds -y
             for n in $(gh issue list --label build-failure --state open --json number,title -q ".[] | select(.title == \"$TITLE\") | .number"); do
               gh issue close "$n" --comment "Builds again: $(basename out/*.zip .zip) in [this run]($RUN_URL)."
             done

@@ -58,6 +58,8 @@ export const resolveVersion = async (t, channel) => {
 export const channelAssets = (assets, t, channel, ext = '.zip') =>
   assets
     .filter((a) => a.name.startsWith(`${t.slug}-`) && a.name.endsWith(ext) && a.name.startsWith(`${t.slug}-head-`) === (channel === 'head'))
+    // lightroom-classic's builds are not lightroom's: a longer slug that starts with this one owns its names.
+    .filter((a) => !tools.some((o) => o.slug.length > t.slug.length && a.name.startsWith(`${o.slug}-`)))
     .sort((a, b) => b.created_at.localeCompare(a.created_at))
 
 // Assets of the builds release (none yet if it doesn't exist).

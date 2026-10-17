@@ -9,6 +9,7 @@
 //   node scripts/build.mjs check <slug> <channel>  # quick check: the patches apply and the app compiles
 //   node scripts/build.mjs facts <slug> <channel>  # GitHub Actions output: its build id and failure history
 //   node scripts/build.mjs prune <slug> <channel>  # the published builds to delete (all but the 3 newest)
+//   node scripts/build.mjs failures <slug> <channel>  # its failure markers (build.yml deletes them on a full build)
 //
 // Patch files hold a list of rules; each edits the first file (matching the `file` glob) where the
 // `find` regex matches, and must match, or the build fails:
@@ -210,6 +211,9 @@ if (command === 'plan') {
   console.log(`failed_today=${failures.some((a) => age(a) < DAY)}`)
   console.log(`failed_before=${failures.some((a) => age(a) > DAY - 3600e3)}`)
   console.log(`live=${hasLive(t)}`)
+} else if (command === 'failures' && slug && CHANNELS.includes(channel)) {
+  // The channel's failure markers, for build.yml to delete once it builds again in full.
+  for (const a of channelAssets(await builtAssets(), toolFor(slug), channel, '.failed')) console.log(a.name)
 } else if (command === 'prune' && slug && CHANNELS.includes(channel)) {
   // Everything but the channel's newest build: fetch only ever installs that one.
   for (const a of channelAssets(await builtAssets(), toolFor(slug), channel).slice(1)) console.log(a.name)
@@ -223,6 +227,6 @@ if (command === 'plan') {
 } else if (command === 'tidy' && slug) {
   tidyDiffs(toolFor(slug))
 } else if (process.argv[1] === import.meta.filename) {
-  console.error('usage: node scripts/build.mjs plan | tidy <slug> | build|check|source|facts|prune <slug> release|head')
+  console.error('usage: node scripts/build.mjs plan | tidy <slug> | build|check|source|facts|prune|failures <slug> release|head')
   process.exit(2)
 }

@@ -57,7 +57,7 @@ export class PeerSession extends EventTarget {
     this.peers = new Map(); this.members = []; this.files = []; this.fileQueue = Promise.resolve(); this.status = 'connecting'; this.progress = { received: 0, total: 0 }
     this.accepted = !!config.accepted
     this.seq = 0; this.epoch = 0; this.generation = null; this.signalQueue = Promise.resolve(); this.downloads = []
-    this.stopped = false; this.requested = null; this.ice = null; this.error = null; this.available = new Set()
+    this.stopped = false; this.requested = null; this.ice = null; this.error = null; this.available = new Set(); this.wanted = new Set()
   }
   changed() { this.dispatchEvent(new Event('change')) }
   fail(error) { if (this.stopped) return; this.error = error.message || 'Peer authentication failed'; this.status = 'failed'; this.changed() }
@@ -329,12 +329,16 @@ export class PeerSession extends EventTarget {
       const entries = new Map(this.files.map(f => [f.id, f]))
       for (const f of await validateManifest(files)) {
         const old = entries.get(f.id)
-        if (old && (old.asset !== f.asset || old.name !== f.name)) throw new Error('Conflicting file version')
+        if (old && (old.asset !== f.asset || old.name !== f.name)) {
+          // Live media go to whoever shares them first; a second version is ignored, not a broken file list.
+          if (f.id.startsWith('live-')) continue
+          throw new Error('Conflicting file version')
+        }
         entries.set(f.id, f)
       }
       const next = await validateManifest([...entries.values()])
       this.files = persist ? await this.store.saveManifest(next) : next
-      if (this.accepted && !this.stopped) { this.scanDownloads = true; this.status = 'syncing' }
+      if ((this.accepted || this.wanted.size) && !this.stopped) { this.scanDownloads = true; this.status = 'syncing' }
     })
     this.fileQueue = merged.catch(() => {})
     return merged
@@ -417,6 +421,12 @@ export class PeerSession extends EventTarget {
     this.accepted = true; this.config.accepted = true
     await this.remember(); await this.prepareDownloads()
   }
+  // Downloads just these files (a live document's media) without accepting the session's other files.
+  async receiveFiles(ids) {
+    const before = this.wanted.size
+    for (const id of ids) this.wanted.add(id)
+    if (this.wanted.size > before) await this.prepareDownloads()
+  }
   async prepareDownloads() {
     this.scanDownloads = true
     await this.pump()
@@ -434,13 +444,13 @@ export class PeerSession extends EventTarget {
     }
   }
   async pump() {
-    if (!this.accepted || this.stopped || this.requested || this.pumping || this.ws?.readyState !== WebSocket.OPEN) return
+    if (!(this.accepted || this.wanted.size) || this.stopped || this.requested || this.pumping || this.ws?.readyState !== WebSocket.OPEN) return
     this.pumping = true
     try {
       if (this.scanDownloads) {
         this.scanDownloads = false
         this.downloads = []; this.available.clear(); this.progress = { received: 0, total: 0 }
-        for (const f of new Map(this.files.map((f) => [f.asset, f])).values()) {
+        for (const f of new Map(this.files.filter((f) => this.accepted || this.wanted.has(f.id)).map((f) => [f.asset, f])).values()) {
           const missing = await this.store.missing(f.asset)
           this.progress.total += f.size
           this.progress.received += f.size - missing.reduce((n, i) => n + Math.min(CHUNK_SIZE, f.size - i * CHUNK_SIZE), 0)
@@ -451,7 +461,7 @@ export class PeerSession extends EventTarget {
       const job = this.downloads.find((d) => d.at < d.indices.length)
       const source = job && [...this.peers.values()].find(p => p.channel?.readyState === 'open' && p.inventory.has(job.asset))
       const pending = [...this.peers.values()].some(p => !['closed','failed'].includes(p.pc.connectionState) && p.channel?.readyState !== 'closed' && !p.inventoryKnown)
-      this.status = job || this.scanDownloads ? 'syncing' : 'ready'
+      this.status = job || this.scanDownloads ? 'syncing' : this.accepted ? 'ready' : 'awaiting acceptance'
       const disconnected = this.peers.size && [...this.peers.values()].every(p => ['closed', 'failed'].includes(p.pc.connectionState) || p.channel?.readyState === 'closed')
       if (disconnected || (job && !source && !pending)) {
         this.status = 'failed'

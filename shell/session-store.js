@@ -123,6 +123,11 @@ export class SessionStore {
     if (value !== undefined) await write(await this.root(), 'connection.json', JSON.stringify(value))
     return readJSON(await this.root(), 'connection.json')
   }
+  // The media this browser brought into the live document: the only ones it shares (live.js).
+  async media(ids) {
+    if (ids !== undefined) await write(await this.root(), 'media.json', JSON.stringify(ids))
+    return readJSON(await this.root(), 'media.json')
+  }
   // The live document's recovery record (the coordinator's journal); written atomically on every commit.
   async document(record) {
     const dir = await this.root()

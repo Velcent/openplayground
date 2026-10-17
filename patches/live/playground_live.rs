@@ -33,7 +33,8 @@ pub trait Live {
     fn live_assets(&self) -> Vec<(String, String, bool)> {
         Vec::new()
     }
-    /// The ids [`Self::live_assets`] would list for `document`. A browser shares only media its own edits added, so
+    /// The ids [`Self::live_assets`] would list for `document`. The document may come from anyone in the session:
+    /// treat ids as data, never as paths to open as they are. A browser shares only media its own edits added, so
     /// another person referring to a file this browser has does not make it share that file.
     fn live_assets_of(_document: &Value) -> Vec<String>
     where
@@ -45,7 +46,9 @@ pub trait Live {
     fn live_read_asset(&self, _id: &str) -> Option<Vec<u8>> {
         None
     }
-    /// Installs an asset someone else shared, without touching the document or the undo history.
+    /// Installs an asset someone else shared, without touching the document or the undo history. `id`, `name` and
+    /// `bytes` come from another person: validate them before they name anything in the app's storage (no path
+    /// traversal) and check the bytes against the id when the id is a content hash.
     fn live_write_asset(&mut self, _id: &str, _name: &str, _bytes: Vec<u8>) {}
     /// This person's presence for the others: a small JSON value (under 4 KiB) such as the pointer in document
     /// coordinates, the selected object ids and the page shown. `Null`: nothing to show.
@@ -642,7 +645,11 @@ pub mod web {
         let app = with_app.clone();
         let disconnect = move || {
             super::disconnect();
-            app(&mut |app: &mut A| app.live_disconnected());
+            app(&mut |app: &mut A| {
+                app.live_disconnected();
+                // The others' pointers go with the session, even when the shell could not clear them.
+                app.live_show_presence(Vec::new());
+            });
         };
         set(
             "disconnect",
