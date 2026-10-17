@@ -34,9 +34,17 @@ test('verified chunks resume out of order and never touch personal files', async
     const personal = await import('/shell/store.js')
     await personal.write('/mine.txt', new Blob(['mine']))
     await personal.flattenOnce()
-    return { missing, hidden, corrupt, matched: restored.every((v, i) => v === bytes[i]), personal: await (await personal.file('/mine.txt')).text(), complete: await again.missing(entry.asset) }
+    let forged = false
+    try { await again.putHashes(entry.asset, [entry.hashes[0], entry.hashes[0], entry.hashes[2]]) } catch { forged = true }
+    // A copy kept by an earlier version (every chunk hash in the file list) opens as before.
+    const dir = await (await (await navigator.storage.getDirectory()).getDirectoryHandle('playground-sessions')).getDirectoryHandle(room)
+    await (await dir.getDirectoryHandle(entry.asset)).removeEntry('hashes.json')
+    const out = await (await dir.getFileHandle('manifest.json')).createWritable(); await out.write(JSON.stringify([entry])); await out.close()
+    const old = new Uint8Array(await (await new SessionStore(room).file(entry.asset)).arrayBuffer())
+    const kept = JSON.parse(await (await (await dir.getFileHandle('manifest.json')).getFile()).text())
+    return { missing, hidden, corrupt, forged, matched: restored.every((v, i) => v === bytes[i]) && old.every((v, i) => v === bytes[i]), moved: !kept[0].hashes, personal: await (await personal.file('/mine.txt')).text(), complete: await again.missing(entry.asset) }
   })
-  assert.deepEqual(result, { missing: [0, 1], hidden: true, corrupt: true, matched: true, personal: 'mine', complete: [] })
+  assert.deepEqual(result, { missing: [0, 1], hidden: true, corrupt: true, forged: true, matched: true, moved: true, personal: 'mine', complete: [] })
 })
 
 test('empty assets and identical names keep independent verified versions', async () => {
@@ -62,7 +70,7 @@ test('a failed completion write never reports a partially stored asset as comple
       return original.apply(this, args)
     }
     let failed = false, hidden = false
-    try { await store.putChunk(entry.asset, 0, new TextEncoder().encode('safe')) } catch { failed = true }
+    try { await store.putChunk(entry.asset, 0, new TextEncoder().encode('safe')) } catch (e) { failed = e.message.startsWith('Not enough storage in this browser') }
     try { await store.file(entry.asset) } catch { hidden = true }
     FileSystemFileHandle.prototype.createWritable = original
     await store.putChunk(entry.asset, 0, new TextEncoder().encode('safe'))
