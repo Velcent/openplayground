@@ -5,7 +5,8 @@
 #   mesh) and see where the others point on the model and which layer they work on, in each person's color.
 # How: the adapter lives in new files: crates/ui/src/app/live.rs (the binary checkpoint's adapter, Undo, the session
 #   guards, presence, the kept runner and the app that ends each frame with the session's frame hook; it declares the
-#   template, copied next to lib.rs), crates/ui/src/app/live/checkpoint.rs (the canonical checkpoint and its merge)
+#   template, copied next to lib.rs), crates/ui/src/app/live/checkpoint.rs (the canonical checkpoint and its merge),
+#   crates/ui/src/app/live/peers.rs (the others drawn: pointers, strokes and pen paths under way, Layers panel marks)
 #   and crates/app/src/session/live.rs (Session::live_adopt: a document from elsewhere, no undo step of its own).
 #   These rules only declare them and call in, each one line at the end of a file or right after a function's
 #   signature (the Undo/Redo buttons' line is the exception).
@@ -69,3 +70,21 @@
   file: crates/ui/src/lib.rs
   find: '(?<=\bstart_web\b[\s\S]*)Ok\(Box::new\((?=\s*SubcraftApp::new\b)'
   replace: 'Ok(app::live::web::wrap('
+# The Layers panel: each row shows the others' marks on it (their selected layer, where a layer they drag would drop,
+# the value of a setting they drag), and the drop marker notes where a layer this person drags would drop. If upstream
+# changes: the first rule goes before the row loop's click check (it needs the row's `resp`, `ts` and `l`), the second
+# after drop_marker's signature.
+- live: true
+  file: crates/ui/src/panels/layers.rs
+  find: '^[ \t]*if\s+resp\.clicked\(\)\s*\{'
+  before: "            #[cfg(target_arch = \"wasm32\")] crate::app::live::row(ui, ts.id, l.id, resp.rect);\n"
+- live: true
+  file: crates/ui/src/panels/layers.rs
+  find: '\bfn\s+drop_marker\s*\([^{]*\{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")] crate::app::live::reorder(target);"
+# The 2D view: the others' pen paths under way, over the image and under this person's own pen path. If upstream
+# changes: insert it before the 2D view's own pen overlay (it needs `painter` and `img_rect`).
+- live: true
+  file: crates/ui/src/panels/uv_view.rs
+  find: '^[ \t]*if\b[^\n]*\bstate\.pen\.preview\b[^\n]*\n[ \t]*crate::pen::draw\(&painter\b'
+  before: "    #[cfg(target_arch = \"wasm32\")] crate::app::live::draw_uv(state, &painter, img_rect);\n"

@@ -35,20 +35,22 @@ index 0000000..2fdd7ce
 +}
 diff --git a/crates/ui/src/app/live.rs b/crates/ui/src/app/live.rs
 new file mode 100644
-index 0000000..43cc08d
+index 0000000..7ac2112
 --- /dev/null
 +++ b/crates/ui/src/app/live.rs
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,621 @@
 +//! Live editing in a Playground session (`shell/live.js` drives it through [`web`]); nothing here runs until the shell
 +//! connects. The shared project is [`checkpoint`]'s canonical binary checkpoint: the layer trees and settings, the
 +//! painted tiles, the images they use and the mesh, without anyone's views (camera, selection, tool, brush, open
 +//! folders, panels). A remote change merges into the project at the end of a quiet frame, keeping this person's views
 +//! and unsent work, and is no step of the native undo history. While connected, Undo and Redo go to the session,
 +//! which reverts only this person's operations, History jumps are off, and New and Open wait for the session's end.
-+//! Presence: each person shares the surface point under their pointer on the model and their texture set and layer;
-+//! the 3D view draws the others' pointers through this person's camera, tagged with their name and layer.
++//! Presence: each person shares the surface point under their pointer on the model and their texture set and layer, and
++//! what they have under way: the stroke they paint (its surface points so far), the pen path they edit (in UV), the
++//! layer setting they drag (its value) and where a layer they drag would drop. [`peers`] draws the others.
 +
 +pub(crate) mod checkpoint;
++mod peers;
 +// The template (patches/live/playground_live.rs, copied next to lib.rs): its JSON merge, canonical form and presence.
 +#[path = "../playground_live.rs"]
 +#[allow(dead_code)]
@@ -56,12 +58,14 @@ index 0000000..43cc08d
 +
 +use std::collections::VecDeque;
 +
-+use egui::{Pos2, Rect, vec2};
++use egui::{Pos2, Rect};
 +use glam::{Vec2, Vec3};
 +use serde_json::{Value, json};
 +use subcraft_app::{Action, Camera, Command};
 +
 +use super::SubcraftApp;
++use subcraft_app::layer_tree::DropTarget;
++use subcraft_core::LayerId;
 +use crate::dialogs::Pending;
 +use crate::state::UiState;
 +use playground_live::Presence;
@@ -89,6 +93,16 @@ index 0000000..43cc08d
 +    /// This person's pointer on the model: as the 3D view drew it this frame, and as of the last frame (shared).
 +    drawn: Option<[f32; 3]>,
 +    pointer: Option<[f32; 3]>,
++    /// The stroke this person paints: its surface points so far, and where the newest was on screen.
++    stroke: Vec<[f32; 3]>,
++    stroke_at: Option<Pos2>,
++    /// A pointer is down; the newest history entry (index, time) as of the last frame none was: a slider drag that
++    /// coalesces into one entry changes it.
++    down: bool,
++    rest: Option<(usize, web_time::Instant)>,
++    /// Where a layer this person drags would drop: as the Layers panel marked it this frame, and as of the last frame.
++    marker: Option<DropTarget>,
++    reorder: Option<DropTarget>,
 +    /// The others, as the shell gave them.
 +    others: Vec<Presence>,
 +    #[cfg(test)]
@@ -194,44 +208,30 @@ index 0000000..43cc08d
 +    state.session.pick(camera, Vec2::new(at.x - rect.min.x, at.y - rect.min.y) * ppp).map(|hit| hit.position)
 +}
 +
-+/// Where the surface point `p` shows in the 3D view at `rect` (in points), and whether the model hides it there.
-+fn screen_point(state: &UiState, camera: &Camera, rect: Rect, ppp: f32, p: Vec3) -> Option<(Pos2, bool)> {
-+    let screen = camera.project(p)?;
-+    let at = rect.min + vec2(screen.x, screen.y) / ppp;
-+    if !rect.contains(at) {
-+        return None;
-+    }
-+    let tolerance = state.session.scene().mesh.bounds.diagonal() * 0.03;
-+    Some((at, state.session.pick(camera, screen.truncate()).is_none_or(|hit| hit.position.distance(p) > tolerance)))
++/// The most points of a stroke or path this person shares (the newest).
++const MAX_POINTS: usize = 200;
++
++/// Notes this person's pointer `at` over the 3D view at `rect`: the surface point under it and, while they paint, the
++/// stroke's points (each at least a pixel on from the last).
++fn note(state: &UiState, camera: &Camera, rect: Rect, ppp: f32, at: Option<Pos2>) {
++    let mine = at.and_then(|at| Some((at, surface_point(state, camera, rect, ppp, at)?)));
++    LIVE.with_borrow_mut(|live| {
++        live.drawn = mine.map(|(_, p)| p.to_array());
++        let Some((at, p)) = mine.filter(|_| state.painting && state.session.is_stroking()) else { return };
++        if live.stroke_at.is_none_or(|last| last.distance(at) * ppp >= 1.0) {
++            if live.stroke.len() == MAX_POINTS {
++                live.stroke.remove(0);
++            }
++            live.stroke.push(p.to_array());
++            live.stroke_at = Some(at);
++        }
++    });
 +}
 +
-+/// Another person's pointer: three finite coordinates of a sane size (remote data).
-+fn point(v: &Value) -> Option<Vec3> {
-+    let c = |i: usize| v.get(i)?.as_f64().filter(|c| c.abs() < 1e9).map(|c| c as f32);
-+    (v.as_array()?.len() == 3).then_some(())?;
-+    Some(Vec3::new(c(0)?, c(1)?, c(2)?))
-+}
-+
-+/// "Name · Layer": their name and the layer they work on, when it is in this document.
-+fn label(state: &UiState, o: &Presence) -> String {
-+    use serde::Deserialize as _;
-+    let layer = subcraft_core::TextureSetId::deserialize(&o.state["page"])
-+        .ok()
-+        .and_then(|ts| state.session.document().texture_set(ts))
-+        .zip(subcraft_core::LayerId::deserialize(&o.state["selection"][0]).ok())
-+        .and_then(|(ts, layer)| ts.find(layer));
-+    match layer {
-+        Some(layer) => format!("{} · {}", o.name, layer.name),
-+        None => o.name.clone(),
-+    }
-+}
-+
-+/// The 3D view's overlays (after the render): this person's pointer on the model is noted for the others, and the
-+/// others' pointers are drawn through this person's camera, each an arrow and a tag in their color (faded where the
-+/// model hides the point).
++/// The 3D view's overlays (after the render): this person's pointer on the model (and stroke) is noted for the others,
++/// and [`peers`] draws the others through this person's camera.
 +#[cfg(target_arch = "wasm32")]
 +pub(crate) fn draw(state: &UiState, painter: &egui::Painter, rect: Rect) {
-+    use egui::{Color32, Shape, Stroke};
 +    if !connected() {
 +        return;
 +    }
@@ -239,26 +239,73 @@ index 0000000..43cc08d
 +    let ppp = ctx.pixels_per_point();
 +    // The 3D view's camera, as viewport::show makes it.
 +    let camera = state.camera.paint_camera([(rect.width() * ppp).round().max(1.0) as u32, (rect.height() * ppp).round().max(1.0) as u32]);
-+    let mine = ctx
-+        .pointer_hover_pos()
-+        .filter(|_| ctx.rect_contains_pointer(painter.layer_id(), rect))
-+        .and_then(|at| surface_point(state, &camera, rect, ppp, at));
-+    LIVE.with_borrow_mut(|live| {
-+        live.drawn = mine.map(|p| p.to_array());
-+        for o in &live.others {
-+            let Some((at, hidden)) = point(&o.state["pointer"]).and_then(|p| screen_point(state, &camera, rect, ppp, p)) else {
-+                continue;
-+            };
-+            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
-+            let color = if hidden { color.gamma_multiply(0.45) } else { color };
-+            let arrow = vec![at, at + vec2(0.0, 15.0), at + vec2(10.0, 10.5)];
-+            painter.add(Shape::convex_polygon(arrow, color, Stroke::new(1.0, Color32::WHITE)));
-+            let text = painter.layout_no_wrap(label(state, o), crate::theme::font(11.0), Color32::WHITE);
-+            let tag = Rect::from_min_size(at + vec2(10.0, 12.0), text.size() + vec2(8.0, 4.0));
-+            painter.rect_filled(tag, 2.0, color);
-+            painter.galley(tag.min + vec2(4.0, 2.0), text, Color32::WHITE);
++    note(state, &camera, rect, ppp, ctx.pointer_hover_pos().filter(|_| ctx.rect_contains_pointer(painter.layer_id(), rect)));
++    if LIVE.with_borrow(|live| peers::draw_3d(state, painter, &camera, rect, &live.others)) {
++        ctx.request_repaint();
++    }
++}
++
++/// The 2D view's overlays (after the image, under this person's own pen path): the others' pen paths on its texture set.
++#[cfg(target_arch = "wasm32")]
++pub(crate) fn draw_uv(state: &UiState, painter: &egui::Painter, image: Rect) {
++    LIVE.with_borrow(|live| peers::draw_uv(state, painter, image, &live.others));
++}
++
++/// A Layers panel row (`layer` of texture set `set`, at `rect`) is drawn: the others' marks on it.
++#[cfg(target_arch = "wasm32")]
++pub(crate) fn row(ui: &egui::Ui, set: subcraft_core::TextureSetId, layer: LayerId, rect: Rect) {
++    LIVE.with_borrow(|live| peers::row(ui.painter(), set, layer, rect, &live.others));
++}
++
++/// The Layers panel marks where the layer this person drags would drop.
++#[cfg(target_arch = "wasm32")]
++pub(crate) fn reorder(target: DropTarget) {
++    LIVE.with_borrow_mut(|live| live.marker = Some(target));
++}
++
++/// `points` rounded to `scale`, the newest [`MAX_POINTS`].
++fn rounded<const N: usize>(points: &[[f32; N]], scale: f64) -> Vec<[f64; N]> {
++    points[points.len().saturating_sub(MAX_POINTS)..].iter().map(|p| p.map(|c| (f64::from(c) * scale).round() / scale)).collect()
++}
++
++/// The first number that differs between two layers' JSON (as `b` has it), named by the field holding it and the
++/// channel it is for.
++fn changed(a: &Value, b: &Value, field: &str, channel: Option<subcraft_core::ChannelKind>) -> Option<(String, Option<subcraft_core::ChannelKind>, f64)> {
++    use serde::Deserialize as _;
++    match (a, b) {
++        (Value::Number(x), Value::Number(y)) if x != y => Some((field.to_owned(), channel, y.as_f64()?)),
++        (Value::Object(x), Value::Object(y)) => {
++            let channel = y.get("channel").and_then(|c| subcraft_core::ChannelKind::deserialize(c).ok()).or(channel);
++            y.iter().find_map(|(k, v)| changed(x.get(k)?, v, k, channel))
 +        }
-+    });
++        (Value::Array(x), Value::Array(y)) => x.iter().zip(y).find_map(|(x, y)| changed(x, y, field, channel)),
++        _ => None,
++    }
++}
++
++/// The layer setting a slider drag is changing (its history entry still coalescing): the layer, and the setting with its
++/// value so far ("Base Color · Opacity 63%").
++fn adjusting(s: &subcraft_app::Session) -> Option<Value> {
++    let h = s.history();
++    // Its merge key names the layer: "opacity:<layer>:…", "fill:<layer>:…", "projection:<layer>", "effect:<layer>:…".
++    let id = LayerId(uuid::Uuid::parse_str(h.current_merge_key()?.split(':').nth(1)?).ok()?);
++    let find = |doc: &subcraft_doc::Document| doc.texture_sets.iter().find_map(|ts| ts.find(id)).map(|l| serde_json::to_value(checkpoint::layer_json(l)).ok());
++    let before = find(&h.entries().get(h.cursor().checked_sub(1)?)?.doc)??;
++    let (field, channel, v) = changed(&before, &find(h.current())??, "", None)?;
++    let value = match field.as_str() {
++        "opacity" => format!("{:.0}%", v * 100.0),
++        f if f.ends_with("_deg") => format!("{v:.0}°"),
++        _ => format!("{v:.2}"),
++    };
++    let mut name = field.trim_end_matches("_deg").replace('_', " ");
++    if let Some(first) = name.get(..1).map(str::to_uppercase) {
++        name.replace_range(..1, &first);
++    }
++    let text = match channel {
++        Some(c) => format!("{} · {name} {value}", c.display_name()),
++        None => format!("{name} {value}"),
++    };
++    Some(json!({ "layer": id, "text": text }))
 +}
 +
 +impl SubcraftApp {
@@ -282,19 +329,70 @@ index 0000000..43cc08d
 +    }
 +
 +    /// This person's presence: the texture set and layer they work on and, while it is on the model, the surface point
-+    /// under their pointer (object space, the same on everyone's mesh).
++    /// under their pointer (object space, the same on everyone's mesh). What they have under way: the stroke they paint
++    /// (`stroke`: its surface points so far, the brush radius in object units and its base colour), the pen path they
++    /// edit (`pen`: its points in UV and its radius as a share of the UV square), the layer setting a slider drag
++    /// changes (`adjust`: the layer and "Setting value") and where a layer they drag would drop (`reorder`).
 +    fn live_presence(&self) -> Value {
-+        let s = self.state.session.selection();
++        let (st, session) = (&self.state, &self.state.session);
++        let s = session.selection();
 +        let mut state = json!({ "page": s.texture_set, "selection": s.layer.into_iter().collect::<Vec<_>>() });
-+        if let Some(p) = LIVE.with_borrow(|live| live.pointer) {
-+            state["pointer"] = json!(p.map(|c| (f64::from(c) * 1e4).round() / 1e4));
++        LIVE.with_borrow(|live| {
++            if let Some(p) = live.pointer {
++                state["pointer"] = json!(p.map(|c| (f64::from(c) * 1e4).round() / 1e4));
++            }
++            if !live.stroke.is_empty() {
++                let r = (f64::from(session.brush_radius()) * 1e6).round() / 1e6;
++                state["stroke"] = json!({ "points": rounded(&live.stroke, 1e4), "size": r });
++                if let Some(c) = session.brush.material.channels.get(&subcraft_core::ChannelKind::BaseColor).filter(|c| c.enabled) {
++                    let [r, g, b] = c.value.0;
++                    let c = egui::Color32::from(egui::Rgba::from_rgb(r, g, b));
++                    state["stroke"]["color"] = format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b()).into();
++                }
++            }
++            let h = session.history();
++            if live.down && live.rest != Some((h.cursor(), h.entries()[h.cursor()].time))
++                && let Some(adjust) = adjusting(session)
++            {
++                state["adjust"] = adjust;
++            }
++            let target = match live.reorder {
++                Some(DropTarget::Above(id)) => Some(("above", id)),
++                Some(DropTarget::Below(id)) => Some(("below", id)),
++                Some(DropTarget::Inside(id)) => Some(("inside", id)),
++                _ => None,
++            };
++            if let Some((at, id)) = target {
++                state["reorder"] = json!([at, id]);
++            }
++        });
++        if st.pen.is_editing()
++            && let Some(path) = st.pen.preview(session)
++            && let Ok(line) = path.polyline(0.002)
++        {
++            // Points at least a texel (at 1024²) apart.
++            let mut kept: Vec<[f32; 2]> = Vec::new();
++            for p in line {
++                if kept.last().is_none_or(|q| Vec2::from_array(*q).distance(p) >= 1e-3) {
++                    kept.push(p.to_array());
++                }
++            }
++            state["pen"] = json!({ "points": rounded(&kept, 1e4), "size": (f64::from(path.radius) * 1e6).round() / 1e6 });
++        }
++        // Within the shell's 4 KiB: the newest points that fit.
++        for key in ["stroke", "pen"] {
++            while state.to_string().len() > 4000
++                && let Some(points) = state.get_mut(key).and_then(|v| v.get_mut("points")).and_then(Value::as_array_mut).filter(|p| p.len() > 1)
++            {
++                points.drain(..points.len() / 4 + 1);
++            }
 +        }
 +        state
 +    }
 +
 +    /// Nothing under way that a remote change would cut short or a checkpoint would catch half done: no pointer down
 +    /// (a stroke, a slider drag still coalescing into one history entry), no pen edit or image still being applied,
-+    /// no text being typed.
++    /// no text being typed (a focused slider or button is nothing under way).
 +    fn live_quiet(&self, ctx: &egui::Context) -> bool {
 +        let s = &self.state;
 +        !ctx.input(|i| i.pointer.any_down())
@@ -303,7 +401,7 @@ index 0000000..43cc08d
 +            && !s.pen.is_editing()
 +            && !s.pen.is_pending()
 +            && !s.asset_preview.is_applying()
-+            && !ctx.egui_wants_keyboard_input()
++            && !ctx.text_edit_focused()
 +    }
 +
 +    /// The end of a frame: the remote changes waiting, then a report if the committed document changed, once quiet.
@@ -314,6 +412,11 @@ index 0000000..43cc08d
 +            live.ctx.get_or_insert_with(|| ctx.clone());
 +            live.busy = !quiet;
 +            live.pointer = live.drawn.take();
++            live.reorder = live.marker.take();
++            live.down = ctx.input(|i| i.pointer.any_down());
++            if !self.state.painting {
++                (live.stroke, live.stroke_at) = (Vec::new(), None);
++            }
 +            if live.connected && quiet { std::mem::take(&mut live.remote) } else { VecDeque::new() }
 +        });
 +        for remote in waiting {
@@ -321,8 +424,12 @@ index 0000000..43cc08d
 +            (remote.done)(result);
 +            ctx.request_repaint();
 +        }
-+        let doc = self.state.session.history().current();
++        let h = self.state.session.history();
++        let doc = h.current();
 +        let changed = LIVE.with_borrow_mut(|live| {
++            if !live.down {
++                live.rest = Some((h.cursor(), h.entries()[h.cursor()].time));
++            }
 +            if !live.connected || !quiet || live.seen.as_ref() == Some(doc) {
 +                return false;
 +            }
@@ -555,7 +662,7 @@ index 0000000..43cc08d
 +mod tests;
 diff --git a/crates/ui/src/app/live/checkpoint.rs b/crates/ui/src/app/live/checkpoint.rs
 new file mode 100644
-index 0000000..648d14a
+index 0000000..2ada60a
 --- /dev/null
 +++ b/crates/ui/src/app/live/checkpoint.rs
 @@ -0,0 +1,931 @@
@@ -994,7 +1101,7 @@ index 0000000..648d14a
 +    out
 +}
 +
-+fn layer_json(l: &Layer) -> LayerV1 {
++pub(super) fn layer_json(l: &Layer) -> LayerV1 {
 +    let blend = l.blend.iter().map(|(&channel, b)| BlendV1 { channel, mode: b.mode, opacity: b.opacity }).collect();
 +    let mask = l.mask.as_ref().map(|m| MaskV1 {
 +        enabled: m.enabled,
@@ -1490,12 +1597,466 @@ index 0000000..648d14a
 +        Ok(Install { doc, resources, mesh: new_mesh })
 +    })
 +}
+diff --git a/crates/ui/src/app/live/peers.rs b/crates/ui/src/app/live/peers.rs
+new file mode 100644
+index 0000000..d08b8ae
+--- /dev/null
++++ b/crates/ui/src/app/live/peers.rs
+@@ -0,0 +1,448 @@
++//! The others in a live session, in their colour. In the 3D view, through this person's camera: the strokes they are
++//! painting (the surface points so far, at their brush width) and the pen paths they are editing, then their pointers
++//! with a "Name · Layer" tag; what the model hides is drawn faint. In the 2D view: their pen paths under way. In the
++//! Layers panel: a frame around the layer each has selected, the line where a layer they drag would drop, and a tag
++//! with the value of a layer setting they are dragging. Presence arrives about ten times a second: pointers and the
++//! newest end of strokes ease toward their latest state in object space, so this person's own orbiting never lags them.
++//! Everything in a state comes from another person: what doesn't read as ids or numbers in range is skipped.
++// The painting is web only (the hooks are); native tests use the projections.
++#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
++
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::sync::Arc;
++
++use egui::{Color32, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2 as V2, vec2};
++use glam::{Vec2, Vec3};
++use serde::Deserialize as _;
++use serde_json::Value;
++use subcraft_app::Camera;
++use subcraft_app::layer_tree::DropTarget;
++use subcraft_core::{LayerId, TextureSetId};
++
++use super::Presence;
++use crate::state::UiState;
++
++/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
++const EASE: f32 = 0.08;
++/// The most points of a remote path (twice what a presence carries).
++const MAX_POINTS: usize = 400;
++
++/// `N` finite numbers of a sane size (remote data).
++fn coords<const N: usize>(v: &Value) -> Option<[f32; N]> {
++    let v = v.as_array().filter(|v| v.len() == N)?;
++    let mut out = [0.0; N];
++    for (o, c) in out.iter_mut().zip(v) {
++        *o = c.as_f64().filter(|c| c.abs() < 1e9)? as f32;
++    }
++    Some(out)
++}
++
++/// Another person's pointer: a point on the model in object space.
++pub(super) fn point(v: &Value) -> Option<Vec3> {
++    coords::<3>(v).map(Vec3::from_array)
++}
++
++/// A path of `N`-number points, at most [`MAX_POINTS`].
++pub(super) fn path<const N: usize>(v: &Value) -> Option<Vec<[f32; N]>> {
++    v.as_array().filter(|v| v.len() <= MAX_POINTS)?.iter().map(coords).collect()
++}
++
++/// A positive size in range.
++fn size(v: &Value) -> Option<f32> {
++    v.as_f64().filter(|s| *s > 0.0 && *s < 1e6).map(|s| s as f32)
++}
++
++fn page(o: &Presence) -> Option<TextureSetId> {
++    TextureSetId::deserialize(&o.state["page"]).ok()
++}
++
++fn layer(v: &Value) -> Option<LayerId> {
++    LayerId::deserialize(v).ok()
++}
++
++fn color(o: &Presence) -> Color32 {
++    Color32::from_rgb(o.color[0], o.color[1], o.color[2])
++}
++
++/// `text` cut to `n` characters, with "…" when cut.
++fn cut_text(text: &str, n: usize) -> String {
++    match text.chars().nth(n) {
++        Some(_) => text.chars().take(n - 1).chain(['…']).collect(),
++        None => text.to_owned(),
++    }
++}
++
++/// "Name · Layer": their name and the layer they work on, when it is in this document.
++pub(super) fn label(state: &UiState, o: &Presence) -> String {
++    let name = cut_text(&o.name, 24);
++    let layer = page(o)
++        .and_then(|ts| state.session.document().texture_set(ts))
++        .zip(layer(&o.state["selection"][0]))
++        .and_then(|(ts, layer)| ts.find(layer));
++    match layer {
++        Some(layer) => format!("{name} · {}", cut_text(&layer.name, 24)),
++        None => name,
++    }
++}
++
++/// Where the surface point `p` shows in the 3D view at `rect` (in points), and whether the model hides it there; none
++/// behind the eye.
++pub(super) fn on_screen(state: &UiState, camera: &Camera, rect: Rect, ppp: f32, p: Vec3) -> Option<(Pos2, bool)> {
++    let screen = camera.project(p)?;
++    let at = rect.min + vec2(screen.x, screen.y) / ppp;
++    let tolerance = state.session.scene().mesh.bounds.diagonal() * 0.03;
++    Some((at, state.session.pick(camera, screen.truncate()).is_none_or(|hit| hit.position.distance(p) > tolerance)))
++}
++
++/// A person's moving marks as last drawn, in object space: their pointer, and how far (along the path) the drawn end of
++/// their stroke trails its newest point.
++#[derive(Default)]
++struct Shown {
++    pointer: Option<Vec3>,
++    tip: Option<Vec3>,
++    behind: f32,
++}
++
++thread_local! {
++    static SHOWN: RefCell<HashMap<String, Shown>> = RefCell::default();
++}
++
++/// How far along `path` from `q` (within `tol` of it) to its newest end, searched from that end.
++fn from_end(path: &[Vec3], q: Vec3, tol: f32) -> Option<f32> {
++    let mut d = 0.0;
++    for w in path.windows(2).rev() {
++        let (a, b) = (w[0], w[1]);
++        let len = a.distance(b);
++        let t = if len > 0.0 { ((q - a).dot(b - a) / (len * len)).clamp(0.0, 1.0) } else { 0.0 };
++        if a.lerp(b, t).distance(q) <= tol {
++            return Some(d + len * (1.0 - t));
++        }
++        d += len;
++    }
++    None
++}
++
++/// `path` without its last `behind` units.
++fn cut(path: &[Vec3], mut behind: f32) -> Vec<Vec3> {
++    let mut end = path.len();
++    while behind > 0.0 && end > 1 {
++        let (a, b) = (path[end - 2], path[end - 1]);
++        let len = a.distance(b);
++        if behind < len {
++            let mut kept = path[..end - 1].to_vec();
++            kept.push(b.lerp(a, behind / len));
++            return kept;
++        }
++        behind -= len;
++        end -= 1;
++    }
++    path[..end].to_vec()
++}
++
++/// A translucent stroke `w` wide along `path` (screen points), as one mesh so that no part of it covers another: round
++/// caps, mitred joins (at most twice as long), its edges feathered over `aa` points as egui feathers its own shapes.
++fn stroke(path: &[Pos2], w: f32, ink: Color32, aa: f32) -> Shape {
++    let mut pts: Vec<Pos2> = Vec::with_capacity(path.len());
++    for &p in path {
++        if pts.last().is_none_or(|q| q.distance(p) > 0.01) {
++            pts.push(p);
++        }
++    }
++    let n = pts.len();
++    let (inner, outer) = ((w - aa).max(0.0) / 2.0, (w + aa) / 2.0);
++    let clear = Color32::TRANSPARENT;
++    let dir = |i: usize| (pts[i + 1] - pts[i]).normalized();
++    let mut mesh = egui::Mesh::default();
++    // Per point, along its normal: the left edge's feather and inside, the right edge's inside and feather.
++    let normals: Vec<V2> = (0..n)
++        .map(|i| match i {
++            _ if n == 1 => V2::Y,
++            0 => dir(0).rot90(),
++            _ if i == n - 1 => dir(n - 2).rot90(),
++            _ => {
++                let (a, b) = (dir(i - 1).rot90(), dir(i).rot90());
++                let m = (a + b).normalized();
++                m / m.dot(a).max(0.5)
++            }
++        })
++        .collect();
++    for (p, normal) in pts.iter().zip(&normals) {
++        for (off, c) in [(outer, clear), (inner, ink), (-inner, ink), (-outer, clear)] {
++            mesh.colored_vertex(*p + *normal * off, c);
++        }
++    }
++    for a in (0..n.saturating_sub(1) as u32).map(|i| 4 * i) {
++        for k in 0..3 {
++            mesh.add_triangle(a + k, a + k + 1, a + 4 + k);
++            mesh.add_triangle(a + k + 1, a + 5 + k, a + 4 + k);
++        }
++    }
++    // Half a disc out of each end (a whole one around a single point), from the end's left edge to its right.
++    let mut cap = |i: usize, out: V2| {
++        let (p, left) = (pts[i], normals[i]);
++        let at = 4 * i as u32;
++        let centre = mesh.vertices.len() as u32;
++        mesh.colored_vertex(p, ink);
++        let (mut last_in, mut last_out) = (at + 1, at);
++        for k in 1..=12 {
++            let (sin, cos) = (std::f32::consts::PI * k as f32 / 12.0).sin_cos();
++            let (inside, edge) = match k {
++                12 => (at + 2, at + 3),
++                _ => {
++                    let u = left * cos + out * sin;
++                    let v = mesh.vertices.len() as u32;
++                    mesh.colored_vertex(p + u * inner, ink);
++                    mesh.colored_vertex(p + u * outer, clear);
++                    (v, v + 1)
++                }
++            };
++            mesh.add_triangle(centre, last_in, inside);
++            mesh.add_triangle(last_in, last_out, inside);
++            mesh.add_triangle(last_out, edge, inside);
++            (last_in, last_out) = (inside, edge);
++        }
++    };
++    match n {
++        0 => {}
++        1 => {
++            cap(0, V2::X);
++            cap(0, -V2::X);
++        }
++        _ => {
++            cap(0, -dir(0));
++            cap(n - 1, dir(n - 2));
++        }
++    }
++    Shape::mesh(mesh)
++}
++
++/// Relative luminance (sRGB) of `c`.
++fn luminance(c: Color32) -> f32 {
++    let lin = |v: u8| {
++        let v = f32::from(v) / 255.0;
++        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
++    };
++    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
++}
++
++const TAG_PAD: V2 = vec2(7.0, 3.0);
++
++/// A tag's text on `color` (white, or near black on a light colour), at `alpha`.
++fn tag_text(painter: &egui::Painter, text: &str, color: Color32, alpha: f32) -> Arc<egui::Galley> {
++    let ink = if luminance(color) > 0.55 { Color32::from_rgb(0x11, 0x11, 0x11) } else { Color32::WHITE };
++    painter.layout_no_wrap(text.to_owned(), crate::theme::font_strong(12.0), ink.gamma_multiply(alpha))
++}
++
++/// A name or value tag filled with `fill`, its top left at `at` (on a pixel).
++fn tag(painter: &egui::Painter, at: Pos2, galley: Arc<egui::Galley>, fill: Color32) {
++    let ppp = painter.pixels_per_point();
++    let at = (at.to_vec2() * ppp).round().to_pos2() / ppp;
++    painter.rect_filled(Rect::from_min_size(at, galley.size() + 2.0 * TAG_PAD), 6.0, fill);
++    painter.galley(at + TAG_PAD, galley, fill);
++}
++
++/// The pointer arrow, tip at (0, 0), in points.
++const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
++
++/// `points` filled with `fill` as a fan from the first (the arrow is star-shaped around its tip).
++fn fan(points: &[Pos2], fill: Color32) -> Shape {
++    let mut mesh = egui::Mesh::default();
++    for p in points {
++        mesh.colored_vertex(*p, fill);
++    }
++    for i in 1..points.len() as u32 - 1 {
++        mesh.add_triangle(0, i, i + 1);
++    }
++    Shape::mesh(mesh)
++}
++
++/// A person's pointer: the arrow in their colour with a white outline and a soft shadow, and their name tag (faint
++/// where the model hides the point).
++fn pointer(painter: &egui::Painter, tip: Pos2, color: Color32, name: &str, faint: bool) {
++    let ppp = painter.pixels_per_point();
++    let tip = (tip.to_vec2() * ppp).round().to_pos2() / ppp;
++    let alpha = if faint { 0.45 } else { 1.0 };
++    let arrow = |off: V2| ARROW.map(|[x, y]| tip + off + vec2(x, y));
++    painter.add(fan(&arrow(vec2(0.0, 1.0)), Color32::from_black_alpha(64).gamma_multiply(alpha)));
++    painter.add(fan(&arrow(V2::ZERO), color.gamma_multiply(alpha)));
++    painter.add(Shape::closed_line(arrow(V2::ZERO).to_vec(), Stroke::new(1.5, Color32::WHITE.gamma_multiply(alpha))));
++    tag(painter, tip + vec2(12.0, 15.0), tag_text(painter, name, color, alpha), color.gamma_multiply(alpha));
++}
++
++/// A stroke on the model: its points in object space (`None` breaks it), at `w` points wide; where the model hides it,
++/// faint.
++fn surface_stroke(state: &UiState, painter: &egui::Painter, camera: &Camera, rect: Rect, points: &[Option<Vec3>], w: f32, color: Color32) {
++    let ppp = painter.pixels_per_point();
++    // Runs of points alike (shown or hidden), each starting where the last one ended.
++    let mut runs: Vec<(bool, Vec<Pos2>)> = Vec::new();
++    let mut last: Option<(Pos2, bool)> = None;
++    for p in points {
++        let Some((at, hidden)) = p.and_then(|p| on_screen(state, camera, rect, ppp, p)) else {
++            last = None;
++            continue;
++        };
++        match (last, runs.last_mut()) {
++            (Some((_, was)), Some((h, run))) if was == hidden && *h == hidden => run.push(at),
++            (Some((from, _)), _) => runs.push((hidden, vec![from, at])),
++            (None, _) => runs.push((hidden, vec![at])),
++        }
++        last = Some((at, hidden));
++    }
++    let aa = 1.0 / ppp;
++    for (hidden, run) in runs {
++        let ink = color.gamma_multiply(if hidden { 0.7 * 0.45 } else { 0.7 });
++        painter.add(stroke(&run, w, ink, aa));
++    }
++}
++
++/// Points on screen per object unit at `p`.
++fn per_unit(camera: &Camera, ppp: f32, p: Vec3) -> f32 {
++    camera.pixels_per_unit(camera.view_depth(p)) / ppp
++}
++
++/// On the model in the 3D view at `rect` (this person's `camera`): the others' strokes and pen paths under way, then
++/// their pointers and tags, easing toward where they last were. Whether a mark is still on its way.
++pub(super) fn draw_3d(state: &UiState, painter: &egui::Painter, camera: &Camera, rect: Rect, others: &[Presence]) -> bool {
++    let ctx = painter.ctx();
++    let ppp = ctx.pixels_per_point();
++    let k = 1.0 - (-ctx.input(|i| i.stable_dt).clamp(0.0, 0.1) / EASE).exp();
++    let far = rect.width().max(rect.height()) / 4.0;
++    let screen = |p: Vec3| camera.project(p).map(|s| rect.min + vec2(s.x, s.y) / ppp);
++    let mine = state.session.selected_texture_set().id;
++    let mut moving = false;
++    SHOWN.with_borrow_mut(|shown| {
++        shown.retain(|id, _| others.iter().any(|o| o.id == *id));
++        let mut tips = Vec::new();
++        for o in others {
++            let s = shown.entry(o.id.clone()).or_default();
++            let color = color(o);
++            // Their stroke on the model, its newest end easing along it.
++            let st = &o.state["stroke"];
++            let points: Vec<Vec3> = path::<3>(&st["points"]).unwrap_or_default().into_iter().map(Vec3::from_array).collect();
++            if let (Some(&tip), Some(r)) = (points.last(), size(&st["size"])) {
++                let unit = per_unit(camera, ppp, tip);
++                if s.tip != Some(tip) {
++                    let since = s.tip.and_then(|old| from_end(&points, old, 4.0 / unit.max(1e-6)));
++                    s.behind = since.map_or(0.0, |d| s.behind + d);
++                    s.tip = Some(tip);
++                }
++                s.behind *= 1.0 - k;
++                if s.behind * unit < 0.5 || s.behind * unit > far {
++                    s.behind = 0.0;
++                }
++                moving |= s.behind > 0.0;
++                let shown: Vec<_> = cut(&points, s.behind).into_iter().map(Some).collect();
++                let w = (2.0 * r * unit).clamp(2.0, far);
++                surface_stroke(state, painter, camera, rect, &shown, w, color);
++            } else {
++                (s.tip, s.behind) = (None, 0.0);
++            }
++            // Their pen path, where it lies on this texture set (when it is the one shown here).
++            let pen = &o.state["pen"];
++            if page(o) == Some(mine)
++                && let (Some(points), Some(r)) = (path::<2>(&pen["points"]), size(&pen["size"]))
++            {
++                let at = |uv: Vec2| state.session.pen_uv_position(uv);
++                let on: Vec<Option<Vec3>> = points.iter().map(|uv| at(Vec2::from_array(*uv))).collect();
++                // Its width (a share of the UV square) on the model at its newest point: the nearest of the surface
++                // points a radius away in UV (a seam lands farther).
++                let w = points.iter().zip(&on).rev().find_map(|(uv, p)| {
++                    let (uv, p) = (Vec2::from_array(*uv), (*p)?);
++                    let near = [Vec2::X, -Vec2::X, Vec2::Y, -Vec2::Y].into_iter().filter_map(|d| at(uv + d * r)).map(|q| q.distance(p));
++                    near.filter(|d| *d > 0.0).min_by(f32::total_cmp).map(|d| 2.0 * d * per_unit(camera, ppp, p))
++                });
++                surface_stroke(state, painter, camera, rect, &on, w.unwrap_or(2.0).clamp(2.0, far), color);
++            }
++            // Their pointer, eased in object space; whether the model hides it is decided where it is going.
++            let target = point(&o.state["pointer"]);
++            let jump = |a: Vec3, b: Vec3| screen(a).zip(screen(b)).is_none_or(|(a, b)| a.distance(b) > far);
++            s.pointer = match (s.pointer, target) {
++                (Some(at), Some(to)) if !jump(at, to) => {
++                    let next = at.lerp(to, k);
++                    let near = screen(next).zip(screen(to)).is_none_or(|(a, b)| a.distance(b) < 0.5);
++                    moving |= !near;
++                    Some(if near { to } else { next })
++                }
++                (_, to) => to,
++            };
++            if let (Some(at), Some(to)) = (s.pointer, target)
++                && let (Some(at), Some((_, hidden))) = (screen(at), on_screen(state, camera, rect, ppp, to))
++                && rect.contains(at)
++            {
++                tips.push((at, color, label(state, o), hidden));
++            }
++        }
++        // Pointers over every stroke.
++        for (at, color, name, hidden) in tips {
++            pointer(painter, at, color, &name, hidden);
++        }
++    });
++    moving
++}
++
++/// In the 2D view (the selected texture set's UV square at `image`): the others' pen paths under way on it.
++pub(super) fn draw_uv(state: &UiState, painter: &egui::Painter, image: Rect, others: &[Presence]) {
++    let mine = state.session.selected_texture_set().id;
++    for o in others.iter().filter(|o| page(o) == Some(mine)) {
++        let pen = &o.state["pen"];
++        if let (Some(points), Some(r)) = (path::<2>(&pen["points"]), size(&pen["size"])) {
++            let on: Vec<Pos2> = points.iter().map(|[u, v]| image.min + vec2(*u, *v) * image.width()).collect();
++            let w = (2.0 * r * image.width()).clamp(2.0, image.width());
++            painter.add(stroke(&on, w, color(o).gamma_multiply(0.7), 1.0 / painter.pixels_per_point()));
++        }
++    }
++}
++
++/// The drop target someone's layer drag would take, when it is a row of theirs (`["above" | "below" | "inside", id]`).
++pub(super) fn drop_target(v: &Value) -> Option<DropTarget> {
++    let id = layer(&v[1])?;
++    match v[0].as_str()? {
++        "above" => Some(DropTarget::Above(id)),
++        "below" => Some(DropTarget::Below(id)),
++        "inside" => Some(DropTarget::Inside(id)),
++        _ => None,
++    }
++}
++
++/// In the Layers panel, on the row of `layer` (of texture set `set`) at `rect`, for each other person on that texture
++/// set: a frame in their colour when it is the layer they selected, the line (or frame, for into a folder) where a
++/// layer they drag would drop, and the value of a setting of it they are dragging.
++pub(super) fn row(painter: &egui::Painter, set: TextureSetId, id: LayerId, rect: Rect, others: &[Presence]) {
++    let ppp = painter.pixels_per_point();
++    let snap = |r: Rect| Rect::from_min_max((r.min.to_vec2() * ppp).round().to_pos2() / ppp, (r.max.to_vec2() * ppp).round().to_pos2() / ppp);
++    let mut inset = 0.0;
++    let mut right = rect.right() - 8.0;
++    for o in others.iter().filter(|o| page(o) == Some(set)) {
++        let color = color(o);
++        if layer(&o.state["selection"][0]) == Some(id) {
++            painter.rect_stroke(snap(rect.shrink(inset)), 0.0, Stroke::new(2.0, color), StrokeKind::Inside);
++            inset += 2.0;
++        }
++        // The app's own drop marker, in their colour.
++        let (line, edge) = (Stroke::new(2.0, color.gamma_multiply(0.85)), Stroke::new(1.5, color.gamma_multiply(0.85)));
++        match drop_target(&o.state["reorder"]) {
++            Some(DropTarget::Above(l)) if l == id => {
++                painter.line_segment([rect.left_top(), rect.right_top()], line);
++            }
++            Some(DropTarget::Below(l)) if l == id => {
++                painter.line_segment([rect.left_bottom(), rect.right_bottom()], line);
++            }
++            Some(DropTarget::Inside(l)) if l == id => {
++                painter.rect(snap(rect), 0.0, color.gamma_multiply(0.28), edge, StrokeKind::Inside);
++            }
++            _ => {}
++        }
++        let adjust = &o.state["adjust"];
++        if layer(&adjust["layer"]) == Some(id)
++            && let Some(text) = adjust["text"].as_str()
++        {
++            let text: String = cut_text(&text.chars().filter(|c| !c.is_control()).collect::<String>(), 40);
++            let galley = tag_text(painter, &text, color, 1.0);
++            let size = galley.size() + 2.0 * TAG_PAD;
++            right -= size.x;
++            tag(painter, Pos2::new(right, rect.center().y - size.y / 2.0), galley, color);
++            right -= 4.0;
++        }
++    }
++}
 diff --git a/crates/ui/src/app/live/tests.rs b/crates/ui/src/app/live/tests.rs
 new file mode 100644
-index 0000000..477a6f1
+index 0000000..311e4df
 --- /dev/null
 +++ b/crates/ui/src/app/live/tests.rs
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,319 @@
 +use std::collections::HashSet;
 +use std::sync::Arc;
 +
@@ -1776,25 +2337,42 @@ index 0000000..477a6f1
 +}
 +
 +#[test]
-+fn presence_shares_the_point_under_the_pointer_which_another_camera_places_on_the_model() {
++fn presence_shares_the_point_under_the_pointer_and_the_stroke_so_far_which_another_camera_places_on_the_model() {
++    use super::peers::{label, on_screen, path, point};
 +    let mut a = app(Session::sample());
 +    let (rect, ppp) = (egui::Rect::from_min_size(egui::pos2(40.0, 30.0), egui::vec2(400.0, 300.0)), 2.0);
 +    let camera = a.state.camera.paint_camera([800, 600]);
-+    let p = surface_point(&a.state, &camera, rect, ppp, rect.center()).expect("the crate is under the center");
-+    LIVE.with_borrow_mut(|live| live.drawn = Some(p.to_array()));
++    // Painting: a stroke under way to the center.
++    a.state.session.begin_stroke().unwrap();
++    a.state.painting = true;
++    for at in [rect.center() - egui::vec2(30.0, 0.0), rect.center() - egui::vec2(0.2, 0.0), rect.center()] {
++        note(&a.state, &camera, rect, ppp, Some(at));
++    }
 +    a.live_frame(&egui::Context::default());
 +    let state = a.live_presence();
 +    let s = a.state.session.selection();
 +    assert_eq!((&state["page"], &state["selection"]), (&serde_json::json!(s.texture_set), &serde_json::json!([s.layer.unwrap()])));
 +
-+    // As someone else's: where it is under the same camera, unhidden, tagged with their layer.
++    // As someone else's: their pointer and the stroke's newest point where they are under the same camera, unhidden
++    // (a point under a pixel from the last is left out); tagged with their layer.
 +    let ann = Presence { id: "a".into(), name: "Ann".into(), color: [1, 2, 3], state: state.clone() };
-+    let (at, hidden) = screen_point(&a.state, &camera, rect, ppp, point(&state["pointer"]).unwrap()).unwrap();
-+    assert!(at.distance(rect.center()) < 1.0 && !hidden, "{at:?} {hidden}");
++    let stroke = path::<3>(&state["stroke"]["points"]).unwrap();
++    assert_eq!(stroke.len(), 2, "{stroke:?}");
++    for p in [point(&state["pointer"]).unwrap(), glam::Vec3::from_array(stroke[1])] {
++        let (at, hidden) = on_screen(&a.state, &camera, rect, ppp, p).unwrap();
++        assert!(at.distance(rect.center()) < 1.0 && !hidden, "{at:?} {hidden}");
++    }
 +    assert_eq!(label(&a.state, &ann), format!("Ann · {}", a.state.session.selected_layer().unwrap().name));
++
++    // A slider drag under way (its history entry still coalescing): the layer and the setting's value so far.
++    a.state.session.end_stroke();
++    let layer = a.state.session.selection().layer.unwrap();
++    a.state.session.execute(Command::SetBlendOpacity { layer, channel: ChannelKind::BaseColor, opacity: 0.63 }).unwrap();
++    LIVE.with_borrow_mut(|live| live.down = true);
++    assert_eq!(a.live_presence()["adjust"], serde_json::json!({ "layer": layer, "text": "Base Color · Opacity 63%" }));
 +    // Remote junk draws nothing.
 +    for junk in [serde_json::json!([1.0, 2.0]), serde_json::json!([1e300, 0, 0]), serde_json::json!(["x", 0, 0])] {
 +        assert_eq!(point(&junk), None);
 +    }
-+    assert_eq!(screen_point(&a.state, &camera, rect, ppp, glam::Vec3::splat(1e6)), None);
++    assert_eq!(on_screen(&a.state, &camera, rect, ppp, glam::Vec3::splat(1e6)).filter(|(at, _)| rect.contains(*at)), None);
 +}

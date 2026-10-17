@@ -2,6 +2,9 @@
 // Brush tool; `ready` closes the welcome hub. The owner paints a stroke across the crate's front (Layer 1's tiles), the
 // editor adds a fill layer above it (Ctrl+Shift+F: appended, so no array shifts); Ctrl+Z is the owner's Undo. point():
 // the owner hovers over the crate, which the editor's 3D view shows as an arrow tagged "Alice · Layer 1".
+// drag(): a brush stroke can't be taken back mid-way (letting go commits it), so the owner holds a Pen point instead (P,
+// press on the crate, drag its handle): presence `pen` carries the path under way, in UV. release(): Escape drops the
+// uncommitted point (pen.rs `keyboard`: undo_pending), letting go then commits nothing, and B brings the Brush back.
 //
 // The checkpoint is binary (layer tree JSON, mesh, images, deflated tiles): `ready` defines liveTestDocument(), a JSON
 // view of it (tiles by content hash) for the harness.
@@ -10,6 +13,7 @@ import { until } from '../helpers.mjs'
 // Below the shell's 36 px top bar: the welcome hub's "Continue in workspace", and a stroke across the crate's front
 // between its bands.
 const CONTINUE = { x: 607, y: 455 }, STROKE = [{ x: 500, y: 370 }, { x: 630, y: 385 }], POINT = { x: 565, y: 378 }
+const PEN = { x: 540, y: 400 }
 
 // The view: { doc, mesh, resources: { id: ... }, rasters: { layer: { slot: { comps, size, fill, tiles: { i: hash } } } } }.
 function view(bytes) {
@@ -79,6 +83,20 @@ export default {
     }
   },
   undo: (page) => page.keyboard.press('Control+z'),
+  drag: async (page) => {
+    // The status bar takes the click (and gives the canvas the keyboard) without editing anything.
+    await page.mouse.click(640, 790)
+    await page.keyboard.press('p')
+    await page.mouse.move(PEN.x, PEN.y)
+    await page.mouse.down()
+    for (let i = 1; i <= 6; i++) { await page.mouse.move(PEN.x + 8 * i, PEN.y + 3 * i); await page.waitForTimeout(50) }
+    await until(() => page.evaluate(() => !!playgroundLiveAdapter.presence()?.pen), 5000, 'the pen point under way')
+  },
+  release: async (page) => {
+    await page.keyboard.press('Escape')
+    await page.mouse.up()
+    await page.keyboard.press('b')
+  },
   // The owner hovers over the crate's front: their presence gains the surface point under the pointer.
   point: async (page) => {
     await page.mouse.move(POINT.x, POINT.y, { steps: 4 })
