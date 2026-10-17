@@ -1,19 +1,24 @@
 // LightCraft Classic (lightroom-classic): a fresh profile opens the demo library on its first photo in Develop's loupe.
 // The owner rates that photo 1 star (key 1); the editor steps to the next photo (Right arrow) and rates it 2 stars;
 // Ctrl+Z is the owner's Undo (crates/ui-egui/src/shortcuts.rs: 0-5 rate the active photo, the arrows step through the
-// filmstrip). The owner then imports a photo: its original reaches the others as a session file. drag() holds the
-// Exposure slider (presence `adjust`) and lets go with nothing changed.
+// filmstrip). The owner then imports a photo: its original reaches the others as a session file; before that, both
+// change one photo at once (lightroom.mjs together()). drag() holds the Exposure slider (presence `adjust`) and lets go
+// with nothing changed.
 // Each page has its own browser context, so the app's one-tab-per-browser lock never trips.
 import { until } from '../helpers.mjs'
+import { together } from './lightroom.mjs'
 
 const active = (page) => page.evaluate(async () => {
   try { return JSON.parse(await app.command('library.state', '{}')).selection.active } catch { return null }
 })
+// The pages in the order the harness opens them (the owner's first): together() needs the owner's and the editor's.
+const pages = []
 
 export default {
   path: '/lightcraft-classic/',
   viewport: { width: 1280, height: 800 },
   ready: async (page) => {
+    pages.push(page)
     await until(async () => await active(page) != null, 60000, 'the demo library')
     await page.focus('#app_canvas')
   },
@@ -48,6 +53,7 @@ export default {
   },
   // File > Add Photos (file.addPhotos) opens the browser's file picker; the photo is a 16×16 PNG drawn here.
   importMedia: async (page) => {
+    await together(page, pages.find((p) => p !== page), 'app')
     const png = await page.evaluate(async () => {
       const canvas = new OffscreenCanvas(16, 16), g = canvas.getContext('2d')
       g.fillStyle = '#36c'

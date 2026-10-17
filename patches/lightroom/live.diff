@@ -1,9 +1,9 @@
 diff --git a/apps/lightcraft-web/src/live.rs b/apps/lightcraft-web/src/live.rs
 new file mode 100644
-index 00000000..47415883
+index 00000000..73feb996
 --- /dev/null
 +++ b/apps/lightcraft-web/src/live.rs
-@@ -0,0 +1,1040 @@
+@@ -0,0 +1,1225 @@
 +//! Playground live editing (`playground_live`): the shared document is the library's catalog as JSON (every photo's
 +//! develop settings, History, Versions, rating, flag, label and metadata; albums, stacks, the keyword list), without
 +//! this browser's own browsing records (when it browsed Local folders and the photos seen there) and without views
@@ -53,6 +53,9 @@ index 00000000..47415883
 +    static TYPED: RefCell<Option<(&'static str, String)>> = const { RefCell::new(None) };
 +    /// The others in the session, as the shell last gave them, with their marks as this person last drew them.
 +    static OTHERS: RefCell<Vec<(Presence, Shown)>> = const { RefCell::new(Vec::new()) };
++    /// Others' changes are being merged into this person's work (the end of a frame), and one of them conflicted.
++    static MERGING: Cell<bool> = const { Cell::new(false) };
++    static CONFLICTED: Cell<bool> = const { Cell::new(false) };
 +}
 +
 +/// Photos sent as a selection or a drag, and points as a stroke, at most; the most bytes a presence takes (the shell
@@ -133,7 +136,7 @@ index 00000000..47415883
 +        let d = &p.develop;
 +        state["adjust"] = json!({"photo": i.photo.0, "label": i.label});
 +        if let Some(id) = app.ui.dragging_control.as_deref()
-+            && let Some(v) = controls::get(d, id)
++            && let Some(v) = control_value(d, id)
 +        {
 +            (state["adjust"]["control"], state["adjust"]["value"]) = (id.into(), v.into());
 +        }
@@ -296,6 +299,9 @@ index 00000000..47415883
 +    TYPED.set(META_FIELDS.into_iter().find_map(draft));
 +    show_others(app, ctx);
 +    frame(app, down);
++    if CONFLICTED.take() {
++        app.toast_error(ctx, "Someone else changed the same setting at the same time: your edit is kept as a draft (Share)");
++    }
 +}
 +
 +/// The others over this person's app, in their colors (the look every Playground app shares), what does not resolve
@@ -419,7 +425,7 @@ index 00000000..47415883
 +    use lightcraft_ui_egui::i18n::tr;
 +    let a = &state["adjust"];
 +    if let Some(photo) = a["photo"].as_u64() {
-+        let spec = a["control"].as_str().and_then(controls::find);
++        let spec = a["control"].as_str().and_then(control_spec);
 +        let value = a["value"].as_f64().filter(|v| v.is_finite()).zip(spec).map(|(v, spec)| spec.clamp(v));
 +        let text = match (spec, value) {
 +            (Some(spec), Some(v)) => format!("{} {}", tr(spec.label), spec.format(v)),
@@ -655,7 +661,131 @@ index 00000000..47415883
 +        // failed renders are retried once the catalog changes (as after a relink); the document itself stays as it is
 +        app.session.catalog.revision = app.session.catalog.revision.wrapping_add(1);
 +    }
++    MERGING.set(true);
 +    playground_live::frame(app);
++    MERGING.set(false);
++}
++
++/// The slider a develop control's id names: a registered control, or the relative Temp and Tint that rendered files
++/// (JPEG, PNG…) show instead of Kelvin (panels/edit.rs `REL_TEMP`, `REL_TINT`).
++fn control_spec(id: &str) -> Option<controls::ControlSpec> {
++    let (of, id) = match id {
++        "wb.tempRel" => ("wb.temp", "wb.tempRel"),
++        "wb.tintRel" => ("wb.tint", "wb.tintRel"),
++        _ => return controls::find(id).copied(),
++    };
++    Some(controls::ControlSpec { id, min: -100.0, max: 100.0, default: 0.0, step: 1.0, decimals: 0, ..*controls::find(of)? })
++}
++
++/// The value of [`control_spec`]'s slider in `d` (panels/edit.rs `k_to_rel` for the relative Temp).
++fn control_value(d: &lightcraft_engine::develop::DevelopSettings, id: &str) -> Option<f64> {
++    match id {
++        "wb.tempRel" => Some(((1e6 / 6500.0 - 1e6 / d.wb.temp) / 0.8).clamp(-100.0, 100.0)),
++        "wb.tintRel" => Some(d.wb.tint.clamp(-100.0, 100.0)),
++        _ => controls::get(d, id),
++    }
++}
++
++/// Before the strict merge, a photo both sides changed keeps both changes wherever they are to different values: its
++/// edit time is the later one, its History `edited`'s steps (more of them, or fewer after an Undo) then the ones
++/// `current` added, re-based onto `edited`'s settings so the newest step is still the photo's settings; the rest as
++/// [`settle`] leaves it. What is settled goes into `current`, and into `base` as `edited` has it, so the merge takes
++/// it from `current`.
++fn settle_photos(base: &mut Value, current: &mut Value, edited: &Value) {
++    let (Some(b), Some(c), Some(e)) = (
++        base.get_mut("photos").and_then(Value::as_object_mut),
++        current.get_mut("photos").and_then(Value::as_object_mut),
++        edited.get("photos").and_then(Value::as_object),
++    ) else {
++        return;
++    };
++    for (id, e) in e {
++        let (Some(b), Some(c)) = (b.get_mut(id), c.get_mut(id)) else { continue };
++        if b == c || b == e || !b.is_object() || !c.is_object() {
++            continue;
++        }
++        let history = match (b["history"].as_array(), c["history"].as_array(), e["history"].as_array()) {
++            (Some(bh), Some(ch), Some(eh)) if eh != bh => appended(bh, ch, true).map(|n| {
++                let rebase = |step: &Value| {
++                    let mut step = step.clone();
++                    if let Ok(settings) = merged(&b["develop"], &step["settings"], &e["develop"]) {
++                        step["settings"] = settings;
++                    }
++                    step
++                };
++                let mut h = eh.clone();
++                h.extend(ch[ch.len() - n..].iter().map(rebase));
++                h.drain(..h.len().saturating_sub(lightcraft_engine::catalog::HISTORY_LIMIT));
++                h
++            }),
++            _ => None,
++        };
++        if let Some(h) = history {
++            (b["history"], c["history"]) = (e["history"].clone(), h.into());
++        }
++        if c.get("edited") != b.get("edited") && e.get("edited") != b.get("edited") && e.get("edited").is_some() {
++            let later = c["edited"].as_str().max(e["edited"].as_str()).map_or(Value::Null, Value::from);
++            (b["edited"], c["edited"]) = (e["edited"].clone(), later);
++        }
++        settle(b, c, e);
++    }
++}
++
++/// The parts of a value both sides changed that keep both changes: a list both only added to is `edited`'s additions
++/// then `current`'s (a word or number already there not twice); items with an `id`, list items in the same place when
++/// the list kept its length (a mask's components, whose strokes are added to) and objects settle deeper, key by key.
++/// Everything else is left to the strict merge (both changing one value is a conflict).
++fn settle(b: &mut Value, c: &mut Value, e: &Value) {
++    if b == c || b == e {
++        return;
++    }
++    match (b, c, e) {
++        (Value::Object(b), Value::Object(c), Value::Object(e)) => {
++            for (k, e) in e {
++                if let (Some(b), Some(c)) = (b.get_mut(k), c.get_mut(k)) {
++                    settle(b, c, e);
++                }
++            }
++        }
++        (Value::Array(b), Value::Array(c), Value::Array(e)) => {
++            let id = |v: &Value| v.get("id").filter(|id| id.is_number() || id.is_string()).cloned();
++            if [&*b, &*c, e].iter().all(|l| l.iter().all(|v| id(v).is_some())) {
++                for e in e {
++                    let at = |l: &[Value]| l.iter().position(|v| id(v) == id(e));
++                    if let (Some(i), Some(j)) = (at(b), at(c)) {
++                        settle(&mut b[i], &mut c[j], e);
++                    }
++                }
++            } else if let (Some(n), Some(_)) = (appended(b, c, false), appended(b, e, false)) {
++                let added: Vec<Value> = c[c.len() - n..].iter().filter(|v| v.is_object() || v.is_array() || !e.contains(v)).cloned().collect();
++                *b = e.clone();
++                *c = e.clone();
++                c.extend(added);
++            } else if b.len() == c.len() && b.len() == e.len() {
++                for ((b, c), e) in b.iter_mut().zip(c.iter_mut()).zip(e) {
++                    settle(b, c, e);
++                }
++            }
++        }
++        _ => {}
++    }
++}
++
++/// How many items `x` adds after the end of `b` (`None`: it changed more than that); `capped`: also when it dropped
++/// some from the front, as History does past its limit.
++fn appended(b: &[Value], x: &[Value], capped: bool) -> Option<usize> {
++    let most = if capped { b.len().saturating_sub(1) } else { 0 };
++    (0..=most).find_map(|dropped| {
++        let kept = b.len() - dropped;
++        (x.len() > kept && x.starts_with(&b[dropped..])).then(|| x.len() - kept)
++    })
++}
++
++/// [`settle`], then the strict merge.
++fn merged(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
++    let (mut b, mut c) = (base.clone(), current.clone());
++    settle(&mut b, &mut c, edited);
++    playground_live::merge(&b, &c, edited, &[])
 +}
 +
 +/// Offers live editing to the Playground shell (nothing happens until it connects).
@@ -838,6 +968,18 @@ index 00000000..47415883
 +        catalog(document).map(drop)
 +    }
 +
++    /// Two edits of one photo both land unless they change the same value ([`settle_photos`]). A conflict while this
++    /// person's work takes in the others' says so: the shell keeps that work as a draft.
++    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
++        let (mut b, mut c) = (base.clone(), current.clone());
++        settle_photos(&mut b, &mut c, edited);
++        let merged = playground_live::merge(&b, &c, edited, Self::COUNTERS);
++        if merged.is_err() && MERGING.get() {
++            CONFLICTED.set(true);
++        }
++        merged
++    }
++
 +    /// The originals the shared photos were imported from, by content hash (demo photos have none).
 +    fn live_assets(&self) -> Vec<(String, String, bool)> {
 +        MEDIA.with_borrow(|(originals, stored)| {
@@ -952,6 +1094,49 @@ index 00000000..47415883
 +
 +        // New ids are this peer's own; the counter goes past them, so the catalog needs no repair.
 +        assert!(seen.id.0 >> 52 == 1 && a.session.catalog.alloc_album_id().0 >> 52 == 1 && a.session.catalog.repair().is_empty());
++        playground_live::disconnect();
++        Ok(())
++    }
++
++    #[test]
++    fn a_crop_held_while_someone_brushes_the_same_photo_lands_with_their_stroke() -> Result<(), String> {
++        let _ = hooks::FRESH_ID.set(playground_live::fresh_id);
++        let (mut a, mut b) = (demo(), demo());
++        playground_live::connect();
++        let start = canonical(&a.live_document());
++        b.live_adopt(playground_live::parse(&start)?)?;
++        let photo = a.session.active().ok_or("no active photo")?;
++        // A holds a crop drag; B, on the same photo, brushes a new mask, which reaches A mid-drag and waits.
++        a.run("develop.beginInteraction", json!({"label": "Crop"}))?;
++        a.run("crop.set", json!({"rect": [0.1, 0.2, 0.9, 0.8]}))?;
++        b.run("mask.brushStroke", json!({"points": [[0.3, 0.4], [0.6, 0.5]]}))?;
++        let done = std::rc::Rc::new(Cell::new(false));
++        let to = done.clone();
++        playground_live::queue(Some(start.clone()), canonical(&b.live_document()), Box::new(move |r| to.set(r.is_ok())));
++        playground_live::frame(&mut a);
++        assert!(!done.get());
++        // A lets go: the crop lands on top of the stroke; History is B's step then A's, whose settings are the photo's.
++        a.run("develop.endInteraction", json!({}))?;
++        playground_live::frame(&mut a);
++        assert!(done.get(), "the two edits merge");
++        let p = a.session.catalog.photo(photo).ok_or("no photo")?;
++        let r = p.develop.crop.geometry.rect;
++        assert_eq!(([r.x0, r.y0, r.x1, r.y1], p.develop.masks.len()), ([0.1, 0.2, 0.9, 0.8], 1));
++        assert_eq!(p.history.iter().map(|h| h.label.as_str()).collect::<Vec<_>>(), ["Brush", "Crop"]);
++        assert_eq!(p.history.last().map(|h| &*h.settings), Some(&*p.develop));
++        // B's Undo of the stroke (the journal's merge(after, now, before)) keeps A's crop, History its step alone.
++        let (brushed, both) = (b.live_document(), a.live_document());
++        let undone = LightcraftApp::live_merge(&brushed, &both, &playground_live::parse(&start)?)?;
++        let p = &undone["photos"][photo.0.to_string()];
++        assert_eq!((&p["develop"]["crop"], p["develop"]["masks"].as_array().map(Vec::len)), (&both["photos"][photo.0.to_string()]["develop"]["crop"], Some(0)));
++        assert_eq!((p["history"].as_array().map(Vec::len), &p["history"][0]["settings"]), (Some(1), &p["develop"]));
++        // Both changing one control is a conflict (the shell keeps the losing edit as a draft).
++        let exposure = |v: f64| -> Result<Value, String> {
++            let mut d = playground_live::parse(&start)?;
++            *d.pointer_mut(&format!("/photos/{}/develop/light/exposure", photo.0)).ok_or("no exposure")? = v.into();
++            Ok(d)
++        };
++        assert!(LightcraftApp::live_merge(&playground_live::parse(&start)?, &exposure(0.5)?, &exposure(1.0)?).is_err());
 +        playground_live::disconnect();
 +        Ok(())
 +    }
