@@ -4,8 +4,8 @@ import { after, before, test } from 'node:test'
 import { sessionSite } from './session-helpers.mjs'
 import { until } from './helpers.mjs'
 
-// Real Honeydew browsers. LIVE_PUBLIC is a public directory whose honeydew/ holds a web build with
-// patches/fl-studio-mobile/live.diff and the shell injected (fetch.mjs does this for installed builds).
+// Real Honeydew browsers. LIVE_PUBLIC is a public directory whose honeydew/ holds a web build (0.1.7 on carry the live
+// adapter themselves) with the shell injected (fetch.mjs does this for installed builds).
 const publicDir = process.env.LIVE_PUBLIC
 let site
 before(async () => { if (publicDir) site = await sessionSite({ publicDir }) })

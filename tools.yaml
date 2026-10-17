@@ -270,7 +270,7 @@ groups:
 
       - slug: fl-studio
         name: Lemon Studio
-        alternative: FL Studio
+        alternative: FL Studio (experimental)
         blurb: Compose and arrange music with a piano roll, mixer and built-in instruments.
         opens: []
         imports: []
