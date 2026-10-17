@@ -31,6 +31,8 @@ async function click(page, ...points) {
   for (const point of points) { await page.mouse.click(...point); await page.waitForTimeout(400) }
 }
 const tempoUp = (page) => click(page, BPM, PLUS_ONE, CLOSE_TEMPO)
+// The editor's MiniSynth clip on its track (row 1, under the master's), and the bottom editors' close X.
+const SYNTH_CLIP = at(80, 144), EDITOR_CLOSE = at(1082, 24)
 
 // A 50 ms 440 Hz sine, 16-bit mono PCM WAV at 44.1 kHz.
 function wav() {
@@ -82,7 +84,7 @@ async function same(pages, what, before) {
   }, 20000, what)
 }
 
-test('Honeydew browsers edit one song live, keep views local, undo personally, share samples and catch up late', { skip: !publicDir && 'set LIVE_PUBLIC' }, async () => {
+test('Honeydew browsers edit one song live, keep views local, show each other where they point, undo personally, share samples and catch up late', { skip: !publicDir && 'set LIVE_PUBLIC' }, async () => {
   const a = await open(), b = await open()
   const invite = await a.evaluate(async () => {
     window.session = await PeerSession.create({ app: '/honeydew/', name: 'Alice' })
@@ -104,6 +106,25 @@ test('Honeydew browsers edit one song live, keep views local, undo personally, s
   await click(b, ADD_CHANNEL, MINISYNTH)
   const both = await same([a, b], 'a new channel to reach the owner', faster)
   assert.ok(both.length > faster.length, 'the channel was added')
+
+  // Presence: the editor back on the playlist; the owner selects the editor's new clip and points at it. The editor's
+  // app is shown exactly the owner's presence(), and draws it there (PRESENCE_SCREENSHOT: a picture of that).
+  await b.evaluate(() => {
+    const show = playgroundLiveAdapter.showPresence
+    playgroundLiveAdapter.showPresence = (others) => { window.shownPresence = others; return show(others) }
+  })
+  await click(b, EDITOR_CLOSE)
+  await click(a, SYNTH_CLIP)
+  await a.mouse.move(SYNTH_CLIP[0] + 40, SYNTH_CLIP[1] + 10)
+  await a.waitForTimeout(500)
+  const [owner, mine] = await a.evaluate(() => [session.id, playgroundLiveAdapter.presence()])
+  assert.equal(mine.view, 'playlist')
+  assert.equal(mine.clips?.length, 1, 'the owner selected the clip')
+  assert.ok(mine.pointer?.track, 'the owner points at a track')
+  await until(() => b.evaluate(([id, mine]) => JSON.stringify(window.shownPresence?.find((p) => p.id === id)?.state) === JSON.stringify(mine), [owner, mine]), 10000, 'the owner\'s presence to reach the editor')
+  if (process.env.PRESENCE_SCREENSHOT) { await b.waitForTimeout(300); await b.screenshot({ path: process.env.PRESENCE_SCREENSHOT }) }
+  await a.keyboard.press('Escape')
+  await a.mouse.move(0, 0)
 
   await a.keyboard.press('Control+z')
   const undone = await same([a, b], 'the owner\'s Undo to reach the editor', both)
