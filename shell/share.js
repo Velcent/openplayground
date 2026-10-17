@@ -24,7 +24,7 @@ export async function mountShare(bar, app, here, groups = []) {
   try { invite = readInvite(location.href); if (invite && invite.app !== here.path) throw new Error('This invitation belongs to another app or build') }
   catch(e) { issue = e.message; invite = null }
   const config = await fetch('/api/session/config', {cache:'no-store'}).then(r=>r.ok?r.json():{}).catch(()=>({}))
-  if (!config.enabled && !invite && !issue && !active.get() && !(await SessionStore.list(here.path).catch(()=>[])).length) return
+  if (!config.enabled && !invite && !issue && !active.get() && !(await SessionStore.list().catch(()=>[])).length) return
   let session, dialogOpen = false
   const count = h('span', {class:'pg-share-count'}, 'Share')
   const progress = h('progress', {class:'pg-share-progress',max:'1',value:'0',hidden:true,'aria-label':'File sync progress'})
@@ -170,8 +170,19 @@ export async function mountShare(bar, app, here, groups = []) {
             if(!files.length && !liveAdapter())throw new Error('Choose at least one file')
             use(await PeerSession.create({app:here.path,name:name.value,files}));live()
           }),true))
-          for(const room of await SessionStore.list(here.path)) {
-            body.append(button(`Local copy: ${room.name}`,()=>attempt(async()=>{use(await PeerSession.restore(room.id));live()})))
+          // Sessions this browser was in, to rejoin or clear: auto-resume covers the current one.
+          const earlier=(await SessionStore.list()).filter(room=>room.id!==active.get())
+          if (earlier.length) body.append(h('p',{class:'pg-hint'},'Earlier sessions in this browser'))
+          for(const room of earlier) {
+            const when=new Date(room.modified).toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})
+            const detail=[when, room.app!==here.path ? `started in ${appName(room.app)}` : '', room.files ? `${room.files} ${room.files===1?'file':'files'}` : ''].filter(Boolean).join(' · ')
+            const row=h('div',{class:'pg-share-file'},h('span',{},room.owner?'Your session':'Session you joined'),h('small',{},detail),h('div',{class:'pg-actions'},
+              button('Rejoin',()=>attempt(async()=>{const s=await PeerSession.restore(room.id);use(s);await s.connect();live()})),
+              button('Remove',()=>attempt(async()=>{
+                if (!await confirmIn(view,room.owner?'Remove this session from this browser? You can no longer host it; the others keep their copies.':'Remove this session’s copy from this browser? The others keep theirs.','Remove',{danger:true})) return
+                await new SessionStore(room.id).remove(); row.remove()
+              }))))
+            body.append(row)
           }
         }
         start().catch(e=>error.textContent=e.message)

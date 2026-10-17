@@ -23,7 +23,8 @@ export async function describe(file, id = crypto.randomUUID()) {
 }
 
 export class SessionStore {
-  static async list(app) {
+  // The sessions this browser keeps a copy of (to rejoin), newest first: whose they are, from which app, when, files.
+  static async list() {
     const result = []
     let root
     try { root = await (await navigator.storage.getDirectory()).getDirectoryHandle('playground-sessions') }
@@ -31,11 +32,12 @@ export class SessionStore {
     for await (const [id, dir] of root.entries()) {
       if (dir.kind !== 'directory' || !UUID.test(id)) continue
       const config = await readJSON(dir, 'connection.json')
-      if (config?.app !== app) continue
+      if (!config?.app) continue
       const files = await new SessionStore(id).manifest()
-      result.push({ id, name: files[0]?.name || 'Empty session' })
+      const modified = await dir.getFileHandle('connection.json').then((h) => h.getFile()).then((f) => f.lastModified, () => 0)
+      result.push({ id, app: config.app, owner: !!config.owner, files: files.length, modified })
     }
-    return result
+    return result.sort((a, b) => b.modified - a.modified)
   }
   constructor(room) {
     if (!UUID.test(room)) throw new Error('Invalid session ID')
