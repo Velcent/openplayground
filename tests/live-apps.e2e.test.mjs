@@ -24,7 +24,10 @@ async function open(app) {
   await page.setViewportSize(app.viewport ?? { width: 1280, height: 800 })
   await page.goto(`${site.url}${app.path}`)
   await until(() => page.evaluate(() => !!globalThis.playgroundLiveAdapter), 120000, `${app.path} to start`)
-  await page.evaluate(async () => { window.PeerSession = (await import('/shell/session.js')).PeerSession })
+  await page.evaluate(async (path) => {
+    const { PeerSession, setPage } = await import('/shell/session.js')
+    window.PeerSession = PeerSession; setPage(path)
+  }, app.path)
   await app.ready?.(page)
   return page
 }

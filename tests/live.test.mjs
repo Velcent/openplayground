@@ -61,8 +61,8 @@ class Hub {
     this.gates.set(`${from}>${to}`, gate)
     return () => { if (this.gates.get(`${from}>${to}`) === gate) this.gates.delete(`${from}>${to}`); release() }
   }
-  async join(id, role, app = new App(), store = { saved: null, drafts: [] }, { linkFirst = false } = {}) {
-    const session = Object.assign(new EventTarget(), { id, role, room: id, config: role === 'owner' ? { owner: 'token' } : {}, peers: new Map() })
+  async join(id, role, app = new App(), store = { saved: null, drafts: [] }, { linkFirst = false, page = '/honeydew/' } = {}) {
+    const session = Object.assign(new EventTarget(), { id, role, room: id, page, config: role === 'owner' ? { owner: 'token' } : {}, peers: new Map() })
     store.document ??= async (record) => record === undefined ? store.saved && copy(store.saved) : void (store.saved = await copy(record))
     store.draft ??= async (bytes) => { store.drafts.push(bytes.slice()) }
     let chain = Promise.resolve()
@@ -97,7 +97,7 @@ class Hub {
   }
   link(a, b) {
     for (const [from, to] of [[a, b], [b, a]]) {
-      const peer = { id: to.id, role: to.role, document: { readyState: 'open' } }
+      const peer = { id: to.id, role: to.role, page: to.page, document: { readyState: 'open' } }
       from.peers.set(to.id, peer)
       from.dispatchEvent(Object.assign(new Event('document-open'), { peer }))
     }
@@ -269,7 +269,7 @@ test('proposals reach the journal as they arrive, so its pending bound rejects a
   const save = ownerStore.document
   ownerStore.document = async (record) => { if (record !== undefined) await sleep(500); return save(record) }
   const { acked } = editor.live, edit = await delta(acked.bytes, Uint8Array.from([1, 0, 0])), peer = editor.session.peers.get(o)
-  for (let i = 0; i < 80; i++) editor.session.sendDocument(peer, { type: 'propose', proposal: { version: 1, document: acked.document, format: 'honeydew:1:test', id: crypto.randomUUID(), base: acked.revision, kind: 'edit', edit } })
+  for (let i = 0; i < 80; i++) editor.session.sendDocument(peer, { type: 'propose', app: '/honeydew/', proposal: { version: 1, document: acked.document, format: 'honeydew:1:test', id: crypto.randomUUID(), base: acked.revision, kind: 'edit', edit } })
   const rejects = []
   owner.session.addEventListener('document', () => {})
   await eventually(() => {
@@ -320,4 +320,20 @@ test('presence reaches the others, stays out of the document, and goes when they
   const late = await hub.join(crypto.randomUUID(), 'viewer', Object.assign(new App(), { here: null }), undefined, { linkFirst: true })
   await eventually(() => assert.deepEqual(late.app.shown?.map((p) => p.state), [{ cursor: [1, 2] }]))
   owner.live.stop()
+})
+
+test('a session spans apps: each app edits its own document, and an app the owner is not in waits for them', async () => {
+  const hub = new Hub(), [o, e, x] = ids()
+  const owner = await hub.join(o, 'owner', new App([1, 0, 0])), editor = await hub.join(e, 'editor')
+  await converge([owner, editor], [1, 0, 0])
+  // Someone in another app: the owner's document is not theirs, and nobody there can coordinate theirs yet.
+  const other = await hub.join(x, 'editor', new App([7, 7, 7], 'gridcraft:1:test'), undefined, { page: '/gridcraft/' })
+  await sleep(300)
+  assert.deepEqual([...other.app.doc], [7, 7, 7])
+  assert.equal(other.live.status, 'catching up')
+  assert.equal(other.live.ownerElsewhere?.id, o)
+  owner.app.edit(1, 5)
+  await converge([owner, editor], [1, 5, 0])
+  assert.deepEqual([...other.app.doc], [7, 7, 7])
+  assert.ok(!hub.sent.some((m) => m.from === o && m.to === x && ['snapshot', 'entry'].includes(m.type)), 'the owner sends one app\'s document only to people in that app')
 })

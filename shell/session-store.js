@@ -124,15 +124,15 @@ export class SessionStore {
     return readJSON(await this.root(), 'connection.json')
   }
   // The media this browser brought into the live document: the only ones it shares (live.js).
-  async media(ids) {
-    if (ids !== undefined) await write(await this.root(), 'media.json', JSON.stringify(ids))
-    return readJSON(await this.root(), 'media.json')
+  async media(ids, name = 'media') {
+    if (ids !== undefined) await write(await this.root(), `${name}.json`, JSON.stringify(ids))
+    return readJSON(await this.root(), `${name}.json`)
   }
-  // The live document's recovery record (the coordinator's journal); written atomically on every commit.
-  async document(record) {
+  // A live document's recovery record (the coordinator's journal), one per app; written atomically on every commit.
+  async document(record, name = 'document') {
     const dir = await this.root()
-    if (record !== undefined) return write(dir, 'document.bin', pack(record))
-    try { return unpack(new Uint8Array(await (await (await dir.getFileHandle('document.bin')).getFile()).arrayBuffer())) }
+    if (record !== undefined) return write(dir, `${name}.bin`, pack(record))
+    try { return unpack(new Uint8Array(await (await (await dir.getFileHandle(`${name}.bin`)).getFile()).arrayBuffer())) }
     catch (e) { if (e.name === 'NotFoundError') return null; throw e }
   }
   // Local work a live document could not keep: a rejected or conflicting draft, or what a session replaced.

@@ -71,7 +71,7 @@ export async function mountTopbar() {
   const { groups } = await loadApps()
   const app = groups.flatMap((g) => g.apps).find((a) => here && a[here.channel]?.path === here.path)
   if (!app) return
-  mountShare(bar, app, here).catch(() => {})
+  mountShare(bar, app, here, groups).catch(() => {})
   const build = app[here.channel]
   // "Alternative naming": the tab goes by the alternative's name and icon too.
   if (app.own) {

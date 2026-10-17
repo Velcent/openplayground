@@ -3,6 +3,10 @@ import { SessionStore, describe } from './session-store.js'
 import { MAX_DOCUMENT } from './document-delta.js'
 
 const cleanName = (name) => String(name || 'Guest').replace(/[\x00-\x1f\x7f]/g, '').slice(0, 40)
+// The app this page runs (its Playground path): a session spans apps, and each person says which one they are in.
+const APP_PATH = /^\/(?:head\/)?[a-z0-9-]+\/$/
+let page = null
+export const setPage = (path) => { page = APP_PATH.test(path) ? path : null }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 // Document messages by sender: the owner's snapshots (a document and its retained history, see document-history.js),
 // an editor's proposal to the owner (a delta's two spans), anything else small (a resync).
@@ -52,7 +56,7 @@ export class PeerSession extends EventTarget {
   constructor(config) {
     super()
     this.config = config
-    this.id = config.id; this.room = config.room; this.role = config.role; this.name = config.name
+    this.id = config.id; this.room = config.room; this.role = config.role; this.name = config.name; this.page = page
     this.store = new SessionStore(config.room)
     this.peers = new Map(); this.members = []; this.files = []; this.fileQueue = Promise.resolve(); this.status = 'connecting'; this.progress = { received: 0, total: 0 }
     this.accepted = !!config.accepted
@@ -246,7 +250,7 @@ export class PeerSession extends EventTarget {
     if (peer.channel || channel.label !== 'files') { channel.close(); return }
     peer.channel = channel; channel.binaryType = 'arraybuffer'; channel.bufferedAmountLowThreshold = 65536
     channel.onopen = () => {
-      this.send(peer, { type: 'hello', name: this.name }).then(() => this.announce(peer)).catch((e) => this.fail(e))
+      this.send(peer, { type: 'hello', name: this.name, page: this.page }).then(() => this.announce(peer)).catch((e) => this.fail(e))
       this.changed()
     }
     channel.onmessage = (event) => {
@@ -373,6 +377,7 @@ export class PeerSession extends EventTarget {
     const value = JSON.parse(data)
     if (value.type === 'hello') {
       peer.name = cleanName(value.name)
+      peer.page = APP_PATH.test(value.page) ? value.page : null
       if (this.config.owner) { (this.config.names ??= {})[peer.id] = peer.name; await this.remember() }
       this.changed()
     }

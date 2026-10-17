@@ -1,4 +1,4 @@
-import { PeerSession } from './session.js'
+import { PeerSession, setPage } from './session.js'
 import { follow, liveAdapter, unfollow } from './live.js'
 import { SessionStore } from './session-store.js'
 import { readInvite } from './session-protocol.js'
@@ -10,14 +10,21 @@ const button = (label, run, primary = false) => h('button', { type:'button', cla
 const color = id => `hsl(${parseInt(id.slice(0, 6), 16) % 360} 65% 60%)`
 const total = files => [...new Map(files.map(f => [f.asset, f])).values()].reduce((n,f)=>n+f.size,0)
 const LIVE = { live:'Live editing', 'read-only':'Viewing live edits', paused:'Paused: the owner is offline. Your edits stay here until they return.', 'catching up':'Catching up on edits', incompatible:'Not live: another app version' }
+// The session this browser is in: it follows the person from app to app (each app page resumes it).
+const active = {
+  get() { try { return localStorage.getItem('pg-active-session') } catch { return null } },
+  set(room) { try { room ? localStorage.setItem('pg-active-session', room) : localStorage.removeItem('pg-active-session') } catch {} },
+}
 
-export async function mountShare(bar, app, here) {
+export async function mountShare(bar, app, here, groups = []) {
   if (app.slug === 'outlook') return
+  setPage(here.path)
+  const appName = path => groups.flatMap(g=>g.apps).find(a=>a.release?.path===path||a.head?.path===path)?.name ?? path
   let invite, issue
   try { invite = readInvite(location.href); if (invite && invite.app !== here.path) throw new Error('This invitation belongs to another app or build') }
   catch(e) { issue = e.message; invite = null }
   const config = await fetch('/api/session/config', {cache:'no-store'}).then(r=>r.ok?r.json():{}).catch(()=>({}))
-  if (!config.enabled && !invite && !issue && !(await SessionStore.list(here.path).catch(()=>[])).length) return
+  if (!config.enabled && !invite && !issue && !active.get() && !(await SessionStore.list(here.path).catch(()=>[])).length) return
   let session, dialogOpen = false
   const count = h('span', {class:'pg-share-count'}, 'Share')
   const progress = h('progress', {class:'pg-share-progress',max:'1',value:'0',hidden:true,'aria-label':'File sync progress'})
@@ -34,11 +41,15 @@ export async function mountShare(bar, app, here) {
   }
   const use = next => {
     session?.removeEventListener('change',update); session=next; session.addEventListener('change',update); update()
+    active.set(next.room)
     follow(next).then(live => live?.addEventListener('change', () => next.changed())).catch(e => { next.error = e.message; next.changed() })
     // Removed, or opened in another tab: this page no longer takes part, so Undo is the app's own again.
-    next.addEventListener('change', () => { if (['removed','displaced'].includes(next.status)) unfollow(next) })
+    next.addEventListener('change', () => {
+      if (['removed','displaced'].includes(next.status)) unfollow(next)
+      if (next.status === 'removed' && active.get() === next.room) active.set(null)
+    })
   }
-  const end = () => { unfollow(session); session.leave() }
+  const end = () => { unfollow(session); session.leave(); active.set(null) }
   const clearLink = () => {
     const url = new URL(location.href), hash = new URLSearchParams(url.hash.slice(1)); hash.delete('pg-session'); url.hash=hash.toString(); history.replaceState(history.state,'',url)
   }
@@ -94,7 +105,8 @@ export async function mountShare(bar, app, here) {
           add.onchange=()=>attempt(async()=>{await session.share([...add.files]);add.value=''})
           body.append(status,warning,members,files,receive,addLabel,h('div',{class:'pg-actions'},forget,reconnect,leave))
           renderSession = () => {
-            status.textContent=`${session.live ? `${LIVE[session.live.status]} · ` : ''}${session.files.length} ${session.files.length===1?'file':'files'} · ${formatSize(total(session.files))}`
+            const away=session.live?.status==='paused' && session.live.ownerElsewhere
+            status.textContent=`${session.live ? `${away ? `Paused: ${away.name} (owner) is in ${appName(away.page)}. Your edits stay here until they open ${app.name}.` : LIVE[session.live.status]} · ` : ''}${session.files.length} ${session.files.length===1?'file':'files'} · ${formatSize(total(session.files))}`
             warning.textContent=session.live?.error || session.error || session.relayWarning || (session.peers.size ? '' : 'Waiting for another participant. A person with a local copy must be online to send files.')
             addLabel.hidden=session.role==='viewer' || session.stopped
             receive.hidden=session.accepted; receive.disabled=!session.files.length
@@ -116,7 +128,8 @@ export async function mountShare(bar, app, here) {
                 }
                 rows.set(peer.id,row);members.append(row)
               }
-              row.label.textContent=peer.name; row.detail.textContent=`${peer.role} · ${peer.progress?.status||'connecting'}${peer.progress?.total ? ` · ${formatSize(peer.progress.received)} / ${formatSize(peer.progress.total)}`:''}`
+              const where=peer.id===session.id ? here.path : peer.page
+              row.label.textContent=peer.name; row.detail.textContent=`${peer.role}${where ? ` · in ${appName(where)}` : ''} · ${peer.progress?.status||'connecting'}${peer.progress?.total ? ` · ${formatSize(peer.progress.received)} / ${formatSize(peer.progress.total)}`:''}`
               if (row.access) {row.access.value=peer.role;row.access.setAttribute('aria-label',`Access for ${peer.name}`)}
             }
             for(const [id,row] of rows) if(!peers.some(p=>p.id===id)){row.remove();rows.delete(id)}
@@ -167,4 +180,10 @@ export async function mountShare(bar, app, here) {
     } finally { dialogOpen=false;control.focus() }
   }
   if(invite || issue) show()
+  // Resume the session this browser is in, whichever app it was started from.
+  else if (config.enabled && active.get()) {
+    const resumed = await PeerSession.restore(active.get()).catch(() => null)
+    if (!resumed) active.set(null)
+    else { use(resumed); resumed.connect().catch(e => { resumed.error = e.message; resumed.changed() }) }
+  }
 }

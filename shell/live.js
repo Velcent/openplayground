@@ -25,7 +25,7 @@ const depth = (v, d = 0) => d > MAX_DEPTH || !v || typeof v !== 'object' ? d : M
 const COLORS = ['#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4', '#0fa5b5', '#f032e6', '#9a6324']
 const color = (id) => COLORS[parseInt(id.replaceAll('-', '').slice(-8), 16) % COLORS.length]
 const fileIds = new Map()
-// The session file that carries an app's asset: one per asset ID, whoever shares it first.
+// The session file that carries an app's asset: one per app and asset ID, whoever shares it first.
 async function fileId(asset) {
   if (!fileIds.has(asset)) {
     const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(asset)))
@@ -61,7 +61,7 @@ export class LiveDocument extends EventTarget {
     const live = new LiveDocument(session, adapter, store)
     // Connected first: the owner's coordinate() may need the app to apply a stored document.
     adapter.connect({ changed: () => queueMicrotask(() => live.kick()), undo: (redo) => queueMicrotask(() => live.undo(redo)) })
-    live.mine = new Set(await store.media?.().catch(() => null) ?? [])
+    live.mine = new Set(await store.media?.(undefined, `media-${live.slug}`).catch(() => null) ?? [])
     if (session.config.owner) await live.coordinate()
     for (const [type, handler] of Object.entries(live.handlers)) session.addEventListener(type, handler)
     for (const peer of session.peers.values()) if (peer.document?.readyState === 'open') live.opened(peer)
@@ -76,13 +76,16 @@ export class LiveDocument extends EventTarget {
     super()
     // `mine`: the media this browser may share, those its own document or edits brought in. Someone else referring to
     // a file this browser happens to have never makes it share that file.
+    // A session spans apps: this document is the one of the app this page runs, and only that app's people see it.
+    this.app = session.page ?? null
+    this.slug = (this.app ?? '').split('/').filter(Boolean).join('-') || 'app'
     Object.assign(this, { session, adapter, store, acked: null, entries: [], inflight: null, wanted: [], error: null, unsaved: [], mine: new Set(), others: new Map() })
     this.work = this.coordinating = this.assetWork = Promise.resolve()
     this.handlers = {
       document: (e) => this.receive(e.peer, e.value),
       'document-open': (e) => this.opened(e.peer),
       'document-close': (e) => this.closed(e.peer),
-      change: () => this.syncAssets(),
+      change: () => this.sessionChanged(),
     }
   }
   get editable() { return this.session.role !== 'viewer' }
@@ -102,7 +105,24 @@ export class LiveDocument extends EventTarget {
     this.adapter.disconnect()
   }
   coordinator() {
-    return [...this.session.peers.values()].find((p) => p.role === 'owner' && p.document?.readyState === 'open')
+    return [...this.session.peers.values()].find((p) => p.role === 'owner' && p.page === this.app && p.document?.readyState === 'open')
+  }
+  // The owner, when connected but in another app: editing here waits for them (the app's own code merges its edits).
+  get ownerElsewhere() {
+    if (this.history || this.coordinator()) return null
+    return [...this.session.peers.values()].find((p) => p.role === 'owner' && p.page && p.page !== this.app) ?? null
+  }
+  post(peer, value) { return this.session.sendDocument(peer, { ...value, app: this.app }) }
+  // The people in this app with the document channel open.
+  here() { return [...this.session.peers.values()].filter((p) => p.page === this.app && p.document?.readyState === 'open') }
+  // People say which app they are in once connected: a coordinator that appears is asked for this app's document.
+  sessionChanged() {
+    const owner = this.coordinator()
+    if (owner !== this.seenCoordinator) { this.seenCoordinator = owner; if (owner) { this.resyncing = false; this.resync() } this.changed() }
+    if (this.history) for (const peer of this.session.peers.values()) {
+      if (peer.page === this.app && peer.document?.readyState === 'open' && !peer.offered) { peer.offered = true; this.snapshot(peer) }
+    }
+    this.syncAssets()
   }
 
   // Coordinator. Proposals go to the journal as they arrive (its own bounds apply); their replies and broadcasts
@@ -110,10 +130,10 @@ export class LiveDocument extends EventTarget {
   async coordinate() {
     const options = {
       merge: (base, current, edited) => this.adapter.merge(base, current, edited),
-      commit: (record) => this.store.document(record),
+      commit: (record) => this.store.document(record, `document-${this.slug}`),
       allowed: (id) => id === this.session.id ? this.editable : ['owner', 'editor'].includes(this.session.peers.get(id)?.role),
     }
-    const record = await this.store.document().catch(() => null)
+    const record = await this.store.document(undefined, `document-${this.slug}`).catch(() => null)
     try {
       if (record?.format !== this.adapter.format) throw new Error('another build')
       this.history = DocumentHistory.restore(record, options)
@@ -152,7 +172,7 @@ export class LiveDocument extends EventTarget {
       // A replayed ID returns its original entry: only its sender can have missed it.
       if (entry.revision <= this.broadcasted) return reply({ type: 'entry', entry })
       this.broadcasted = entry.revision
-      for (const peer of this.session.peers.values()) if (peer.document?.readyState === 'open') this.session.sendDocument(peer, { type: 'entry', entry }).catch(() => {})
+      for (const peer of this.here()) this.post(peer, { type: 'entry', entry }).catch(() => {})
       this.receive(null, { type: 'entry', entry })
     })
   }
@@ -161,14 +181,14 @@ export class LiveDocument extends EventTarget {
   snapshot(peer) {
     if (peer.snapshotting) { peer.snapshotAgain = true; return }
     peer.snapshotting = true
-    this.session.sendDocument(peer, { type: 'snapshot', record: this.history.snapshot() }).catch(() => {}).then(() => sleep(1000)).then(() => {
+    this.post(peer, { type: 'snapshot', record: this.history.snapshot() }).catch(() => {}).then(() => sleep(1000)).then(() => {
       peer.snapshotting = false
       if (peer.snapshotAgain && this.session.peers.get(peer.id) === peer && !this.stopped) { peer.snapshotAgain = false; this.snapshot(peer) }
     })
   }
   opened(peer) {
     this.presenceSent = null
-    if (this.history) this.snapshot(peer)
+    if (this.history && peer.page === this.app) { peer.offered = true; this.snapshot(peer) }
     else if (peer.role === 'owner') this.resyncing = false
     this.changed()
   }
@@ -181,15 +201,15 @@ export class LiveDocument extends EventTarget {
     const owner = !this.history && !this.resyncing && this.coordinator()
     if (!owner) return
     this.resyncing = true
-    this.session.sendDocument(owner, { type: 'resync' }).catch(() => { this.resyncing = false })
+    this.post(owner, { type: 'resync' }).catch(() => { this.resyncing = false })
   }
 
   // Client. `peer` is null for the coordinator in this browser.
   receive(peer, value) {
-    if (this.stopped) return
+    if (this.stopped || (peer && value?.app !== this.app)) return
     if (peer && value?.type === 'presence') return this.presence(peer, value.state, value.hello === true)
     if (this.history && peer) {
-      if (value?.type === 'propose') this.coordinateProposal(peer.id, value.proposal, (reply) => this.session.sendDocument(peer, reply).catch(() => {}))
+      if (value?.type === 'propose') this.coordinateProposal(peer.id, value.proposal, (reply) => this.post(peer, reply).catch(() => {}))
       else if (value?.type === 'resync') this.snapshot(peer)
       return
     }
@@ -266,7 +286,7 @@ export class LiveDocument extends EventTarget {
       const old = new Set(before ? await this.adapter.assetsOf(before) : []), size = this.mine.size
       for (const id of await this.adapter.assetsOf(after)) if (!old.has(id)) this.mine.add(id)
       // Kept with the session, so a reload before they are shared still shares them.
-      if (this.mine.size > size) await this.store.media?.([...this.mine])
+      if (this.mine.size > size) await this.store.media?.([...this.mine], `media-${this.slug}`)
     } catch (e) { this.report(e) }
   }
   async merge(before, after) {
@@ -305,9 +325,9 @@ export class LiveDocument extends EventTarget {
     if (this.status !== 'live' && this.status !== 'read-only') return
     const files = new Map(this.session.files.map((f) => [f.id, f]))
     for (const { id, name, have } of await this.adapter.assets()) {
-      const file = files.get(await fileId(id))
+      const file = files.get(await fileId(`${this.app}\n${id}`))
       // One at a time, so a large catalog is never in memory at once.
-      if (have && !file && this.editable && this.mine.has(id)) await this.session.share([new File([await this.adapter.readAsset(id)], fileName(name))], [await fileId(id)])
+      if (have && !file && this.editable && this.mine.has(id)) await this.session.share([new File([await this.adapter.readAsset(id)], fileName(name))], [await fileId(`${this.app}\n${id}`)])
       else if (!have && file && file.size <= MAX_ASSET) {
         // Only this file: the session's other files still wait for the person to accept them.
         if (!this.session.accepted) await this.session.receiveFiles([file.id])
@@ -330,12 +350,10 @@ export class LiveDocument extends EventTarget {
         this.presenceSent = text
         const hello = this.presenceHello === true
         this.presenceHello = false
-        for (const peer of this.session.peers.values()) {
-          if (peer.document?.readyState === 'open') this.session.sendDocument(peer, { type: 'presence', state: JSON.parse(text), hello }).catch(() => {})
-        }
+        for (const peer of this.here()) this.post(peer, { type: 'presence', state: JSON.parse(text), hello }).catch(() => {})
       }
       // Someone whose connection dropped without a close event goes too.
-      for (const id of this.others.keys()) if (this.session.peers.get(id)?.document?.readyState !== 'open') { this.others.delete(id); this.presenceDirty = true }
+      for (const id of this.others.keys()) if (!this.here().some((p) => p.id === id)) { this.others.delete(id); this.presenceDirty = true }
       if (this.presenceDirty) {
         this.adapter.showPresence?.([...this.others].map(([id, state]) => ({ id, name: this.session.peers.get(id)?.name ?? '', color: color(id), state })))
         this.presenceDirty = false
@@ -371,6 +389,6 @@ export class LiveDocument extends EventTarget {
     this.inflight = { proposal, inLive }
     if (this.history) return this.coordinateProposal(this.session.id, proposal, (reply) => this.receive(null, reply))
     const owner = this.coordinator()
-    if (owner) this.session.sendDocument(owner, { type: 'propose', proposal }).catch(() => {})
+    if (owner) this.post(owner, { type: 'propose', proposal }).catch(() => {})
   }
 }

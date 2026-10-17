@@ -20,7 +20,7 @@ async function open(page = null) {
   await page.setViewportSize({ width: 1170, height: 576 })
   await page.goto(`${site.url}/honeydew/`)
   await until(() => page.evaluate(() => !!globalThis.playgroundLiveAdapter), 60000, 'Honeydew to start')
-  await page.evaluate(async () => { window.PeerSession = (await import('/shell/session.js')).PeerSession })
+  await page.evaluate(async () => { const m = await import('/shell/session.js'); window.PeerSession = m.PeerSession; m.setPage('/honeydew/') })
   await page.waitForTimeout(500)
   return page
 }
