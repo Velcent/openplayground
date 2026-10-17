@@ -1,9 +1,9 @@
 diff --git a/apps/deckcraft-web/src/live.rs b/apps/deckcraft-web/src/live.rs
 new file mode 100644
-index 0000000..ab51e92
+index 0000000..9b96448
 --- /dev/null
 +++ b/apps/deckcraft-web/src/live.rs
-@@ -0,0 +1,1038 @@
+@@ -0,0 +1,1117 @@
 +//! Playground live editing (`playground_live`): the shared document is the session's presentations, `{documents: [{id,
 +//! name, ...presentation}]}`: the one active when the session started (or that a joiner's active window takes) and each
 +//! one opened, created or imported since by anyone, which opens behind the others' own. Each is its model as JSON
@@ -14,13 +14,15 @@ index 0000000..ab51e92
 +//!
 +//! Presence: the presentation and slide each person shows, their pointer on it (slide points), their selected shapes and
 +//! what they are doing before it reaches the document (shapes moved, resized or rotated, a shape or text box being drawn,
-+//! ink or a freeform path), drawn over the others' slides in their color and eased toward where they are. Typing needs
++//! ink or a freeform path), drawn over the others' slides in their color and eased toward where they are; each slide's
++//! thumbnail (the Slides pane, the Slide Sorter) shows a badge with the initial of each other person on it. Typing needs
 +//! nothing of its own: each keystroke edits the document (between keystrokes the app is quiet), so it reaches the others
 +//! at once.
 +//!
 +//! Upstream calls in through hooks (rules in patches/powerpoint.yaml): `deckcraft_engine::LIVE_UNDO` at the top of
 +//! `Session::execute`, `deckcraft_model::LIVE_ALLOC` at the top of `Presentation::alloc_id`, `deckcraft_ui_egui::LIVE_PAINT`
-+//! at the top of the canvas's overlays and `deckcraft_ui_egui::LIVE_HOME` at the top of File › Home.
++//! at the top of the canvas's overlays, `deckcraft_ui_egui::LIVE_THUMB` on each slide thumbnail and
++//! `deckcraft_ui_egui::LIVE_HOME` at the top of File › Home.
 +
 +// The frame hook and drawing run in the browser only.
 +#![cfg_attr(test, allow(dead_code))]
@@ -45,6 +47,7 @@ index 0000000..ab51e92
 +use serde::Deserialize as _;
 +use serde_json::{Value, json};
 +use std::cell::{Cell, RefCell};
++use std::collections::BTreeMap;
 +use std::sync::Arc;
 +
 +pub const FORMAT: &str = concat!("powerpoint:2:", env!("CARGO_PKG_VERSION"));
@@ -61,6 +64,13 @@ index 0000000..ab51e92
 +const EASE: f64 = 0.08;
 +/// A pointer's arrow, tip first: egui fills a closed path as a fan from its first point, which this shape allows.
 +const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [12.5, 11.0], [7.3, 11.0], [10.4, 17.3], [7.6, 18.6], [4.5, 12.2], [0.0, 16.0]];
++/// A thumbnail's badges: their side, their gap, their inset from the image's top right, how many show (the last one
++/// "+N" when more are on the slide) and how long one takes to fade in (seconds).
++const BADGE: f32 = 16.0;
++const BADGE_GAP: f32 = 2.0;
++const BADGE_INSET: f32 = 4.0;
++const MAX_BADGES: usize = 3;
++const BADGE_FADE: f64 = 0.12;
 +
 +thread_local! {
 +    /// The session's presentations as this page knows them.
@@ -99,12 +109,13 @@ index 0000000..ab51e92
 +    title: String,
 +}
 +
-+/// Hooks the engine's Undo and Redo, the model's id allocator, the canvas and File › Home.
++/// Hooks the engine's Undo and Redo, the model's id allocator, the canvas, the slide thumbnails and File › Home.
 +pub fn install() {
 +    let _ = deckcraft_engine::LIVE_UNDO.set(undo);
 +    let _ = deckcraft_engine::model::LIVE_ALLOC.set(alloc_id);
 +    let _ = deckcraft_ui_egui::LIVE_PAINT.set(paint);
 +    let _ = deckcraft_ui_egui::LIVE_HOME.set(session_list);
++    let _ = deckcraft_ui_egui::LIVE_THUMB.set(badges);
 +}
 +
 +/// The end of a frame. `kept`: the slide rect from before the frame, put back when the canvas was not drawn (the
@@ -406,13 +417,15 @@ index 0000000..ab51e92
 +
 +/// Another person as they last showed themselves, with their moving marks where this canvas last drew them (slide
 +/// points), eased toward where they are: the pointer, the moved shapes' ghosts, the rubber band, and the stroke ([its
-+/// length, how far its shown end is behind its newest point]; a length of infinity: not seen yet, shown whole at once).
++/// length, how far its shown end is behind its newest point]; a length of infinity: not seen yet, shown whole at once),
++/// and when their badge first showed on their slide's thumbnail (egui's clock; NaN: not yet).
 +struct Peer {
 +    who: Presence,
 +    pointer: Option<[f64; 2]>,
 +    ghosts: Vec<Ghost>,
 +    band: Option<([f64; 4], u8)>,
 +    ink: [f64; 2],
++    arrived: f64,
 +}
 +
 +/// A moved shape's ghost: (id, [x, y, w, h, rot], flags).
@@ -605,13 +618,18 @@ index 0000000..ab51e92
 +        return;
 +    }
 +    let name: String = if name.chars().count() > MAX_NAME { name.chars().take(MAX_NAME - 1).chain(['…']).collect() } else { name.into() };
-+    let lin = egui::ecolor::linear_f32_from_gamma_u8;
-+    let luminance = 0.2126 * lin(color.r()) + 0.7152 * lin(color.g()) + 0.0722 * lin(color.b());
-+    let ink = if luminance > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE };
++    let ink = ink(color);
 +    let text = p.layout_no_wrap(name, theme::bold(12.0), ink);
 +    let r = Rect::from_min_size(at, text.size() + vec2(14.0, 6.0));
 +    p.rect_filled(r, 6.0, color);
 +    p.galley(r.min + vec2(7.0, 3.0), text, ink);
++}
++
++/// Text on `color`: dark on light colors, else white.
++fn ink(color: Color32) -> Color32 {
++    let lin = egui::ecolor::linear_f32_from_gamma_u8;
++    let luminance = 0.2126 * lin(color.r()) + 0.7152 * lin(color.g()) + 0.0722 * lin(color.b());
++    if luminance > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE }
 +}
 +
 +fn color(o: &Peer) -> Color32 {
@@ -658,6 +676,57 @@ index 0000000..ab51e92
 +                paint_arrow(p, tip, color(o));
 +                paint_tag(p, tip + vec2(12.0, 15.0), &o.who.name, color(o));
 +            }
++        }
++    });
++}
++
++/// Who of the others is on each slide of presentation `doc`: slide id → their places in `others`, in session order.
++fn on_slides(others: &[Peer], doc: u64) -> BTreeMap<u64, Vec<usize>> {
++    let mut on: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
++    for (k, o) in others.iter().enumerate() {
++        if o.who.state["doc"].as_u64() == Some(doc)
++            && let Some(slide) = o.who.state["slide"].as_u64()
++        {
++            on.entry(slide).or_default().push(k);
++        }
++    }
++    on
++}
++
++/// The Slides pane and the Slide Sorter call it for each thumbnail (`img`: its image, `i`: its slide): a square badge in
++/// each other person's color with their initial, at the image's top right, the first on the right and the rest to its
++/// left, the last of [`MAX_BADGES`] "+N" for the rest; hovering one shows who. Each fades in where its person arrives.
++fn badges(app: &SlideApp, ui: &egui::Ui, img: Rect, i: usize) {
++    let (Some(doc), Some(st)) = (active_id(&app.session), app.session.active()) else { return };
++    let Some(slide) = st.doc.slides.get(i).map(|s| u64::from(s.id.0)) else { return };
++    let now = ui.input(|inp| inp.time);
++    OTHERS.with_borrow_mut(|others| {
++        let Some(on) = on_slides(others, doc).remove(&slide) else { return };
++        let shown = if on.len() > MAX_BADGES { MAX_BADGES - 1 } else { on.len() };
++        let mut right = img.right() - BADGE_INSET;
++        let mut badge = |n: usize, label: String, fill: Color32, alpha: f32, tip: String| {
++            let r = Rect::from_min_size(pos2(right - BADGE, img.top() + BADGE_INSET), vec2(BADGE, BADGE));
++            right -= BADGE + BADGE_GAP;
++            let p = ui.painter();
++            p.rect_filled(r, 0.0, fill.gamma_multiply(alpha));
++            p.text(r.center(), Align2::CENTER_CENTER, label, theme::bold(10.5), ink(fill).gamma_multiply(alpha));
++            ui.interact(r, ui.id().with(("live-badge", i, n)), Sense::hover()).on_hover_text(tip);
++        };
++        for (n, &k) in on[..shown].iter().enumerate() {
++            let o = &mut others[k];
++            if o.arrived.is_nan() {
++                o.arrived = now;
++            }
++            let alpha = ((now - o.arrived) / BADGE_FADE).clamp(0.0, 1.0) as f32;
++            if alpha < 1.0 {
++                ui.ctx().request_repaint();
++            }
++            let initial = o.who.name.chars().next().map_or_else(|| "?".into(), |c| c.to_uppercase().collect());
++            badge(n, initial, color(o), alpha, o.who.name.clone());
++        }
++        if on.len() > shown {
++            let names: Vec<&str> = on[shown..].iter().map(|&k| others[k].who.name.as_str()).collect();
++            badge(shown, format!("+{}", names.len()), Color32::from_gray(0x55), 1.0, names.join("\n"));
 +        }
 +    });
 +}
@@ -864,9 +933,9 @@ index 0000000..ab51e92
 +                .map(|who| {
 +                    let place = |s: &Value| (s["doc"].clone(), s["slide"].clone());
 +                    let same = |o: &&Peer| o.who.id == who.id && place(&o.who.state) == place(&who.state);
-+                    let kept = old.iter().find(same).map(|o| (o.pointer, o.ghosts.clone(), o.band, o.ink));
-+                    let (pointer, ghosts, band, ink) = kept.unwrap_or((None, Vec::new(), None, [f64::INFINITY, 0.0]));
-+                    Peer { who, pointer, ghosts, band, ink }
++                    let kept = old.iter().find(same).map(|o| (o.pointer, o.ghosts.clone(), o.band, o.ink, o.arrived));
++                    let (pointer, ghosts, band, ink, arrived) = kept.unwrap_or((None, Vec::new(), None, [f64::INFINITY, 0.0], f64::NAN));
++                    Peer { who, pointer, ghosts, band, ink, arrived }
 +                })
 +                .collect();
 +        });
@@ -998,6 +1067,16 @@ index 0000000..ab51e92
 +        assert!(SlideApp::live_check(&parse(&edited)?).is_ok());
 +        playground_live::disconnect();
 +        Ok(())
++    }
++
++    #[test]
++    fn the_slide_strip_badges_the_others_on_each_slide_of_this_presentation() {
++        let mut a = SlideApp::new(Session::new(), Services::default());
++        let who = |name: &str, doc: u64, slide: u32| Presence { id: name.into(), name: name.into(), color: [1, 2, 3], state: json!({"doc": doc, "slide": slide}) };
++        a.live_show_presence(vec![who("A", 7, 2), who("B", 7, 3), who("C", 8, 2)]);
++        let model = OTHERS.with_borrow(|o| on_slides(o, 7).into_iter().map(|(s, on)| (s, on.iter().map(|&k| o[k].who.name.clone()).collect())).collect::<Vec<(u64, Vec<String>)>>());
++        assert_eq!(model, [(2, vec!["A".to_string()]), (3, vec!["B".to_string()])]);
++        a.live_show_presence(Vec::new());
 +    }
 +
 +    #[test]

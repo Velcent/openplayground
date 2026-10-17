@@ -308,12 +308,12 @@
 # What it's for: people in a Playground session edit the session's presentations together (the one open when it started
 #   and every one opened since, which reaches the others behind their own) and see each other's presentation, slide,
 #   pointer, selection and gestures under way (moves, resizes and rotations as ghosts, shapes and text boxes being drawn,
-#   ink and freeform paths), in each person's color.
+#   ink and freeform paths), in each person's color, and who is on which slide (badges on the slide thumbnails).
 # The adapter lives in new files: apps/deckcraft-web/src/live.rs (the shared document, merge, Undo, the id allocator,
-# presence and its drawing, File › Home's session list; the template is its child module, live/finite.rs writes
-# non-finite numbers as 0) and apps/deckcraft-web/src/web/live.rs (the kept runner, and the shell that ends each frame
-# with the session's frame hook). These rules only declare them and call in, one
-# line each at the end of a file or after a function's signature, the same on both channels. Verify: node
+# presence and its drawing, the thumbnails' badges, File › Home's session list; the template is its child module,
+# live/finite.rs writes non-finite numbers as 0) and apps/deckcraft-web/src/web/live.rs (the kept runner, and the shell
+# that ends each frame with the session's frame hook). These rules only declare them and call in, one line each at the
+# end of a file, after a function's signature or before a call, the same on both channels. Verify: node
 # scripts/build.mjs check powerpoint head|release, then the e2e (tests/live-apps/powerpoint.mjs). If upstream renames a
 # function named below, anchor on its new signature; if it renames WebShell or its `app` field, follow it in web/live.rs.
 #
@@ -369,7 +369,7 @@
 - live: true
   file: crates/ui-egui/src/lib.rs
   find: '(?![\s\S])'
-  after: "\n/// Live editing in a Playground session: draws the others' marks on the canvas, under this person's own overlays.\npub static LIVE_PAINT: std::sync::OnceLock<fn(&SlideApp, &egui::Painter, canvas::Xf)> = std::sync::OnceLock::new();\n/// Live editing in a Playground session: lists the session's presentations on File › Home; true when one was chosen.\npub static LIVE_HOME: std::sync::OnceLock<fn(&mut SlideApp, &mut egui::Ui) -> bool> = std::sync::OnceLock::new();\n"
+  after: "\n/// Live editing in a Playground session: draws the others' marks on the canvas, under this person's own overlays.\npub static LIVE_PAINT: std::sync::OnceLock<fn(&SlideApp, &egui::Painter, canvas::Xf)> = std::sync::OnceLock::new();\n/// Live editing in a Playground session: lists the session's presentations on File › Home; true when one was chosen.\npub static LIVE_HOME: std::sync::OnceLock<fn(&mut SlideApp, &mut egui::Ui) -> bool> = std::sync::OnceLock::new();\n/// Live editing in a Playground session: marks a slide thumbnail (its image, its slide's index) with the others on it.\npub static LIVE_THUMB: std::sync::OnceLock<fn(&SlideApp, &egui::Ui, egui::Rect, usize)> = std::sync::OnceLock::new();\n"
 - live: true
   file: crates/ui-egui/src/canvas.rs
   find: '\bfn\s+overlays\s*\(\s*app\b[^{]*\bpainter\b[^{]*\bxf\b[^{]*\{'
@@ -378,3 +378,15 @@
   file: crates/ui-egui/src/backstage.rs
   find: '\bfn\s+home\s*\(\s*app\b[^{]*\bui\b[^{]*\bout\b[^{]*\{'
   after: "\n    if crate::LIVE_HOME.get().is_some_and(|list| list(app, ui)) { out.close = true; }"
+# Each slide thumbnail, in the Slides pane and in the Slide Sorter, gets the others' badges (one per person on that
+# slide, at the image's top right) after its image and this person's selection frame are drawn and before its context
+# menu: anchored on that menu's call of `slide_menu(app, ui, <index>)` (a pub fn both share), the index named as there.
+# It also uses the thumbnail image's rect, `img` in both; if upstream renames it, follow it here.
+- live: true
+  file: crates/ui-egui/src/thumbs.rs
+  find: '\bresp\.context_menu\(\s*\|\s*ui\s*\|\s*(?:crate::thumbs::)?slide_menu\(\s*app\s*,\s*ui\s*,\s*(\w+)'
+  replace: "if let Some(badges) = crate::LIVE_THUMB.get() { badges(app, ui, img, $1); }\n        $&"
+- live: true
+  file: crates/ui-egui/src/sorter.rs
+  find: '\bresp\.context_menu\(\s*\|\s*ui\s*\|\s*(?:crate::thumbs::)?slide_menu\(\s*app\s*,\s*ui\s*,\s*(\w+)'
+  replace: "if let Some(badges) = crate::LIVE_THUMB.get() { badges(app, ui, img, $1); }\n                $&"
