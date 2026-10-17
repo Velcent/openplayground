@@ -6,7 +6,8 @@ import { until } from '../helpers.mjs'
 // then the owner adds another Box (features), the editor a New Component (components, occurrences). The shared
 // document is the session's designs ({ documents: [...] }), the owner's first.
 // drag: the owner opens Extrude on the Box's top face and holds its distance arrow mid-drag (the editor is shown the
-// dialog's value at the arrow, `value`, and the box its preview fills, `box`); Escape cancels it. openTab: the owner
+// dialog's value at the arrow, `value`, the owner's pointer on it, and the extruded prism's edges, `solid`); Escape
+// cancels it. openTab: the owner
 // starts a new design (Ctrl+N) and adds a Box to it, so the session shares it: the editor gets it as a tab behind.
 const VIEWPORT = [700, 450]
 // The top face of the Box a new design gets at its origin, in the default view.
@@ -65,7 +66,10 @@ export default {
       await page.mouse.move(ARROW[0], ARROW[1] - 8 * i)
       await page.waitForTimeout(50)
     }
-    await until(() => page.evaluate(() => !!playgroundLiveAdapter.presence()?.value), 10000, 'the extrude under way')
+    await until(() => page.evaluate(() => {
+      const p = playgroundLiveAdapter.presence()
+      return !!p?.solid && JSON.stringify(p.pointer) === JSON.stringify(p.value?.at)
+    }), 10000, 'the extrude under way, its prism shown and the pointer on its arrow')
     await pause(page)
   },
   openTab: async (page) => {

@@ -1,9 +1,9 @@
 diff --git a/apps/solidcraft-web/src/live.rs b/apps/solidcraft-web/src/live.rs
 new file mode 100644
-index 00000000..7880ac8e
+index 00000000..64640fbc
 --- /dev/null
 +++ b/apps/solidcraft-web/src/live.rs
-@@ -0,0 +1,1376 @@
+@@ -0,0 +1,1552 @@
 +//! Live editing in a Playground session (`playground_live` drives it). The shared document is the set of designs open
 +//! in the session, `{ documents: [{ id, ...design }] }`: the one shown when the session started and every design
 +//! opened, created or imported here or by the others since (once it holds something), which reaches the others as a
@@ -16,7 +16,7 @@ index 00000000..7880ac8e
 +//!
 +//! Presence: the design and scope (component and sketch) each person is on, the pointer as a point in the model, the
 +//! selection, and the gesture under way ([`gesture`]): a sketch shape's rubber band, sketch geometry being dragged, a
-+//! feature dialog's value at its handle with the box its preview fills, a component being moved. The others' show
++//! feature dialog's value at its handle with the feature's own volume ([`volume`]), a component being moved. The others' show
 +//! over the viewport in their colours, eased toward where they are; dots on the tabs show who is on which design.
 +
 +#[path = "playground_live.rs"]
@@ -24,6 +24,7 @@ index 00000000..7880ac8e
 +
 +use std::cell::{Cell, OnceCell, RefCell};
 +use std::collections::{BTreeMap, BTreeSet};
++use std::hash::{Hash, Hasher};
 +use std::sync::Arc;
 +
 +use egui::{Color32, FontId, Pos2, Rect, Shape, Stroke, pos2, vec2};
@@ -31,6 +32,7 @@ index 00000000..7880ac8e
 +use solidcraft_engine::doc::{Document, FeatureKind};
 +use solidcraft_engine::geom::{Aabb3, Plane, Vec2, Vec3};
 +use solidcraft_engine::{Sel, Session};
++use solidcraft_ui_egui::dialogs::{self, Dialog, Kind};
 +use solidcraft_ui_egui::documents::{self, live as tabs};
 +use solidcraft_ui_egui::viewport::{self, Hit, Proj};
 +use solidcraft_ui_egui::{SolveApp, canvas, scenario};
@@ -70,7 +72,7 @@ index 00000000..7880ac8e
 +/// Another person, and their moving marks as last drawn here.
 +struct Peer {
 +    who: Presence,
-+    /// `pointer`, `band`, `ghost`, `box` and `at` (their value's place), eased toward their presence.
++    /// `pointer`, `band`, `ghost`, `box`, `solid` and `at` (their value's place), eased toward their presence.
 +    shown: Value,
 +}
 +
@@ -86,6 +88,11 @@ index 00000000..7880ac8e
 +    static OTHERS: RefCell<Vec<Peer>> = const { RefCell::new(Vec::new()) };
 +    /// This person's gesture under way, as of the last frame ([`gesture`]).
 +    static GESTURE: RefCell<Map<String, Value>> = RefCell::default();
++    /// Where the pointer is on the page, as of the last frame: also over what the app draws inside the viewport (a value
++    /// box, a sketch's dimension inputs), which hides it from the viewport.
++    static OVER: Cell<Option<Pos2>> = const { Cell::new(None) };
++    /// The last feature volume worked out ([`volume`]) and what it was worked out from.
++    static VOLUME: RefCell<Option<(u64, Option<(&'static str, Value)>)>> = const { RefCell::new(None) };
 +    static CTX: OnceCell<egui::Context> = const { OnceCell::new() };
 +}
 +
@@ -93,8 +100,9 @@ index 00000000..7880ac8e
 +const FORMAT: &str = concat!("fusion-360:1:", env!("CARGO_PKG_VERSION"));
 +/// The most bytes of a presence (the shell sends at most 4 KiB).
 +const MAX_BYTES: usize = 3900;
-+/// The most points of a gesture's lines, and the most lines.
++/// The most points of a gesture's lines, and the most lines; the most points of a feature's volume (3D, so fewer).
 +const MAX_POINTS: usize = 150;
++const MAX_SOLID: usize = 90;
 +const MAX_ITEMS: usize = 50;
 +/// Numbers beyond this are not drawn (remote data).
 +const FAR_OUT: f64 = 1e9;
@@ -141,6 +149,7 @@ index 00000000..7880ac8e
 +        c.get_or_init(|| ctx.clone());
 +    });
 +    INPUT_BUSY.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
++    OVER.set(ctx.input(|i| i.pointer.hover_pos()));
 +    if playground_live::connected() {
 +        settle(app);
 +        ids_move_on(app);
@@ -492,7 +501,7 @@ index 00000000..7880ac8e
 +        let s = &self.session;
 +        let mut p = json!({ "doc": doc, "component": s.active_component, "sketch": s.active_sketch });
 +        if let Some(at) = pointer(self) {
-+            p["pointer"] = json!([round(at.x), round(at.y), round(at.z)]);
++            p["pointer"] = xyz(at);
 +        }
 +        GESTURE.with_borrow(|g| g.iter().for_each(|(k, v)| p[k] = v.clone()));
 +        let mut room = MAX_BYTES.saturating_sub(p.to_string().len() + 16);
@@ -639,6 +648,10 @@ index 00000000..7880ac8e
 +    (x * 1e3).round() / 1e3
 +}
 +
++fn xyz(p: Vec3) -> Value {
++    json!([round(p.x), round(p.y), round(p.z)])
++}
++
 +/// Millimetres per point at the view's target.
 +fn mm_per_px(proj: &Proj) -> f64 {
 +    proj.cam.half_height() * 2.0 / f64::from(proj.rect.height().max(1.0))
@@ -690,16 +703,16 @@ index 00000000..7880ac8e
 +    lines
 +}
 +
-+/// Lines in presence: `[[x, y, x, y, …], …]`, at most [`MAX_POINTS`] points all told (every so many kept, and each
-+/// line's ends) and [`MAX_ITEMS`] lines.
-+fn lines_json(lines: Vec<Vec<Vec2>>) -> Option<Value> {
++/// Lines in presence: `[[x, y, x, y, …], …]` (or `x, y, z`), at most `max` points all told (every so many kept, and
++/// each line's ends) and [`MAX_ITEMS`] lines.
++fn lines_json<const N: usize>(lines: Vec<Vec<[f64; N]>>, max: usize) -> Option<Value> {
 +    let lines: Vec<_> = lines.into_iter().filter(|l| l.len() >= 2).take(MAX_ITEMS).collect();
 +    let total: usize = lines.iter().map(Vec::len).sum();
-+    let step = total.div_ceil(MAX_POINTS).max(1);
++    let step = total.div_ceil(max).max(1);
 +    let out: Vec<Value> = (lines.iter())
 +        .map(|l| {
 +            let kept = l.iter().enumerate().filter(|(i, _)| i % step == 0 || *i + 1 == l.len());
-+            Value::Array(kept.flat_map(|(_, p)| [round(p.x).into(), round(p.y).into()]).collect())
++            Value::Array(kept.flat_map(|(_, p)| p.map(|x| Value::from(round(x)))).collect())
 +        })
 +        .collect();
 +    (!out.is_empty()).then_some(Value::Array(out))
@@ -708,8 +721,9 @@ index 00000000..7880ac8e
 +/// The gesture under way, read from the app's own state, as presence fields: `band`, the rubber band of a sketch shape
 +/// being drawn (what the app paints for its tool, on the sketch's plane), and `ghost`, the sketch curves a drag is
 +/// moving (where they are now), both as lines in the active sketch's coordinates; `value`, a feature dialog's main
-+/// value at its handle (`{ text: "Extrude 12.5 mm", at: [x, y, z] }`); `box`, what its preview fills or the bounds of
-+/// a component being moved (`[x0, y0, z0, x1, y1, z1]`). Dimension and text-handle drags show no ghost.
++/// value at its handle (`{ text: "Extrude 12.5 mm", at: [x, y, z] }`), and while one of its handles is dragged the
++/// `pointer` on it; the feature's volume ([`volume`]: `solid` or `box`); `box`, also the bounds of a component being
++/// moved (`[x0, y0, z0, x1, y1, z1]`). Dimension and text-handle drags show no ghost.
 +fn gesture(app: &mut SolveApp, ctx: &egui::Context) -> Map<String, Value> {
 +    let mut out = Map::new();
 +    let Some(rect) = app.viewport.rect.filter(|_| !app.home.open) else { return out };
@@ -728,44 +742,47 @@ index 00000000..7880ac8e
 +                        kept.push(*q);
 +                    }
 +                }
-+                kept.into_iter().filter_map(|q| on_plane(&proj, &plane, q)).collect()
++                kept.into_iter().filter_map(|q| on_plane(&proj, &plane, q)).map(|q| [q.x, q.y]).collect()
 +            });
-+            out.extend(lines_json(lines.collect()).map(|v| ("band".to_string(), v)));
++            out.extend(lines_json(lines.collect(), MAX_POINTS).map(|v| ("band".to_string(), v)));
 +        }
 +        if let Some((_, depth, _)) = &app.viewport.point_drag
 +            && let Some(before) = app.session.undo.get(*depth).and_then(|u| u.doc.sketch(sid).ok())
 +            && let Ok(now) = app.session.doc.sketch(sid)
 +        {
 +            let moved = (0..now.curves.len()).map(|i| now.polyline(i)).enumerate().filter(|(i, l)| before.polyline(*i) != *l);
-+            out.extend(lines_json(moved.map(|(_, l)| l).collect()).map(|v| ("ghost".to_string(), v)));
++            let moved = moved.map(|(_, l)| l.iter().map(|q| [q.x, q.y]).collect());
++            out.extend(lines_json(moved.collect(), MAX_POINTS).map(|v| ("ghost".to_string(), v)));
 +        }
 +    }
 +    if let Some(mut d) = app.dialog.take() {
 +        let triad = solidcraft_ui_egui::dialogs_move::triad(app, &d).map(|t| t.center);
 +        let anchor = canvas::anchor(app, &d);
 +        let name = format!("{:?}", d.kind).split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default().to_owned();
-+        let mut b = app.preview.bounds;
-+        if let Some((label, _, value)) = d.primary()
++        let mut grow = None;
++        if let Some((label, kind, value)) = d.primary()
 +            && let Some((base, dir)) = anchor
 +        {
-+            let tip = dir.zip(scenario::handle_at("arrow")).and_then(|(dir, p)| on_line(&proj, p, base, dir));
-+            // An extrude along an axis fills what lies past its face, toward the arrow (the rest is the body it joins).
-+            if let (Some(dir), Some(tip), "Extrude") = (dir, tip, name.as_str()) {
-+                let axes = |v: Vec3| [v.x, v.y, v.z];
-+                let (d, t, o, mut lo, mut hi) = (axes(dir), axes(tip), axes(base), axes(b.min), axes(b.max));
-+                for k in (0..3).filter(|k| d[*k].abs() > 0.999) {
-+                    if t[k] >= o[k] { lo[k] = lo[k].max(o[k]) } else { hi[k] = hi[k].min(o[k]) }
-+                }
-+                (b.min, b.max) = (Vec3::new(lo[0], lo[1], lo[2]), Vec3::new(hi[0], hi[1], hi[2]));
-+            }
++            grow = app.session.doc.eval(value, kind).ok().filter(|v| v.is_finite());
++            let tip = |handle: &str| dir.zip(scenario::handle_at(handle)).and_then(|(dir, p)| on_line(&proj, p, base, dir));
 +            let name = if name == "Fillet" && label == "Distance" { "Chamfer".into() } else { name };
-+            let at = triad.or(tip).unwrap_or(base);
++            let at = triad.or(tip("arrow")).unwrap_or(base);
 +            let text: String = format!("{name} {}", value.trim()).chars().take(40).collect();
-+            out.insert("value".into(), json!({ "text": text, "at": [round(at.x), round(at.y), round(at.z)] }));
++            out.insert("value".into(), json!({ "text": text, "at": xyz(at) }));
++            // One of its handles dragged (a small widget over the viewport, not the viewport's own drag): the pointer
++            // is the handle, where the value shows, not whatever lies behind it.
++            if let Some(id) = ctx.dragged_id()
++                && ctx.read_response(id).is_some_and(|r| r.rect.size().max_elem() < 48.0 && rect.contains(r.rect.center()))
++            {
++                let grip = if id == egui::Id::new("sc_manipulator2") { tip("arrow2").unwrap_or(at) } else { at };
++                out.insert("pointer".into(), xyz(grip));
++            }
 +        }
 +        app.dialog = Some(d);
-+        if app.preview.active && !b.is_empty() {
-+            out.insert("box".into(), boxed(&b));
++        if let Some(d) = app.dialog.as_ref().filter(|d| app.preview.active && d.previews())
++            && let Some((key, v)) = volume(app, d, grow)
++        {
++            out.insert(key.into(), v);
 +        }
 +    }
 +    if let Some(m) = &app.tree.occurrence_move {
@@ -783,18 +800,97 @@ index 00000000..7880ac8e
 +    json!([b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z].map(round))
 +}
 +
-+/// The model point under the pointer: where the pointer's ray meets what it is over, or else the point of the ray
-+/// nearest the view's target. `None` while the pointer is not over the viewport.
++/// The feature a dialog previews, as the others' ghost of it (`grow`: the dialog's value). One that makes a body, or
++/// joins, cuts or intersects with one, gives that body made on its own, as its edges (`solid`, lines in the model), as
++/// the app's preview builds such a feature's tool; one that changes bodies (a fillet, a shell, a move), the box around
++/// the bodies it changes (`box`), and for a fillet or chamfer only around its edges, grown by the value. The preview's
++/// commands are evaluated again, which the session's evaluation cache answers from the preview's own run, and only when
++/// they change.
++fn volume(app: &SolveApp, d: &Dialog, grow: Option<f64>) -> Option<(&'static str, Value)> {
++    let mut cmds = dialogs::preview_commands(app, d).ok().filter(|c| !c.is_empty())?;
++    let mut makes = false;
++    for (command, p) in &mut cmds {
++        let nested = p.get("command").and_then(Value::as_str).map(str::to_owned);
++        // A combine is between bodies already there.
++        if nested.as_deref().unwrap_or(command.as_str()) == "solid.combine" {
++            continue;
++        }
++        let p = if nested.is_some() { p.get_mut("params") } else { Some(p) };
++        if let Some(op) = p.and_then(|p| p.get_mut("operation")).filter(|op| op.is_string()) {
++            *op = "new".into();
++            makes = true;
++        }
++    }
++    let mut h = std::collections::hash_map::DefaultHasher::new();
++    (serde_json::to_string(&cmds).ok()?, app.session.revision).hash(&mut h);
++    let key = h.finish();
++    if let Some((k, v)) = VOLUME.with_borrow(Clone::clone)
++        && k == key
++    {
++        return v;
++    }
++    let found = (|| {
++        let p = app.session.preview_world(&cmds).ok()?;
++        let made = p.after.bodies.iter().filter(|b| p.before.body(&b.name).is_none());
++        if makes {
++            let edges = made.flat_map(|b| {
++                let m = b.mesh();
++                (0..m.edges.len()).filter(|i| m.shaded_edge_visible(*i)).map(|i| m.edges[i].iter().map(|q| [q.x, q.y, q.z]).collect()).collect::<Vec<_>>()
++            });
++            return lines_json(edges.collect(), MAX_SOLID).map(|v| ("solid", v));
++        }
++        let changed = p.after.bodies.iter().filter(|b| {
++            p.before.body(&b.name).is_none_or(|old| {
++                let (old, new) = (old.mesh(), b.mesh());
++                !(Arc::ptr_eq(&old, &new) || old.triangles == new.triangles && old.positions == new.positions)
++            })
++        });
++        let mut b = changed.fold(Aabb3::EMPTY, |b, x| b.union(&x.mesh().bounds()));
++        let mut edges = Aabb3::EMPTY;
++        if let Kind::Fillet { .. } = d.kind {
++            for sel in d.inputs.first().map_or(&[][..], |i| &i.items) {
++                if let Sel::Edge { body, index, .. } = sel {
++                    let m = p.before.body(body).map(|b| b.mesh());
++                    m.iter().flat_map(|m| m.edges.get(*index)).flatten().for_each(|q| edges.add(*q));
++                }
++            }
++        }
++        if !edges.is_empty() {
++            let r = grow.unwrap_or(0.0).abs();
++            let r = Vec3::new(r, r, r);
++            b = Aabb3 { min: b.min.max(edges.min - r), max: b.max.min(edges.max + r) };
++        }
++        (!b.is_empty()).then(|| ("box", boxed(&b)))
++    })();
++    VOLUME.set(Some((key, found.clone())));
++    found
++}
++
++/// The model point under the pointer: where the pointer's ray meets what it is over; over a sketch's geometry, or off
++/// the model in a sketch, where it meets the sketch's plane; near an edge, the ray's point beside it; or else the ray's
++/// point nearest the view's target. Also over what the app draws inside the viewport (a value box, dimension inputs).
++/// `None` while the pointer is not over the viewport.
 +fn pointer(app: &SolveApp) -> Option<Vec3> {
 +    let v = &app.viewport;
-+    let (rect, mouse) = (v.rect?, v.mouse?);
-+    let at = match &v.hover {
++    let rect = v.rect?;
++    let mouse = v.mouse.or_else(|| OVER.get().filter(|p| rect.contains(*p)))?;
++    let proj = viewport::projection(app, rect);
++    let (o, d) = proj.ray(mouse);
++    let near = |q: Vec3| o + d * ((q - o).dot(d) / d.len2());
++    let st = app.session.world_state();
++    // Not far out on a plane seen edge-on.
++    let reach = proj.cam.half_height() * 20.0;
++    let sketch = |id: u64| {
++        let plane = st.sketch(id)?.plane;
++        on_plane(&proj, &plane, mouse).map(|q| plane.to_world(q)).filter(|q| (*q - proj.cam.target).len() < reach)
++    };
++    let at = match v.mouse.and(v.hover.as_ref()) {
 +        Some(Hit::Face { point, .. } | Hit::Vertex { point, .. } | Hit::Plane { point, .. }) => *point,
-+        _ => {
-+            let proj = viewport::projection(app, rect);
-+            let (o, d) = proj.ray(mouse);
-+            o + d * ((proj.cam.target - o).dot(d) / d.len2())
++        Some(Hit::Edge { mid, .. }) => near(*mid),
++        Some(Hit::SketchPoint { sketch: id, .. } | Hit::SketchCurve { sketch: id, .. } | Hit::Profile { sketch: id, .. }) => {
++            sketch(*id).unwrap_or_else(|| near(proj.cam.target))
 +        }
++        _ => app.session.active_sketch.and_then(sketch).unwrap_or_else(|| near(proj.cam.target)),
 +    };
 +    at.is_finite().then_some(at)
 +}
@@ -811,7 +907,7 @@ index 00000000..7880ac8e
 +            _ => false,
 +        }
 +    }
-+    let picks = [("pointer", "/pointer"), ("band", "/band"), ("ghost", "/ghost"), ("box", "/box"), ("at", "/value/at")];
++    let picks = [("pointer", "/pointer"), ("band", "/band"), ("ghost", "/ghost"), ("box", "/box"), ("solid", "/solid"), ("at", "/value/at")];
 +    let m = picks.iter().filter_map(|(key, at)| Some((key.to_string(), state.pointer(at).filter(|v| sane(v))?.clone())));
 +    Value::Object(m.collect())
 +}
@@ -878,12 +974,12 @@ index 00000000..7880ac8e
 +    Some(out)
 +}
 +
-+/// A presence's lines (`[[x, y, …], …]`, in a sketch's coordinates) on the screen through `plane`.
-+fn screen_lines(proj: &Proj, plane: &Plane, v: &Value) -> Vec<Vec<Pos2>> {
++/// A presence's lines (`[[x, y, …], …]`, `n` numbers a point) on the screen, each point placed in the model by `at`.
++fn screen_lines(proj: &Proj, v: &Value, n: usize, at: impl Fn(&[f64]) -> Vec3) -> Vec<Vec<Pos2>> {
 +    let line = |l: &Value| -> Option<Vec<Pos2>> {
-+        let n = l.as_array()?;
-+        let xy: Vec<f64> = n.iter().map(|x| x.as_f64().filter(|x| x.abs() < FAR_OUT)).collect::<Option<_>>()?;
-+        xy.chunks_exact(2).map(|p| proj.to_screen(plane.to_world(Vec2::new(p[0], p[1])))).collect()
++        let xs = l.as_array()?;
++        let xs: Vec<f64> = xs.iter().map(|x| x.as_f64().filter(|x| x.abs() < FAR_OUT)).collect::<Option<_>>()?;
++        xs.chunks_exact(n).map(|p| proj.to_screen(at(p))).collect()
 +    };
 +    v.as_array().into_iter().flatten().take(MAX_ITEMS).filter_map(line).collect()
 +}
@@ -919,11 +1015,13 @@ index 00000000..7880ac8e
 +        if let Some(b) = numbers::<6>(&o.shown["box"]) {
 +            ghost_box(&painter, &proj, b, c);
 +        }
++        ghost(&painter, screen_lines(&proj, &o.shown["solid"], 3, |p| Vec3::new(p[0], p[1], p[2])), c);
 +        if let Some(plane) = o.who.state["sketch"].as_u64().and_then(|id| st.sketch(id)).map(|ss| ss.plane) {
-+            for line in screen_lines(&proj, &plane, &o.shown["ghost"]) {
++            let on_sketch = |p: &[f64]| plane.to_world(Vec2::new(p[0], p[1]));
++            for line in screen_lines(&proj, &o.shown["ghost"], 2, on_sketch) {
 +                painter.add(Shape::line(line, Stroke::new(2.0, c.gamma_multiply(GHOST_EDGE))));
 +            }
-+            for line in screen_lines(&proj, &plane, &o.shown["band"]) {
++            for line in screen_lines(&proj, &o.shown["band"], 2, on_sketch) {
 +                painter.extend(Shape::dashed_line(&line, Stroke::new(1.5, c), 4.0, 3.0));
 +            }
 +        }
@@ -973,17 +1071,26 @@ index 00000000..7880ac8e
 +    })
 +}
 +
-+/// A box in the model as a ghost: its outline on the screen filled, its twelve edges drawn.
++/// A box in the model as a ghost: its twelve edges.
 +fn ghost_box(p: &egui::Painter, proj: &Proj, [x0, y0, z0, x1, y1, z1]: [f64; 6], color: Color32) {
 +    let b = Aabb3 { min: Vec3::new(x0, y0, z0), max: Vec3::new(x1, y1, z1) };
 +    let Some(pts) = corners(&b).iter().map(|q| proj.to_screen(*q)).collect::<Option<Vec<Pos2>>>() else { return };
-+    if pts.iter().any(|q| !q.is_finite() || q.x.abs() > 1e5 || q.y.abs() > 1e5) {
++    let edges = [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)];
++    ghost(p, edges.iter().map(|&(i, j)| vec![pts[i], pts[j]]).collect(), color);
++}
++
++/// A shape's edges on the screen as a ghost: what they span filled, the edges drawn.
++// ponytail: the fill is the edges' convex hull, exact for a box, a convex profile's prism or a cylinder, a little more
++// for an L-shaped one (a union of the faces' outlines would fix that).
++fn ghost(p: &egui::Painter, lines: Vec<Vec<Pos2>>, color: Color32) {
++    let pts: Vec<Pos2> = lines.iter().flatten().copied().collect();
++    if pts.len() < 2 || pts.iter().any(|q| !q.is_finite() || q.x.abs() > 1e5 || q.y.abs() > 1e5) {
 +        return;
 +    }
 +    p.add(Shape::convex_polygon(hull(&pts), color.gamma_multiply(GHOST), Stroke::NONE));
 +    let edge = Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE));
-+    for (i, j) in [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)] {
-+        p.line_segment([pts[i], pts[j]], edge);
++    for line in lines {
++        p.add(Shape::line(line, edge));
 +    }
 +}
 +
@@ -1370,6 +1477,75 @@ index 00000000..7880ac8e
 +        for c in [(0.0, 0.0), (10.0, 0.0), (10.0, 5.0), (0.0, 5.0)] {
 +            assert!(corners.iter().any(|q| (q.0 - c.0).abs() < 0.05 && (q.1 - c.1).abs() < 0.05), "{c:?} in {corners:?}");
 +        }
++        // Off the model in a sketch, the pointer stays on the sketch's plane.
++        a.viewport.mouse = Some(egui::pos2(5.0, 5.0));
++        assert!(a.live_presence()["pointer"][2].as_f64().is_some_and(|z| z.abs() < 1e-3), "on XY");
++        disconnect();
++
++        // A 24 x 11 tab extruded 22 mm from the top of an 80 x 50 x 30 plate: the ghost is the tab's prism, not the plate.
++        let mut a = bound();
++        a.run(BOX.0, json!({"length": "80", "width": "50", "height": "30"})).unwrap();
++        a.run("sketch.create", json!({"plane": {"face": [40, 25, 30]}})).unwrap();
++        a.run("sketch.rectangle.two_point", json!({"p0": [6, 4], "p1": [30, 15]})).unwrap();
++        let sketch = a.session.active_sketch.unwrap();
++        a.finish_sketch();
++        // The tab's profile (the face's outline around it is another).
++        let st = a.session.world_state();
++        let area = |p: &solidcraft_engine::sketch::Profile| {
++            let l = p.region.outer.polyline(1e-2);
++            l.iter().zip(l.iter().cycle().skip(1)).map(|(p, q)| p.x * q.y - q.x * p.y).sum::<f64>().abs()
++        };
++        let profiles = &st.sketch(sketch).unwrap().profiles;
++        let index = (0..profiles.len()).min_by(|i, j| area(&profiles[*i]).total_cmp(&area(&profiles[*j]))).unwrap();
++        connect();
++        a.start("solid.extrude");
++        let d = a.dialog.as_mut().unwrap();
++        d.inputs[0].items = vec![Sel::Profile { sketch, index }];
++        if let Kind::Extrude { distance, operation, .. } = &mut d.kind {
++            (*distance, *operation) = ("22 mm".into(), 1);
++        }
++        (a.viewport.rect, a.viewport.mouse) = (Some(rect), Some(egui::pos2(700.0, 500.0)));
++        for _ in 0..500 {
++            solidcraft_ui_egui::preview::update(&mut a, &ctx);
++            if a.preview.active && !a.preview.busy {
++                break;
++            }
++            std::thread::sleep(std::time::Duration::from_millis(10));
++        }
++        assert!(a.preview.active && a.preview.error.is_none(), "{:?}", a.preview.error);
++        let handle = egui::Rect::from_center_size(egui::pos2(400.0, 300.0), vec2(20.0, 20.0));
++        let input = |pressed: bool, at: egui::Pos2| egui::RawInput {
++            events: vec![
++                egui::Event::PointerMoved(at),
++                egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() },
++            ],
++            ..Default::default()
++        };
++        let run = |input: egui::RawInput, a: &mut SolveApp| {
++            let _ = ctx.run_ui(input, |ui| {
++                let _ = ui.interact(handle, egui::Id::new("sc_manipulator"), egui::Sense::drag());
++                frame(a, ui.ctx());
++            });
++        };
++        // egui hit-tests against the last pass's widgets: the handle is there before it is pressed.
++        run(egui::RawInput { events: vec![egui::Event::PointerMoved(handle.center())], ..Default::default() }, &mut a);
++        run(input(true, handle.center()), &mut a);
++        run(egui::RawInput { events: vec![egui::Event::PointerMoved(handle.center() - vec2(0.0, 30.0))], ..Default::default() }, &mut a);
++        let p = a.live_presence();
++        let mut prism = Aabb3::EMPTY;
++        for l in p["solid"].as_array().expect("a solid") {
++            let xyz: Vec<f64> = serde_json::from_value(l.clone()).unwrap();
++            xyz.chunks(3).for_each(|q| prism.add(Vec3::new(q[0], q[1], q[2])));
++        }
++        let mut size = [prism.size().x, prism.size().y, prism.size().z];
++        size.sort_by(f64::total_cmp);
++        assert!(size.iter().zip([11.0, 22.0, 24.0]).all(|(a, b)| (a - b).abs() < 0.01), "{prism:?}");
++        assert!((prism.min.z - 30.0).abs() < 0.01 && (prism.max.z - 52.0).abs() < 0.01, "{prism:?}");
++        assert!(p.get("box").is_none());
++        // The distance arrow dragged: the pointer is on it, where the value shows.
++        assert_eq!(p["pointer"], p["value"]["at"]);
++        run(input(false, handle.center()), &mut a);
++        assert_ne!(a.live_presence()["pointer"], p["value"]["at"], "let go, the pointer is the mouse's again");
 +        disconnect();
 +
 +        // The others' marks ease toward where they are; a jump wider than a quarter of the view goes at once.
