@@ -18,7 +18,7 @@ import { applyDelta, delta } from './document-delta.js'
 const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i])
 const busy = (e) => e === 'busy' || e?.message === 'busy'
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-const RETAINED = 100, MAX_WANTED = 8, PRESENCE_MS = 100, MAX_PRESENCE = 4096, MAX_DEPTH = 16
+const RETAINED = 100, MAX_WANTED = 8, PRESENCE_MS = 50, MAX_PRESENCE = 4096, MAX_DEPTH = 16
 // The largest media file installed: the browser holds it about twice while the app takes it.
 const MAX_ASSET = 1024 ** 3
 const depth = (v, d = 0) => d > MAX_DEPTH || !v || typeof v !== 'object' ? d : Math.max(d, ...Object.values(v).map((x) => depth(x, d + 1)))
@@ -40,6 +40,8 @@ let adapter = globalThis.playgroundLiveAdapter ?? null
 const waiting = new Set(), followed = new WeakMap()
 globalThis.playgroundLive = { attach(next) { adapter = next; for (const resolve of waiting) resolve(next); waiting.clear() } }
 export const liveAdapter = () => adapter
+// Calls fn once the app offers its adapter (at once if it has).
+export const onAdapter = (fn) => adapter ? fn(adapter) : waiting.add(fn)
 // Live editing for a session once this page's app offers an adapter; apps without one only share files.
 export function follow(session) {
   if (!followed.has(session)) followed.set(session, (adapter ? Promise.resolve(adapter) : new Promise((resolve) => waiting.add(resolve)))
@@ -412,8 +414,8 @@ export class LiveDocument extends EventTarget {
       }
     }
   }
-  // Presence, ten times a second at most: this person's, when it changed (to everyone again when someone arrives), and
-  // the others' as the app shows them.
+  // Presence, twenty times a second at most (apps ease between updates, so marks glide): this person's, when it changed
+  // (to everyone again when someone arrives), and the others' as the app shows them.
   presence(peer, state, hello) {
     if (hello) this.presenceSent = null
     if (JSON.stringify(state ?? null).length > MAX_PRESENCE || depth(state) > MAX_DEPTH) return

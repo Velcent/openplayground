@@ -1,5 +1,5 @@
 import { PeerSession, setPage } from './session.js'
-import { follow, liveAdapter, unfollow } from './live.js'
+import { follow, liveAdapter, onAdapter, unfollow } from './live.js'
 import { SessionStore } from './session-store.js'
 import { readInvite } from './session-protocol.js'
 import * as store from './store.js'
@@ -77,10 +77,12 @@ export async function mountShare(bar, app, here, groups = []) {
             renderSession()
           }
         }))
+        // An invite link can open this before the app has loaded: the wording follows its adapter once it arrives.
+        const liveText=(yes,no)=>{const text=document.createTextNode(liveAdapter()?yes:no);onAdapter(()=>{text.data=yes});return text}
         const body = h('div', {class:'pg-share-body'})
         const view = h('div', {class:'pg-choice pg-sharing'},
-          h('div', {class:'pg-share-heading'}, h('h2', {class:'pg-title'}, liveAdapter() ? 'Live session' : 'File sharing'), button('Close',()=>done())),
-          h('p', {class:'pg-hint'}, liveAdapter() ? `${app.name} · Edits to this project are shared live, with the media they use; Undo reverts only your own edits.` : `${app.name} · Files are copied between participants. Live edits are not shared in this build.`),
+          h('div', {class:'pg-share-heading'}, h('h2', {class:'pg-title'}, liveText('Live session', 'File sharing')), button('Close',()=>done())),
+          h('p', {class:'pg-hint'}, liveText(`${app.name} · Edits to this project are shared live, with the media they use; Undo reverts only your own edits.`, `${app.name} · Files are copied between participants. Live edits are not shared in this build.`)),
           h('label',{},'Your name',name), body, error)
         function live() {
           body.replaceChildren()
@@ -104,7 +106,7 @@ export async function mountShare(bar, app, here, groups = []) {
           const warning=h('p',{class:'pg-hint'})
           let link, lock
           if (session.config.owner) {
-            const role=h('select',{class:'pg-input','aria-label':'Invitation access'},h('option',{value:'editor'},liveAdapter()?'Can edit':'Can share files'),h('option',{value:'viewer'},liveAdapter()?'Can view':'Can receive files'))
+            const role=h('select',{class:'pg-input','aria-label':'Invitation access'},h('option',{value:'editor'},liveText('Can edit','Can share files')),h('option',{value:'viewer'},liveText('Can view','Can receive files')))
             link=h('input',{class:'pg-input',readonly:true,'aria-label':'Invitation link'})
             const refreshLink=()=>{link.value=session.invite(role.value)}; role.onchange=refreshLink; refreshLink()
             lock=button('Lock invitations',()=>attempt(async()=>{await session.admin({lock:!session.locked})}))
@@ -182,7 +184,7 @@ export async function mountShare(bar, app, here, groups = []) {
         async function start() {
           if (session) {live();return}
           if (invite) {
-            body.append(h('p',{},liveAdapter()?'Joining opens the shared project here, live, with the media it uses. Other shared files wait until you accept them.':'Join to see the shared file list and download size. Nothing is received until you accept.'),button('Join session',()=>attempt(async()=>{use(await PeerSession.join(invite,{name:name.value}));live()}),true))
+            body.append(h('p',{},liveText('Joining opens the shared project here, live, with the media it uses. Other shared files wait until you accept them.','Join to see the shared file list and download size. Nothing is received until you accept.')),button('Join session',()=>attempt(async()=>{use(await PeerSession.join(invite,{name:name.value}));live()}),true))
             return
           }
           const selection=h('div',{class:'pg-share-pick'}), picks=[]
@@ -191,7 +193,7 @@ export async function mountShare(bar, app, here, groups = []) {
             selection.append(h('label',{},checkbox,h('span',{},entry.name),h('small',{},formatSize(entry.size))))
           }
           const computer=h('input',{type:'file',multiple:true,'aria-label':'Add files from computer'})
-          body.append(h('p',{},liveAdapter()?'The project open here is shared live once the session starts. You can also add files to send along; your other files stay private.':'Choose the saved project and its assets. Your other files stay private.'),selection,computer,button('Create session',()=>attempt(async()=>{
+          body.append(h('p',{},liveText('The project open here is shared live once the session starts. You can also add files to send along; your other files stay private.','Choose the saved project and its assets. Your other files stay private.')),selection,computer,button('Create session',()=>attempt(async()=>{
             const files=[...computer.files]
             for(const {entry,checkbox} of picks)if(checkbox.checked)files.push(await store.file(entry.path))
             if(!files.length && !liveAdapter())throw new Error('Choose at least one file')
