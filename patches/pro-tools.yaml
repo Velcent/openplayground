@@ -1,9 +1,9 @@
 # SoundCraft: its diffs (patches/pro-tools/) and the live adapter (tools.yaml live:) apply, then these rules.
 
 # Live editing in Playground sessions (patches/pro-tools/live.diff + patches/live/playground_live.rs)
-# The adapter lives in new files: crates/ui-egui/src/live.rs (the shared document, merge, media, presence, Undo and the
-# session-switch guard) and apps/soundcraft-web/src/web/live.rs (the kept runner and the shell that ends each frame
-# with the session's frame hook). These rules only declare them and call in; most append at the end of a file or
+# The adapter lives in new files: crates/ui-egui/src/edit_window/live.rs (the shared document, merge, media, presence,
+# Undo and the session-switch guard) and apps/soundcraft-web/src/web/live.rs (the kept runner and the shell that ends
+# each frame with the session's frame hook and the others drawn over the Mix window and plug-in windows). These rules only declare them and call in; most append at the end of a file or
 # follow a function's signature. Verify: node scripts/build.mjs check pro-tools head|release, then the e2e
 # (tests/live-apps/pro-tools.mjs). If upstream renames a function named below, anchor on its new signature.
 #
@@ -22,25 +22,35 @@
   file: crates/model/src/session.rs
   find: 'pub\s+fn\s+alloc\s*\(\s*&mut\s+self\s*\)\s*->\s*u64\s*\{'
   after: "\n        #[cfg(target_arch = \"wasm32\")] if crate::playground_live::connected() { return crate::playground_live::fresh_id(&mut self.next_id); }"
-# The frontend's module; SoundApp::run's first step (Undo and Redo go to the session); the session-switch guard (a
-# connected session stays open: no New/Open/Close/Revert or opened bundle replaces it); the others' pointers and
-# selections, drawn first in the Edit window's overlay (over the tracks).
+# The frontend's module, a child of the Edit window's (for its drag preview and lane geometry); SoundApp::run's first
+# step (Undo and Redo go to the session); the session-switch guard (a connected session stays open: no
+# New/Open/Close/Revert or opened bundle replaces it); the others' pointers, selections and gestures under way, drawn
+# first in the Edit window's overlay (over the tracks), in the MIDI Editor after its notes (with its roll and its own
+# tick and pitch mapping), and over each Mix-window strip once the strip has its rect.
 - live: true
-  file: crates/ui-egui/src/lib.rs
+  file: crates/ui-egui/src/edit_window.rs
   find: '(?![\s\S])'
-  after: "\n// Live editing in a Playground session (web only).\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
+  after: "\n// Live editing in a Playground session (web only).\n#[cfg(any(target_arch = \"wasm32\", test))]\npub mod live;\n"
 - live: true
   file: crates/ui-egui/src/lib.rs
   find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\b[^{]*\{'
-  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if crate::live::undo(id) { return Ok(Default::default()); }"
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if crate::edit_window::live::undo(id) { return Ok(Default::default()); }"
 - live: true
   file: crates/ui-egui/src/bounce.rs
   find: 'pub\s+fn\s+refuses_session_switch\s*\([^{]*\{'
-  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] if crate::live::refuses_session_switch(app) { return true; }"
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] if crate::edit_window::live::refuses_session_switch(app) { return true; }"
 - live: true
   file: crates/ui-egui/src/edit_window.rs
   find: '^fn\s+overlay\s*\([^{]*\{'
-  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] crate::live::draw_presence(app, ui);"
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] live::draw_presence(app, ui);"
+- live: true
+  file: crates/ui-egui/src/midi_editor.rs
+  find: '^[ \t]*let\s+resp\s*=\s*ui\.interact\(\s*roll\b'
+  before: "    #[cfg(any(target_arch = \"wasm32\", test))] crate::edit_window::live::midi(ui, cid, roll, &x_of, &y_of);\n"
+- live: true
+  file: crates/ui-egui/src/mix_window.rs
+  find: 'let\s+\(r,\s*_\)\s*=\s*ui\.allocate_exact_size\(vec2\(w,\s*h\)[^;\n]*;'
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] crate::edit_window::live::strip(ui, id, r);"
 # The web entry keeps its runner for the adapter and wraps its app (web/live.rs, a child module so it reaches
 # WebShell's fields). If upstream renames WebShell or its `app` field, follow it in web/live.rs.
 - live: true

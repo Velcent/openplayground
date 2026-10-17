@@ -1,11 +1,12 @@
 diff --git a/apps/soundcraft-web/src/web/live.rs b/apps/soundcraft-web/src/web/live.rs
 new file mode 100644
-index 0000000..93161d3
+index 0000000..ad9191a
 --- /dev/null
 +++ b/apps/soundcraft-web/src/web/live.rs
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,79 @@
 +//! Live editing in a Playground session: the page's runner, kept for the session to reach the app, and the shell
-+//! around [`WebShell`] that ends each frame with the session's frame hook.
++//! around [`WebShell`] that ends each frame with the others drawn over the Mix window and plug-in windows, then the
++//! session's frame hook.
 +
 +use super::WebShell;
 +use soundcraft_model::playground_live;
@@ -54,6 +55,7 @@ index 0000000..93161d3
 +
 +    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
 +        self.0.ui(ui, frame);
++        soundcraft_ui_egui::edit_window::live::end_frame(&self.0.app, ui.ctx());
 +        playground_live::frame(&mut self.0.app);
 +    }
 +
@@ -81,34 +83,208 @@ index 0000000..93161d3
 +        self.0.raw_input_hook(ctx, raw_input);
 +    }
 +}
-diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
+diff --git a/crates/ui-egui/src/edit_window/live.rs b/crates/ui-egui/src/edit_window/live.rs
 new file mode 100644
-index 0000000..8ee5265
+index 0000000..c22a64c
 --- /dev/null
-+++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,427 @@
++++ b/crates/ui-egui/src/edit_window/live.rs
+@@ -0,0 +1,1008 @@
 +//! Live editing in a Playground session (web only). The shared document is the session without anyone's views: no
 +//! Edit-window state (`edit`: selection, playhead, zoom, tools, modes, view flags), and per track no height, lane view,
 +//! folder state, pin, record arm or input monitor. Audio reaches everyone as session files, one per source id (the
-+//! built-in demo's synthesized audio excepted: every browser makes the same). Presence: each person's pointer over the
-+//! Edit window's tracks (track, time, height in the row) and selection (tracks, clips, time range), drawn over the others'
-+//! tracks in their color.
++//! built-in demo's synthesized audio excepted: every browser makes the same).
++//!
++//! Presence ([`Live::live_presence`]): each person's pointer and selection, and the gesture under way where it has
++//! things so far (the session changes only when it ends), all in the session's terms so each person draws them through
++//! their own zoom and scroll, eased toward where they last were. Over the Edit window's tracks: clips being moved or
++//! trimmed as ghosts, a fade being drawn or bent, a MIDI clip being drawn as a rubber band, a Pencil stroke on an
++//! automation lane, a time selection being dragged, the playhead while playing or scrubbing. In the MIDI Editor: the
++//! selected notes and those being dragged. Over the Mix window's strips and over plug-in windows: the pointer. A value
++//! being set (a fader, pan, trim, send, plug-in parameter, clip gain or velocity) is tagged under the person's name.
++//! A child of the Edit window's module, for its drag preview and lane geometry.
 +
-+use crate::SoundApp;
-+use crate::edit_window::{rect, sample_at, x_of};
-+use egui::{Color32, Pos2, Rect, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
-+use serde_json::{Value, json};
++use super::{clip_name_height, clip_preview_fades, drag_plan, fade_curve_points, midi_clip_span, ops, plugin_range, rect, sample_at, x_of};
++use crate::widgets::{db_text, pan_text};
++use crate::{Gesture, MainWindow, SoundApp};
++use egui::emath::GuiRounding as _;
++use egui::{Color32, Context, Id, LayerId, Order, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
 +use serde::Deserialize as _;
-+use soundcraft_model::playground_live::{self, Live};
-+use soundcraft_audio_io::{BitDepth, EncodeOptions, FileFormat};
-+use soundcraft_model::playground_live::Presence;
-+use soundcraft_model::{ClipId, EditState, Session, Source, SourceAudio, SourceId, Track, TrackId};
-+use std::cell::RefCell;
++use serde_json::{Value, json};
++use soundcraft_audio_io::{BitDepth, EncodeOptions, FileFormat, SampleFormat};
++use soundcraft_model::playground_live::{self, Live, Presence};
++use soundcraft_model::{AutoParam, ClipContent, ClipId, EditState, Fade, Session, Source, SourceAudio, SourceId, Track, TrackId};
++use std::cell::{Cell, RefCell};
++use std::collections::HashMap;
 +use std::sync::Arc;
 +
 +thread_local! {
-+    /// The others in the session, as the shell last gave them.
-+    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
++    /// The others in the session, as the shell last gave them, with their marks as drawn last.
++    static OTHERS: RefCell<Vec<Other>> = const { RefCell::new(Vec::new()) };
++    /// The Mix window's strips as the latest pass drew them (that pass's number first).
++    static STRIPS: RefCell<(u64, Vec<Strip>)> = const { RefCell::new((0, Vec::new())) };
++    /// The MIDI Editor's piano roll as last drawn.
++    static ROLL: Cell<Option<Roll>> = const { Cell::new(None) };
++    /// The command journal's length when no pointer button was last down: what follows is the gesture's.
++    static PRESSED_AT: Cell<usize> = const { Cell::new(usize::MAX) };
++}
++
++/// Selected or dragged things a presence carries, at most; the points of a stroke.
++const MAX_ITEMS: usize = 50;
++const MAX_STROKE: usize = 120;
++/// The most characters of a tag (name or value), its ellipsis included.
++const MAX_TAG: usize = 24;
++/// How long the others' marks take to go most (1 - 1/e) of the way to their latest place, in seconds.
++const EASE: f64 = 0.08;
++/// A ghost's fill and edge, and a stroke under way: the person's colour at these opacities.
++const GHOST: f32 = 0.28;
++const GHOST_EDGE: f32 = 0.85;
++const STROKE: f32 = 0.7;
++
++/// Another person, with their marks as drawn last by kind (see [`ease`]): the pass and where.
++struct Other {
++    p: Presence,
++    marks: HashMap<&'static str, (u64, Vec<[f64; 3]>)>,
++}
++
++impl Other {
++    fn color(&self) -> Color32 {
++        Color32::from_rgb(self.p.color[0], self.p.color[1], self.p.color[2])
++    }
++
++    /// The value they are setting, when there is one.
++    fn value(&self) -> Option<&str> {
++        self.p.state["value"].as_str().filter(|v| v.len() <= 64)
++    }
++
++    /// `to` (marks of one kind), eased from where they were drawn the pass before: `px` points a unit of each part, a
++    /// jump wider than `far` points on any part goes at once, as marks first seen, not drawn the pass before (another
++    /// view or scope) or of another number do. Sets `moving` while any is still on its way.
++    fn ease(&mut self, key: &'static str, to: Vec<[f64; 3]>, ctx: &Context, px: [f64; 3], far: [f64; 3], moving: &mut bool) -> Vec<[f64; 3]> {
++        let pass = ctx.cumulative_pass_nr();
++        let k = 1.0 - (-f64::from(ctx.input(|i| i.stable_dt).clamp(0.0, 0.1)) / EASE).exp();
++        let (last, at) = self.marks.entry(key).or_default();
++        if *last + 1 < pass || at.len() != to.len() {
++            *at = to;
++        } else {
++            for (s, t) in at.iter_mut().zip(to) {
++                let off = |s: &[f64; 3], i: usize| ((t[i] - s[i]) * px[i]).abs();
++                if (0..3).any(|i| !(off(s, i) <= far[i])) {
++                    *s = t;
++                    continue;
++                }
++                for i in 0..3 {
++                    s[i] += (t[i] - s[i]) * k;
++                }
++                if (0..3).all(|i| off(s, i) < 0.5) {
++                    *s = t;
++                } else {
++                    *moving = true;
++                }
++            }
++        }
++        *last = pass;
++        at.clone()
++    }
++}
++
++/// A Mix-window strip as drawn: its track, its rect, the area it shows in and its layer.
++#[derive(Clone, Copy)]
++struct Strip {
++    track: u64,
++    rect: Rect,
++    clip: Rect,
++    layer: LayerId,
++}
++
++/// The MIDI Editor's piano roll as drawn ([`midi`]): the pass, the clip, the roll, and where tick 0 and pitch 0 are with
++/// the points a tick and a pitch take (pitches go up, so `ky` is below zero: a row is `-ky` tall from `y(pitch)` down).
++#[derive(Clone, Copy)]
++struct Roll {
++    pass: u64,
++    clip: u64,
++    rect: Rect,
++    x0: f32,
++    kx: f32,
++    y0: f32,
++    ky: f32,
++}
++
++impl Roll {
++    fn at(&self, [tick, pitch]: [f64; 2]) -> Pos2 {
++        pos2(self.x0 + tick as f32 * self.kx, self.y0 + pitch as f32 * self.ky)
++    }
++
++    /// A note's box, as the MIDI Editor draws it.
++    fn note(&self, [tick, pitch, len]: [f64; 3]) -> Rect {
++        let (a, b) = (self.at([tick, pitch]), self.at([tick + len, pitch]));
++        Rect::from_min_max(a + vec2(0.0, 1.0), pos2(b.x.max(a.x + 3.0), a.y - self.ky - 1.0))
++    }
++}
++
++/// Whether `pass` is the latest one or the one before.
++fn fresh(ctx: &Context, pass: u64) -> bool {
++    pass + 1 >= ctx.cumulative_pass_nr()
++}
++
++/// A remote time (samples, ticks), unless it is no whole number or too far off to draw.
++fn time(v: &Value) -> Option<f64> {
++    v.as_i64().filter(|t| t.unsigned_abs() < 1 << 48).map(|t| t as f64)
++}
++
++/// A remote fraction (0 to 1).
++fn fraction(v: &Value) -> Option<f64> {
++    v.as_f64().filter(|f| (0.0..=1.0).contains(f))
++}
++
++/// The items of a remote list, at most [`MAX_ITEMS`].
++fn items(v: &Value) -> impl Iterator<Item = &Value> {
++    v.as_array().into_iter().flatten().take(MAX_ITEMS)
++}
++
++/// `f` in thousandths: finer than a point, and short in JSON.
++fn fine(f: f32) -> f64 {
++    (f64::from(f) * 1000.0).round() / 1000.0
++}
++
++/// A ghost: the colour at [`GHOST`] over `r`, with an edge at [`GHOST_EDGE`].
++fn ghost(painter: &Painter, r: Rect, radius: f32, color: Color32) {
++    painter.rect(r, radius, color.gamma_multiply(GHOST), Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE)), StrokeKind::Inside);
++}
++
++/// A selection outline: 2 points of the colour around `r`.
++fn outline(painter: &Painter, r: Rect, radius: f32, color: Color32) {
++    painter.rect_stroke(r, radius, Stroke::new(2.0, color), StrokeKind::Inside);
++}
++
++/// A rubber band: `r`'s outline dashed in the colour.
++fn band(painter: &Painter, r: Rect, color: Color32) {
++    let corners = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
++    painter.extend(Shape::dashed_line(&corners, Stroke::new(1.5, color), 4.0, 3.0));
++}
++
++/// A pointer at `tip` with a tag of `name` and, under it, one of a `value` being set (the look every Playground app
++/// shares).
++fn cursor(painter: &Painter, tip: Pos2, color: Color32, name: &str, value: Option<&str>) {
++    const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
++    // Star-shaped around the tip (its first point), which is what a filled path's triangle fan needs.
++    let arrow = |d: Vec2| ARROW.iter().map(|&[x, y]| tip + d + vec2(x, y)).collect::<Vec<_>>();
++    painter.add(Shape::convex_polygon(arrow(vec2(0.0, 1.0)), Color32::from_black_alpha(64), Stroke::NONE));
++    painter.add(Shape::convex_polygon(arrow(Vec2::ZERO), color, Stroke::new(1.5, Color32::WHITE)));
++    let l = egui::Rgba::from(color);
++    let ink = if 0.2126 * l.r() + 0.7152 * l.g() + 0.0722 * l.b() > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE };
++    let mut at = tip + vec2(12.0, 15.0);
++    for text in [Some(name), value].into_iter().flatten().filter(|t| !t.is_empty()) {
++        let text: String = match text.chars().count() > MAX_TAG {
++            true => text.chars().take(MAX_TAG - 1).chain(['…']).collect(),
++            false => text.to_owned(),
++        };
++        let galley = painter.layout_no_wrap(text, crate::theme::bold(12.0), ink);
++        let pad = vec2(7.0, 3.0);
++        let tag = Rect::from_min_size(at.round_to_pixels(painter.pixels_per_point()), galley.size() + 2.0 * pad);
++        painter.rect_filled(tag, 6.0, color);
++        painter.galley(tag.min + pad, galley, ink);
++        at.y = tag.max.y + 2.0;
++    }
 +}
 +
 +/// Copies what each person keeps of a track for themselves.
@@ -122,7 +298,7 @@ index 0000000..8ee5265
 +}
 +
 +/// A new track's views: what the shared document gives every track.
-+fn fresh(t: &Track) -> Track {
++fn fresh_track(t: &Track) -> Track {
 +    Track::new(t.id, "", t.kind, t.format, t.color)
 +}
 +
@@ -162,61 +338,424 @@ index 0000000..8ee5265
 +    Some(json!({"track": track, "at": sample_at(app.engine.session(), tl, p.x), "y": y}))
 +}
 +
-+/// Where another person's pointer ([`pointer_at`]) is on this person's Edit window.
-+fn pointer_pos(app: &SoundApp, v: &Value) -> Option<Pos2> {
-+    let (track, at, y) = (v["track"].as_u64()?, v["at"].as_i64().filter(|at| at.unsigned_abs() < 1 << 48)?, v["y"].as_f64()?);
-+    let (_, r) = app.edit_layout.rows.iter().find(|(id, _)| *id == track)?;
++/// Another person's Edit-window pointer ([`pointer_at`]) in this person's terms: the time, and the row (its index among
++/// this person's rows plus how far down it).
++fn pointer_target(app: &SoundApp, v: &Value) -> Option<[f64; 3]> {
++    let row = app.edit_layout.rows.iter().position(|(id, _)| Some(*id) == v["track"].as_u64())?;
++    Some([time(&v["at"])?, row as f64 + v["y"].as_f64()?.clamp(0.0, 1.0), 0.0])
++}
++
++/// A time and row ([`pointer_target`]) on this person's Edit window, when it shows there.
++fn edit_pos(app: &SoundApp, at: f64, row: f64) -> Option<Pos2> {
++    let rows = &app.edit_layout.rows;
++    let i = (row.max(0.0) as usize).min(rows.len().checked_sub(1)?);
++    let r = rect(rows[i].1);
 +    let tl = rect(app.edit_layout.timeline);
-+    let p = pos2(x_of(app.engine.session(), tl, at), r[1] + (r[3] - r[1]) * y.clamp(0.0, 1.0) as f32);
++    let p = pos2(x_of(app.engine.session(), tl, at.round() as i64), r.min.y + (row - i as f64) as f32 * r.height());
 +    tl.contains(p).then_some(p)
 +}
 +
-+/// The others' pointers with their names, and outlines around what they selected, over the Edit window's tracks.
++/// The value range an automation lane draws `p` over (as `draw_automation` does).
++fn value_range(track: &Track, p: &AutoParam) -> (f32, f32) {
++    match p {
++        AutoParam::Volume | AutoParam::SendLevel(_) => (-60.0, 12.0),
++        AutoParam::Plugin { .. } => plugin_range(track, p),
++        _ => {
++            let (lo, hi, _) = p.range();
++            (lo, hi)
++        }
++    }
++}
++
++/// The others over the Edit window's tracks (`overlay` calls it first, over the clips): their ghosts, rubber bands,
++/// strokes and playheads, then outlines around what they selected, then their pointers.
 +pub(crate) fn draw_presence(app: &SoundApp, ui: &Ui) {
 +    let (s, tl) = (app.engine.session(), rect(app.edit_layout.timeline));
++    let rows: Vec<(u64, Rect)> = app.edit_layout.rows.iter().map(|(id, r)| (*id, rect(*r))).collect();
 +    let painter = ui.painter().with_clip_rect(tl);
-+    let ids = |v: &Value| v.as_array().into_iter().flatten().filter_map(Value::as_u64).take(50).collect::<Vec<_>>();
-+    let x = |at: Option<i64>| at.filter(|at| at.unsigned_abs() < 1 << 48).map(|at| x_of(s, tl, at));
-+    // An outline from time `a` to `b` (at least 2 points wide: an insertion point) on a lane, when any of it shows.
-+    let outline = |a: f32, b: f32, (y0, y1): (f32, f32), width: f32, color: Color32| {
-+        if b >= tl.min.x && a <= tl.max.x {
-+            let r = Rect::from_min_max(pos2(a.max(tl.min.x - 4.0), y0), pos2(b.max(a + 2.0).min(tl.max.x + 4.0), y1));
-+            painter.rect_stroke(r, 2.0, Stroke::new(width, color), StrokeKind::Inside);
++    let ctx = ui.ctx();
++    let row_of = |track: &Value| Some(rows.iter().position(|(id, _)| Some(*id) == track.as_u64())? as f64);
++    // The main lane of row `v` (its index plus a fraction), moved down by that fraction.
++    let lane = |v: f64| {
++        let i = (v.max(0.0) as usize).min(rows.len().checked_sub(1)?);
++        let (id, r) = rows[i];
++        let h = s.track(TrackId(id)).map_or(r.height(), |t| t.height.points().min(r.height()));
++        Some(Rect::from_min_size(pos2(tl.min.x, r.min.y + (v - i as f64) as f32 * r.height()), vec2(tl.width(), h)))
++    };
++    // Remote times: x clamped to just past the timeline.
++    let x = |at: f64| x_of(s, tl, at.round() as i64).clamp(tl.min.x - 8.0, tl.max.x + 8.0);
++    // A clip's body from time `a` to `b` on the main lane of row `v`.
++    let body = |a: f64, v: f64, b: f64| lane(v).map(|l| Rect::from_min_max(pos2(x(a), l.min.y + 1.0), pos2(x(b).max(x(a) + 1.0), l.max.y - 1.0)));
++    let spp = s.edit.zoom.samples_per_px.max(0.01);
++    let px = [1.0 / spp, rows.first().map_or(50.0, |r| f64::from(r.1.height())), 1.0 / spp];
++    let far = [f64::from(tl.width()) / 4.0, f64::from(tl.height()) / 4.0, f64::from(tl.width()) / 4.0];
++    let mut moving = false;
++    OTHERS.with_borrow_mut(|others| {
++        for o in others.iter_mut() {
++            let (st, color) = (&o.p.state, o.color());
++            let span = |g: &Value| Some([time(&g[1])?, row_of(&g[0])?, time(&g[2])?]);
++            let ghosts: Vec<_> = items(&st["ghosts"]).filter_map(span).collect();
++            let rubber: Vec<_> = span(&st["band"]).into_iter().collect();
++            let playhead: Vec<_> = time(&st["playhead"]).map(|t| [t, 0.0, 0.0]).into_iter().collect();
++            // A Pencil stroke on an automation lane: its points as values on this person's lane for that track.
++            let stroke = &st["stroke"];
++            let stroke = (s.track(TrackId(stroke["track"].as_u64().unwrap_or_default())))
++                .zip(stroke["view"].as_str().and_then(AutoParam::parse))
++                .zip(row_of(&stroke["track"]).and_then(lane))
++                .map(|((t, p), lane)| {
++                    let (lo, hi) = value_range(t, &p);
++                    let y = move |v: f64| lane.max.y - 4.0 - ((v as f32 - lo) / (hi - lo).max(1e-6)).clamp(0.0, 1.0) * (lane.height() - 8.0);
++                    let points: Vec<[f64; 2]> = (stroke["points"].as_array().into_iter().flatten().take(MAX_STROKE))
++                        .filter_map(|p| Some([time(&p[0])?, p[1].as_f64().filter(|v| v.is_finite())?]))
++                        .collect();
++                    (points, y, (hi - lo).max(1e-6), lane)
++                });
++            let fade = &st["fade"];
++            let fade = s.find_clip(ClipId(fade["clip"].as_u64().unwrap_or_default())).zip(Fade::deserialize(&fade["fade"]).ok()).zip(fade["in"].as_bool());
++            let ghosts = o.ease("edit.ghosts", ghosts, ctx, px, far, &mut moving);
++            let rubber = o.ease("edit.band", rubber, ctx, px, far, &mut moving);
++            let playhead = o.ease("edit.playhead", playhead, ctx, px, far, &mut moving);
++            for [t, ..] in playhead {
++                let at = painter.round_to_pixel_center(x(t));
++                painter.line_segment([pos2(at, tl.min.y), pos2(at, tl.max.y)], Stroke::new(1.5, color));
++            }
++            for [a, v, b] in ghosts {
++                if let Some(r) = body(a, v, b) {
++                    ghost(&painter, r, 2.0, color);
++                }
++            }
++            for [a, v, b] in rubber {
++                if let Some(r) = body(a, v, b) {
++                    band(&painter, r, color);
++                }
++            }
++            // A fade being drawn or bent: the area under its curve, as the clip draws its fades.
++            if let Some((((track, c), fade), fade_in)) = fade
++                && fade.len > 0
++                && fade.len <= c.length
++                && fade.curvature.is_finite()
++                && let Some(l) = row_of(&json!(track.0)).and_then(lane)
++            {
++                let r = Rect::from_min_max(pos2(x(c.start as f64), l.min.y + 1.0), pos2(x(c.end() as f64), l.max.y - 1.0));
++                let body = Rect::from_min_max(pos2(r.min.x, r.min.y + clip_name_height(s, l)), r.max);
++                let (a, b) = match fade_in {
++                    true => (r.min.x, x((c.start + fade.len) as f64)),
++                    false => (x((c.end() - fade.len) as f64), r.max.x),
++                };
++                let curve = fade_curve_points(fade, fade_in, a, b, body, ctx.pixels_per_point());
++                let mut mesh = egui::Mesh::default();
++                for (i, p) in curve.iter().enumerate() {
++                    mesh.colored_vertex(*p, color.gamma_multiply(GHOST));
++                    mesh.colored_vertex(pos2(p.x, body.max.y), color.gamma_multiply(GHOST));
++                    if let Some(k) = (2 * i as u32).checked_sub(2) {
++                        mesh.add_triangle(k, k + 1, k + 2);
++                        mesh.add_triangle(k + 1, k + 2, k + 3);
++                    }
++                }
++                painter.with_clip_rect(r.intersect(tl)).add(mesh);
++                painter.with_clip_rect(r.intersect(tl)).add(Shape::line(curve, Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE))));
++            }
++            if let Some((mut points, y, span, lane)) = stroke {
++                // The newest point eases; the others are where the stroke has them.
++                if let Some(tip) = points.pop() {
++                    let tip = o.ease("edit.stroke", vec![[tip[0], tip[1], 0.0]], ctx, [px[0], f64::from(lane.height() / span), 0.0], far, &mut moving);
++                    points.extend(tip.iter().map(|&[t, v, _]| [t, v]));
++                }
++                let line: Vec<Pos2> = points.iter().map(|&[t, v]| pos2(x(t), y(v))).collect();
++                if let Some(&tip) = line.last() {
++                    painter.circle_filled(tip, 2.0, color.gamma_multiply(STROKE));
++                }
++                painter.with_clip_rect(lane.intersect(tl)).add(Shape::line(line, Stroke::new(2.0, color.gamma_multiply(STROKE))));
++            }
 +        }
-+    };
-+    // The main lane of a track's row (alternate playlists below it are this person's view).
-+    let lane = |track: u64| {
-+        let (_, r) = app.edit_layout.rows.iter().find(|(id, _)| *id == track)?;
-+        let h = s.track(TrackId(track)).map_or(r[3] - r[1], |t| t.height.points().min(r[3] - r[1]));
-+        Some((r[1] + 1.0, r[1] + h - 1.0))
-+    };
-+    OTHERS.with_borrow(|others| {
-+        for o in others {
-+            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
-+            let state = &o.state["selection"];
-+            let range = &state["range"];
-+            if let (Some(a), Some(b)) = (x(range[0].as_i64()), x(range[1].as_i64())) {
-+                for ys in ids(&state["tracks"]).into_iter().filter_map(lane) {
-+                    outline(a, b, ys, 1.5, color);
++        for o in others.iter() {
++            let (st, color) = (&o.p.state["selection"], o.color());
++            let selecting = o.p.state["selecting"] == true;
++            let ids = |v: &Value| items(v).filter_map(Value::as_u64).collect::<Vec<_>>();
++            if let (Some(a), Some(b)) = (time(&st["range"][0]), time(&st["range"][1])) {
++                for v in ids(&st["tracks"]).into_iter().filter_map(|t| row_of(&json!(t))) {
++                    // A time range (at least 2 points wide: an insertion point); filled while it is being dragged.
++                    if let Some(l) = lane(v).filter(|_| x(b) >= tl.min.x && x(a) <= tl.max.x) {
++                        let r = Rect::from_min_max(pos2(x(a), l.min.y + 1.0), pos2(x(b).max(x(a) + 2.0), l.max.y - 1.0));
++                        if selecting { ghost(&painter, r, 2.0, color) } else { outline(&painter, r, 2.0, color) }
++                    }
 +                }
 +            }
-+            for clip in ids(&state["clips"]) {
++            for clip in ids(&st["clips"]) {
 +                if let Some((track, c)) = s.find_clip(ClipId(clip))
-+                    && let (Some(ys), Some(a), Some(b)) = (lane(track.0), x(Some(c.start)), x(Some(c.end())))
++                    && let Some(r) = row_of(&json!(track.0)).and_then(|v| body(c.start as f64, v, c.end() as f64))
 +                {
-+                    outline(a, b, ys, 2.0, color);
++                    outline(&painter, r, 2.0, color);
 +                }
 +            }
-+            if let Some(p) = pointer_pos(app, &o.state["pointer"]) {
-+                let arrow = vec![p, p + vec2(0.0, 15.0), p + vec2(10.0, 10.5)];
-+                painter.add(Shape::convex_polygon(arrow, color, Stroke::new(1.0, Color32::WHITE)));
-+                let name = painter.layout_no_wrap(o.name.clone(), crate::theme::regular(11.0), Color32::WHITE);
-+                let tag = Rect::from_min_size(p + vec2(10.0, 12.0), name.size() + vec2(8.0, 4.0));
-+                painter.rect_filled(tag, 3.0, color);
-+                painter.galley(tag.min + vec2(4.0, 2.0), name, Color32::WHITE);
++        }
++        for o in others.iter_mut() {
++            let to: Vec<_> = pointer_target(app, &o.p.state["pointer"]).into_iter().collect();
++            let tip = o.ease("edit.pointer", to, ctx, px, far, &mut moving);
++            if let Some(tip) = tip.first().and_then(|&[at, v, _]| edit_pos(app, at, v)) {
++                cursor(&painter, tip, o.color(), &o.p.name, o.value());
 +            }
 +        }
 +    });
++    if moving {
++        ctx.request_repaint();
++    }
++}
++
++/// The others in the MIDI Editor when they edit `clip` there too: the notes they drag as ghosts, outlines around those
++/// they selected, and their pointers. The editor calls it after drawing its notes, with its roll and its own mapping
++/// of ticks and pitches to the roll; this records them for [`Live::live_presence`].
++pub(crate) fn midi(ui: &Ui, clip: ClipId, roll: Rect, x_of: &dyn Fn(i64) -> f32, y_of: &dyn Fn(i32) -> f32) {
++    let ctx = ui.ctx();
++    let (x0, y0) = (x_of(0), y_of(0));
++    let r = Roll { pass: ctx.cumulative_pass_nr(), clip: clip.0, rect: roll, x0, kx: (x_of(960) - x0) / 960.0, y0, ky: y_of(1) - y0 };
++    ROLL.set(Some(r));
++    if !(r.kx > 0.0 && r.ky < 0.0) {
++        return;
++    }
++    let painter = ui.painter().with_clip_rect(roll);
++    let note = |n: &Value| {
++        let len = time(&n[2]).filter(|l| *l > 0.0)?;
++        Some([time(&n[0])?, n[1].as_u64().filter(|p| *p <= 127)? as f64, len])
++    };
++    let px = [f64::from(r.kx), f64::from(-r.ky), f64::from(r.kx)];
++    let far = [f64::from(roll.width()) / 4.0, f64::from(roll.height()) / 4.0, f64::from(roll.width()) / 4.0];
++    let mut moving = false;
++    OTHERS.with_borrow_mut(|others| {
++        let mut here: Vec<_> = others.iter_mut().filter(|o| o.p.state["midi"]["clip"].as_u64() == Some(clip.0)).collect();
++        for o in &mut here {
++            let ghosts: Vec<_> = items(&o.p.state["midi"]["ghosts"]).filter_map(note).collect();
++            let color = o.color();
++            for g in o.ease("midi.ghosts", ghosts, ctx, px, far, &mut moving) {
++                ghost(&painter, r.note(g), 2.0, color);
++            }
++        }
++        for o in &here {
++            for n in items(&o.p.state["midi"]["notes"]).filter_map(note) {
++                outline(&painter, r.note(n), 2.0, o.color());
++            }
++        }
++        for o in &mut here {
++            let p = &o.p.state["pointer"];
++            let to: Vec<_> = (p["clip"].as_u64() == Some(clip.0))
++                .then(|| Some([time(&p["tick"])?, p["pitch"].as_f64().filter(|p| (-1.0..=129.0).contains(p))?, 0.0]))
++                .flatten()
++                .into_iter()
++                .collect();
++            if let Some(&[tick, pitch, _]) = o.ease("midi.pointer", to, ctx, px, far, &mut moving).first() {
++                cursor(&painter, r.at([tick, pitch]), o.color(), &o.p.name, o.value());
++            }
++        }
++    });
++    if moving {
++        ctx.request_repaint();
++    }
++}
++
++/// A Mix-window strip being drawn (`strip` calls it once it has its rect), for [`end_frame`] and the pointer.
++pub(crate) fn strip(ui: &Ui, track: TrackId, rect: Rect) {
++    let pass = ui.ctx().cumulative_pass_nr();
++    STRIPS.with_borrow_mut(|(at, strips)| {
++        if *at != pass {
++            (*at, *strips) = (pass, Vec::new());
++        }
++        strips.push(Strip { track: track.0, rect, clip: ui.clip_rect(), layer: ui.layer_id() });
++    });
++}
++
++/// The end of a frame (the web app's shell calls it): the others' pointers over the Mix window's strips and over the
++/// plug-in windows open here too, drawn over them; and where the gesture under way starts in the command journal.
++pub fn end_frame(app: &SoundApp, ctx: &Context) {
++    if !ctx.input(|i| i.pointer.any_down()) {
++        PRESSED_AT.set(app.engine.journal.len());
++    }
++    let strips = STRIPS.with_borrow(|(pass, strips)| if fresh(ctx, *pass) { strips.clone() } else { Vec::new() });
++    let mut moving = false;
++    OTHERS.with_borrow_mut(|others| {
++        for o in others.iter_mut() {
++            let p = o.p.state["pointer"].clone();
++            let (x, y) = (fraction(&p["x"]), fraction(&p["y"]));
++            // Over a strip: its place among this person's strips, plus how far across and down it.
++            let on = p["strip"].as_u64().and_then(|t| strips.iter().position(|s| s.track == t));
++            let to: Vec<_> = on.zip(x).zip(y).map(|((i, x), y)| [i as f64 + x, y, 0.0]).into_iter().collect();
++            if let Some(&first) = strips.first() {
++                let px = [f64::from(first.rect.width()), f64::from(first.clip.height()), 0.0];
++                let far = [f64::from(first.clip.width()) / 4.0, f64::from(first.clip.height()) / 4.0, 0.0];
++                if let Some(&[v, y, _]) = o.ease("mix.pointer", to, ctx, px, far, &mut moving).first() {
++                    let i = (v.max(0.0) as usize).min(strips.len() - 1);
++                    let s = strips[i];
++                    let tip = pos2(s.rect.min.x + (v - i as f64) as f32 * s.rect.width(), s.rect.min.y + y as f32 * s.rect.height());
++                    cursor(&ctx.layer_painter(s.layer).with_clip_rect(s.clip), tip, o.color(), &o.p.name, o.value());
++                }
++            }
++            // Over a plug-in window this person has open too: how far across and down it.
++            let window = (p["plugin"][0].as_u64().zip(p["plugin"][1].as_u64()))
++                .and_then(|(t, slot)| Some((TrackId(t), usize::try_from(slot).ok()?)))
++                .filter(|w| app.ui.plugin_windows.contains(w))
++                .map(|(t, slot)| Id::new(("plugin", t.0, slot)))
++                .and_then(|id| Some((id, ctx.memory(|m| m.area_rect(id))?)));
++            let to: Vec<_> = window.zip(x).zip(y).map(|((_, x), y)| [x, y, 0.0]).into_iter().collect();
++            if let Some((id, r)) = window {
++                let px = [f64::from(r.width()), f64::from(r.height()), 0.0];
++                if let Some(&[x, y, _]) = o.ease("plugin.pointer", to, ctx, px, px.map(|p| p / 4.0), &mut moving).first() {
++                    let tip = r.min + vec2(x as f32 * r.width(), y as f32 * r.height());
++                    cursor(&ctx.layer_painter(LayerId::new(Order::Middle, id)).with_clip_rect(r), tip, o.color(), &o.p.name, o.value());
++                }
++            }
++        }
++    });
++    if moving {
++        ctx.request_repaint();
++    }
++}
++
++/// Where `p` is, in the session's terms: over a plug-in window (`{plugin: [track, slot], x, y}`), a Mix-window strip
++/// (`{strip: track, x, y}`), the MIDI Editor's roll (`{clip, tick, pitch}`) or the Edit window's tracks ([`pointer_at`]).
++fn pointer(app: &SoundApp, ctx: &Context, p: Pos2) -> Option<Value> {
++    let across = |r: Rect| [fine((p.x - r.min.x) / r.width()), fine((p.y - r.min.y) / r.height())];
++    let layer = ctx.layer_id_at(p);
++    for &(t, slot) in &app.ui.plugin_windows {
++        let id = Id::new(("plugin", t.0, slot));
++        if layer == Some(LayerId::new(Order::Middle, id))
++            && let Some(r) = ctx.memory(|m| m.area_rect(id))
++        {
++            let [x, y] = across(r);
++            return Some(json!({"plugin": [t.0, slot], "x": x, "y": y}));
++        }
++    }
++    let strip = STRIPS.with_borrow(|(pass, strips)| {
++        let hit = |s: &&Strip| layer == Some(s.layer) && s.rect.contains(p) && s.clip.contains(p);
++        strips.iter().find(hit).filter(|_| fresh(ctx, *pass)).copied()
++    });
++    if let Some(s) = strip {
++        let [x, y] = across(s.rect);
++        return Some(json!({"strip": s.track, "x": x, "y": y}));
++    }
++    if let Some(r) = ROLL.get().filter(|r| fresh(ctx, r.pass) && r.rect.contains(p) && r.kx > 0.0 && r.ky < 0.0) {
++        let pitch = (f64::from((p.y - r.y0) / r.ky) * 100.0).round() / 100.0;
++        return Some(json!({"clip": r.clip, "tick": f64::from((p.x - r.x0) / r.kx).round() as i64, "pitch": pitch}));
++    }
++    (app.ui.window == MainWindow::Edit || app.ui.mix_separate).then(|| pointer_at(app, p)).flatten()
++}
++
++/// The gesture under way in the Edit window, where it has things so far: `ghosts` ([track, start, end] of each clip
++/// moved or trimmed, as the Edit window previews them), `band` (a MIDI clip being drawn), `fade` (`{clip, in, fade}`),
++/// `stroke` (`{track, view, points: [[time, value]...]}`, the newest points of a Pencil stroke) or `selecting`.
++fn edit_gesture(app: &SoundApp, ctx: Option<&Context>, state: &mut Value) {
++    let s = app.engine.session();
++    let span = |track: TrackId, a: i64, b: i64| json!([track.0, a, b]);
++    match &app.gesture {
++        Some(Gesture::Select { .. }) => state["selecting"] = true.into(),
++        Some(Gesture::MoveClips { clips, delta, from_track, to_track, grab_at }) => {
++            let Some(ctx) = ctx else { return };
++            // As the Edit window's overlay draws the move.
++            let plan = drag_plan(ctx, s, app.engine.revision, clips, (*from_track, *to_track), *grab_at);
++            let Some(dest) = &plan.dest else { return };
++            let ghosts: Vec<_> = (plan.moving.iter().take(MAX_ITEMS))
++                .map(|&(t, start, len)| {
++                    let d = ops::lands(dest, t);
++                    let start = (plan.groups.iter().find(|g| g.0 == d))
++                        .map_or(start + delta, |(_, first, slots)| ops::nearest_slot(slots, first + delta) + (start - first));
++                    span(d, start, start + len)
++                })
++                .collect();
++            state["ghosts"] = ghosts.into();
++        }
++        Some(g @ (Gesture::TrimStart { clip, to, .. } | Gesture::TrimEnd { clip, to, .. })) => {
++            if let Some((t, c)) = s.find_clip(*clip) {
++                // Where trimming leaves the clip (as Spot::trim has it).
++                let (a, b) = match g {
++                    Gesture::TrimStart { .. } => ((*to).min(c.end().saturating_sub(1)), c.end()),
++                    _ => (c.start, (*to).max(c.start.saturating_add(1))),
++                };
++                state["ghosts"] = json!([span(t, a, b)]);
++            }
++        }
++        Some(Gesture::MidiClip { track, from, to }) => {
++            if let Some(r) = midi_clip_span(s, *track, *from, *to) {
++                state["band"] = span(*track, r.start, r.end);
++            }
++        }
++        Some(Gesture::Fade { clip, fade_in, .. } | Gesture::FadeCurve { clip, fade_in, .. }) => {
++            if let Some((_, c)) = s.find_clip(*clip) {
++                let (i, o) = clip_preview_fades(c, app.gesture.as_ref());
++                let fade = if *fade_in { i } else { o };
++                state["fade"] = json!({"clip": clip.0, "in": fade_in, "fade": fade});
++            }
++        }
++        Some(Gesture::Pencil { track, points }) if !points.is_empty() => {
++            let newest = &points[points.len().saturating_sub(MAX_STROKE)..];
++            let points: Vec<_> = newest.iter().map(|&(at, v)| json!([at, (f64::from(v) * 100.0).round() / 100.0])).collect();
++            state["stroke"] = json!({"track": track.0, "view": s.track(*track).map(|t| t.view.as_str()), "points": points});
++        }
++        _ => {}
++    }
++}
++
++/// The MIDI Editor's clip when it shows one: `{clip, notes, ghosts?}`, the selected notes and those being dragged, as
++/// [tick, pitch, length] (where the editor draws a drag: a move takes the selection along with the grabbed note).
++fn midi_marks(app: &SoundApp, ctx: &Context, state: &mut Value) {
++    let Some(r) = ROLL.get().filter(|r| fresh(ctx, r.pass)) else { return };
++    let Some((_, c)) = app.engine.session().find_clip(ClipId(r.clip)) else { return };
++    let ClipContent::Midi { sequence } = &c.content else { return };
++    let selected = &app.midi.selected;
++    let notes: Vec<_> = selected.iter().filter_map(|&i| sequence.notes.get(i)).take(MAX_ITEMS).map(|n| json!([n.start, n.pitch, n.length])).collect();
++    state["midi"] = json!({"clip": r.clip, "notes": notes});
++    if let Some(d) = &app.midi.drag {
++        let dragged = |i: &usize| *i == d.index || (!d.resize && selected.contains(i) && selected.contains(&d.index));
++        let ghosts: Vec<_> = (sequence.notes.iter().enumerate().filter(|(i, _)| dragged(i)).take(MAX_ITEMS))
++            .map(|(_, n)| match d.resize {
++                true => json!([n.start, n.pitch, (n.length + d.dx_ticks).max(1)]),
++                false => json!([(n.start + d.dx_ticks).max(0), (i64::from(n.pitch) + d.dy_semi).clamp(0, 127), n.length]),
++            })
++            .collect();
++        state["midi"]["ghosts"] = ghosts.into();
++    }
++}
++
++/// What a command a gesture runs sets, as its tag shows it: a fader, pan, trim, send, plug-in parameter, clip gain or
++/// velocity. Other commands say nothing.
++fn value_text(s: &Session, (id, p): &(String, Value)) -> Option<String> {
++    let num = |k: &str| p[k].as_f64().filter(|v| v.is_finite()).map(|v| v as f32);
++    let track = || s.track(TrackId(p["track"].as_u64()?));
++    let send = || Some(char::from(b'A' + u8::try_from(p["slot"].as_u64()?).ok().filter(|s| *s < 26)?));
++    let param = |plugin: &str| crate::mix_window::plugin_info(plugin)?.param(p["param"].as_str()?);
++    Some(match id.as_str() {
++        "mix.volume" => format!("Volume {} dB", db_text(num("db")?)),
++        "mix.pan" => format!("Pan {}", pan_text(num("pan")?)),
++        "mix.trim" => format!("Trim {:+.1} dB", num("db")?),
++        "clip.gain" => format!("Clip gain {:+.1} dB", num("db")?),
++        "mix.send_level" => match num("db") {
++            Some(db) => format!("Send {} {} dB", send()?, db_text(db)),
++            None => format!("Send {} pan {}", send()?, pan_text(num("pan")?)),
++        },
++        "mix.insert_param" => {
++            let ins = track()?.mixer.inserts.get(usize::try_from(p["slot"].as_u64()?).ok()?)?.as_ref()?;
++            let info = param(&ins.plugin)?;
++            format!("{} {}", info.name, info.format(num("value")?))
++        }
++        "mix.instrument_param" => {
++            let ins = track()?.instrument.as_ref()?;
++            let info = param(&ins.plugin)?;
++            format!("{} {}", info.name, crate::sampler_window::format_param(&ins.plugin, info, num("value")?))
++        }
++        "midi.note_edit" => format!("Velocity {}", p["velocity"].as_u64()?),
++        _ => return None,
++    })
++}
++
++/// Halves the longest list a gesture grows until the state fits the shell's 4 KiB (a stroke keeps its newest points).
++fn fit(state: &mut Value) {
++    const LISTS: [&str; 6] = ["/stroke/points", "/ghosts", "/midi/ghosts", "/midi/notes", "/selection/clips", "/selection/tracks"];
++    while state.to_string().len() > 4000 {
++        let len = |p: &str| state.pointer(p).and_then(Value::as_array).map_or(0, Vec::len);
++        let Some(longest) = LISTS.into_iter().max_by_key(|p| len(p)).filter(|p| len(p) > 0) else { return };
++        let Some(list) = state.pointer_mut(longest).and_then(Value::as_array_mut) else { return };
++        match longest == LISTS[0] {
++            true => drop(list.drain(..list.len().div_ceil(2))),
++            false => list.truncate(list.len() / 2),
++        }
++    }
 +}
 +
 +impl Live for SoundApp {
@@ -225,7 +764,7 @@ index 0000000..8ee5265
 +    fn live_document(&self) -> Value {
 +        let mut s = self.engine.session().clone();
 +        for t in &mut s.tracks {
-+            keep_views(t, &fresh(t));
++            keep_views(t, &fresh_track(t));
 +        }
 +        s.sources.iter_mut().for_each(|s| s.unsaved = false);
 +        let mut doc = serde_json::to_value(&s).unwrap_or_default();
@@ -268,7 +807,7 @@ index 0000000..8ee5265
 +        s.sanitize();
 +        s.next_id = next_id;
 +        for t in &mut s.tracks {
-+            let new = fresh(t);
++            let new = fresh_track(t);
 +            keep_views(t, current.track(t.id).unwrap_or(&new));
 +        }
 +        for src in &mut s.sources {
@@ -308,26 +847,48 @@ index 0000000..8ee5265
 +        self.engine.history_limit = limit;
 +    }
 +
-+    /// `{ pointer?: { track, at, y }, selection: { tracks, clips, range: [start, end] } }` (see [`pointer_at`]; an
-+    /// empty range is the insertion point).
++    /// `{ selection: { tracks, clips, range: [start, end] }, pointer?, playhead?, value?, midi?, ...the Edit window's
++    /// gesture }` (see [`pointer`], [`edit_gesture`], [`midi_marks`], [`value_text`]; an empty range is the insertion
++    /// point; the playhead while playing or scrubbing).
 +    fn live_presence(&self) -> Value {
 +        let s = self.engine.session();
-+        let edit = self.ui.window == crate::MainWindow::Edit || self.ui.mix_separate;
-+        let hover = self.docking_context.as_ref().and_then(|ctx| ctx.input(|i| i.pointer.hover_pos())).filter(|_| edit);
++        let ctx = self.docking_context.as_ref();
 +        let selection = json!({
-+            "tracks": s.edit.selected_tracks.iter().take(50).collect::<Vec<_>>(),
-+            "clips": s.edit.selected_clips.iter().take(50).collect::<Vec<_>>(),
++            "tracks": s.edit.selected_tracks.iter().take(MAX_ITEMS).collect::<Vec<_>>(),
++            "clips": s.edit.selected_clips.iter().take(MAX_ITEMS).collect::<Vec<_>>(),
 +            "range": [s.edit.selection.start, s.edit.selection.end],
 +        });
 +        let mut state = json!({"selection": selection});
-+        if let Some(pointer) = hover.and_then(|p| pointer_at(self, p)) {
-+            state["pointer"] = pointer;
++        if let Some(ctx) = ctx {
++            if let Some(pointer) = ctx.input(|i| i.pointer.hover_pos()).and_then(|p| pointer(self, ctx, p)) {
++                state["pointer"] = pointer;
++            }
++            midi_marks(self, ctx, &mut state);
++            let since = PRESSED_AT.get();
++            if ctx.input(|i| i.pointer.any_down())
++                && let Some(value) = self.engine.journal.get(since..).and_then(|j| j.iter().rev().find_map(|c| value_text(s, c)))
++            {
++                state["value"] = value.into();
++            }
 +        }
++        if self.is_playing() || matches!(self.gesture, Some(Gesture::Scrub { .. })) {
++            state["playhead"] = self.position().into();
++        }
++        edit_gesture(self, ctx, &mut state);
++        fit(&mut state);
 +        state
 +    }
 +
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        OTHERS.set(others);
++        OTHERS.with_borrow_mut(|was| {
++            let now = (others.into_iter())
++                .map(|p| {
++                    let marks = was.iter_mut().find(|o| o.p.id == p.id).map(|o| std::mem::take(&mut o.marks));
++                    Other { p, marks: marks.unwrap_or_default() }
++                })
++                .collect();
++            *was = now;
++        });
 +    }
 +
 +    fn live_assets(&self) -> Vec<(String, String, bool)> {
@@ -348,9 +909,20 @@ index 0000000..8ee5265
 +        soundcraft_audio_io::encode(&audio.buffer, &wav).ok()
 +    }
 +
-+    /// Into the pool, as opening a bundle decodes it, if it is the audio the source describes.
++    /// Into the pool, as opening a bundle decodes it, if it is the audio the source describes and none is here yet (a late
++    /// arrival never replaces it). Only what [`Self::live_read_asset`] sends is decoded: a 32-bit float WAV no bigger
++    /// than that audio, never a compressed file that could decode to far more.
 +    fn live_write_asset(&mut self, id: &str, _name: &str, bytes: Vec<u8>) {
-+        let Some(src) = id.parse().ok().and_then(|id| self.engine.session().source(SourceId(id))) else { return };
++        let s = self.engine.session();
++        let Some(src) = id.parse().ok().and_then(|id| s.source(SourceId(id))) else { return };
++        let most = src.frames.saturating_mul(u64::from(src.channels)).saturating_mul(4).saturating_add(65536);
++        let f32_wav = || {
++            soundcraft_audio_io::detect_format(&bytes, None) == FileFormat::Wav
++                && soundcraft_audio_io::probe(&bytes, None).is_ok_and(|i| (i.format, i.sample_format) == (FileFormat::Wav, SampleFormat::Float32))
++        };
++        if s.pool.contains(src.id) || bytes.len() as u64 > most || !f32_wav() {
++            return;
++        }
 +        let Ok((_, buf)) = soundcraft_audio_io::decode(&bytes, Some("wav")) else { return };
 +        if (buf.num_channels(), buf.frames() as u64, buf.sample_rate) == (usize::from(src.channels), src.frames, src.sample_rate) {
 +            let id = src.id;
@@ -460,6 +1032,10 @@ index 0000000..8ee5265
 +        peer.live_adopt(owner.live_document()).unwrap();
 +        assert_eq!(peer.live_assets(), [(id.clone(), "a.wav".into(), false)], "the peer's own audio under that id is not it");
 +        let doc = canonical(&peer.live_document());
++        let audio = &owner.engine.session().pool.get(SourceId(id.parse().unwrap())).unwrap().buffer;
++        let flac = EncodeOptions { format: FileFormat::Flac, bit_depth: BitDepth::Int16, dither: false, bwf: None };
++        peer.live_write_asset(&id, "a.wav", soundcraft_audio_io::encode(audio, &flac).unwrap());
++        assert!(!peer.live_assets()[0].2, "only a float WAV of the source's size is decoded");
 +        peer.live_write_asset(&id, "a.wav", owner.live_read_asset(&id).unwrap());
 +        assert_eq!(peer.live_read_asset(&id), owner.live_read_asset(&id));
 +        assert!(canonical(&peer.live_document()) == doc && !peer.engine.can_undo());
@@ -478,10 +1054,17 @@ index 0000000..8ee5265
 +        other.engine.session_mut().edit.zoom.samples_per_px *= 2.0;
 +        other.edit_layout.timeline = app.edit_layout.timeline;
 +        other.edit_layout.rows = vec![(ids[1], [0.0, 50.0, 900.0, 250.0])];
-+        assert_eq!(pointer_pos(&other, &pointer), Some(pos2(250.0, 150.0)), "half as far at twice the samples per point");
++        let lands = |v: &Value| pointer_target(&other, v).and_then(|[at, row, _]| edit_pos(&other, at, row));
++        assert_eq!(lands(&pointer), Some(pos2(250.0, 150.0)), "half as far at twice the samples per point");
 +        for junk in [json!({"track": ids[1], "at": i64::MAX, "y": 0.5}), json!({"track": "a", "at": 0, "y": 0}), json!(null)] {
-+            assert_eq!(pointer_pos(&other, &junk), None);
++            assert_eq!(lands(&junk), None);
 +        }
++        // A clip held mid-move onto the next track: its ghost is where the move has it so far.
++        app.engine.session_mut().tracks[0].playlists[0].clips.push(Clip::audio(ClipId(10), "c", SourceId(9), 0, 1000, 500));
++        app.docking_context = Some(egui::Context::default());
++        let (from_track, to_track) = (TrackId(ids[0]), TrackId(ids[1]));
++        app.gesture = Some(Gesture::MoveClips { clips: vec![ClipId(10)], grab_at: 1000, delta: 480, from_track, to_track });
++        assert_eq!(app.live_presence()["ghosts"], json!([[ids[1], 1480, 1980]]));
 +    }
 +
 +    #[test]

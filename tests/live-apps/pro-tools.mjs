@@ -16,6 +16,20 @@ export default {
   // Hovers over the Kick clip (the Kick lane is the first track row, y 230-318; the timeline starts at x 308), leaving
   // the selection as it is: Kick selected, the insertion point at bar 5.
   point: async (page) => { await page.mouse.move(700, 275); await page.waitForTimeout(500) },
+  // Grabs the Kick clip in the lower half of its lane (the Smart tool's Grabber) and holds it about 90 px to the right
+  // (presence `ghosts`, edit_window/live.rs edit_gesture), with no release.
+  drag: async (page) => {
+    await page.mouse.move(700, 300)
+    await page.mouse.down()
+    for (let i = 1; i <= 6; i++) { await page.mouse.move(700 + 15 * i, 300); await page.waitForTimeout(50) }
+    await page.waitForTimeout(300)
+  },
+  // Escape doesn't cancel an Edit-window drag: the clip goes back to where it was grabbed, so the release moves nothing.
+  release: async (page) => {
+    for (let i = 5; i >= 0; i--) { await page.mouse.move(700 + 15 * i, 300); await page.waitForTimeout(50) }
+    await page.waitForTimeout(200)
+    await page.mouse.up()
+  },
   // File > Import > Audio (Ctrl+Shift+I) opens the browser's file picker (web.rs take_path_prompt, rfd's file input,
   // which a picker nobody answers cancels): a 10 ms mono 16-bit WAV goes onto a new track.
   importMedia: async (page) => {
