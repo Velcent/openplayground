@@ -1,2 +1,82 @@
-# CADCraft: no rule patches; its diffs (patches/autocad/) and the live adapter (tools.yaml live:) apply.
-[]
+# Live editing in Playground sessions (patches/autocad/live.diff + patches/live/playground_live.rs)
+# What it's for: people in a Playground session edit one drawing together and see each other's space, pointer and
+#   selection, in each person's color.
+# How: the adapter lives in new files: crates/ui-egui/src/live.rs (the shared document, merge, adopt, presence),
+#   crates/doc/src/live.rs (handles and anonymous block names no one else picks), crates/engine/src/live.rs (the shared
+#   drawing's Undo and Redo) and apps/cadcraft-web/src/web/live.rs (the kept runner and the shell that ends each frame
+#   with the session's frame hook). The template goes into crates/doc/src (tools.yaml live:). These rules only declare
+#   them and call in, each one line at the end of a file or right after a function's signature, except rule 9 (after
+#   one statement) and rules 11 and 12 (an expression replaced). Native builds behave as before: the hooks compile on
+#   wasm, and in debug builds (the native tests) where nothing connects.
+# Verify all: node scripts/build.mjs check autocad head|release, LIVE=0 the same, the e2e (tests/live-apps/autocad.mjs)
+#   and `cargo test -p cadcraft-ui-egui --lib live::`.
+# If upstream changes: if a function named below is renamed, anchor on its new signature; if Shell or its fields
+#   change, follow them in apps/cadcraft-web/src/web/live.rs.
+#
+# Rules 1 and 2: the template and the ids module in cadcraft-doc (wasm, and debug builds for the native tests), and the
+#   template's wasm dependencies under a target spelling nobody else uses. Drop one once the crate has it for wasm.
+- live: true
+  file: crates/doc/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web, and debug builds for the native tests).\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))]\npub mod playground_live;\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))]\nmod live;\n"
+- live: true
+  file: crates/doc/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\njs-sys = \"0.3\"\nwasm-bindgen = \"0.2\"\n"
+# Rules 3 and 4: ids no one else in the session picks. Handles count up `handseed`, and anonymous blocks take the first
+#   free `*U<n>`, so two people adding at once would collide. While connected, Drawing::new_handle takes a random step
+#   past the counter (kept above every handle: ARRAYEDIT treats "handle >= seed" as new) and anonymous_block_name
+#   numbers from a random start. Verify: the native tests concurrent_additions_merge… and objects_drawn_while_connected….
+- live: true
+  file: crates/doc/src/lib.rs
+  find: 'pub\s+fn\s+new_handle\s*\(\s*&mut\s+self\s*\)[^{]*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", debug_assertions))] if let Some(h) = self.live_handle() { return h; }"
+- live: true
+  file: crates/doc/src/lib.rs
+  find: 'pub\s+fn\s+anonymous_block_name\s*\([^{]*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", debug_assertions))] if let Some(n) = self.live_block_name(prefix) { return n; }"
+
+# Rules 5–7: the engine's module (the shared drawing's uid), and Undo and Redo in the shared drawing going to the
+#   session, which takes back only this person's edits: first in Session::undo and Session::redo, which every Undo goes
+#   through (U, UNDO, REDO, MREDO, Ctrl+Z). Verify: the e2e's undo step reverts only the owner's edit.
+- live: true
+  file: crates/engine/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web, and debug builds for the native tests).\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))]\npub mod live;\n"
+- live: true
+  file: crates/engine/src/lib.rs
+  find: 'pub\s+fn\s+undo\s*\(\s*&mut\s+self\s*\)[^{]*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] if let Some(r) = self.live_undo(false) { return r; }"
+- live: true
+  file: crates/engine/src/lib.rs
+  find: 'pub\s+fn\s+redo\s*\(\s*&mut\s+self\s*\)[^{]*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] if let Some(r) = self.live_undo(true) { return r; }"
+
+# Rule 8: the UI crate's live module (wasm, and the crate's own tests).
+# Rule 9: the others' pointers and selections, drawn on the canvas in their colors: in canvas::show right after the
+#   drawing and its selection highlights are painted (where it times them), with the sheet's transform `xf_paper`. If
+#   that line moves, call draw_presence anywhere in canvas::show after the highlights.
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web, and the crate's own tests).\n#[cfg(any(target_arch = \"wasm32\", test))]\npub mod live;\n"
+- live: true
+  file: crates/ui-egui/src/canvas.rs
+  find: 'app\.canvas\.draw_ms\s*=[^;]*;'
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] crate::live::draw_presence(app, ui.ctx(), &painter, &xf_paper, rect);"
+
+# Rules 10–12: the web glue. The module (web/live.rs, a child of `web` so it reaches Shell's fields); the runner kept for
+#   the adapter; and the app the runner starts wrapped in live's shell, which delegates every eframe::App method to
+#   Shell, then runs the session's frame hook, and gives the runner `as_any_mut`.
+- live: true
+  file: apps/cadcraft-web/src/main.rs
+  find: '\bmod\s+web\s*\{'
+  after: "\n    // Live editing in a Playground session.\n    mod live;"
+- live: true
+  file: apps/cadcraft-web/src/main.rs
+  find: 'eframe::WebRunner::new\(\)'
+  replace: 'live::runner()'
+- live: true
+  file: apps/cadcraft-web/src/main.rs
+  find: 'Ok\(Box::new\((?=\s*Shell\b)'
+  replace: 'Ok(live::wrap('
