@@ -33,6 +33,32 @@ async function click(page, ...points) {
 const tempoUp = (page) => click(page, BPM, PLUS_ONE, CLOSE_TEMPO)
 // The editor's MiniSynth clip on its track (row 1, under the master's), and the bottom editors' close X.
 const SYNTH_CLIP = at(80, 144), EDITOR_CLOSE = at(1082, 24)
+// Two empty spots of its piano roll's grid.
+const NOTE_A = at(400, 150), NOTE_B = at(700, 210)
+const view = (page) => page.evaluate(() => { try { return playgroundLiveAdapter.presence().view } catch { return null } })
+// The piano roll on the clip: a double tap on it (a tap that opened its menu instead is cleared, then again).
+async function openRoll(page) {
+  for (let i = 0; i < 4 && await view(page) !== 'piano'; i++) {
+    await page.keyboard.press('Escape'); await page.waitForTimeout(300)
+    await page.mouse.dblclick(...SYNTH_CLIP); await page.waitForTimeout(900)
+  }
+  assert.equal(await view(page), 'piano', 'the piano roll opens on the clip')
+}
+// The records (notes, hits, points) of a page's song: each EVN2 chunk is its payload's length, then a u16 record
+// size and the records. Null while a gesture is under way.
+const records = (page) => page.evaluate(() => {
+  let b
+  try { b = playgroundLiveAdapter.checkpoint() } catch { return null }
+  const v = new DataView(b.buffer, b.byteOffset, b.byteLength), evn2 = [69, 86, 78, 50]
+  let n = 0
+  for (let i = 0; i + 10 <= b.length; i++) {
+    if (!evn2.every((c, k) => b[i + k] === c)) continue
+    const length = v.getUint32(i + 4, true), size = v.getUint16(i + 8, true)
+    if (size) n += (length - 2) / size
+    i += 7 + length
+  }
+  return n
+})
 
 // Optional harness step: the owner, on the playlist with the editor's MiniSynth clip there (as after the presence
 // step), holds the clip and drags it right and back without letting go. Meanwhile the owner's presence has
@@ -155,6 +181,24 @@ test('Honeydew browsers edit one song live, keep views local, show each other wh
   const undone = await same([a, b], 'the owner\'s Undo to reach the editor', both)
   assert.equal(undone.length - both.length, start.length - faster.length, 'Undo reverted the tempo, not the editor\'s channel')
   assert.deepEqual(await a.evaluate(() => session.live.entries.map((e) => e.kind)), ['edit', 'edit', 'undo'])
+
+  // Both open the clip's piano roll and tap a note into it at the same moment: the clip merges note by note, so both
+  // notes land on both pages.
+  for (const page of [a, b]) await openRoll(page)
+  for (const spot of [NOTE_A, NOTE_B]) {
+    await a.mouse.move(...spot)
+    await a.waitForTimeout(300)
+    assert.ok((await a.evaluate(() => playgroundLiveAdapter.presence())).pointer?.key !== undefined, 'the tap is on the grid')
+  }
+  const notes = await records(a)
+  await Promise.all([a.mouse.click(...NOTE_A), b.mouse.click(...NOTE_B)])
+  const tapped = await until(async () => {
+    const [songs, counts] = [await Promise.all([a, b].map(song)), await Promise.all([a, b].map(records))]
+    return songs[0] === songs[1] && counts.every((n) => n === notes + 2) && songs[0]
+  }, 20000, 'both notes on both pages')
+  await a.waitForTimeout(1500)
+  assert.equal(await same([a, b], 'the taps to settle'), tapped, 'neither note is lost later')
+  for (const page of [a, b]) await click(page, EDITOR_CLOSE)
 
   await importSample(a)
   const imported = await same([a, b], 'the owner\'s sample clip to reach the editor', undone)
