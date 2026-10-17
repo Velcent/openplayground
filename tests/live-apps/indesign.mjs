@@ -28,6 +28,8 @@ export default {
     await page.mouse.click(TITLE.x, TITLE.y)
     await page.mouse.move(560, 330)
     await until(() => page.evaluate(() => { const p = playgroundLiveAdapter.presence(); return !!p?.pointer && p.selection.length > 0 }), 10000, 'the pointer and a selection on the cover')
+    // editA clicks the same frame next: a second click this soon is a double-click, which starts typing in it.
+    await page.waitForTimeout(800)
   },
   editA: (page) => nudge(page, TITLE),
   editB: (page) => nudge(page, KICKER),

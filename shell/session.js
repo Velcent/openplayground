@@ -324,7 +324,7 @@ export class PeerSession extends EventTarget {
     })
     return peer.announcing
   }
-  mergeFiles(files, persist = this.accepted) {
+  mergeFiles(files, persist = this.accepted || this.wanted.size > 0) {
     const merged = this.fileQueue.then(async () => {
       const entries = new Map(this.files.map(f => [f.id, f]))
       for (const f of await validateManifest(files)) {
@@ -425,7 +425,8 @@ export class PeerSession extends EventTarget {
   async receiveFiles(ids) {
     const before = this.wanted.size
     for (const id of ids) this.wanted.add(id)
-    if (this.wanted.size > before) await this.prepareDownloads()
+    // The store verifies chunks against the saved file list, which a session not accepted yet does not keep.
+    if (this.wanted.size > before) { await this.mergeFiles([], true); await this.prepareDownloads() }
   }
   async prepareDownloads() {
     this.scanDownloads = true
