@@ -108,19 +108,21 @@ export class SessionStore {
     await write(await this.directory(asset), 'hashes.json', JSON.stringify(hashes))
     this.list = { asset, hashes }; this.verified.delete(asset)
   }
-  async verifiedChunks(file) {
-    if (this.verified.has(file.asset)) return this.verified.get(file.asset)
-    const verified = new Set(), dir = await this.directory(file.asset), hashes = await this.hashes(file.asset)
-    if (hashes) for await (const [name, handle] of dir.entries()) {
-      const i = Number(name)
-      if (handle.kind !== 'file' || !/^(0|[1-9][0-9]*)$/.test(name) || i >= hashes.length) continue
-      try {
-        const chunk = await handle.getFile()
-        if (chunk.size === Math.min(CHUNK_SIZE, file.size - i * CHUNK_SIZE) && await digest(await chunk.arrayBuffer()) === hashes[i]) verified.add(i)
-      } catch (e) { if (e.name !== 'NotFoundError') throw e }
-    }
-    this.verified.set(file.asset, verified)
-    return verified
+  // One scan per asset, shared by every caller: a second one finishing later would drop chunks stored meanwhile.
+  verifiedChunks(file) {
+    if (!this.verified.has(file.asset)) this.verified.set(file.asset, (async () => {
+      const verified = new Set(), dir = await this.directory(file.asset), hashes = await this.hashes(file.asset)
+      if (hashes) for await (const [name, handle] of dir.entries()) {
+        const i = Number(name)
+        if (handle.kind !== 'file' || !/^(0|[1-9][0-9]*)$/.test(name) || i >= hashes.length) continue
+        try {
+          const chunk = await handle.getFile()
+          if (chunk.size === Math.min(CHUNK_SIZE, file.size - i * CHUNK_SIZE) && await digest(await chunk.arrayBuffer()) === hashes[i]) verified.add(i)
+        } catch (e) { if (e.name !== 'NotFoundError') throw e }
+      }
+      return verified
+    })().catch((e) => { this.verified.delete(file.asset); throw e }))
+    return this.verified.get(file.asset)
   }
   async missing(asset) {
     const entry = await this.entry(asset), verified = await this.verifiedChunks(entry)
