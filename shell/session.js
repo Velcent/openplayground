@@ -19,6 +19,9 @@ async function request(room, action, data, token) {
 }
 
 export class PeerSession extends EventTarget {
+  // This person's own choice to connect through the relay only (the owner can also require it for everyone).
+  static preferRelay = false
+  get relayOnly() { return this.relayRequired === true || PeerSession.preferRelay }
   static async restore(room) {
     const config = await new SessionStore(room).connection()
     if (!config || config.room !== room) throw new Error('Local session unavailable')
@@ -116,6 +119,7 @@ export class PeerSession extends EventTarget {
             const me = message.peers.find((p) => p.id === this.id)
             if (!me || message.app !== this.config.app) throw new Error('Session identity or app mismatch')
             this.epoch = message.epoch; this.generation = me.generation; this.role = me.role; this.locked = message.locked; this.since = me.since
+            this.relayRequired = message.relay === true
             this.members = message.members ?? []
             if (this.config.names) for (const id of Object.keys(this.config.names)) if (!this.members.some(m => m.id === id)) delete this.config.names[id]
             if (!settled) {
@@ -164,7 +168,7 @@ export class PeerSession extends EventTarget {
     try {
       const iceServers = await this.relay()
       for (const [id, peer] of this.peers) {
-        peer.pc.setConfiguration({ iceServers })
+        peer.pc.setConfiguration({ iceServers, iceTransportPolicy: this.relayOnly ? 'relay' : 'all' })
         if (this.id < id) peer.pc.restartIce()
       }
     } finally { this.refreshing = false }
@@ -177,7 +181,7 @@ export class PeerSession extends EventTarget {
     this.changed()
   }
   async addPeer(info) {
-    const pc = new RTCPeerConnection({ iceServers: this.ice?.iceServers ?? [] })
+    const pc = new RTCPeerConnection({ iceServers: this.ice?.iceServers ?? [], iceTransportPolicy: this.relayOnly ? 'relay' : 'all' })
     const peer = { ...info, pc, name: 'Connecting…', inventory: new Set(), seq: 0, candidates: [], sends: Promise.resolve(), incoming: Promise.resolve(), progress: null, pending: 0 }
     this.peers.set(info.id, peer)
     await this.sendSignal(peer, { hello: true })
@@ -190,7 +194,7 @@ export class PeerSession extends EventTarget {
       } catch (e) { if (this.peers.get(peer.id) === peer) this.fail(e) }
     }
     // Still not connected after a while: say why it may be, rather than show "Connecting…" for good.
-    const stuck = `Can't reach the other browser yet.${this.relayWarning ? ' The encrypted relay is off, and this network may not allow a direct connection.' : ''}`
+    const stuck = `Can't reach the other browser yet.${this.relayWarning ? this.relayOnly ? ' Connections go through the relay only, and the relay is unavailable.' : ' The encrypted relay is off, and this network may not allow a direct connection.' : ''}`
     setTimeout(() => {
       if (this.peers.get(peer.id) !== peer || ['connected', 'closed'].includes(pc.connectionState)) return
       this.error = stuck; this.changed()

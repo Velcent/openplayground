@@ -22,7 +22,7 @@ async function body(request) {
 }
 
 export async function sessionRequest(request, env) {
-  if (request.method === 'GET' && new URL(request.url).pathname === '/api/session/config') return json({ enabled: env.SESSIONS_ENABLED === 'true' })
+  if (request.method === 'GET' && new URL(request.url).pathname === '/api/session/config') return json({ enabled: env.SESSIONS_ENABLED === 'true', relay: !!(env.TURN_KEY_ID && env.TURN_API_TOKEN) })
   if (env.SESSIONS_ENABLED !== 'true') return error('File sharing is not enabled yet', 503)
   const url = new URL(request.url)
   if (request.headers.get('origin') !== url.origin) return error('Origin not allowed', 403)
@@ -53,7 +53,7 @@ export class SessionRoom extends DurableObject {
       // Which app each connection is in, and since when: every browser derives the same host for each app's document.
       return member && a.epoch === room.epoch ? [{ id: a.id, role: member.role, generation: a.generation, page: a.page ?? null, since: a.since ?? 0 }] : []
     })
-    const data = { type: 'roster', app: room.app, epoch: room.epoch, locked: room.locked, peers }
+    const data = { type: 'roster', app: room.app, epoch: room.epoch, locked: room.locked, relay: !!room.relay, peers }
     for (const ws of this.sockets()) {
       const member = room.members[ws.deserializeAttachment().id]
       if (member) ws.send(JSON.stringify({ ...data, ...(member.role === 'owner' ? { members: Object.entries(room.members).map(([id, m]) => ({ id, role: m.role })) } : {}) }))
@@ -104,6 +104,8 @@ export class SessionRoom extends DurableObject {
       if (action === 'admin') {
         if (!hash || hash !== room.owner) return error('Only the owner can manage this session', 403)
         if (typeof input.lock === 'boolean') room.locked = input.lock
+        // Everyone's connections go through the relay (no participant sees another's IP address); all reconnect.
+        if (typeof input.relay === 'boolean') room.relay = input.relay
         if (input.remove) {
           if (!room.members[input.remove] || room.members[input.remove].role === 'owner' || !HASH.test(input.editor) || !HASH.test(input.viewer) || input.editor === room.editor || input.viewer === room.viewer || new Set([input.editor, input.viewer, room.owner]).size !== 3) return error('Invalid removal or invitation rotation', 400)
           delete room.members[input.remove]

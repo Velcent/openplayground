@@ -248,3 +248,17 @@ test('a session nobody opens for 30 days ends, and joining or reconnecting says 
   assert.equal(await b.evaluate(async (invite) => { try { await PeerSession.join(invite); return 'joined' } catch (e) { return e.message } }, invite), 'This session has ended')
   assert.deepEqual(await a.evaluate(async () => [await session.connect().then(() => 'connected', (e) => e.message), session.status]), ['This session has ended: nobody had it open for 30 days. Your local copies are still available.', 'ended'])
 })
+
+test('the owner can route everyone through the relay, so no participant sees another\'s IP address', async () => {
+  const a = await site.page(), b = await site.page()
+  const invite = await a.evaluate(async () => {
+    window.session = await PeerSession.create({ app: '/honeydew/', files: [new File(['safe'], 'safe.txt')] })
+    return session.invite()
+  })
+  await b.evaluate(async (invite) => { window.session = await PeerSession.join(invite) }, invite)
+  const policy = (page) => page.evaluate(() => [...session.peers.values()].map((p) => p.pc.getConfiguration().iceTransportPolicy).join())
+  await until(async () => await policy(b) === (process.env.SESSION_RELAY === '1' ? 'relay' : 'all'))
+  await a.evaluate(() => session.admin({ relay: true }))
+  await until(async () => await b.evaluate(() => session.relayRequired === true) && await policy(b) === 'relay' && await policy(a) === 'relay', 20000, 'everyone to reconnect through the relay')
+  for (const page of [a, b]) await page.evaluate(() => session.leave())
+})

@@ -20,6 +20,7 @@ const active = {
 export async function mountShare(bar, app, here, groups = []) {
   if (app.slug === 'outlook') return
   setPage(here.path)
+  try { PeerSession.preferRelay = localStorage.getItem('pg-relay-only') === '1' } catch {}
   const appName = path => groups.flatMap(g=>g.apps).find(a=>a.release?.path===path||a.head?.path===path)?.name ?? path
   let invite, issue
   try { invite = readInvite(location.href); if (invite && invite.app !== here.path) throw new Error('This invitation belongs to another app or build') }
@@ -109,6 +110,18 @@ export async function mountShare(bar, app, here, groups = []) {
             lock=button('Lock invitations',()=>attempt(async()=>{await session.admin({lock:!session.locked})}))
             body.append(h('div',{class:'pg-share-invite'},role,link,button('Copy link',()=>attempt(async()=>{await navigator.clipboard.writeText(link.value);toast('Invitation copied')}))),lock)
           }
+          // Direct connections are fastest; through the relay, nobody sees another participant's IP address (the
+          // traffic stays end-to-end encrypted). The owner can require it for everyone; anyone can choose it for themselves.
+          const route=h('select',{class:'pg-input',id:'pg-share-route','aria-label':'Connections'},
+            h('option',{value:'direct'},'Direct when possible (fastest)'),
+            h('option',{value:'relay',disabled:!config.relay},`Always through the relay (hides IP addresses)${config.relay?'':' · not available here'}`))
+          const routeHint=h('small',{class:'pg-hint'})
+          route.onchange=()=>attempt(async()=>{
+            const relay=route.value==='relay'
+            if (session.config.owner) await session.admin({relay})
+            else { try { localStorage.setItem('pg-relay-only', relay ? '1' : '0') } catch {}; PeerSession.preferRelay=relay; session.leave(); await session.connect() }
+          })
+          body.append(h('label',{},'Connections',route),routeHint)
           const add = h('input',{type:'file',multiple:true,'aria-label':'Share more files'})
           const addLabel = h('label',{},'Add files',add)
           add.onchange=()=>attempt(async()=>{await session.share([...add.files]);add.value=''})
@@ -120,6 +133,9 @@ export async function mountShare(bar, app, here, groups = []) {
             addLabel.hidden=session.role==='viewer' || session.stopped
             receive.hidden=session.accepted; receive.disabled=!session.files.length
             reconnect.hidden=!['failed','reconnecting','left','displaced'].includes(session.status)
+            route.value=session.relayOnly?'relay':'direct'
+            route.disabled=!session.config.owner && session.relayRequired===true
+            routeHint.textContent=session.relayRequired?'The owner routes everyone through the relay: no one sees another participant\'s IP address.':session.relayOnly?'Your connections go through the relay: the others don\'t see your IP address.':'Connections go directly between browsers when the network allows it, through the encrypted relay otherwise.'
             if (lock) {lock.textContent=session.locked?'Unlock invitations':'Lock invitations';link.value=session.invite(body.querySelector('select').value)}
             const offline=session.members.filter(p=>p.id!==session.id&&!session.peers.has(p.id)).map(p=>({...p,name:session.config.names?.[p.id]||`Participant ${p.id.slice(0,8)}`,progress:{status:'offline'}}))
             const peers=[{id:session.id,name:`${session.name} (you)`,role:session.role,progress:{...session.progress,status:session.status}},...session.peers.values(),...offline]
