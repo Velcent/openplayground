@@ -1,25 +1,42 @@
 diff --git a/apps/wordcraft-web/src/live.rs b/apps/wordcraft-web/src/live.rs
 new file mode 100644
-index 0000000..791fb78
+index 0000000..e022069
 --- /dev/null
 +++ b/apps/wordcraft-web/src/live.rs
-@@ -0,0 +1,441 @@
+@@ -0,0 +1,617 @@
 +//! Playground live editing (`playground_live`): the shared document is the open document's model as JSON (as the
 +//! app's own JSON format writes it, with pictures and kept parts as base64) without what is personal or stamped on
 +//! save: the zoom saved with it, the save times, author and count, and field-code toggles. Text merges character by
 +//! character (`text_merge`). Native undo history stays local; while connected Undo and Redo go to the session.
++//!
++//! Presence: each person shares their selection in the shared document (`anchor` and `focus`: story, paragraph path,
++//! byte offset) and their pointer over a page (`[page, x, y]`, page points); the others are drawn over the pages in
++//! their color: the selection shaded, the caret as a bar with their name, the pointer as an arrow (`web/live.rs`
++//! calls [`frame`] after each frame).
++//!
++//! Upstream calls in through two hooks (rules in patches/word.yaml): `wordcraft_engine::LIVE_UNDO` at the top of
++//! `Session::run` and `wordcraft_engine::LIVE_HISTORY` at the top of the QAT's `qat_enabled`.
++
++// The frame hook and drawing run in the browser only.
++#![cfg_attr(test, allow(dead_code))]
++
++#[path = "playground_live.rs"]
++#[allow(dead_code)]
++pub mod playground_live;
++mod text_merge;
 +
 +use std::cell::{Cell, RefCell};
 +use std::collections::BTreeMap;
 +use std::sync::Arc;
 +
-+use serde_json::{Map, Value};
++use egui::{Color32, FontId, Pos2, Rect, Shape, Stroke, pos2, vec2};
++use serde_json::{Map, Value, json};
 +use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph, Pos, StoryRef};
 +use wordcraft_engine::cmd::insert::{base64_decode, base64_encode};
++use wordcraft_engine::layout::DocLayout;
 +use wordcraft_ui_egui::WordApp;
 +
-+use crate::playground_live::{self, Error, Live};
-+use crate::text_merge;
++use playground_live::{Error, Live, Presence};
 +
 +pub const FORMAT: &str = concat!("word:1:", env!("CARGO_PKG_VERSION"));
 +
@@ -32,12 +49,58 @@ index 0000000..791fb78
 +    /// A pointer is down, or a text field other than the page has the keyboard.
 +    static UI_BUSY: Cell<bool> = const { Cell::new(false) };
 +    static CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
++    /// This person's pointer over the shared document's pages as of the last frame: page, x, y (points).
++    static POINTER: Cell<Option<(usize, f64, f64)>> = const { Cell::new(None) };
++    /// The others in the session, as the shell last gave them.
++    static OTHERS: RefCell<Vec<Other>> = const { RefCell::new(Vec::new()) };
++}
++
++/// Another person's presence, read defensively: positions are checked against the document before use.
++struct Other {
++    name: String,
++    color: Color32,
++    selection: Option<(Pos, Pos)>,
++    pointer: Option<(usize, f32, f32)>,
++}
++
++impl From<Presence> for Other {
++    fn from(p: Presence) -> Other {
++        let pos = |key: &str| serde_json::from_value::<Pos>(p.state[key].clone()).ok();
++        let number = |v: &Value| v.as_f64().filter(|v| v.abs() < 1e6).map(|v| v as f32);
++        let at = &p.state["pointer"];
++        Other {
++            name: p.name.chars().take(32).collect(),
++            color: Color32::from_rgb(p.color[0], p.color[1], p.color[2]),
++            selection: pos("anchor").zip(pos("focus")),
++            pointer: at[0].as_u64().and_then(|page| Some((usize::try_from(page).ok()?, number(&at[1])?, number(&at[2])?))),
++        }
++    }
++}
++
++/// Hooks the engine's Undo and Redo, and the QAT's state of them.
++pub fn install() {
++    let _ = wordcraft_engine::LIVE_UNDO.set(undo);
++    let _ = wordcraft_engine::LIVE_HISTORY.set(holds);
 +}
 +
 +/// The end of a frame.
-+pub fn frame(app: &mut WordApp, ctx: &egui::Context) {
++pub fn frame(app: &mut WordApp, ui: &egui::Ui) {
++    let ctx = ui.ctx();
 +    UI_BUSY.set(ctx.input(|i| i.pointer.any_down()) || (ctx.memory(|m| m.focused().is_some()) && !app.canvas.focused));
 +    CTX.with_borrow_mut(|c| _ = c.get_or_insert_with(|| ctx.clone()));
++    // The shared document's pages are on screen (no Backstage or Start screen over them).
++    let shown = !app.ui.backstage && app.has_document() && SHARED.get() == Some(app.session.document_id());
++    let hover = ctx.input(|i| i.pointer.hover_pos()).filter(|p| app.canvas.canvas_rect.is_some_and(|r| r.contains(*p)));
++    let mut pointer = None;
++    if shown && (hover.is_some() || OTHERS.with_borrow(|o| !o.is_empty())) {
++        let layout = app.session.layout();
++        let round = |v: f32| (f64::from(v) * 10.0).round() / 10.0;
++        pointer = hover
++            .and_then(|p| wordcraft_ui_egui::canvas::page_at(&app.canvas.page_rects, &layout, app.canvas.scale, p))
++            .map(|(page, x, y)| (page, round(x), round(y)));
++        draw_presence(app, ui, &layout);
++    }
++    POINTER.set(pointer);
 +    playground_live::frame(app);
 +}
 +
@@ -45,12 +108,81 @@ index 0000000..791fb78
 +    CTX.with_borrow(|c| c.iter().for_each(egui::Context::request_repaint));
 +}
 +
-+/// `wordcraft_engine::LIVE_UNDO`: while connected, the shared document's Undo and Redo are the session's.
-+pub fn undo(document: u64) -> Option<fn(bool)> {
-+    fn session(redo: bool) {
++/// `wordcraft_engine::LIVE_HISTORY`: whether the session holds document `id`'s Undo and Redo (the shared one, while
++/// connected).
++fn holds(document: u64) -> bool {
++    SHARED.get() == Some(document) && playground_live::connected()
++}
++
++/// `wordcraft_engine::LIVE_UNDO`, `Session::run`'s first step: while the session holds the document's history, its Undo
++/// and Redo (`count` steps for Undo Actions) are the session's.
++fn undo(document: u64, command: &str, params: &Value) -> bool {
++    let redo = match command {
++        "edit.undo" | "edit.undoTo" => false,
++        "edit.redo" => true,
++        _ => return false,
++    };
++    if !holds(document) {
++        return false;
++    }
++    for _ in 0..params.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 64) {
 +        playground_live::undo(redo);
 +    }
-+    (SHARED.get() == Some(document) && playground_live::connected()).then_some(session as fn(bool))
++    true
++}
++
++/// A selection from another person that lies in this document: both ends in one story, each a paragraph's position on
++/// a character boundary.
++fn resolved<'a>(doc: &Document, selection: &'a Option<(Pos, Pos)>) -> Option<(&'a Pos, &'a Pos)> {
++    let valid = |pos: &Pos| doc.para_at(pos).is_some_and(|p| p.text.is_char_boundary(pos.off));
++    selection.as_ref().filter(|(a, f)| a.story == f.story && valid(a) && valid(f)).map(|(a, f)| (a, f))
++}
++
++/// The others' selections (shaded), carets (a bar with their name) and pointers (an arrow), in their color, over the
++/// pages as this frame drew them.
++fn draw_presence(app: &WordApp, ui: &egui::Ui, layout: &DocLayout) {
++    let Some(clip) = app.canvas.canvas_rect else { return };
++    let painter = ui.painter().with_clip_rect(clip);
++    let (doc, hint, rects) = (&app.session.doc, app.session.page_hint, &app.canvas.page_rects);
++    // A page point on screen, with the page's scale (as the canvas places its own selection).
++    let screen = |page: usize, x: f32, y: f32| {
++        let (r, p) = (rects.get(page)?, layout.pages.get(page)?);
++        let scale = if p.w > 0.0 { r.width() / p.w } else { app.canvas.scale };
++        Some((pos2(r.min.x + x * scale, r.min.y + y * scale), scale))
++    };
++    OTHERS.with_borrow(|others| {
++        for other in others {
++            let color = other.color;
++            if let Some((anchor, focus)) = resolved(doc, &other.selection) {
++                if anchor != focus {
++                    for (page, r) in layout.selection_rects(doc, anchor, focus, hint) {
++                        if let Some((min, scale)) = screen(page, r.x, r.y) {
++                            painter.rect_filled(Rect::from_min_size(min, vec2(r.w, r.h) * scale), 0.0, color.gamma_multiply(0.25));
++                        }
++                    }
++                }
++                if let Some(c) = layout.caret_on(focus, hint)
++                    && let Some((top, scale)) = screen(c.page, c.x, c.top)
++                {
++                    // Turned text (a table cell's text direction): the caret lies across the page.
++                    let end = if c.width > 0.0 { top + vec2(c.width * scale, 0.0) } else { top + vec2(0.0, c.height * scale) };
++                    painter.line_segment([top, end], Stroke::new(2.0, color));
++                    name_tag(&painter, top, &other.name, color);
++                }
++            }
++            if let Some((tip, _)) = other.pointer.and_then(|(page, x, y)| screen(page, x, y)) {
++                painter.add(Shape::convex_polygon(vec![tip, tip + vec2(0.0, 16.0), tip + vec2(11.0, 11.0)], color, Stroke::new(1.0, Color32::WHITE)));
++            }
++        }
++    });
++}
++
++/// `name` on a tag in `color` just above `at`.
++fn name_tag(painter: &egui::Painter, at: Pos2, name: &str, color: Color32) {
++    let text = painter.layout_no_wrap(name.to_owned(), FontId::proportional(11.0), Color32::WHITE);
++    let tag = Rect::from_min_size(at - vec2(0.0, text.size().y + 4.0), text.size() + vec2(8.0, 4.0));
++    painter.rect_filled(tag, 2.0, color);
++    painter.galley(tag.min + vec2(4.0, 2.0), text, Color32::WHITE);
 +}
 +
 +/// Whether the open document is the shared one; the first document open becomes it.
@@ -69,9 +201,12 @@ index 0000000..791fb78
 +fn project(doc: &Document) -> Value {
 +    let mut d = doc.clone();
 +    let (media, passthrough) = (std::mem::take(&mut d.media), std::mem::take(&mut d.passthrough));
-+    d.settings.zoom = None;
 +    (d.core.created, d.core.modified, d.core.last_modified_by, d.core.revision) = Default::default();
 +    let mut v = serde_json::to_value(&d).unwrap_or_default();
++    // The zoom saved with the document (in versions that save one) is this person's.
++    if let Some(settings) = v.get_mut("settings").and_then(Value::as_object_mut) {
++        settings.remove("zoom");
++    }
 +    without_field_codes(&mut v);
 +    // ponytail: files are encoded again on every changed frame; cache the text by Arc if big pictures make typing lag.
 +    for (key, files) in [("media", media), ("passthrough", passthrough)] {
@@ -221,7 +356,14 @@ index 0000000..791fb78
 +        project(&self.session.doc)
 +    }
 +
-+    fn live_adopt(&mut self, document: Value) -> Result<(), Error> {
++    fn live_adopt(&mut self, mut document: Value) -> Result<(), Error> {
++        // This person's saved zoom stays (read by name: the field is newer than some releases).
++        if let Some(settings) = document.get_mut("settings").and_then(Value::as_object_mut) {
++            match serde_json::to_value(&self.session.doc.settings).ok().and_then(|mut v| v.get_mut("zoom").map(Value::take)) {
++                Some(zoom) => settings.insert("zoom".into(), zoom),
++                None => settings.remove("zoom"),
++            };
++        }
 +        let mut doc = from_shared(document)?;
 +        if !self.has_document() {
 +            // The Start screen: the shared document opens.
@@ -236,7 +378,6 @@ index 0000000..791fb78
 +            return Ok(());
 +        }
 +        let s = &mut self.session;
-+        doc.settings.zoom = s.doc.settings.zoom;
 +        let core = &s.doc.core;
 +        (doc.core.created, doc.core.modified, doc.core.last_modified_by, doc.core.revision) =
 +            (core.created.clone(), core.modified.clone(), core.last_modified_by.clone(), core.revision);
@@ -316,13 +457,28 @@ index 0000000..791fb78
 +        }
 +        if valid { Ok(()) } else { Err("Conflict: the merged document is not valid".into()) }
 +    }
++
++    /// `{anchor, focus, pointer?}` while the shared document is open: the selection's ends and the pointer over a page.
++    fn live_presence(&self) -> Value {
++        if !self.has_document() || SHARED.get() != Some(self.session.document_id()) {
++            return Value::Null;
++        }
++        let mut v = json!({"anchor": self.session.sel.anchor, "focus": self.session.sel.focus});
++        if let Some((page, x, y)) = POINTER.get() {
++            v["pointer"] = json!([page, x, y]);
++        }
++        v
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        OTHERS.set(others.into_iter().map(Other::from).collect());
++    }
 +}
 +
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
 +    use playground_live::canonical;
-+    use serde_json::json;
 +    use wordcraft_engine::Session;
 +    use wordcraft_ui_egui::Services;
 +
@@ -357,7 +513,7 @@ index 0000000..791fb78
 +            caret(&mut a, at.0, at.1);
 +            a.session.run("insert.field", &json!({"instr": "PAGE"})).unwrap();
 +        }
-+        let _ = wordcraft_engine::LIVE_UNDO.set(undo);
++        install();
 +        playground_live::connect();
 +        let start = canonical(&a.live_document());
 +        // Views, save stamps and field-code toggles are not shared.
@@ -429,6 +585,26 @@ index 0000000..791fb78
 +    }
 +
 +    #[test]
++    fn presence_is_the_selection_in_the_shared_document_and_only_positions_in_it_are_drawn() {
++        let mut a = app(&["Hello w\u{f6}rld", "Second"]);
++        assert_eq!(a.live_presence(), Value::Null, "nothing before the session reads the document");
++        a.live_document();
++        a.session.sel = wordcraft_engine::Selection { anchor: Pos::body(0, 6), focus: Pos::body(0, 12) };
++        let mine = a.live_presence();
++        let end = |path: Value, off: usize| json!({"story": "body", "path": path, "off": off});
++        assert_eq!(mine, json!({"anchor": end(json!([0]), 6), "focus": end(json!([0]), 12)}));
++        let drawn = |state: Value| {
++            let other = Other::from(Presence { id: "b".into(), name: "Bob".into(), color: [9, 9, 9], state });
++            resolved(&a.session.doc, &other.selection).is_some()
++        };
++        assert!(drawn(mine));
++        let part = json!({"story": {"part": 1}, "path": [0], "off": 0});
++        for focus in [end(json!([0]), 8), end(json!([0]), 13), end(json!([2]), 0), end(json!([0, 0]), 0), part, json!(-1)] {
++            assert!(!drawn(json!({"anchor": end(json!([0]), 0), "focus": focus})), "{focus}");
++        }
++    }
++
++    #[test]
 +    fn only_documents_every_page_can_open_pass_the_check() {
 +        let doc = |text: &str, runs: Value| json!({"body": [{"kind": "para", "text": text, "runs": runs}]});
 +        assert!(WordApp::live_check(&project(&Document::new())).is_ok());
@@ -445,31 +621,11 @@ index 0000000..791fb78
 +        }
 +    }
 +}
-diff --git a/apps/wordcraft-web/src/main.rs b/apps/wordcraft-web/src/main.rs
-index 2f4283d..9f074ff 100644
---- a/apps/wordcraft-web/src/main.rs
-+++ b/apps/wordcraft-web/src/main.rs
-@@ -12,6 +12,15 @@
- #[cfg(target_arch = "wasm32")]
- mod web;
- 
-+#[cfg(any(target_arch = "wasm32", test))]
-+#[cfg_attr(test, allow(dead_code))]
-+mod live;
-+#[cfg(any(target_arch = "wasm32", test))]
-+#[allow(dead_code)]
-+mod playground_live;
-+#[cfg(any(target_arch = "wasm32", test))]
-+mod text_merge;
-+
- #[cfg(target_arch = "wasm32")]
- fn main() {
-     web::start();
-diff --git a/apps/wordcraft-web/src/text_merge.rs b/apps/wordcraft-web/src/text_merge.rs
+diff --git a/apps/wordcraft-web/src/live/text_merge.rs b/apps/wordcraft-web/src/live/text_merge.rs
 new file mode 100644
-index 0000000..8292802
+index 0000000..60c0d1b
 --- /dev/null
-+++ b/apps/wordcraft-web/src/text_merge.rs
++++ b/apps/wordcraft-web/src/live/text_merge.rs
 @@ -0,0 +1,440 @@
 +//! Playground live editing: the three-way merge of WordCraft's shared document (JSON). Stories (the body, parts, note
 +//! separators, table cells) are lists of blocks without ids and a paragraph is one string with byte-length runs and
@@ -484,7 +640,7 @@ index 0000000..8292802
 +
 +use serde_json::{Map, Value};
 +
-+use crate::playground_live::{self, Error};
++use super::playground_live::{self, Error};
 +
 +/// The object replacement character: an inline object's place in a paragraph's text.
 +const OBJ: char = '\u{FFFC}';
@@ -911,96 +1067,77 @@ index 0000000..8292802
 +        assert_eq!(pairs("abc", "zabcz"), [Some(1), Some(2), Some(3)]);
 +    }
 +}
-diff --git a/apps/wordcraft-web/src/web.rs b/apps/wordcraft-web/src/web.rs
-index 0e40099..683b454 100644
---- a/apps/wordcraft-web/src/web.rs
-+++ b/apps/wordcraft-web/src/web.rs
-@@ -38,7 +38,8 @@ pub fn start() {
-         {
-             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
-         }
--        let result = eframe::WebRunner::new()
-+        let runner = eframe::WebRunner::new();
-+        let result = runner
-             .start(
-                 canvas,
-                 options,
-@@ -73,6 +74,14 @@ pub fn start() {
-                 }),
-             )
-             .await;
-+        if result.is_ok() {
-+            // Playground live editing (inert until its shell connects).
-+            let _ = wordcraft_engine::LIVE_UNDO.set(crate::live::undo);
-+            let with_app = move |f: &mut dyn FnMut(&mut WordApp)| runner.app_mut::<WebShell>().map(|mut shell| f(&mut shell.app)).is_some();
-+            if let Err(e) = crate::playground_live::web::attach::<WordApp>(crate::live::FORMAT, with_app, crate::live::repaint) {
-+                log::error!("live editing unavailable: {e:?}");
-+            }
-+        }
-         if let Some(el) = document.get_element_by_id(LOADING_ID) {
-             match result {
-                 Ok(()) => el.remove(),
-@@ -124,6 +133,11 @@ impl eframe::App for WebShell {
- 
-     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-         self.app.ui(ui);
-+        crate::live::frame(&mut self.app, ui.ctx());
+diff --git a/apps/wordcraft-web/src/web/live.rs b/apps/wordcraft-web/src/web/live.rs
+new file mode 100644
+index 0000000..3b2715c
+--- /dev/null
++++ b/apps/wordcraft-web/src/web/live.rs
+@@ -0,0 +1,68 @@
++//! Live editing in a Playground session: the page's runner, kept so the session can reach the app, and the shell around
++//! [`WebShell`] that ends each frame with the session's frame hook (`crate::live`).
++
++use std::cell::OnceCell;
++
++use wordcraft_ui_egui::WordApp;
++
++use super::WebShell;
++use crate::live::{self as adapter, playground_live};
++
++thread_local! {
++    static RUNNER: OnceCell<eframe::WebRunner> = const { OnceCell::new() };
++}
++
++/// A new web runner, kept for [`wrap`].
++pub(super) fn runner() -> eframe::WebRunner {
++    let runner = eframe::WebRunner::new();
++    RUNNER.with(|kept| kept.get_or_init(|| runner.clone()).clone())
++}
++
++/// The app eframe runs: `shell`, offered to the page for live editing.
++pub(super) fn wrap(shell: WebShell) -> Box<dyn eframe::App> {
++    adapter::install();
++    let with_app = |with: &mut dyn FnMut(&mut WordApp)| {
++        RUNNER.with(|runner| runner.get().and_then(|r| r.app_mut::<Live>().map(|mut live| with(&mut live.0.app))).is_some())
++    };
++    if let Err(e) = playground_live::web::attach::<WordApp>(adapter::FORMAT, with_app, adapter::repaint) {
++        log::error!("live editing unavailable: {e:?}");
++    }
++    Box::new(Live(shell))
++}
++
++struct Live(WebShell);
++
++impl eframe::App for Live {
++    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
++        self.0.logic(ctx, frame);
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        self.0.ui(ui, frame);
++        adapter::frame(&mut self.0.app, ui);
 +    }
 +
 +    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
 +        Some(self)
-     }
- }
- 
-diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 0158a60..8b6067c 100644
---- a/crates/engine/src/lib.rs
-+++ b/crates/engine/src/lib.rs
-@@ -31,6 +31,10 @@ pub use session::{
-     CellRange, ColumnBlock, EditSnapshot, FindState, MathEdit, Prefs, Selection, Session, UNDO_LIST_MAX, ViewState, blank_document, set_system_locale,
- };
- pub use wordcraft_doc as doc;
++    }
 +
-+/// Set by the web app for live editing: the Undo (false) and Redo (true) that take document `id`'s place of its native
-+/// history while a live session holds it.
-+pub static LIVE_UNDO: std::sync::OnceLock<fn(u64) -> Option<fn(bool)>> = std::sync::OnceLock::new();
- pub use wordcraft_geom::Region;
- pub use wordcraft_layout as layout;
- pub use wordcraft_proof as proof;
-diff --git a/crates/engine/src/session.rs b/crates/engine/src/session.rs
-index 4f16aea..896470a 100644
---- a/crates/engine/src/session.rs
-+++ b/crates/engine/src/session.rs
-@@ -1165,6 +1165,14 @@ impl Session {
-     /// control channel). Mutating commands are undoable; a failed command leaves the document as
-     /// it was; a panic inside a command becomes an error.
-     pub fn run(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
-+        if matches!(id, "edit.undo" | "edit.undoTo" | "edit.redo")
-+            && let Some(undo) = crate::LIVE_UNDO.get().and_then(|live| live(self.document_id))
-+        {
-+            for _ in 0..params.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 64) {
-+                undo(id == "edit.redo");
-+            }
-+            return Ok(Value::Null);
-+        }
-         let join = std::mem::take(&mut self.join_next);
-         let reg = self.registry.clone();
-         let Some(spec) = reg.get(id) else { return Err(CmdError::Unknown(id.to_string())) };
-diff --git a/crates/ui-egui/src/chrome.rs b/crates/ui-egui/src/chrome.rs
-index c057992..8502ffe 100644
---- a/crates/ui-egui/src/chrome.rs
-+++ b/crates/ui-egui/src/chrome.rs
-@@ -29,9 +29,11 @@ const QAT_MENU: [&str; 10] =
- 
- /// Match the toolbar's enabled state for keyboard activation too.
- pub(crate) fn qat_enabled(app: &WordApp, id: &str) -> bool {
-+    // While live editing, the session holds the shared document's Undo and Redo.
-+    let live = || wordcraft_engine::LIVE_UNDO.get().is_some_and(|live| live(app.session.document_id()).is_some());
-     match id {
--        "edit.undo" => app.session.can_undo(),
--        "edit.redo" => app.session.can_redo(),
-+        "edit.undo" => app.session.can_undo() || live(),
-+        "edit.redo" => app.session.can_redo() || live(),
-         "file.save" => app.has_document(),
-         _ => crate::widgets::enabled(app, id),
-     }
++    fn save(&mut self, storage: &mut dyn eframe::Storage) {
++        self.0.save(storage);
++    }
++
++    fn auto_save_interval(&self) -> std::time::Duration {
++        self.0.auto_save_interval()
++    }
++
++    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
++        self.0.clear_color(visuals)
++    }
++
++    fn persist_egui_memory(&self) -> bool {
++        self.0.persist_egui_memory()
++    }
++
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
++        self.0.raw_input_hook(ctx, raw_input);
++    }
++}

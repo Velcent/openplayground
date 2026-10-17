@@ -352,3 +352,49 @@
   replace: |-
     $&
             playground::report_unsaved(self.app.session.dirty);
+
+
+# Live editing in Playground sessions (patches/word/live.diff + patches/live/playground_live.rs)
+# The adapter lives in new files: apps/wordcraft-web/src/live.rs (the shared document, adopt, Undo and presence; the
+# template is its child module, live/text_merge.rs merges text character by character) and
+# apps/wordcraft-web/src/web/live.rs (the kept runner, and the shell that ends each frame with the session's frame hook,
+# which draws the others' carets, selections and pointers over the pages). These rules only declare them and call in,
+# one line each at the end of a file or after a function's signature, the same on both channels. Verify: node
+# scripts/build.mjs check word head|release, then the e2e (tests/live-apps/word.mjs). If upstream renames a function
+# named below, anchor on its new signature; if it renames WebShell or its `app` field, follow it in web/live.rs.
+#
+# The adapter's module (web, and native tests).
+- live: true
+  file: apps/wordcraft-web/src/main.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (patches/live/playground_live.rs).\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
+# The two hooks upstream calls through, set by live.rs: the session takes Undo and Redo of the shared document, and
+# the QAT keeps them enabled while it does.
+- live: true
+  file: crates/engine/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n/// Live editing in a Playground session: runs first in Session::run (document id, command, params) and takes the command when it returns true.\npub static LIVE_UNDO: std::sync::OnceLock<fn(u64, &str, &serde_json::Value) -> bool> = std::sync::OnceLock::new();\n/// Live editing in a Playground session: whether the session holds a document's Undo and Redo (by document id).\npub static LIVE_HISTORY: std::sync::OnceLock<fn(u64) -> bool> = std::sync::OnceLock::new();\n"
+# Session::run, which every Undo and Redo goes through (keys, menus, the QAT, Undo Actions): first, the session's.
+- live: true
+  file: crates/engine/src/**/*.rs
+  find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\s*,\s*(\w+)\s*:\s*&str\s*,\s*(\w+)\s*:[^{]*\{'
+  replace: "$&\n        if crate::LIVE_UNDO.get().is_some_and(|undo| undo(self.document_id(), $1, &$2)) { return Ok(Default::default()); }"
+# qat_enabled, the Quick Access Toolbar's (and its keytips') enabled state: Undo and Redo while the session holds them.
+- live: true
+  file: crates/ui-egui/src/**/*.rs
+  find: 'fn\s+qat_enabled\s*\(\s*(\w+)\s*:\s*&WordApp\s*,\s*(\w+)\s*:\s*&str\s*\)\s*->\s*bool\s*\{'
+  replace: "$&\n    if matches!($2, \"edit.undo\" | \"edit.redo\") && wordcraft_engine::LIVE_HISTORY.get().is_some_and(|live| live($1.session.document_id())) { return true; }"
+# The web entry keeps its runner for the adapter and wraps its app (web/live.rs, a child module so it reaches
+# WebShell's fields); the browser-storage rules above still insert before the same Ok(…WebShell…).
+- live: true
+  file: apps/wordcraft-web/src/web.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session.\nmod live;\n"
+- live: true
+  file: apps/wordcraft-web/src/web.rs
+  find: 'eframe::WebRunner::new\(\)'
+  replace: 'live::runner()'
+- live: true
+  file: apps/wordcraft-web/src/web.rs
+  find: 'Ok\(Box::new\((?=\s*WebShell\b)'
+  replace: 'Ok(live::wrap('
