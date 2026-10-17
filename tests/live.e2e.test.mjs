@@ -34,6 +34,21 @@ const tempoUp = (page) => click(page, BPM, PLUS_ONE, CLOSE_TEMPO)
 // The editor's MiniSynth clip on its track (row 1, under the master's), and the bottom editors' close X.
 const SYNTH_CLIP = at(80, 144), EDITOR_CLOSE = at(1082, 24)
 
+// Optional harness step: the owner, on the playlist with the editor's MiniSynth clip there (as after the presence
+// step), holds the clip and drags it right and back without letting go. Meanwhile the owner's presence has
+// `drag_clips` (where the drag has the clip so far), which the editor is shown; the caller checks that, then releases
+// (page.mouse.up()). The drag ends where it started, so the release leaves the song as it was. Resolves to that field.
+export async function drag(page) {
+  await page.mouse.move(...SYNTH_CLIP)
+  await page.mouse.down()
+  await page.waitForTimeout(400)
+  for (const dx of [16, 32, 48, 64, 80, 64, 48, 32, 16, 0]) {
+    await page.mouse.move(SYNTH_CLIP[0] + dx, SYNTH_CLIP[1])
+    await page.waitForTimeout(50)
+  }
+  return 'drag_clips'
+}
+
 // A 50 ms 440 Hz sine, 16-bit mono PCM WAV at 44.1 kHz.
 function wav() {
   const frames = 2205, out = Buffer.alloc(44 + frames * 2)
@@ -125,6 +140,16 @@ test('Honeydew browsers edit one song live, keep views local, show each other wh
   if (process.env.PRESENCE_SCREENSHOT) { await b.waitForTimeout(300); await b.screenshot({ path: process.env.PRESENCE_SCREENSHOT }) }
   await a.keyboard.press('Escape')
   await a.mouse.move(0, 0)
+
+  // A held drag reaches the editor mid-way; let go where it started, it leaves the song as it was.
+  const field = await drag(a)
+  const held = await a.evaluate(() => playgroundLiveAdapter.presence())
+  assert.ok(held[field]?.length && !mine[field], `the owner's presence has ${field} only mid-drag`)
+  await until(() => b.evaluate(([id, held]) => JSON.stringify(window.shownPresence?.find((p) => p.id === id)?.state) === JSON.stringify(held), [owner, held]), 10000, 'the owner\'s drag to reach the editor')
+  await a.mouse.up()
+  await a.mouse.move(0, 0)
+  await a.waitForTimeout(1000)
+  assert.equal(await same([a, b], 'the drag to settle'), both, 'a drag back to where it started leaves the song')
 
   await a.keyboard.press('Control+z')
   const undone = await same([a, b], 'the owner\'s Undo to reach the editor', both)
