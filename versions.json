@@ -8,7 +8,7 @@
   "lightroom": "v0.8.0+005356f2",
   "lightroom@head": "head-f34c7a8+005356f2",
   "lightroom-classic": "v0.9.1+37173fb2",
-  "lightroom-classic@head": "head-35320f4+37173fb2",
+  "lightroom-classic@head": "head-1ddac80+37173fb2",
   "premiere": "v0.8.0+43dec245",
   "premiere@head": "head-09aaf9b+43dec245",
   "after-effects": "v0.10.0+bd403ca3",
@@ -34,6 +34,6 @@
   "fl-studio-mobile": "v0.1.8+394aa42a",
   "fl-studio-mobile@head": "head-99db69b+394aa42a",
   "figma": "v0.6.0+bfef1be6",
-  "figma@head": "head-ac4b98d+bfef1be6",
+  "figma@head": "head-b8f97a5+bfef1be6",
   "artcraft-store": "dff1898"
 }
