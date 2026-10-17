@@ -1,9 +1,9 @@
 diff --git a/apps/photocraft-web/src/live.rs b/apps/photocraft-web/src/live.rs
 new file mode 100644
-index 0000000..ae31d04
+index 0000000..3294913
 --- /dev/null
 +++ b/apps/photocraft-web/src/live.rs
-@@ -0,0 +1,1176 @@
+@@ -0,0 +1,1245 @@
 +//! Live editing in a Playground session (web only). Playground's `shell/live.js` drives it through [`web::attach`];
 +//! nothing here runs until it connects. The shared document is the set of documents open in the session (the tabs), as
 +//! a checkpoint ([`shared`]): each one's `.pcraft` manifest as canonical JSON without personal views ([`entry`]), then
@@ -16,12 +16,12 @@ index 0000000..ae31d04
 +//! the canvas and as dots on its tab (`peers`).
 +//!
 +//! Checkpoint layout (integers little-endian):
-+//! - `photocraft-live 2\n`;
-+//! - u32 n, n bytes: `{"documents": [...]}`, keys sorted, each document the manifest's `document` without [`VIEWS`],
-+//!   with `id`: its id in the set (in increasing order), each surface's `tiles` empty;
-+//! - per surface, in the order a walk of that JSON meets them (keys sorted): u32 count, then per tile in row order:
-+//!   i32 tx, i32 ty, the BLAKE3 hash of its pixels (32 bytes), u32 n, n bytes of its `.pcraft` zstd frame (0: that
-+//!   tile came earlier);
++//! - `photocraft-live 3\n`;
++//! - `{"documents": [...]}`, keys sorted, each document the manifest's `document` without [`VIEWS`], with `id`: its id
++//!   in the set (in increasing order), each surface's `tiles` empty; cut after each surface ([`pieces`]) into u32 n, n
++//!   bytes pieces, each followed by that surface's tiles (a type layer's text and its rendered tiles change together):
++//!   u32 count, then per tile in row order: i32 tx, i32 ty, the BLAKE3 hash of its pixels (32 bytes), u32 n, n bytes
++//!   of its `.pcraft` zstd frame (0: that tile came earlier); the last piece by u32::MAX instead;
 +//! - u32 count, then per blob the JSON names (ICC profile, EXIF, smart object source, …) in hash order: the hash,
 +//!   u32 n, n bytes of its zstd frame.
 +
@@ -40,7 +40,7 @@ index 0000000..ae31d04
 +
 +/// The shell's document limit (`shell/document-delta.js`).
 +pub const MAX_BYTES: usize = 128 << 20;
-+const MAGIC: &[u8] = b"photocraft-live 2\n";
++const MAGIC: &[u8] = b"photocraft-live 3\n";
 +/// The manifest document's personal views; `Session::install_remote` keeps the local ones (and groups' `expanded`
 +/// and the measurement's `ruler` and `active_count_group`). Its `id` is replaced by the one in the set.
 +const VIEWS: &[&str] = &["id", "file_encoding", "selection", "quick_mask", "quick_mask_unselected", "work_path"];
@@ -187,6 +187,48 @@ index 0000000..ae31d04
 +    set["documents"].as_array().into_iter().flatten().filter_map(|d| Some((d["id"].as_u64()?, d)))
 +}
 +
++/// `template::canonical(header)` cut after each surface, in the order [`surfaces`] meets them.
++fn pieces(header: &Value) -> Vec<Vec<u8>> {
++    fn last(out: &mut [Vec<u8>]) -> &mut Vec<u8> {
++        out.last_mut().expect("a piece")
++    }
++    fn walk(v: &Value, out: &mut Vec<Vec<u8>>) {
++        match v {
++            Value::Object(m) if m.len() == 3 && ["default", "format", "tiles"].iter().all(|k| m.contains_key(*k)) => {
++                last(out).extend(template::canonical(v));
++                out.push(Vec::new());
++            }
++            Value::Object(m) => {
++                last(out).push(b'{');
++                for (i, (key, v)) in m.iter().collect::<BTreeMap<_, _>>().into_iter().enumerate() {
++                    let piece = last(out);
++                    if i > 0 {
++                        piece.push(b',');
++                    }
++                    piece.extend(template::canonical(&Value::String(key.clone())));
++                    piece.push(b':');
++                    walk(v, out);
++                }
++                last(out).push(b'}');
++            }
++            Value::Array(items) => {
++                last(out).push(b'[');
++                for (i, v) in items.iter().enumerate() {
++                    if i > 0 {
++                        last(out).push(b',');
++                    }
++                    walk(v, out);
++                }
++                last(out).push(b']');
++            }
++            scalar => last(out).extend(template::canonical(scalar)),
++        }
++    }
++    let mut out = vec![Vec::new()];
++    walk(header, &mut out);
++    out
++}
++
 +/// The canonical bytes of `parts` (see the module's layout).
 +fn write(parts: &Parts) -> Result<Vec<u8>, String> {
 +    let mut header = parts.doc.clone();
@@ -202,15 +244,15 @@ index 0000000..ae31d04
 +        *tiles = Value::Array(Vec::new());
 +        Ok(())
 +    })?;
-+    let json = template::canonical(&header);
++    let json = pieces(&header);
 +    let mut out = MAGIC.to_vec();
 +    fn put(out: &mut Vec<u8>, bytes: &[u8]) {
 +        out.extend((bytes.len() as u32).to_le_bytes());
 +        out.extend(bytes);
 +    }
-+    put(&mut out, &json);
 +    let mut seen = HashSet::new();
-+    for list in sections {
++    for (piece, list) in json.iter().zip(sections) {
++        put(&mut out, piece);
 +        out.extend((list.len() as u32).to_le_bytes());
 +        for (ty, tx, hash) in list {
 +            out.extend(tx.to_le_bytes());
@@ -223,6 +265,8 @@ index 0000000..ae31d04
 +            return Err(too_large(out.len()));
 +        }
 +    }
++    put(&mut out, json.last().map_or(&[], Vec::as_slice));
++    out.extend(u32::MAX.to_le_bytes());
 +    let mut named = HashSet::new();
 +    hashes(&header, &mut named);
 +    let blobs: BTreeMap<_, _> = parts.blobs.iter().filter(|(hash, _)| named.contains(*hash)).collect();
@@ -263,28 +307,18 @@ index 0000000..ae31d04
 +    if r.take(MAGIC.len())? != MAGIC {
 +        return Err(invalid("not a PhotoCraft live document"));
 +    }
-+    let n = r.u32()? as usize;
-+    let json = r.take(n)?;
-+    let mut doc = template::parse(json)?;
-+    if template::canonical(&doc) != json {
-+        return Err(invalid("noncanonical document"));
-+    }
-+    let ids: Option<Vec<u64>> =
-+        doc.as_object().filter(|m| m.len() == 1).and_then(|m| m["documents"].as_array()).and_then(|d| d.iter().map(|d| d["id"].as_u64()).collect());
-+    if !ids.is_some_and(|ids| ids.windows(2).all(|w| w[0] < w[1])) {
-+        return Err(invalid("not a set of documents in id order"));
-+    }
-+    let mut named = HashSet::new();
-+    hashes(&doc, &mut named);
 +    let mut parts = Parts::default();
-+    let mut seen = HashSet::new();
-+    surfaces(&mut doc, &mut |tiles| {
-+        if !tiles.as_array().is_some_and(Vec::is_empty) {
-+            return Err(invalid("tiles inline"));
++    let (mut json, mut sections, mut seen) = (Vec::new(), Vec::new(), HashSet::new());
++    loop {
++        let n = r.u32()? as usize;
++        json.push(r.take(n)?);
++        let count = r.u32()?;
++        if count == u32::MAX {
++            break;
 +        }
 +        let mut map = Map::new();
 +        let mut last = None;
-+        for _ in 0..r.u32()? {
++        for _ in 0..count {
 +            let (tx, ty) = (r.u32()? as i32, r.u32()? as i32);
 +            if last.is_some_and(|last| last >= (ty, tx)) {
 +                return Err(invalid("tiles out of order"));
@@ -301,7 +335,25 @@ index 0000000..ae31d04
 +            }
 +            map.insert(format!("{tx},{ty}"), hash.into());
 +        }
-+        *tiles = Value::Object(map);
++        sections.push(map);
++    }
++    let mut doc = template::parse(&json.concat())?;
++    if pieces(&doc).iter().map(Vec::as_slice).ne(json.iter().copied()) {
++        return Err(invalid("noncanonical document"));
++    }
++    let ids: Option<Vec<u64>> =
++        doc.as_object().filter(|m| m.len() == 1).and_then(|m| m["documents"].as_array()).and_then(|d| d.iter().map(|d| d["id"].as_u64()).collect());
++    if !ids.is_some_and(|ids| ids.windows(2).all(|w| w[0] < w[1])) {
++        return Err(invalid("not a set of documents in id order"));
++    }
++    let mut named = HashSet::new();
++    hashes(&doc, &mut named);
++    let mut sections = sections.into_iter();
++    surfaces(&mut doc, &mut |tiles| {
++        if !tiles.as_array().is_some_and(Vec::is_empty) {
++            return Err(invalid("tiles inline"));
++        }
++        *tiles = Value::Object(sections.next().ok_or_else(|| invalid("tiles missing"))?);
 +        Ok(())
 +    })?;
 +    let mut last = None;
@@ -849,7 +901,7 @@ index 0000000..ae31d04
 +    pub fn attach(with_app: impl Fn(&mut dyn FnMut(&PhotocraftApp)) -> bool + 'static) -> Result<(), JsValue> {
 +        let adapter = Object::new();
 +        let set = |name: &str, value: JsValue| Reflect::set(&adapter, &name.into(), &value).map(drop);
-+        set("format", format!("photoshop:1:{}", env!("CARGO_PKG_VERSION")).into())?;
++        set("format", format!("photoshop:2:{}", env!("CARGO_PKG_VERSION")).into())?;
 +        let checkpoint = move || -> Result<Uint8Array, JsValue> {
 +            let mut bytes = None;
 +            with_app(&mut |app| bytes = Some(super::checkpoint(app)));
@@ -982,6 +1034,23 @@ index 0000000..ae31d04
 +        let changed = delta(&a, &b);
 +        eprintln!("checkpoint {} bytes, one-tile stroke changes {changed}", a.len());
 +        assert!(changed < 2048, "{changed} of {} bytes", b.len());
++        // Typing on a type layer changes its text and its rendered cache: bytes close together, not a span over the
++        // pixels of every layer in between (here a tile of noise).
++        let mut noisy = d.clone();
++        let noise: Vec<u8> = (0u32..256 * 256 * 4).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
++        noisy.layers[1].surface_mut().unwrap().write_interleaved(Rect::from_xywh(512, 0, 256, 256), &noise);
++        let typed = |text: &str| {
++            let mut cache = Surface::new(noisy.pixel_format());
++            cache.fill_rect(Rect::from_xywh(0, 300, 20 * text.len() as u32, 40), &[0.0, 0.0, 0.0, 1.0]);
++            let mut d = noisy.clone();
++            let text = photocraft_doc::TextLayer { text: text.into(), cache: Some(cache), ..Default::default() };
++            d.layers.push(Layer::new("Title", photocraft_doc::LayerContent::Text(text)));
++            bytes(&d)
++        };
++        let changed = delta(&typed("Sun"), &typed("Sunr"));
++        assert!(changed < 2048, "a keystroke changes {changed} bytes");
++        let changed = delta(&bytes(&noisy), &typed("S"));
++        assert!(changed < 4096, "a new type layer changes {changed} bytes");
 +        assert!(decode(&b[..b.len() - 1]).is_err() && decode(&[b.as_slice(), &[0]].concat()).is_err());
 +        assert!(decode(&vec![0; MAX_BYTES + 1]).is_err_and(|e| e.contains("over the 128 MiB limit")));
 +    }

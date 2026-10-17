@@ -8,8 +8,8 @@
 // openTab(): the owner opens a second document (Home, "New document…", Create): it joins the session's set of documents
 // and reaches the editor as a tab in the background.
 //
-// PhotoCraft's checkpoint is binary (canonical JSON, then the tiles): `ready` defines liveTestDocument(), which gives
-// the harness that JSON with each surface's tiles as {"tx,ty": hash}.
+// PhotoCraft's checkpoint is binary (canonical JSON in pieces, each surface's tiles after it): `ready` defines
+// liveTestDocument(), which gives the harness that JSON with each surface's tiles as {"tx,ty": hash}.
 import { until } from '../helpers.mjs'
 
 const checkpoint = (page) => page.evaluate(() => {
@@ -31,23 +31,32 @@ export default {
       const real = globalThis.playgroundLiveAdapter
       const json = (bytes) => {
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-        let at = 'photocraft-live 1\n'.length
+        let at = 'photocraft-live 3\n'.length
         const u32 = () => (at += 4, view.getUint32(at - 4, true))
-        const size = u32()
-        const doc = JSON.parse(new TextDecoder().decode(bytes.subarray(at, at += size)))
+        // The JSON in pieces, each surface's tiles after it, the last piece by 2^32-1 (apps/photocraft-web/src/live.rs).
+        const pieces = [], sections = []
+        for (;;) {
+          const size = u32()
+          pieces.push(new TextDecoder().decode(bytes.subarray(at, at += size)))
+          const count = u32()
+          if (count === 0xffffffff) break
+          const tiles = {}
+          for (let n = count; n > 0; n--) {
+            const tile = `${view.getInt32(at, true)},${view.getInt32(at + 4, true)}`
+            tiles[tile] = [...bytes.subarray(at + 8, at + 40)].map((b) => b.toString(16).padStart(2, '0')).join('')
+            at += 40
+            const size = u32()
+            at += size
+          }
+          sections.push(tiles)
+        }
+        const doc = JSON.parse(pieces.join(''))
         const walk = (v) => {
           if (Array.isArray(v)) return v.forEach(walk)
           if (!v || typeof v !== 'object') return
           const keys = Object.keys(v).sort()
           if (keys.join() !== 'default,format,tiles') return keys.forEach((k) => walk(v[k]))
-          v.tiles = {}
-          for (let n = u32(); n > 0; n--) {
-            const tile = `${view.getInt32(at, true)},${view.getInt32(at + 4, true)}`
-            v.tiles[tile] = [...bytes.subarray(at + 8, at + 40)].map((b) => b.toString(16).padStart(2, '0')).join('')
-            at += 40
-            const size = u32()
-            at += size
-          }
+          v.tiles = sections.shift()
         }
         walk(doc)
         return JSON.stringify(doc)
