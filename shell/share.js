@@ -187,7 +187,8 @@ export async function mountShare(bar, app, here, groups = []) {
           for(const room of earlier) {
             const detail=[when(room.modified), room.app!==here.path ? `started in ${appName(room.app)}` : '', room.files ? `${room.files} ${room.files===1?'file':'files'}` : ''].filter(Boolean).join(' · ')
             const row=h('div',{class:'pg-share-file'},h('span',{},room.owner?'Your session':'Session you joined'),h('small',{},detail),h('div',{class:'pg-actions'},
-              button('Rejoin',()=>attempt(async()=>{const s=await PeerSession.restore(room.id);use(s);await s.connect();live()})),
+              // Its files are there even offline or with sessions off; it reconnects only when sessions are on.
+              button(config.enabled?'Rejoin':'Open',()=>attempt(async()=>{const s=await PeerSession.restore(room.id);use(s);live();if(config.enabled)s.connect().catch(e=>{s.error=e.message;s.changed()})})),
               button('Remove',()=>attempt(async()=>{
                 if (!await confirmIn(view,room.owner?'Remove this session from this browser? You can no longer host it; the others keep their copies.':'Remove this session’s copy from this browser? The others keep theirs.','Remove',{danger:true})) return
                 await new SessionStore(room.id).remove(); row.remove()
