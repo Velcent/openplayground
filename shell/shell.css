@@ -290,3 +290,44 @@ body > canvas:first-of-type, body > canvas#lemon-canvas {
 .pg-share-dialog[open] { display: block; }
 .pg-share-dialog .pg-sharing { max-height: calc(100dvh - 24px); box-sizing: border-box; }
 .pg-share-dialog [hidden] { display: none !important; }
+
+/* The share dialog, flat and square: elevation instead of an outline, filled text fields with an underline, flat
+   buttons (text for secondary, filled for the main action). */
+.pg-modal.pg-share-dialog {
+  border: 0; border-radius: 0;
+  box-shadow: 0 11px 15px -7px rgb(0 0 0 / 0.25), 0 24px 38px 3px rgb(0 0 0 / 0.16), 0 9px 46px 8px rgb(0 0 0 / 0.14);
+}
+.pg-share-dialog .pg-sharing { gap: 16px; padding: 24px; }
+.pg-share-dialog .pg-share-body { gap: 16px; }
+.pg-share-dialog .pg-title { margin: 0; font: 500 20px/1.3 var(--pg-font); letter-spacing: 0; }
+.pg-share-dialog .pg-sharing .pg-hint { font-size: 13px; }
+.pg-share-dialog .pg-sharing label { color: var(--pg-muted); font-size: 13px; }
+.pg-share-dialog .pg-btn {
+  height: 36px; padding: 0 16px; border: 0; border-radius: 0; background: transparent; color: var(--pg-accent);
+  font: 600 12.5px var(--pg-font); letter-spacing: 0.08em; text-transform: uppercase;
+  transition: background-color 120ms;
+}
+.pg-share-dialog .pg-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--pg-accent) 10%, transparent); }
+.pg-share-dialog .pg-btn:active:not(:disabled) { background: color-mix(in srgb, var(--pg-accent) 18%, transparent); }
+.pg-share-dialog .pg-primary { background: var(--pg-accent); color: var(--pg-on-accent); }
+.pg-share-dialog .pg-primary:hover:not(:disabled) { background: color-mix(in srgb, var(--pg-accent) 88%, white); }
+.pg-share-dialog .pg-primary:active:not(:disabled) { background: color-mix(in srgb, var(--pg-accent) 78%, white); }
+.pg-share-dialog .pg-danger { background: transparent; color: var(--pg-danger); }
+.pg-share-dialog .pg-danger:hover:not(:disabled) { background: color-mix(in srgb, var(--pg-danger) 10%, transparent); }
+.pg-share-dialog .pg-share-heading .pg-btn { color: var(--pg-muted); }
+.pg-share-dialog .pg-input {
+  height: 40px; padding: 0 12px; border: 0; border-radius: 0; background: var(--pg-raised); color: var(--pg-text);
+  box-shadow: inset 0 -1px 0 var(--pg-muted); transition: box-shadow 120ms;
+}
+.pg-share-dialog .pg-input:hover { box-shadow: inset 0 -1px 0 var(--pg-text); }
+.pg-share-dialog .pg-input:focus-visible { outline: 0; box-shadow: inset 0 -2px 0 var(--pg-accent); }
+.pg-share-dialog .pg-btn:focus-visible { outline: 2px solid var(--pg-accent); outline-offset: 0; }
+.pg-share-dialog input[type=file] { color: var(--pg-muted); font: 13px var(--pg-font); }
+.pg-share-dialog input[type=file]::file-selector-button {
+  height: 36px; margin-right: 12px; padding: 0 16px; border: 0; border-radius: 0; cursor: pointer;
+  background: color-mix(in srgb, var(--pg-accent) 14%, transparent); color: var(--pg-accent);
+  font: 600 12.5px var(--pg-font); letter-spacing: 0.08em; text-transform: uppercase;
+}
+.pg-share-dialog input[type=file]::file-selector-button:hover { background: color-mix(in srgb, var(--pg-accent) 22%, transparent); }
+.pg-share-dialog input[type=checkbox] { accent-color: var(--pg-accent); }
+.pg-share-dialog .pg-share-error:not(:empty) { border: 0; border-left: 3px solid var(--pg-danger); border-radius: 0; background: color-mix(in srgb, var(--pg-danger) 10%, transparent); }
