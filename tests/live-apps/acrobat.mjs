@@ -3,20 +3,24 @@
 // (Ctrl+K, view.palette in crates/engine/src/commands.rs) runs "Rotate pages clockwise" (page.rotate) on the current
 // page: the owner turns page 1; the editor goes to page 2 (ArrowRight, crates/ui-egui/src/canvas.rs shortcuts) and turns
 // it. Two page objects, two paths of the shared document's /objects. The owner's Ctrl+Z (edit.undo) takes back only
-// page 1's turn.
+// page 1's turn. point(): the owner clicks page 1's square comment (selecting it, an object number in presence) and
+// leaves the pointer on the page; the editor draws both in the owner's color.
 import { until } from '../helpers.mjs'
 
 const PAGE = { x: 640, y: 430 }
+// Page 1's comment, in user space.
+const SQUARE = [60, 300, 160, 400]
 
-// A two-page PDF with an exact cross-reference table, so it opens without repairs.
+// A two-page PDF with an exact cross-reference table, so it opens without repairs; page 1 has a square comment.
 function twoPages() {
   const content = '0.2 0.4 0.8 rg 40 40 320 420 re f'
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
     '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 500] /Contents 5 0 R >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 500] /Contents 5 0 R /Annots [6 0 R] >>',
     '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 500] /Contents 5 0 R >>',
     `<< /Length ${content.length} >>\nstream\n${content}\nendstream`,
+    `<< /Type /Annot /Subtype /Square /Rect [${SQUARE.join(' ')}] /C [1 0 0] /Contents (Square) /F 4 >>`,
   ]
   let out = '%PDF-1.4\n'
   const offsets = objects.map((body, i) => {
@@ -58,6 +62,22 @@ export default {
     await until(async () => !!(await shared(page)).pdf, 60000, 'the dropped PDF to open')
     await page.waitForTimeout(500)
     await page.mouse.click(PAGE.x, PAGE.y)
+  },
+  point: async (page) => {
+    // Presence gives the pointer in user space: two samples map it to the screen.
+    const at = async (x, y) => {
+      await page.mouse.move(x, y)
+      await page.waitForTimeout(400)
+      return until(() => page.evaluate(() => playgroundLiveAdapter.presence()?.pointer), 10000, 'the pointer on the page')
+    }
+    const [a, b] = [await at(PAGE.x - 40, PAGE.y - 40), await at(PAGE.x + 40, PAGE.y + 40)]
+    const screen = (u, v) => [PAGE.x - 40 + (u - a[0]) * 80 / (b[0] - a[0]), PAGE.y - 40 + (v - a[1]) * 80 / (b[1] - a[1])]
+    await page.mouse.click(...screen((SQUARE[0] + SQUARE[2]) / 2, (SQUARE[1] + SQUARE[3]) / 2))
+    await page.mouse.move(...screen(250, 330))
+    await until(() => page.evaluate(() => {
+      const mine = playgroundLiveAdapter.presence()
+      return mine?.selection.length === 1 && mine.pointer?.[0] > 200
+    }), 10000, 'the comment selected and the pointer beside it')
   },
   editA: (page) => rotate(page),
   editB: async (page) => {

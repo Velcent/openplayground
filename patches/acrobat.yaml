@@ -1,2 +1,55 @@
-# PdfCraft: no rule patches; its diffs (patches/acrobat/) and the live adapter (tools.yaml live:) apply.
-[]
+# PdfCraft: no rule patches outside live editing; its diffs (patches/acrobat/) and the live adapter (tools.yaml live:) apply.
+#
+# Live editing in Playground sessions (patches/acrobat/live.diff + patches/live/playground_live.rs)
+# What it's for: people in a Playground session edit one PDF together (the file plus its changed objects, merged per
+#   object and dictionary key) and see each other's pointer and selected comment on the pages they look at.
+# How: the adapter lives in new files: crates/ui-egui/live/live.rs (the shared document, merge, adopt, Undo, presence
+#   and its drawing, the kept web runner and the app wrapper whose frames end with the session's frame hook; it
+#   declares the template, copied next to it) and crates/engine/src/live_playground.rs (installs a shared graph with
+#   no undo step, forgets history, and saves of the shared PDF keep its graph). These rules only declare them and call
+#   in, each one line at the end of a file, right after a function's signature, or at the web runner.
+# Verify: node scripts/build.mjs check acrobat head|release (and LIVE=0), the e2e (tests/live-apps/acrobat.mjs) and
+#   `cargo test -p pdfcraft-ui-egui --lib live::` with these rules and live.diff applied.
+# If upstream changes: if a function named below is renamed, anchor on its new signature (keep the argument names
+#   the inserted line uses, or rename them there); if the web entry stops returning `Ok(Box::new(app))`, wrap the app
+#   it returns with `pdfcraft_ui_egui::live::wrap`.
+#
+# The engine's live module (web, and the native tests), a child of the crate root so it reaches the editing state.
+- live: true
+  file: crates/engine/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web only).\npub mod live_playground;\n"
+# Session::mark_saved: a save of the shared PDF keeps the shared graph (its /ModDate is not everyone's change).
+- live: true
+  file: crates/engine/src/lib.rs
+  find: 'pub\s+fn\s+mark_saved\s*\([^{]*\{'
+  after: "\n        if live_playground::keeps_graph(id) { return self.live_mark_saved(id); }"
+# The app's live module (web, and the native tests), outside src/ like the template it declares.
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web only).\n#[cfg(any(target_arch = \"wasm32\", test))]\n#[path = \"../live/live.rs\"]\npub mod live;\n"
+# Undo and Redo of the shared PDF go to the session.
+- live: true
+  file: crates/ui-egui/src/editing.rs
+  find: 'fn\s+history_step\s*\([^{]*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if crate::live::undo(self, undo) { return; }"
+# Undo and Redo stay available for the shared PDF (the session's), Revert is off (it would take back everyone's edits).
+- live: true
+  file: crates/ui-egui/src/commands.rs
+  find: 'fn\s+command_enabled\s*\(\s*&self[^{]*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if let Some(on) = crate::live::command_enabled(self, spec.id) { return on; }"
+# The others' pointers and selected comments, drawn after the pages (the find bar comes next, over them).
+- live: true
+  file: crates/ui-egui/src/canvas.rs
+  find: 'fn\s+find_bar\s*\([^{]*\{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")] crate::live::paint(view, area, ui);"
+# The web entry: the runner the session keeps, and the app wrapped so each frame ends with the session's frame hook.
+- live: true
+  file: apps/pdfcraft-web/src/main.rs
+  find: 'eframe::WebRunner::new\(\)'
+  replace: 'pdfcraft_ui_egui::live::runner()'
+- live: true
+  file: apps/pdfcraft-web/src/main.rs
+  find: 'Ok\(\s*Box::new\((?=\s*app\s*\)\s*\))'
+  replace: 'Ok(pdfcraft_ui_egui::live::wrap('

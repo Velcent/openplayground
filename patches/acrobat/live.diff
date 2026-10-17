@@ -1,53 +1,42 @@
-diff --git a/apps/pdfcraft-web/src/main.rs b/apps/pdfcraft-web/src/main.rs
-index a46a467..86a1c20 100644
---- a/apps/pdfcraft-web/src/main.rs
-+++ b/apps/pdfcraft-web/src/main.rs
-@@ -17,7 +17,8 @@ fn main() {
-         else {
-             return;
-         };
--        let started = eframe::WebRunner::new()
-+        let runner = eframe::WebRunner::new();
-+        let started = runner
-             .start(
-                 canvas,
-                 options,
-@@ -75,6 +76,12 @@ fn main() {
-                 }),
-             )
-             .await;
-+        // Playground live editing: offered to the Playground shell, which only connects when present.
-+        if started.is_ok()
-+            && let Err(e) = pdfcraft_ui_egui::live::attach(&runner)
-+        {
-+            eframe::web_sys::console::error_1(&e);
-+        }
-         if let Err(e) = started {
-             eframe::web_sys::console::error_1(&e);
-             if query_param("host").as_deref() == Some("parent")
-diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 01f162a..e45a093 100644
---- a/crates/engine/src/lib.rs
-+++ b/crates/engine/src/lib.rs
-@@ -664,6 +664,11 @@ impl Document {
-         self.editor.is_some()
-     }
- 
-+    /// The working object graph, when the document can be edited (Playground live editing).
-+    pub fn cos(&self) -> Option<&pdfcraft_cos::Document> {
+diff --git a/crates/engine/src/live_playground.rs b/crates/engine/src/live_playground.rs
+new file mode 100644
+index 0000000..a628597
+--- /dev/null
++++ b/crates/engine/src/live_playground.rs
+@@ -0,0 +1,67 @@
++//! Playground live editing (web only; `pdfcraft_ui_egui`'s `live` module drives it): what a shared document needs of
++//! the session's editing state. A child of the crate root, so it reaches `Document`'s and `Session`'s private parts.
++
++use crate::{DocId, Document, EditError, Session, guard};
++use std::cell::Cell;
++
++thread_local! {
++    /// The document a live session shares: its saves keep the working graph.
++    static SHARED: Cell<Option<DocId>> = const { Cell::new(None) };
++}
++
++/// Marks the document a live session shares (`None`: none).
++pub fn share(id: Option<DocId>) {
++    SHARED.set(id);
++}
++
++/// Whether a save of `id` keeps its graph ([`Session::mark_saved`] asks first): the shared document must not take the
++/// save's own changes (`/ModDate`, a rewritten file), which are not everyone's.
++pub(crate) fn keeps_graph(id: DocId) -> bool {
++    SHARED.get() == Some(id)
++}
++
++impl Document {
++    /// The working object graph, when the document can be edited.
++    pub fn live_cos(&self) -> Option<&pdfcraft_cos::Document> {
 +        self.editor.as_ref().map(|e| &e.cos)
 +    }
++}
 +
-     /// What the opening password allows; `None` when the document is not encrypted.
-     pub fn permissions(&self) -> Option<pdfcraft_cos::Permissions> {
-         self.editor.as_ref().and_then(|e| e.cos.permissions())
-@@ -3813,6 +3818,48 @@ impl Session {
-         Ok(label)
-     }
- 
-+    /// Playground live editing: install `cos` as the working graph the way Undo does, with no undo step. Undo and
-+    /// Redo start again from it (their steps lack the change). On a failed refresh the document stays as it was.
-+    pub fn replace_graph(&mut self, id: DocId, cos: pdfcraft_cos::Document) -> Result<(), EditError> {
++impl Session {
++    /// Installs `cos` as the working graph the way Undo does, with no undo step; Undo and Redo start again from it
++    /// (their steps lack the change). On a failed refresh the document stays as it was.
++    pub fn live_replace_graph(&mut self, id: DocId, cos: pdfcraft_cos::Document) -> Result<(), EditError> {
 +        let doc = self.doc_mut(id)?;
 +        doc.edit_notices.clear();
 +        let editor = doc.editor.as_mut().ok_or_else(|| EditError::ReadOnly(doc.read_only_reason.clone().unwrap_or_default()))?;
@@ -61,43 +50,35 @@ index 01f162a..e45a093 100644
 +            }
 +            return Err(e);
 +        }
-+        Self::sync_dirty(doc);
++        doc.dirty = true;
 +        doc.generation += 1;
-+        self.clear_history(id);
++        self.live_clear_history(id);
 +        Ok(())
 +    }
 +
-+    /// Forget Undo and Redo: a live editing session ended, and its steps hold other people's edits.
-+    pub fn clear_history(&mut self, id: DocId) {
++    /// Forgets Undo and Redo: a live session ended, and its steps hold other people's edits.
++    pub fn live_clear_history(&mut self, id: DocId) {
 +        if let Ok(Some(e)) = self.doc_mut(id).map(|d| d.editor.as_mut()) {
 +            e.undo.clear();
 +            e.redo.clear();
 +        }
 +    }
 +
-+    /// [`Self::mark_saved`] that keeps the working graph (Playground live editing: the shared document must not
-+    /// take the save's own changes). The next save appends to `bytes` all the same.
-+    pub fn mark_saved_keeping_graph(&mut self, id: DocId, bytes: Arc<Vec<u8>>) -> Result<(), EditError> {
-+        let doc = self.doc_mut(id)?;
-+        if let Some(editor) = doc.editor.as_mut() {
-+            editor.saved = bytes;
-+            editor.saved_keys = editor.keys.clone();
-+        }
-+        doc.dirty = false;
++    /// A save of the shared document: nothing unsaved, the graph kept. The next save writes the file as opened plus
++    /// every change again.
++    pub(crate) fn live_mark_saved(&mut self, id: DocId) -> Result<(), EditError> {
++        self.doc_mut(id)?.dirty = false;
 +        Ok(())
 +    }
-+
-     /// Unsaved when the working graph is not the last opened or saved file. Undo back to that
-     /// file is clean; undo past a later save is not, because the restored snapshot's own base
-     /// is an earlier revision.
++}
 diff --git a/crates/ui-egui/live/live.rs b/crates/ui-egui/live/live.rs
 new file mode 100644
-index 0000000..6cceb12
+index 0000000..a7f867a
 --- /dev/null
 +++ b/crates/ui-egui/live/live.rs
-@@ -0,0 +1,932 @@
-+//! Playground live editing of one PDF (web only; [`crate::playground_live`] drives it). The shared document is the
-+//! PDF the session started from plus every object that differs from it, as JSON:
+@@ -0,0 +1,1107 @@
++//! Playground live editing of one PDF (web only; the template [`playground_live`], copied next to this file, drives
++//! it). The shared document is the PDF the session started from plus every object that differs from it, as JSON:
 +//! `{"pdf": base64, "objects": {"<number>": base64("N G obj … endobj") or null when deleted}, "trailer"?: base64(the
 +//! trailer's own entries), "rewrite"?: true}`; `{}` before anyone shares a PDF, and `{"refused": why}` for PDFs this
 +//! version does not share (encrypted, signed, XFA forms, read-only). Objects are written by the PDF writer, so equal
@@ -108,11 +89,19 @@ index 0000000..6cceb12
 +//! Objects both sides added under one number are told apart by giving the unsent side's (`current`'s) new objects
 +//! fresh numbers. The coordinator checks every document it records the way receivers install it (written, then
 +//! inspected); receivers check by installing.
++//!
++//! Presence: `{"page": <page object number>, "pointer"?: [x, y] in that page's user space, "selection": [object numbers
++//! of selected comments]}`, drawn on the pages shown ([`paint`]). The web entry runs the app wrapped ([`wrap`]), so each
++//! frame ends with the session's [`frame`]; the engine's `live_playground` installs graphs without undo steps.
 +
 +#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 +
++#[allow(dead_code)] // fresh_id: PdfCraft numbers objects through the merge
++#[path = "playground_live.rs"]
++mod playground_live;
++
 +use crate::PdfCraftApp;
-+use crate::playground_live::{self, Error, Live};
++use playground_live::{Error, Live, Presence};
 +use base64::Engine as _;
 +use pdfcraft_cos::{Dict, Document, Lexer, Name, ObjRef, Object, SaveOptions, Stream, parse_indirect, serialize, write_incremental};
 +use pdfcraft_engine::DocId;
@@ -150,6 +139,9 @@ index 0000000..6cceb12
 +    in_frame: bool,
 +    notice: Option<String>,
 +    ctx: Option<egui::Context>,
++    /// The others in the session, as the shell last showed them.
++    others: Vec<Presence>,
++    ids: Option<Rc<Ids>>,
 +}
 +
 +thread_local! {
@@ -544,7 +536,7 @@ index 0000000..6cceb12
 +
 +/// Why a document is not shared, if it isn't.
 +fn refusal(doc: &pdfcraft_engine::Document) -> Option<String> {
-+    let why = match doc.cos() {
++    let why = match doc.live_cos() {
 +        None => "it can't be edited",
 +        Some(cos) if cos.security().is_some() || cos.encryption_changed() => "it is encrypted",
 +        Some(_) if doc.is_signed() => "it is signed",
@@ -562,7 +554,7 @@ index 0000000..6cceb12
 +/// Commands that act otherwise on the shared document while live: Undo and Redo go to the session (whatever this
 +/// browser's own history holds), and Revert, which would take back everyone's edits, is off.
 +pub(crate) fn command_enabled(app: &PdfCraftApp, id: &str) -> Option<bool> {
-+    if !app.active_ids().is_some_and(|(_, doc)| shared(doc)) {
++    if app.combine_showing() || !app.active_ids().is_some_and(|(_, doc)| shared(doc)) {
 +        return None;
 +    }
 +    match id {
@@ -572,9 +564,15 @@ index 0000000..6cceb12
 +    }
 +}
 +
++/// Undo or Redo of the shared document goes to the session: whether it did (the app's Undo then stops).
++pub(crate) fn undo(app: &PdfCraftApp, undo: bool) -> bool {
++    app.active_ids().is_some_and(|(_, id)| shared(id)) && playground_live::undo(!undo)
++}
++
 +/// The end of each frame.
 +pub(crate) fn frame(app: &mut PdfCraftApp) {
 +    STATE.with_borrow_mut(|s| (s.ctx.clone_from(&app.ctx), s.in_frame = true));
++    pdfcraft_engine::live_playground::share(STATE.with_borrow(|s| s.pin).filter(|&id| shared(id)));
 +    playground_live::frame(app);
 +    STATE.with_borrow_mut(|s| s.in_frame = false);
 +    if let Some(notice) = STATE.with_borrow_mut(|s| s.notice.take()) {
@@ -587,7 +585,7 @@ index 0000000..6cceb12
 +fn views_changed(app: &mut PdfCraftApp, id: DocId, before: Option<&Document>) {
 +    let Some(doc) = app.session.get(id) else { return };
 +    let pages = |cos: Option<&Document>| cos.map(|c| pdfcraft_model::pages(c).into_iter().map(|p| (p.obj, p.dict)).collect::<Vec<_>>());
-+    let (old, new) = (pages(before), pages(doc.cos()));
++    let (old, new) = (pages(before), pages(doc.live_cos()));
 +    let annot = |pages: &Option<Vec<(ObjRef, Dict)>>, cos: Option<&Document>, page: usize, index: usize| -> Option<ObjRef> {
 +        let (_, dict) = pages.as_ref()?.get(page)?;
 +        cos?.resolve(dict.get(b"Annots")?).as_array()?.get(index)?.as_ref()
@@ -597,7 +595,7 @@ index 0000000..6cceb12
 +        let kept = view
 +            .comments
 +            .selected
-+            .filter(|&(page, index)| annot(&old, before, page, index).is_some_and(|r| annot(&new, doc.cos(), page, index) == Some(r)));
++            .filter(|&(page, index)| annot(&old, before, page, index).is_some_and(|r| annot(&new, doc.live_cos(), page, index) == Some(r)));
 +        if same_pages {
 +            view.document_changed(&doc.info);
 +        } else {
@@ -641,7 +639,7 @@ index 0000000..6cceb12
 +                }
 +                Some(why) => return json!({ "refused": why }),
 +                None if STATE.with_borrow(|s| s.paused) => None,
-+                None => doc.cos().cloned(),
++                None => doc.live_cos().cloned(),
 +            },
 +            None => None,
 +        };
@@ -678,8 +676,8 @@ index 0000000..6cceb12
 +                self.views.iter().map(|v| v.id).find(|id| !open.contains(id)).ok_or("The shared PDF did not open")?
 +            }
 +        };
-+        let before = self.session.get(id).and_then(|d| d.cos()).cloned();
-+        self.session.replace_graph(id, cos).map_err(|e| e.to_string())?;
++        let before = self.session.get(id).and_then(|d| d.live_cos()).cloned();
++        self.session.live_replace_graph(id, cos).map_err(|e| e.to_string())?;
 +        STATE.with_borrow_mut(|s| (s.pin, s.base) = (Some(id), Some(base)));
 +        views_changed(self, id, before.as_ref());
 +        if let Some(ctx) = &self.ctx {
@@ -719,8 +717,9 @@ index 0000000..6cceb12
 +
 +    fn live_disconnected(&mut self) {
 +        if let Some(id) = STATE.with_borrow(|s| s.pin) {
-+            self.session.clear_history(id);
++            self.session.live_clear_history(id);
 +        }
++        pdfcraft_engine::live_playground::share(None);
 +        STATE.with_borrow_mut(|s| *s = State { ctx: s.ctx.take(), ..State::default() });
 +    }
 +
@@ -732,27 +731,168 @@ index 0000000..6cceb12
 +    fn live_check(document: &Value) -> Result<(), Error> {
 +        if STATE.with_borrow(|s| s.in_frame) { read(document).map(drop) } else { validate(document) }
 +    }
++
++    fn live_presence(&self) -> Value {
++        presence(self).unwrap_or(Value::Null)
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        STATE.with_borrow_mut(|s| s.others = others);
++    }
 +}
 +
-+/// Offers the adapter to the Playground shell.
++/// The shared document's page and comment object numbers (what presence refers to), for one state of its graph.
++struct Ids {
++    doc: DocId,
++    generation: u64,
++    /// Each page's object number and geometry.
++    pages: Vec<(u32, pdfcraft_render::PageInfo)>,
++    /// Each annotation's object number: its page, index in `/Annots` and rectangle in user space.
++    annots: HashMap<u32, (usize, usize, [f32; 4])>,
++}
++
++/// [`Ids`] of document `id` as it is now, read again only after a change.
++fn ids(app: &PdfCraftApp, id: DocId) -> Option<Rc<Ids>> {
++    let doc = app.session.get(id)?;
++    let generation = doc.edit_generation();
++    if let Some(ids) = STATE.with_borrow(|s| s.ids.clone()).filter(|i| i.doc == id && i.generation == generation) {
++        return Some(ids);
++    }
++    let cos = doc.live_cos()?;
++    let pages = pdfcraft_model::pages(cos);
++    let lists: Vec<Vec<Option<u32>>> = pages
++        .iter()
++        .map(|p| {
++            let list = p.dict.get(b"Annots").map(|a| cos.resolve(a));
++            list.and_then(|l| Some(l.as_array()?.iter().map(|o| o.as_ref().map(|r| r.num)).collect())).unwrap_or_default()
++        })
++        .collect();
++    let annots = doc
++        .info
++        .annotations
++        .iter()
++        .filter_map(|a| Some((lists.get(a.page)?.get(a.index).copied().flatten()?, (a.page, a.index, a.rect))))
++        .collect();
++    let pages = pages.iter().zip(&doc.info.pages).map(|(p, info)| (p.obj.num, info.clone())).collect();
++    let ids = Rc::new(Ids { doc: id, generation, pages, annots });
++    STATE.with_borrow_mut(|s| s.ids = Some(ids.clone()));
++    Some(ids)
++}
++
++/// This person's presence: the page under the pointer (else the current one), the pointer in its user space while it
++/// is over a page, and the selected comment.
++fn presence(app: &PdfCraftApp) -> Option<Value> {
++    let (i, id) = app.active_ids().filter(|&(_, id)| shared(id))?;
++    let (ids, view) = (ids(app, id)?, app.views.get(i)?);
++    let pointer = app.ctx.as_ref().and_then(|ctx| ctx.pointer_hover_pos()).filter(|p| !view.organize && view.viewport_rect().contains(*p));
++    let at = pointer.and_then(|p| {
++        let (page, _) = view.visible_page_rects().into_iter().find(|(_, r)| r.contains(p))?;
++        Some((page, view.page_xform(page)?.screen_to_view(p)))
++    });
++    let (num, info) = ids.pages.get(at.map_or(view.current, |(page, _)| page))?;
++    let selected = view.comments.selected.and_then(|(page, index)| ids.annots.iter().find(|(_, a)| (a.0, a.1) == (page, index)).map(|(n, _)| *n));
++    let mut state = json!({ "page": num, "selection": selected.into_iter().collect::<Vec<_>>() });
++    if let Some((_, (x, y))) = at {
++        state["pointer"] = json!(info.view_to_user(x, y).map(|v| (f64::from(v) * 10.0).round() / 10.0));
++    }
++    Some(state)
++}
++
++/// Draws the others' selected comments and pointers (with their names) on the pages `view` shows, in their colors.
++pub(crate) fn paint(view: &crate::DocView, area: egui::Rect, ui: &egui::Ui) {
++    use egui::{Color32, CornerRadius, Pos2, Rect, Stroke, StrokeKind, vec2};
++    STATE.with_borrow(|s| {
++        let Some(ids) = s.ids.as_ref().filter(|ids| ids.doc == view.id && !s.others.is_empty() && shared(view.id)) else { return };
++        let painter = ui.painter().with_clip_rect(area);
++        let screen = |page: usize, [x, y]: [f32; 2]| -> Option<Pos2> {
++            let (xf, (_, info)) = (view.page_xform(page)?, ids.pages.get(page)?);
++            let v = info.user_to_view(x, y);
++            Some(xf.norm_to_screen(v[0] / xf.pw, v[1] / xf.ph))
++        };
++        for other in &s.others {
++            let color = Color32::from_rgb(other.color[0], other.color[1], other.color[2]);
++            let num = |v: &Value| v.as_u64().and_then(|n| u32::try_from(n).ok());
++            for n in other.state["selection"].as_array().into_iter().flatten().take(50).filter_map(num) {
++                let Some(&(page, _, r)) = ids.annots.get(&n) else { continue };
++                if let (Some(a), Some(b)) = (screen(page, [r[0], r[1]]), screen(page, [r[2], r[3]])) {
++                    painter.rect_stroke(Rect::from_two_pos(a, b).expand(2.0), CornerRadius::ZERO, Stroke::new(2.0, color), StrokeKind::Middle);
++                }
++            }
++            let page = num(&other.state["page"]).and_then(|n| ids.pages.iter().position(|(p, _)| *p == n));
++            let xy = other.state["pointer"].as_array().filter(|a| a.len() == 2).and_then(|a| Some([a[0].as_f64()? as f32, a[1].as_f64()? as f32]));
++            let at = page.zip(xy.filter(|xy| xy.iter().all(|v| v.abs() < 1e6))).and_then(|(page, xy)| screen(page, xy));
++            let Some(at) = at.filter(|at| area.contains(*at)) else { continue };
++            let arrow = vec![at, at + vec2(0.0, 17.0), at + vec2(12.0, 12.0)];
++            painter.add(egui::Shape::convex_polygon(arrow, color, Stroke::new(1.0, Color32::WHITE)));
++            let name = painter.layout_no_wrap(other.name.clone(), egui::FontId::proportional(12.0), Color32::WHITE);
++            let tag = Rect::from_min_size(at + vec2(10.0, 16.0), name.size() + vec2(8.0, 4.0));
++            painter.rect_filled(tag, CornerRadius::same(3), color);
++            painter.galley(tag.min + vec2(4.0, 2.0), name, Color32::WHITE);
++        }
++    });
++}
++
++/// The web runner, kept for the session to reach the app (the web entry starts it).
 +#[cfg(target_arch = "wasm32")]
-+pub fn attach(runner: &eframe::WebRunner) -> Result<(), wasm_bindgen::JsValue> {
-+    let app = runner.clone();
-+    playground_live::web::attach::<PdfCraftApp>(
++pub fn runner() -> eframe::WebRunner {
++    thread_local! {
++        static RUNNER: std::cell::OnceCell<eframe::WebRunner> = const { std::cell::OnceCell::new() };
++    }
++    let runner = eframe::WebRunner::new();
++    let kept = runner.clone();
++    let attached = playground_live::web::attach::<PdfCraftApp>(
 +        &format!("acrobat:1:{}", env!("CARGO_PKG_VERSION")),
-+        move |f| app.app_mut::<PdfCraftApp>().map(|mut app| f(&mut app)).is_some(),
++        |f| RUNNER.with(|r| r.get().and_then(|r| r.app_mut::<PdfCraftApp>()).map(|mut app| f(&mut app)).is_some()),
 +        || {
 +            if let Some(ctx) = STATE.with_borrow(|s| s.ctx.clone()) {
 +                ctx.request_repaint();
 +            }
 +        },
-+    )
++    );
++    if let Err(e) = attached {
++        eframe::web_sys::console::error_1(&e);
++    }
++    RUNNER.with(|r| r.get_or_init(|| kept).clone())
++}
++
++/// The app the web entry runs: `app`, each frame ending with the session's [`frame`].
++#[cfg(target_arch = "wasm32")]
++pub fn wrap(app: PdfCraftApp) -> Box<dyn eframe::App> {
++    Box::new(Wrapped(app))
++}
++
++#[cfg(target_arch = "wasm32")]
++struct Wrapped(PdfCraftApp);
++
++#[cfg(target_arch = "wasm32")]
++impl eframe::App for Wrapped {
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
++        self.0.raw_input_hook(ctx, raw);
++    }
++
++    fn save(&mut self, storage: &mut dyn eframe::Storage) {
++        self.0.save(storage);
++    }
++
++    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
++        self.0.logic(ctx, frame);
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, f: &mut eframe::Frame) {
++        self.0.ui(ui, f);
++        frame(&mut self.0);
++    }
++
++    /// The app itself, which the session reaches through the runner.
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(&mut self.0)
++    }
 +}
 +
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
-+    use crate::playground_live::{activity, canonical, checkpoint, connect, disconnect, queue};
++    use super::playground_live::{activity, canonical, checkpoint, connect, disconnect, queue};
 +    use pdfcraft_engine::{Edit, NewAnnotation, NoteIcon, Session, Shape, Style};
 +
 +    thread_local! {
@@ -780,11 +920,11 @@ index 0000000..6cceb12
 +        let (shared, base) = (read(doc).unwrap(), base_for(doc["pdf"].as_str().unwrap()).unwrap());
 +        let mut session = Session::new();
 +        let id = session.open("other.pdf", None, base.doc.bytes().clone(), None).unwrap();
-+        session.replace_graph(id, build(&shared, &base)).unwrap();
++        session.live_replace_graph(id, build(&shared, &base)).unwrap();
 +        for edit in edits {
 +            session.apply(id, edit).unwrap();
 +        }
-+        project(session.get(id).unwrap().cos().unwrap(), &base)
++        project(session.get(id).unwrap().live_cos().unwrap(), &base)
 +    }
 +
 +    /// A blank PDF of `pages` pages, as a shared document.
@@ -826,7 +966,8 @@ index 0000000..6cceb12
 +        let mine = app.live_document();
 +        let id = app.views[0].id;
 +        let saved = app.session.save_bytes(id).unwrap();
-+        app.session.mark_saved_keeping_graph(id, saved).unwrap();
++        frame(&mut app);
++        app.session.mark_saved(id, saved, None).unwrap();
 +        assert_eq!(app.live_document(), mine, "a save does not change the shared document");
 +
 +        let remote = edited(&mine, vec![rotate(1, 90)]);
@@ -838,7 +979,22 @@ index 0000000..6cceb12
 +        assert_eq!((app.views[0].zoom, app.views[0].current), (3.0, 1), "this person's view stays");
 +        let doc = app.session.get(id).unwrap();
 +        assert!(doc.can_undo().is_none(), "no undo step, and none left from before (the camera slider replays them)");
-+        assert_eq!(pdfcraft_model::pages(doc.cos().unwrap())[1].dict.int(b"Rotate"), Some(90));
++        assert_eq!(pdfcraft_model::pages(doc.live_cos().unwrap())[1].dict.int(b"Rotate"), Some(90));
++        disconnect();
++    }
++
++    #[test]
++    fn presence_names_the_page_and_the_selected_comment_by_object_number() {
++        let mut app = app_with(2);
++        assert!(app.apply_edit(note(1, "mine")));
++        let _ = app.live_document();
++        (app.views[0].current, app.views[0].comments.selected) = (1, Some((1, 0)));
++        let id = app.views[0].id;
++        let cos = app.session.get(id).unwrap().live_cos().unwrap().clone();
++        let pages = pdfcraft_model::pages(&cos);
++        let comment = cos.resolve(pages[1].dict.get(b"Annots").unwrap()).as_array().unwrap()[0].as_ref().unwrap();
++        assert_eq!(app.live_presence(), json!({"page": pages[1].obj.num, "selection": [comment.num]}), "no pointer off the canvas");
++        assert_eq!(ids(&app, id).unwrap().annots[&comment.num].0, 1, "the others' outline finds it by its number");
 +        disconnect();
 +    }
 +
@@ -1028,86 +1184,3 @@ index 0000000..6cceb12
 +        assert!(accepted > 20 && rejected > 0 && RENUMBERED.get() > 0, "the run exercised merges, conflicts and fresh numbers");
 +    }
 +}
-diff --git a/crates/ui-egui/src/commands.rs b/crates/ui-egui/src/commands.rs
-index c46d93d..79bca53 100644
---- a/crates/ui-egui/src/commands.rs
-+++ b/crates/ui-egui/src/commands.rs
-@@ -84,6 +84,10 @@ impl PdfCraftApp {
-         if self.combine_showing() && matches!(spec.needs, commands::Needs::Undo | commands::Needs::Redo) {
-             return self.combine_can_undo(spec.needs == commands::Needs::Undo);
-         }
-+        #[cfg(any(target_arch = "wasm32", test))]
-+        if let Some(enabled) = crate::live::command_enabled(self, spec.id) {
-+            return enabled;
-+        }
-         commands::is_enabled(spec, &self.session, self.active_ids().map(|(_, id)| id))
-             && (spec.id != "edit.copy"
-                 || self.active.and_then(|i| self.views.get(i)).is_some_and(|v| !v.organize && v.selected_text().is_some_and(|t| !t.is_empty())))
-diff --git a/crates/ui-egui/src/editing.rs b/crates/ui-egui/src/editing.rs
-index be1347d..2f45fa8 100644
---- a/crates/ui-egui/src/editing.rs
-+++ b/crates/ui-egui/src/editing.rs
-@@ -196,6 +196,10 @@ impl PdfCraftApp {
- 
-     fn history_step(&mut self, undo: bool) {
-         let Some((i, id)) = self.active_ids() else { return };
-+        #[cfg(any(target_arch = "wasm32", test))]
-+        if crate::live::shared(id) && crate::playground_live::undo(!undo) {
-+            return;
-+        }
-         let result = if undo { self.session.undo(id) } else { self.session.redo(id) };
-         match result {
-             Ok(label) => {
-@@ -643,7 +647,12 @@ impl PdfCraftApp {
-             };
-             match delivered {
-                 Ok(()) => {
--                    let _ = self.session.mark_saved(id, bytes, None);
-+                    // A shared live document keeps its graph: the save's own changes are not everyone's.
-+                    let _ = if crate::live::shared(id) {
-+                        self.session.mark_saved_keeping_graph(id, bytes)
-+                    } else {
-+                        self.session.mark_saved(id, bytes, None)
-+                    };
-                     if let Some(doc) = self.session.get(id)
-                         && let Some(view) = self.views.get_mut(index)
-                     {
-diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index d101d81..79515e5 100644
---- a/crates/ui-egui/src/lib.rs
-+++ b/crates/ui-egui/src/lib.rs
-@@ -146,6 +146,14 @@ pub mod window_controls;
- #[cfg(all(test, not(target_arch = "wasm32")))]
- mod open_worker_tests;
- 
-+// Playground live editing (web only).
-+#[cfg(any(target_arch = "wasm32", test))]
-+#[path = "../live/live.rs"]
-+pub mod live;
-+#[cfg(any(target_arch = "wasm32", test))]
-+#[path = "../live/playground_live.rs"]
-+mod playground_live;
-+
- use pdfcraft_engine::{DocId, Session};
- 
- pub use canvas::{DocView, RasterMemory};
-@@ -2913,6 +2921,11 @@ impl eframe::App for PdfCraftApp {
-         storage.set_string("pdfcraft", self.persist());
-     }
- 
-+    #[cfg(target_arch = "wasm32")]
-+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-+        Some(&mut *self)
-+    }
-+
-     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-         self.ctx = Some(ctx.clone());
-         self.dialog_epoch();
-@@ -3181,5 +3194,7 @@ impl PdfCraftApp {
-                 view.finish_render_frame(ctx, &doc.info, &doc.renderer);
-             }
-         }
-+        #[cfg(target_arch = "wasm32")]
-+        live::frame(self);
-     }
- }
