@@ -7,7 +7,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "fetch": "node scripts/fetch.mjs",
-    "test": "node --test tests/"
+    "test": "node --test tests/",
+    "live": "node scripts/live-dev.mjs"
   },
   "devDependencies": {
     "miniflare": "5.20261006.0-alpha",
