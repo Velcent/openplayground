@@ -1,0 +1,21 @@
+Fixes the newest commit crashing at start in the browser ("no pids on this platform"): recovery::instance_id
+hashed std::process::id(), which wasm32 lacks (upstream 241ecd5, 2026-10-13). On the web it hashes a random number
+instead, so each tab still gets its own id. Head only: the newest release has no instance_id yet. Delete once upstream
+fixes it (this then applies in reverse, or no longer applies and a repair empties it).
+
+diff --git a/crates/engine/src/recovery.rs b/crates/engine/src/recovery.rs
+index 707d0aa..ef73ee1 100644
+--- a/crates/engine/src/recovery.rs
++++ b/crates/engine/src/recovery.rs
+@@ -44,7 +44,11 @@ pub fn instance_id() -> u64 {
+     *ID.get_or_init(|| {
+         use std::hash::{BuildHasher, Hasher};
+         let mut h = std::collections::hash_map::RandomState::new().build_hasher();
++        #[cfg(not(target_arch = "wasm32"))]
+         h.write_u32(std::process::id());
++        // The browser has no process id, and std's hasher keys aren't random there: a random number instead.
++        #[cfg(target_arch = "wasm32")]
++        h.write_u64(js_sys::Math::random().to_bits());
+         #[cfg(not(target_arch = "wasm32"))]
+         if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+             h.write_u128(d.as_nanos());
