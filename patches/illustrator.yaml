@@ -324,13 +324,13 @@
 
 # Live editing in Playground sessions (patches/illustrator/live.diff + patches/live/playground_live.rs)
 # What it's for: people in a Playground session edit one document together, and see each other's pointer, selected
-#   objects and artboard, in each person's color.
+#   objects and gestures in progress (moves, strokes, shapes being drawn), in each person's color.
 # How: the adapter lives in new files: crates/ui-egui/live/playground.rs (the shared document, merge checks, adopt,
 #   Undo, presence; it declares the template, copied next to it; outside src/, whose strings i18n's tests read),
+#   crates/ui-egui/live/presence.rs (this person's gesture in progress, and the others' marks drawn over the canvas),
 #   crates/doc/src/playground_ids.rs (ids nobody else in the session picks) and apps/vectorcraft-web/src/web/
-#   playground.rs (the shell around WebShell that ends each frame with the session's frame hook, which also draws the
-#   others over the canvas). These rules only declare them and call in, each at the end of a file or right after a
-#   signature.
+#   playground.rs (the shell around WebShell that ends each frame with the session's frame hook). These rules only
+#   declare them and call in, each at the end of a file or right after a signature, except the canvas's one call.
 # Verify: node scripts/build.mjs check illustrator head|release (and LIVE=0), then the e2e
 #   (tests/live-apps/illustrator.mjs) and `cargo test -p vectorcraft-ui-egui --lib playground::`.
 # If upstream changes: if a function named below is renamed, anchor on its new signature; if WebShell or its `app` or
@@ -375,3 +375,22 @@
   file: apps/vectorcraft-web/src/web.rs
   find: 'Ok\(Box::new\((?=\s*WebShell\b)'
   replace: 'Ok(playground::wrap('
+# The others' marks, a child of the canvas module (it outlines objects as the canvas outlines its selection), drawn
+# after the art and before this person's own selection and tool overlays; Home lists the session's documents closed
+# here (under Recent Files), and each tab shows dots for the others on its document.
+- live: true
+  file: crates/ui-egui/src/canvas.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web only): the others' marks over the canvas.\n#[cfg(any(target_arch = \"wasm32\", test))]\n#[path = \"../live/presence.rs\"]\npub(crate) mod playground_presence;\n"
+- live: true
+  file: crates/ui-egui/src/canvas.rs
+  find: '^[ \t]*if\s+app\.ui\.view\.edges\b'
+  before: "    #[cfg(any(target_arch = \"wasm32\", test))] playground_presence::draw(app, ui.ctx(), &painter, &xf);\n"
+- live: true
+  file: crates/ui-egui/src/canvas.rs
+  find: '^[ \t]*recent\(app,\s*ui\);'
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] playground_presence::home(app, ui);"
+- live: true
+  file: crates/ui-egui/src/chrome.rs
+  find: '^[ \t]*x\s*\+=\s*w;'
+  before: "        #[cfg(any(target_arch = \"wasm32\", test))] crate::canvas::playground_presence::tab(app, ui, i, r);\n"

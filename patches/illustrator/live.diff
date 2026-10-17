@@ -101,62 +101,83 @@ index 0000000..e82d167
 +}
 diff --git a/crates/ui-egui/live/playground.rs b/crates/ui-egui/live/playground.rs
 new file mode 100644
-index 0000000..cdb11a3
+index 0000000..966e938
 --- /dev/null
 +++ b/crates/ui-egui/live/playground.rs
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,564 @@
 +//! Live editing in a Playground session (web only): [`playground_live`] is what the page drives.
 +//!
-+//! The shared document is the open document the session started on, as its JSON with the images' bytes and without
-+//! what is this person's: the id counter, the view and Layers rows written at save, the export and print settings. A
-+//! remote change replaces that document at a quiet frame and keeps the selection, tools and views, with no native undo
-+//! step. New ids come from `playground_live::fresh_id` while connected, so additions at once don't collide.
++//! The shared document is the set of documents open in the session, `{ "documents": [{ "id", "name", … }] }`: each one
++//! as its JSON with its images' bytes and without what is this person's (the id counter, the view and Layers rows
++//! written at save, the export and print settings), under an id of its own in the session and its title. The owner
++//! shares the documents open when the session starts; one anyone opens or creates while connected joins them, and opens
++//! for the others as a tab they are not switched to (someone joining is switched to the session's first). Closing a tab
++//! hides that document here only: changes to it are kept, and Home lists it to open again. A remote change installs at
++//! a quiet frame and keeps this person's selection, tools and views, with no native undo step. New ids come from
++//! `playground_live::fresh_id` while connected, so additions at once don't collide.
 +//!
-+//! Presence: while the shared document is the active one, this person's active artboard (its id), pointer (document
-+//! points) and selected objects (ids); the others' are drawn over the canvas in their color at the end of each frame.
++//! Presence: on one of the session's documents, which one (`doc`, its id in the session), the active artboard (its id),
++//! the pointer (document points), the selected objects (ids) and the gesture in progress; the canvas draws the others
++//! on the same document, and the tabs show dots for the others on theirs (`canvas::playground_presence`).
++//!
++//! Typing goes to the others as it is typed: the Type tool's typing (one interaction while the caret stays) counts as
++//! quiet, and a remote change keeps it first, as Undo does; the next key goes on in a new step.
 +
 +#[path = "playground_live.rs"]
 +pub mod playground_live;
 +
 +use std::cell::{Cell, RefCell};
 +use std::collections::{BTreeMap, HashSet};
++use std::hash::{Hash, Hasher};
 +use std::sync::Arc;
 +
-+use serde_json::Value;
++use serde_json::{Value, json};
 +use vectorcraft_doc::{Document, ImageBlob};
 +use vectorcraft_engine::{DocState, Session};
 +
 +use crate::VectorcraftApp;
++use crate::canvas::playground_presence::{MAX_POINTS, fine, gestures};
 +use playground_live::{Live, Presence};
 +
 +/// Document fields that are this person's, or written at save only: not shared.
 +const LOCAL: [&str; 5] = ["next_id", "last_view", "layers_open", "export_settings", "print_setup"];
 +
-+/// What [`BOUND`] holds once the session's document is none (shared before a document was open): no
-+/// [`DocState::uid`] is 0.
-+const NO_DOCUMENT: u64 = 0;
-+
 +/// Image bytes by key, and whether they are a linked image's preview.
 +type Images = BTreeMap<String, (Vec<u8>, bool)>;
 +
-+thread_local! {
-+    /// The shared document ([`DocState::uid`]), from the session's first look at it.
-+    static BOUND: Cell<Option<u64>> = const { Cell::new(None) };
-+    /// A pointer button was down, or a text field had the keyboard, in the last frame.
-+    static POINTER: Cell<bool> = const { Cell::new(false) };
-+    /// The document last compared: held, so that any change to it makes a new one.
-+    static SEEN: RefCell<Option<Arc<Document>>> = const { RefCell::new(None) };
-+    /// The others in the session, as the shell last gave them.
-+    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
++/// One of the session's documents.
++struct Entry {
++    /// Its id in the session.
++    id: u64,
++    /// The open document showing it here ([`DocState::uid`]); none once closed here.
++    uid: Option<u64>,
++    /// It as last seen here (as last received, while closed here).
++    doc: Arc<Document>,
++    /// `doc` (by address) and the digest of its shared form, as last reported: the same one adopted installs nothing.
++    reported: Option<(usize, u64)>,
 +}
 +
-+/// The end of each frame: draws the others over the canvas, applies the remote changes waiting and reports this
-+/// person's, once quiet.
++thread_local! {
++    /// The session's documents, from its first look at this person's.
++    static DOCS: RefCell<Option<Vec<Entry>>> = const { RefCell::new(None) };
++    /// The newest [`DocState::uid`] open here when the session's documents were last brought up to date: a document
++    /// opened after that joins them.
++    static OPENED: Cell<u64> = const { Cell::new(0) };
++    /// A change from the session was installed (the first switches someone joining to the session's documents).
++    static JOINED: Cell<bool> = const { Cell::new(false) };
++    /// The next of the session's document ids, natively (tests).
++    #[cfg(not(target_arch = "wasm32"))]
++    static NEXT: Cell<u64> = const { Cell::new(1) };
++    /// A pointer button was down, or a text field had the keyboard, in the last frame.
++    static POINTER: Cell<bool> = const { Cell::new(false) };
++}
++
++/// The end of each frame: applies the remote changes waiting and reports this person's, once quiet.
 +pub fn frame(app: &mut VectorcraftApp, ui: &egui::Ui) {
 +    let ctx = ui.ctx();
 +    let typing = ctx.memory(|m| m.focused()).is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
 +    POINTER.set(typing || ctx.input(|i| i.pointer.any_down()));
-+    draw_presence(app, ui);
++    crate::canvas::playground_presence::frame(app);
 +    playground_live::frame(app);
 +}
 +
@@ -171,76 +192,128 @@ index 0000000..cdb11a3
 +    playground_live::web::attach::<VectorcraftApp>(concat!("illustrator:1:", env!("CARGO_PKG_VERSION")), with_app, repaint)
 +}
 +
-+/// [`VectorcraftApp::run`]'s first step: Undo and Redo go to the session while it shares the active document.
++/// [`VectorcraftApp::run`]'s first step: Undo and Redo go to the session, unless the active document is this person's
++/// own (not one of the session's).
 +pub fn run(app: &VectorcraftApp, id: &str) -> Option<Result<Value, String>> {
 +    let redo = match id {
 +        "edit.undo" => false,
 +        "edit.redo" => true,
 +        _ => return None,
 +    };
-+    let shared = BOUND.get().is_none_or(|uid| app.session.active().is_some_and(|d| d.uid == uid));
-+    (shared && playground_live::undo(redo)).then_some(Ok(Value::Null))
++    let own = app.session.active().is_some_and(|d| DOCS.with_borrow(Option::is_some) && session_id(d.uid).is_none());
++    (!own && playground_live::undo(redo)).then_some(Ok(Value::Null))
 +}
 +
-+/// The shared document, when it is the one on the canvas here.
-+fn shown(app: &VectorcraftApp) -> Option<&DocState> {
++/// The session's id of open document `uid`, when it is one of the session's documents.
++pub(crate) fn session_id(uid: u64) -> Option<u64> {
++    DOCS.with_borrow(|docs| docs.iter().flatten().find(|e| e.uid == Some(uid)).map(|e| e.id))
++}
++
++/// The session's document on the canvas here, and its id in the session.
++pub(crate) fn shown(app: &VectorcraftApp) -> Option<(&DocState, u64)> {
 +    let st = app.session.active().filter(|_| !crate::menus::home_showing(app))?;
-+    BOUND.get().is_none_or(|uid| uid == st.uid).then_some(st)
++    Some((st, session_id(st.uid)?))
 +}
 +
-+/// The others' pointers (an arrow with their name) and their selected objects' bounds, in their colors, over the
-+/// canvas (the last thing drawn in its layer). Their numbers come from other people: what doesn't resolve is skipped.
-+fn draw_presence(app: &VectorcraftApp, ui: &egui::Ui) {
-+    use egui::{Color32, Shape, Stroke, vec2};
-+    OTHERS.with_borrow(|others| {
-+        let (Some(st), Some(rect), Some(view)) = (shown(app).filter(|_| !others.is_empty()), app.canvas_rect, app.view()) else {
-+            return;
-+        };
-+        let xf = crate::canvas::Xf::new(rect, view);
-+        let painter = ui.painter_at(rect);
-+        let symbols = st.doc.symbol_boxes();
-+        let pad = 2.0 / xf.zoom;
-+        for other in others {
-+            let color = Color32::from_rgb(other.color[0], other.color[1], other.color[2]);
-+            let ids = other.state["selection"].as_array().into_iter().flatten().take(50).filter_map(Value::as_u64);
-+            for bounds in ids.filter_map(|id| st.doc.node(vectorcraft_doc::NodeId(id))?.geometric_bounds_with(&symbols)) {
-+                painter.add(Shape::closed_line(xf.quad(bounds.inflate(pad, pad)), Stroke::new(1.5, color)));
-+            }
-+            let pointer = &other.state["pointer"];
-+            let Some(tip) = pointer[0].as_f64().zip(pointer[1].as_f64()).map(|(x, y)| xf.to_screen(vectorcraft_geom::Point::new(x, y))) else {
-+                continue;
-+            };
-+            // NaN, infinite and far-off points fail this.
-+            if !(tip.x.abs() < 1e6 && tip.y.abs() < 1e6) {
-+                continue;
-+            }
-+            painter.add(Shape::convex_polygon(vec![tip, tip + vec2(0.0, 15.0), tip + vec2(10.5, 10.5)], color, Stroke::new(1.0, Color32::WHITE)));
-+            let name: String = other.name.chars().take(32).collect();
-+            if !name.is_empty() {
-+                let text = painter.layout_no_wrap(name, egui::FontId::proportional(11.0), Color32::WHITE);
-+                let tag = egui::Rect::from_min_size(tip + vec2(8.0, 15.0), text.size() + vec2(8.0, 4.0));
-+                painter.rect_filled(tag, 3.0, color);
-+                painter.galley(tag.min + vec2(4.0, 2.0), text, Color32::WHITE);
++/// The session's documents closed here: (id, title), for Home.
++pub(crate) fn closed() -> Vec<(u64, String)> {
++    DOCS.with_borrow(|docs| docs.iter().flatten().filter(|e| e.uid.is_none()).map(|e| (e.id, e.doc.title.clone())).collect())
++}
++
++/// Opens the session's document `id` again (closed here), and shows it.
++pub(crate) fn reopen(app: &mut VectorcraftApp, id: u64) {
++    let Some(doc) = DOCS.with_borrow(|docs| docs.iter().flatten().find(|e| e.id == id && e.uid.is_none()).map(|e| e.doc.clone())) else {
++        return;
++    };
++    let i = app.session.add_document(Arc::unwrap_or_clone(doc), None);
++    let st = &app.session.documents()[i];
++    DOCS.with_borrow_mut(|docs| {
++        if let Some(e) = docs.iter_mut().flatten().find(|e| e.id == id) {
++            (e.uid, e.doc) = (Some(st.uid), st.doc.clone());
++        }
++    });
++    app.ui.home = None;
++    app.sync_views();
++}
++
++/// The session's documents brought up to date with the ones open here: at the session's first look all of them (the
++/// owner's; someone joining has theirs replaced by the session's), then each one opened since. A closed one keeps its
++/// last state.
++fn sync(app: &VectorcraftApp) {
++    let open = app.session.documents();
++    DOCS.with_borrow_mut(|docs| {
++        let all = docs.is_none();
++        let docs = docs.get_or_insert_with(Vec::new);
++        for e in docs.iter_mut() {
++            e.uid = e.uid.filter(|uid| open.iter().any(|d| d.uid == *uid));
++        }
++        for st in open {
++            match docs.iter_mut().find(|e| e.uid == Some(st.uid)) {
++                Some(e) => e.doc = st.doc.clone(),
++                None if all || st.uid > OPENED.get() => {
++                    docs.push(Entry { id: new_id(), uid: Some(st.uid), doc: st.doc.clone(), reported: None });
++                }
++                None => {}
 +            }
 +        }
 +    });
++    OPENED.set(open.iter().map(|d| d.uid).fold(OPENED.get(), u64::max));
 +}
 +
-+/// The shared document: the bound one, else the active one (bound by `bind`).
-+fn shared(app: &VectorcraftApp, bind: bool) -> Option<&DocState> {
-+    if bind && BOUND.get().is_none() {
-+        BOUND.set(app.session.active().map(|d| d.uid));
-+    }
-+    match BOUND.get() {
-+        Some(uid) => app.session.documents().iter().find(|d| d.uid == uid),
-+        None => app.session.active(),
-+    }
++/// A new id for one of the session's documents: 2^52 and 52 random bits in the browser (a page looks at its documents
++/// before it connects, so a count would repeat another person's), counted natively.
++fn new_id() -> u64 {
++    #[cfg(target_arch = "wasm32")]
++    let id = (1 << 52) | (js_sys::Math::random() * (1u64 << 52) as f64) as u64;
++    #[cfg(not(target_arch = "wasm32"))]
++    let id = NEXT.with(|n| n.replace(n.get() + 1));
++    id
 +}
 +
-+/// A shared document as a [`Document`] whose id counter is `next_id`, and its images' bytes (which the document keeps
-+/// outside its JSON).
++/// Document `doc` as the session shares it, as its document `id`.
++fn project(doc: &Document, id: u64) -> Value {
++    let doc = doc.without_edit_modes();
++    let mut v = serde_json::to_value(&*doc).unwrap_or_default();
++    if let Some(o) = v.as_object_mut() {
++        for k in LOCAL {
++            o.remove(k);
++        }
++        if let Some(Value::Object(images)) = o.get_mut("images") {
++            for (k, blob) in &doc.images {
++                if let Some(Value::Object(image)) = images.get_mut(k) {
++                    image.insert("data".into(), vectorcraft_format::base64_encode(&blob.bytes).into());
++                    if blob.is_proxy() {
++                        image.insert("proxy".into(), true.into());
++                    }
++                }
++            }
++        }
++        o.insert("id".into(), id.into());
++        o.insert("name".into(), doc.title.clone().into());
++    }
++    v
++}
++
++/// The digest of a shared document.
++fn digest(v: &Value) -> u64 {
++    let mut hasher = std::collections::hash_map::DefaultHasher::new();
++    playground_live::canonical(v).hash(&mut hasher);
++    hasher.finish()
++}
++
++/// The session's documents in a shared value: (id, document).
++fn documents(v: &Value) -> Result<Vec<(u64, Value)>, String> {
++    let list = v["documents"].as_array().ok_or("The shared document is not a set of VectorCraft documents")?;
++    list.iter().map(|d| Ok((d["id"].as_u64().ok_or("A shared document has no id")?, d.clone()))).collect()
++}
++
++/// One of the session's documents as a [`Document`] whose id counter is `next_id`, and its images' bytes (which the
++/// document keeps outside its JSON).
 +fn decode(mut document: Value, next_id: u64) -> Result<(Document, Images), String> {
 +    let o = document.as_object_mut().ok_or("The shared document is not a VectorCraft document")?;
++    // Its id and name in the session are not the document's (it would keep keys it does not know).
++    o.remove("id");
++    o.remove("name");
 +    let mut bytes = Images::new();
 +    if let Some(Value::Object(images)) = o.get_mut("images") {
 +        for (k, image) in images.iter_mut() {
@@ -255,126 +328,184 @@ index 0000000..cdb11a3
 +    Ok((doc, bytes))
 +}
 +
-+impl Live for VectorcraftApp {
-+    /// A merged document installs: it reads as a document, with no object in two places (moved into different groups
-+    /// by both sides).
-+    fn live_check(document: &Value) -> Result<(), String> {
-+        let (doc, _) = decode(document.clone(), 1)?;
-+        let (mut ids, mut unique) = (HashSet::new(), true);
-+        doc.walk(|n| unique &= ids.insert(n.id));
-+        if unique { Ok(()) } else { Err("Conflict: an object would be in two places".into()) }
-+    }
-+
-+    fn live_document(&self) -> Value {
-+        // Once the shared document is closed here, the last one seen: a change from the others opens it again.
-+        let Some(doc) = shared(self, true).map(|st| st.doc.clone()).or_else(|| SEEN.with_borrow(Clone::clone)) else {
-+            return Value::Null;
++/// One of the session's documents, `value`, as the next state of `current` (none: new here): this person's settings
++/// kept, and the images that did not change kept as they were.
++fn install(value: Value, current: Option<&Document>) -> Result<Document, String> {
++    let (mut doc, mut bytes) = decode(value, current.map_or(1, Document::peek_next_id))?;
++    for (k, blob) in &mut doc.images {
++        let Some((data, proxy)) = bytes.remove(k) else { continue };
++        *blob = match current.and_then(|d| d.images.get(k)) {
++            // The same image stays the same blob (its decoded pixels are kept).
++            Some(old) if old.mime == blob.mime && *old.bytes == data => old.clone(),
++            _ => {
++                let mut new = ImageBlob::new(blob.mime.clone(), data);
++                new.proxy = proxy.then(|| new.bytes.clone());
++                new
++            }
 +        };
-+        let doc = doc.without_edit_modes();
-+        let mut v = serde_json::to_value(&*doc).unwrap_or_default();
-+        if let Some(o) = v.as_object_mut() {
-+            for k in LOCAL {
-+                o.remove(k);
-+            }
-+            if let Some(Value::Object(images)) = o.get_mut("images") {
-+                for (k, blob) in &doc.images {
-+                    if let Some(Value::Object(image)) = images.get_mut(k) {
-+                        image.insert("data".into(), vectorcraft_format::base64_encode(&blob.bytes).into());
-+                        if blob.is_proxy() {
-+                            image.insert("proxy".into(), true.into());
-+                        }
-+                    }
-+                }
-+            }
-+        }
-+        v
 +    }
++    if let Some(d) = current {
++        (doc.last_view, doc.layers_open) = (d.last_view.clone(), d.layers_open.clone());
++        (doc.export_settings, doc.print_setup) = (d.export_settings.clone(), d.print_setup.clone());
++        // Puppet Warp's pins (the tool's working state).
++        doc.puppet.clone_from(&d.puppet);
++    }
++    doc.fix_next_id();
++    doc.limit_depth();
++    Session::refresh_text_bounds(&mut doc);
++    Ok(doc)
++}
 +
-+    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
-+        // A session shared before a document was open has none: this person's own document isn't shared (the first
-+        // one opened is, without one).
-+        if document.is_null() {
-+            SEEN.set(None);
-+            if BOUND.get().is_some() || self.session.active().is_some() {
-+                BOUND.set(Some(NO_DOCUMENT));
++impl Live for VectorcraftApp {
++    /// A merged set installs: documents with ids of their own, each reading as a document with no object in two places
++    /// (moved into different groups by both sides).
++    fn live_check(document: &Value) -> Result<(), String> {
++        let mut ids = HashSet::new();
++        for (id, d) in documents(document)? {
++            if !ids.insert(id) {
++                return Err("Conflict: two documents with one id".into());
 +            }
-+            return Ok(());
-+        }
-+        let current = shared(self, true).map(|st| st.doc.clone());
-+        let (mut doc, mut bytes) = decode(document, current.as_ref().map_or(1, |d| d.peek_next_id()))?;
-+        for (k, blob) in &mut doc.images {
-+            let Some((data, proxy)) = bytes.remove(k) else { continue };
-+            *blob = match current.as_ref().and_then(|d| d.images.get(k)) {
-+                // The same image stays the same blob (its decoded pixels are kept).
-+                Some(old) if old.mime == blob.mime && *old.bytes == data => old.clone(),
-+                _ => {
-+                    let mut new = ImageBlob::new(blob.mime.clone(), data);
-+                    new.proxy = proxy.then(|| new.bytes.clone());
-+                    new
-+                }
-+            };
-+        }
-+        if let Some(d) = &current {
-+            (doc.last_view, doc.layers_open) = (d.last_view.clone(), d.layers_open.clone());
-+            (doc.export_settings, doc.print_setup) = (d.export_settings.clone(), d.print_setup.clone());
-+            // Puppet Warp's pins (the tool's working state).
-+            doc.puppet.clone_from(&d.puppet);
-+        }
-+        doc.fix_next_id();
-+        doc.limit_depth();
-+        Session::refresh_text_bounds(&mut doc);
-+        match BOUND.get().and_then(|uid| self.session.document_mut(uid)) {
-+            Some(st) => {
-+                st.doc = Arc::new(doc);
-+                st.selection.prune(&st.doc);
-+                st.revision += 1;
-+            }
-+            // No document open (or the shared one was closed): it opens.
-+            None => {
-+                let i = self.session.add_document(doc, None);
-+                BOUND.set(self.session.documents().get(i).map(|d| d.uid));
++            let (doc, _) = decode(d, 1)?;
++            let (mut objects, mut unique) = (HashSet::new(), true);
++            doc.walk(|n| unique &= objects.insert(n.id));
++            if !unique {
++                return Err("Conflict: an object would be in two places".into());
 +            }
 +        }
 +        Ok(())
 +    }
 +
++    fn live_document(&self) -> Value {
++        sync(self);
++        DOCS.with_borrow_mut(|docs| {
++            let documents: Vec<Value> = (docs.iter_mut().flatten())
++                .map(|e| {
++                    let v = project(&e.doc, e.id);
++                    e.reported = Some((Arc::as_ptr(&e.doc) as usize, digest(&v)));
++                    v
++                })
++                .collect();
++            json!({ "documents": documents })
++        })
++    }
++
++    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
++        // Typing in progress is kept first: its preview would start again from the document before this one.
++        if self.session.active().is_some_and(|st| st.interaction.is_some()) {
++            self.session.commit_interaction().map_err(|e| e.to_string())?;
++            self.session.set_tool_option("endTyping", &Value::Bool(true));
++        }
++        let given = if document.is_null() { Vec::new() } else { documents(&document)? };
++        sync(self);
++        // Each document's next state (none: the same as reported), read before anything changes.
++        let next: Vec<(u64, Option<Document>)> = DOCS.with_borrow(|docs| {
++            let entry = |id: u64| docs.iter().flatten().find(|e| e.id == id);
++            let next = |(id, value): (u64, Value)| {
++                let old = entry(id);
++                let same = old.is_some_and(|e| e.reported == Some((Arc::as_ptr(&e.doc) as usize, digest(&value))));
++                Ok((id, if same { None } else { Some(install(value, old.map(|e| &*e.doc))?) }))
++            };
++            given.into_iter().map(next).collect::<Result<_, String>>()
++        })?;
++        let mut docs = DOCS.take().unwrap_or_default();
++        // Someone joining (none of their documents in the session's) is shown the session's.
++        let joining = !JOINED.replace(true) && !next.is_empty() && docs.iter().all(|e| next.iter().all(|(id, _)| *id != e.id));
++        let (active, home) = (self.session.active_index(), crate::menus::home_showing(self));
++        let (mut kept, mut first) = (Vec::new(), None);
++        for (id, doc) in next {
++            let mut entry = docs.iter().position(|e| e.id == id).map(|i| docs.swap_remove(i));
++            if let Some(doc) = doc.map(Arc::new) {
++                match &mut entry {
++                    Some(e) => {
++                        if let Some(st) = e.uid.and_then(|uid| self.session.document_mut(uid)) {
++                            st.doc = doc.clone();
++                            st.selection.prune(&st.doc);
++                            st.revision += 1;
++                        }
++                        (e.doc, e.reported) = (doc, None);
++                    }
++                    // New here: it opens as a tab.
++                    None => {
++                        let i = self.session.add_document(Arc::unwrap_or_clone(doc), None);
++                        let st = &self.session.documents()[i];
++                        first.get_or_insert(i);
++                        entry = Some(Entry { id, uid: Some(st.uid), doc: st.doc.clone(), reported: None });
++                    }
++                }
++            }
++            kept.extend(entry);
++        }
++        // A document no longer in the session (its opening undone) stays open here as this person's own.
++        DOCS.set(Some(kept));
++        OPENED.set(self.session.documents().iter().map(|d| d.uid).fold(OPENED.get(), u64::max));
++        if let Some(i) = first {
++            if joining {
++                self.session.set_active(i);
++                self.ui.home = None;
++            } else {
++                // Another person's document opens behind this person's.
++                if let Some(a) = active {
++                    self.session.set_active(a);
++                }
++                if home {
++                    self.ui.home = Some(crate::menus::home_key(self));
++                }
++            }
++            self.sync_views();
++        }
++        Ok(())
++    }
++
 +    fn live_quiet(&self) -> bool {
++        // Typing is quiet between keys (IME composition aside): it reaches the others as it is typed.
++        let gesture = |st: &DocState| st.interaction.as_ref().is_some_and(|it| it.label != "Typing");
 +        let editing = |st: &DocState| {
-+            st.interaction.is_some() || st.undo_group.is_some() || st.doc.mask_edit.is_some() || st.doc.pattern_edit.is_some()
++            session_id(st.uid).is_some() && (st.undo_group.is_some() || st.doc.mask_edit.is_some() || st.doc.pattern_edit.is_some())
 +        };
-+        !POINTER.get() && !self.picks.is_waiting() && self.ime_marked.is_none() && !shared(self, false).is_some_and(editing)
++        !POINTER.get()
++            && !self.picks.is_waiting()
++            && self.ime_marked.is_none()
++            && !self.session.active().is_some_and(gesture)
++            && !self.session.documents().iter().any(editing)
 +    }
 +
 +    fn live_generation(&self) -> Option<u64> {
-+        if let Some(st) = shared(self, true) {
-+            SEEN.set(Some(st.doc.clone()));
-+        }
-+        SEEN.with_borrow(|d| d.as_ref().map(|d| Arc::as_ptr(d) as usize as u64))
++        sync(self);
++        let mut hasher = std::collections::hash_map::DefaultHasher::new();
++        DOCS.with_borrow(|docs| docs.iter().flatten().for_each(|e| (e.id, Arc::as_ptr(&e.doc) as usize).hash(&mut hasher)));
++        Some(hasher.finish())
 +    }
 +
 +    fn live_presence(&self) -> Value {
-+        let Some(st) = shown(self) else { return Value::Null };
++        let Some((st, doc)) = shown(self) else { return Value::Null };
 +        let artboard = st.doc.artboards.get(crate::panels::artboards::selected(self, st.doc.artboards.len())).map(|a| a.id);
 +        let selection: Vec<u64> = st.selection.objects.iter().take(50).map(|id| id.0).collect();
-+        let mut presence = serde_json::json!({ "artboard": artboard, "selection": selection });
++        let mut presence = json!({ "doc": doc, "artboard": artboard, "selection": selection });
 +        if let Some(p) = self.hover_doc.filter(|p| p.x.is_finite() && p.y.is_finite()) {
-+            let round = |v: f64| (v * 100.0).round() / 100.0;
-+            presence["pointer"] = serde_json::json!([round(p.x), round(p.y)]);
++            presence["pointer"] = json!([fine(p.x), fine(p.y)]);
 +        }
-+        presence
++        // The gesture in progress, with fewer outline points while the whole is over what the shell sends (4 KiB).
++        let with = |points| {
++            let mut p = presence.clone();
++            gestures(self, st, points, &mut p);
++            p
++        };
++        [MAX_POINTS, MAX_POINTS / 3, 0].into_iter().map(with).find(|p| p.to_string().len() <= 4000).unwrap_or(presence)
 +    }
 +
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        OTHERS.set(others);
++        crate::canvas::playground_presence::show(others);
 +    }
 +
 +    fn live_disconnected(&mut self) {
 +        // Native Undo starts again from here: its steps are from before the others' changes.
-+        if let Some(st) = BOUND.take().and_then(|uid| self.session.document_mut(uid)) {
-+            st.history.undo.clear();
-+            st.history.redo.clear();
++        for uid in DOCS.take().into_iter().flatten().filter_map(|e| e.uid) {
++            if let Some(st) = self.session.document_mut(uid) {
++                st.history.undo.clear();
++                st.history.redo.clear();
++            }
 +        }
-+        SEEN.set(None);
++        JOINED.set(false);
 +    }
 +}
 +
@@ -402,7 +533,9 @@ index 0000000..cdb11a3
 +    fn the_shared_document_leaves_views_out_and_adopting_one_keeps_them_without_an_undo_step() {
 +        let mut app = app_with_rect();
 +        let shared = app.live_document();
-+        assert!(shared.get("next_id").is_none() && shared["images"]["pic"]["data"] == "AQID");
++        let title = app.session.active().unwrap().doc.title.clone();
++        let doc = &shared["documents"][0];
++        assert!(doc.get("next_id").is_none() && doc["images"]["pic"]["data"] == "AQID" && doc["name"] == title.as_str());
 +        // Views, selection and Layers rows are this person's.
 +        app.run("select.all", json!({})).unwrap();
 +        let st = app.session.active_mut().unwrap();
@@ -412,11 +545,12 @@ index 0000000..cdb11a3
 +
 +        // A remote change: the rectangle renamed and a new layer.
 +        let mut remote = shared.clone();
-+        remote["layers"][0]["kind"]["children"][0]["name"] = json!("Box");
-+        let mut layer = remote["layers"][0].clone();
++        let doc = &mut remote["documents"][0];
++        doc["layers"][0]["kind"]["children"][0]["name"] = json!("Box");
++        let mut layer = doc["layers"][0].clone();
 +        layer["id"] = json!(1u64 << 52);
 +        layer["kind"]["children"] = json!([]);
-+        remote["layers"].as_array_mut().unwrap().push(layer);
++        doc["layers"].as_array_mut().unwrap().push(layer);
 +        let (undo_steps, selected) = {
 +            let st = app.session.active().unwrap();
 +            (st.history.undo.len(), st.selection.clone())
@@ -432,39 +566,61 @@ index 0000000..cdb11a3
 +    }
 +
 +    #[test]
-+    fn a_session_without_a_document_shares_none_until_one_comes_and_merges_must_give_documents() {
-+        let mut owner = VectorcraftApp::new(Session::new(), crate::Services::default());
-+        owner.live_adopt(Value::Null).unwrap();
-+        owner.run("file.new", json!({})).unwrap();
-+        assert!(!owner.live_document().is_null(), "the first document opened is shared");
-+        BOUND.set(None);
-+        let mut app = app_with_rect();
-+        let doc = app.live_document();
-+        // A session shared before its owner opened a document: joining adopts nothing.
-+        BOUND.set(None);
-+        app.live_adopt(Value::Null).unwrap();
-+        assert!(app.live_document().is_null(), "this person's own document isn't shared");
++    fn documents_opened_join_the_session_as_tabs_behind_and_closing_one_is_personal() {
++        // Someone joining has their own document left out, and is shown the session's.
++        let session = app_with_rect().live_document();
++        DOCS.set(None);
++        let mut joiner = app_with_rect();
++        joiner.live_document();
++        joiner.live_adopt(session.clone()).unwrap();
++        assert_eq!(joiner.session.documents().len(), 2);
++        assert_eq!(session_id(joiner.session.active().unwrap().uid), session["documents"][0]["id"].as_u64());
++        assert_eq!(canonical(&joiner.live_document()), canonical(&session), "their own document stays out");
++
++        // A document opened joins the session.
++        joiner.run("file.new", json!({})).unwrap();
++        let mut remote = joiner.live_document();
++        assert_eq!(remote["documents"].as_array().unwrap().len(), 2);
++        // Someone else's opens here behind the active one.
++        let mut theirs = remote["documents"][0].clone();
++        (theirs["id"], theirs["title"], theirs["name"]) = (json!(7), json!("Theirs"), json!("Theirs"));
++        remote["documents"].as_array_mut().unwrap().push(theirs);
++        let active = joiner.session.active().unwrap().uid;
++        joiner.live_adopt(remote.clone()).unwrap();
++        assert_eq!(joiner.session.documents().len(), 4);
++        assert_eq!(joiner.session.active().unwrap().uid, active, "no switch to it");
++        assert_eq!(canonical(&joiner.live_document()), canonical(&remote));
++        // Closing it hides it here only: a change to it is kept, and doesn't open it again.
++        joiner.session.close_document(3);
++        assert_eq!(canonical(&joiner.live_document()), canonical(&remote));
++        (remote["documents"][2]["title"], remote["documents"][2]["name"]) = (json!("Renamed"), json!("Renamed"));
++        joiner.live_adopt(remote.clone()).unwrap();
++        assert_eq!(joiner.session.documents().len(), 3);
++        assert_eq!(canonical(&joiner.live_document()), canonical(&remote));
++        assert_eq!(closed(), [(7, "Renamed".to_string())]);
++
++        // Merges must give documents, each with no object in two places.
 +        assert!(VectorcraftApp::live_check(&Value::Null).is_err());
-+        let mut twice = doc.clone();
-+        let layer = twice["layers"][0].clone();
-+        twice["layers"].as_array_mut().unwrap().push(json!({"id": 9, "kind": {"type": "layer", "color": {"Preset": 1}, "children": [layer]}}));
++        let mut twice = session.clone();
++        let doc = &mut twice["documents"][0];
++        let layer = doc["layers"][0].clone();
++        doc["layers"].as_array_mut().unwrap().push(json!({"id": 9, "kind": {"type": "layer", "color": {"Preset": 1}, "children": [layer]}}));
 +        assert!(VectorcraftApp::live_check(&twice).unwrap_err().contains("two places"));
-+        // The owner opens one: it opens here too.
-+        app.live_adopt(VectorcraftApp::live_merge(&Value::Null, &Value::Null, &doc).unwrap()).unwrap();
-+        assert_eq!(app.session.documents().len(), 2);
-+        assert_eq!(canonical(&app.live_document()), canonical(&doc));
 +    }
 +
 +    #[test]
 +    fn a_remote_change_waits_while_busy_and_undo_goes_to_the_session() {
 +        let mut app = app_with_rect();
 +        connect();
++        let retitled = |app: &VectorcraftApp, title: &str| {
++            let mut remote = app.live_document();
++            (remote["documents"][0]["title"], remote["documents"][0]["name"]) = (json!(title), json!(title));
++            canonical(&remote)
++        };
 +        let base = canonical(&app.live_document());
-+        let mut remote = app.live_document();
-+        remote["title"] = json!("Shared");
 +        let done = std::rc::Rc::new(Cell::new(false));
 +        let to = done.clone();
-+        queue(Some(base), canonical(&remote), Box::new(move |r| to.set(r.is_ok())));
++        queue(Some(base), retitled(&app, "Shared"), Box::new(move |r| to.set(r.is_ok())));
 +        app.session.begin_interaction("Move").unwrap();
 +        playground_live::frame(&mut app);
 +        assert!(!done.get(), "a drag holds remote changes back");
@@ -472,6 +628,12 @@ index 0000000..cdb11a3
 +        playground_live::frame(&mut app);
 +        assert!(done.get());
 +        assert_eq!(app.session.active().unwrap().doc.title, "Shared");
++        // Typing is quiet: a remote change keeps it first.
++        app.session.begin_interaction("Typing").unwrap();
++        app.session.preview("object.transform", &json!({"matrix": [1, 0, 0, 1, 0, 0]})).unwrap();
++        queue(Some(canonical(&app.live_document())), retitled(&app, "Typed"), Box::new(|_| {}));
++        playground_live::frame(&mut app);
++        assert!(app.session.active().is_some_and(|st| st.interaction.is_none() && st.doc.title == "Typed"));
 +        let undo_steps = app.session.active().unwrap().history.undo.len();
 +        app.run("edit.undo", json!({})).unwrap();
 +        assert_eq!(activity().1, [false]);
@@ -482,17 +644,521 @@ index 0000000..cdb11a3
 +    }
 +
 +    #[test]
-+    fn presence_is_the_pointer_in_document_points_and_the_selection_while_the_shared_document_shows() {
++    fn presence_is_the_document_pointer_selection_and_gesture_while_a_shared_document_shows() {
 +        let mut app = app_with_rect();
-+        app.live_document();
++        let doc = app.live_document()["documents"][0]["id"].clone();
 +        app.run("select.all", json!({})).unwrap();
 +        app.hover_doc = Some(vectorcraft_geom::Point::new(12.345, 67.0));
 +        let ids: Vec<u64> = app.session.active().unwrap().selection.objects.iter().map(|id| id.0).collect();
 +        let presence = app.live_presence();
-+        assert!(!ids.is_empty() && presence["selection"] == json!(ids));
++        assert!(!ids.is_empty() && presence["selection"] == json!(ids) && presence["doc"] == doc);
 +        assert_eq!(presence["pointer"], json!([12.35, 67.0]));
 +        assert_eq!(presence["artboard"], json!(app.session.active().unwrap().doc.artboards[0].id));
++        // Gestures in progress: the selection moved so far, a rectangle being drawn.
++        app.session.begin_interaction("Move").unwrap();
++        app.session.preview("object.transform", &json!({"matrix": [1, 0, 0, 1, 5, 0]})).unwrap();
++        assert_eq!(app.live_presence()["move"], json!({"ids": ids, "m": [1.0, 0.0, 0.0, 1.0, 5.0, 0.0]}));
++        app.session.cancel_interaction().unwrap();
++        app.session.begin_interaction("Rectangle").unwrap();
++        app.session.preview("shape.rectangle", &json!({"x": 100, "y": 100, "width": 40, "height": 20})).unwrap();
++        let band = &app.live_presence()["bands"][0];
++        assert!([[100.0, 100.0], [140.0, 100.0], [140.0, 120.0], [100.0, 120.0]].iter().all(|p| band.as_array().unwrap().chunks(2).any(|q| q == p)), "{band}");
++        app.session.cancel_interaction().unwrap();
 +        app.run("file.new", json!({})).unwrap();
-+        assert!(app.live_presence().is_null(), "another document shown");
++        app.live_document();
++        assert!(app.live_presence()["doc"].as_u64().is_some_and(|d| json!(d) != doc), "on another document");
++    }
++}
+diff --git a/crates/ui-egui/live/presence.rs b/crates/ui-egui/live/presence.rs
+new file mode 100644
+index 0000000..4810bd4
+--- /dev/null
++++ b/crates/ui-egui/live/presence.rs
+@@ -0,0 +1,487 @@
++//! Live editing in a Playground session: the others' marks over the canvas, and this person's gesture in progress for
++//! them. A child of `canvas`, so the others' objects are outlined as the canvas outlines its own selection
++//! ([`node_outline`]).
++//!
++//! The shared document changes when a gesture ends (typing aside: it reaches the others as it is typed). Until then a
++//! presence carries the gesture ([`gestures`]), in document points, outlines as flat `[x0, y0, x1, y1, …]` (a closed one
++//! ends where it starts):
++//! - `move`: `{ ids, m }`, objects being moved, scaled, rotated, reflected or sheared (the Selection tool, Free
++//!   Transform, the transform tools): those objects, as the others have them, through the affine `m` so far;
++//! - `ghosts`: the objects another gesture is changing (anchors, reshapes, widths), as they are so far;
++//! - `bands`: the shapes being drawn (the Rectangle, Ellipse, Polygon, Star, Line Segment, grid… tools);
++//! - `strokes` and `width`: what the Pencil, the Paintbrush, the Blob Brush, the Eraser or the Pen is drawing, and its
++//!   width.
++//!
++//! The others' marks are drawn under this person's own selection and tool overlays: ghosts, strokes and bands, then
++//! selection outlines, then pointers with name tags, each in that person's color, easing toward the latest state.
++
++use std::cell::RefCell;
++use std::collections::HashMap;
++
++use egui::{Color32, Mesh, Painter, Pos2, Shape, Stroke, Vec2, pos2, vec2};
++use serde_json::{Value, json};
++use vectorcraft_doc::{Document, Node, NodeId};
++use vectorcraft_engine::DocState;
++use vectorcraft_geom::{Affine, BezPath, PathEl, Point};
++use vectorcraft_tools::Overlay;
++
++use super::{Xf, kurbo_flatten, node_outline, stroke_path, to_screen_path, too_many_anchors};
++use crate::VectorcraftApp;
++use crate::playground::playground_live::Presence;
++
++/// The most objects, outlines and selected objects a presence carries, or is drawn with.
++const MAX_ITEMS: usize = 50;
++/// The most outline points a presence carries (the shell sends at most 4 KiB of it).
++pub(crate) const MAX_POINTS: usize = 200;
++/// How long the others' marks take to go most (1 - 1/e) of the way to their latest state, in seconds.
++const EASE: f64 = 0.08;
++/// Remote coordinates this far off (document points), or no numbers, are not drawn.
++const FAR: f64 = 1e7;
++
++thread_local! {
++    /// The others in the session, as the shell last gave them.
++    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
++    /// Their marks as last drawn, by person: they ease on from there.
++    static SHOWN: RefCell<HashMap<String, Shown>> = RefCell::new(HashMap::new());
++    /// The Blob Brush's or the Eraser's stroke in progress (only the tool has it until it ends), and its width.
++    static BRUSH: RefCell<Option<(BezPath, f64)>> = const { RefCell::new(None) };
++}
++
++/// The others, as the shell gives them (none once the session ends).
++pub(crate) fn show(others: Vec<Presence>) {
++    OTHERS.set(others);
++}
++
++/// Each frame: the Blob Brush's or the Eraser's stroke so far, for [`gestures`].
++pub(crate) fn frame(app: &mut VectorcraftApp) {
++    let brush = matches!(app.session.tool_id(), "blobBrush" | "eraser") && app.session.tool_busy();
++    let stroke = brush.then(|| {
++        let width = app.session.tool_options()["size"].as_f64().unwrap_or(1.0);
++        let view = app.view_info();
++        app.session.overlays(view).into_iter().find_map(|o| if let Overlay::Path { path, .. } = o { Some((path, width)) } else { None })
++    });
++    BRUSH.set(stroke.flatten());
++}
++
++/// This person's gesture in progress on `st` (the shared document, shown here) into `out`, with at most `points`
++/// outline points.
++pub(crate) fn gestures(app: &VectorcraftApp, st: &DocState, points: usize, out: &mut Value) {
++    let zoom = app.view().map_or(1.0, |v| v.zoom).max(1e-6);
++    let mut left = points;
++    if let Some((path, width)) = BRUSH.with_borrow(Clone::clone) {
++        out["strokes"] = flat(rings(&path, zoom), zoom, &mut left, true);
++        out["width"] = fine(width).into();
++        return;
++    }
++    let Some(it) = st.interaction.as_ref().filter(|it| it.label != "Typing") else { return };
++    let Some((cmd, params)) = &it.preview else { return };
++    let anchors = params["anchors"] == true && !it.selection.anchors.is_empty();
++    let m: Option<Vec<f64>> = params["matrix"].as_array().and_then(|m| m.iter().map(Value::as_f64).collect());
++    if let Some(m) = m.filter(|m| cmd == "object.transform" && !anchors && m.len() == 6) {
++        let ids: Vec<u64> = match params["ids"].as_array() {
++            Some(ids) => ids.iter().filter_map(Value::as_u64).take(MAX_ITEMS).collect(),
++            None => it.selection.objects.iter().take(MAX_ITEMS).map(|id| id.0).collect(),
++        };
++        let m: Vec<f64> = m.iter().enumerate().map(|(i, v)| if i < 4 { (v * 1e4).round() / 1e4 } else { fine(*v) }).collect();
++        out["move"] = json!({ "ids": ids, "m": m });
++        return;
++    }
++    let (changed, added) = changes(&it.doc, &st.doc);
++    let symbols = st.doc.symbol_boxes();
++    let outlines = |nodes: &[&Node]| {
++        let mut bp = BezPath::new();
++        nodes.iter().for_each(|n| bp.extend(node_outline(n, &symbols)));
++        rings(&bp, zoom)
++    };
++    let width = || added.iter().chain(&changed).next().map_or(1.0, |n| fine(n.appearance.stroke_width()));
++    match cmd.as_str() {
++        // The Pencil's and the Paintbrush's points as the hand draws them (the path is fitted to them).
++        "path.freehand" | "brush.freehand" => {
++            let p = |p: &Value| Some(Point::new(p[0].as_f64()?, p[1].as_f64()?));
++            let hand: Vec<Point> = params["points"].as_array().into_iter().flatten().filter_map(p).collect();
++            out["strokes"] = flat(vec![hand], zoom, &mut left, true);
++            out["width"] = width().into();
++        }
++        // The Pen's path, anchor by anchor.
++        "path.create" | "path.appendAnchor" | "path.close" | "path.curvature" => {
++            out["strokes"] = flat(outlines(&[added.as_slice(), changed.as_slice()].concat()), zoom, &mut left, true);
++            out["width"] = width().into();
++        }
++        _ => {
++            for (key, nodes) in [("bands", &added), ("ghosts", &changed)].into_iter().filter(|(_, n)| !n.is_empty()) {
++                out[key] = flat(outlines(nodes), zoom, &mut left, false);
++            }
++        }
++    }
++}
++
++/// The objects a gesture changed in `now` since `before` (its snapshot), the outermost changed, and those it added;
++/// [`MAX_ITEMS`] at most.
++fn changes<'a>(before: &Document, now: &'a Document) -> (Vec<&'a Node>, Vec<&'a Node>) {
++    fn walk<'a>(before: &Document, old: &[std::sync::Arc<Node>], new: &'a [std::sync::Arc<Node>], out: &mut (Vec<&'a Node>, Vec<&'a Node>)) {
++        for (i, n) in new.iter().enumerate() {
++            if out.0.len() + out.1.len() >= MAX_ITEMS {
++                return;
++            }
++            let was = old.get(i).filter(|o| o.id == n.id).map(|o| &**o).or_else(|| before.node(n.id));
++            match was {
++                None => out.1.push(n),
++                Some(o) if std::ptr::eq(o, &**n) => {}
++                Some(o) => {
++                    let found = out.0.len() + out.1.len();
++                    if let (Some(oc), Some(nc)) = (o.children(), n.children()) {
++                        walk(before, oc, nc, out);
++                    }
++                    // A layer is no object; a group none of whose objects changed changed itself.
++                    if out.0.len() + out.1.len() == found && !n.is_layer() {
++                        out.0.push(n);
++                    }
++                }
++            }
++        }
++    }
++    let mut out = (Vec::new(), Vec::new());
++    walk(before, &before.layers, &now.layers, &mut out);
++    out
++}
++
++/// `bp` flattened (to a tenth of a pixel at `zoom`) into polylines of document points, a closed one ending where it
++/// starts.
++fn rings(bp: &BezPath, zoom: f64) -> Vec<Vec<Point>> {
++    let mut out: Vec<Vec<Point>> = Vec::new();
++    kurbo_flatten(bp, 0.1 / zoom, &mut |el| match el {
++        PathEl::MoveTo(p) => out.push(vec![p]),
++        PathEl::LineTo(p) => out.last_mut().into_iter().for_each(|r| r.push(p)),
++        PathEl::ClosePath => out.last_mut().into_iter().filter(|r| r.last() != r.first()).for_each(|r| r.push(r[0])),
++        _ => {}
++    });
++    out
++}
++
++/// `rings` as flat `[x0, y0, …]` arrays: each point a pixel (at `zoom`) or more from the one before, at most `left`
++/// points in all (it goes down by what they take), the newest (`newest`, the last ones) or the first when cut.
++fn flat(rings: Vec<Vec<Point>>, zoom: f64, left: &mut usize, newest: bool) -> Value {
++    let mut rings: Vec<Vec<Point>> = rings
++        .into_iter()
++        .map(|r| {
++            let mut kept: Vec<Point> = Vec::new();
++            for (i, p) in r.iter().enumerate() {
++                if kept.last().is_none_or(|q| q.distance(*p) * zoom >= 1.0 || i + 1 == r.len()) {
++                    kept.push(*p);
++                }
++            }
++            kept
++        })
++        .filter(|r| r.len() >= 2)
++        .collect();
++    if newest {
++        rings.reverse();
++    }
++    let mut out = Vec::new();
++    for mut r in rings.into_iter().take(MAX_ITEMS) {
++        if *left < 2 {
++            break;
++        }
++        if r.len() > *left {
++            match newest {
++                true => drop(r.drain(..r.len() - *left)),
++                false => r.truncate(*left),
++            }
++        }
++        *left -= r.len();
++        out.push(r.iter().flat_map(|p| [fine(p.x), fine(p.y)]).collect::<Vec<f64>>());
++    }
++    if newest {
++        out.reverse();
++    }
++    json!(out)
++}
++
++/// `x` in hundredths: finer than a pixel up to 100× zoom, and short in JSON.
++pub(crate) fn fine(x: f64) -> f64 {
++    (x * 100.0).round() / 100.0
++}
++
++/// A person's moving marks as last drawn, in document points, easing toward their latest state.
++#[derive(Default)]
++struct Shown {
++    pointer: Option<[f64; 2]>,
++    /// The objects moved (ids) and the affine moving them.
++    moved: Option<(Vec<u64>, [f64; 6])>,
++    /// The box the ghosts and bands are drawn into (their own box, as last received).
++    frame: Option<[f64; 4]>,
++    /// The newest point of the strokes.
++    head: Option<[f64; 2]>,
++}
++
++/// `s` `k` of the way on toward `t`, all of it after a jump of more than `far` pixels or once under half a pixel
++/// remains (`px`: pixels a unit of each part). Whether it is still on its way.
++fn ease<const N: usize>(s: &mut [f64; N], t: [f64; N], k: f64, px: [f64; N], far: f64) -> bool {
++    let off = |s: &[f64; N]| s.iter().zip(t).zip(px).map(|((s, t), px)| ((t - s) * px).abs()).fold(0.0, f64::max);
++    if off(s) > far {
++        *s = t;
++    }
++    s.iter_mut().zip(t).for_each(|(s, t)| *s += (t - *s) * k);
++    let moving = off(s) >= 0.5;
++    if !moving {
++        *s = t;
++    }
++    moving
++}
++
++/// [`ease`] for a mark that may come and go: it shows at once where it first does.
++fn step<const N: usize>(s: &mut Option<[f64; N]>, t: Option<[f64; N]>, k: f64, px: [f64; N], far: f64) -> bool {
++    match (s.as_mut(), t) {
++        (Some(s), Some(t)) => ease(s, t, k, px, far),
++        _ => {
++            *s = t;
++            false
++        }
++    }
++}
++
++/// A remote point, unless it is no number or too far off.
++fn point(x: &Value, y: &Value) -> Option<Point> {
++    let (x, y) = (x.as_f64()?, y.as_f64()?);
++    (x.abs() < FAR && y.abs() < FAR).then(|| Point::new(x, y))
++}
++
++/// Remote outlines (flat `[x0, y0, …]` arrays); one with a point that is no number or too far off is skipped.
++fn lines(v: &Value) -> Vec<Vec<Point>> {
++    let line = |l: &Value| -> Option<Vec<Point>> { l.as_array()?.chunks_exact(2).map(|c| point(&c[0], &c[1])).collect() };
++    v.as_array().into_iter().flatten().take(MAX_ITEMS).filter_map(line).filter(|l| l.len() >= 2).collect()
++}
++
++/// The box around `lines`, as `[x0, y0, x1, y1]`.
++fn bounds(lines: &[Vec<Point>]) -> Option<[f64; 4]> {
++    let mut points = lines.iter().flatten();
++    let first = points.next()?;
++    Some(points.fold([first.x, first.y, first.x, first.y], |b, p| [b[0].min(p.x), b[1].min(p.y), b[2].max(p.x), b[3].max(p.y)]))
++}
++
++/// The affine taking box `from` onto box `to`; a side with no extent keeps its size.
++fn fit(from: [f64; 4], to: [f64; 4]) -> Affine {
++    let scale = |a: f64, b: f64| if a > 1e-9 { b / a } else { 1.0 };
++    let (sx, sy) = (scale(from[2] - from[0], to[2] - to[0]), scale(from[3] - from[1], to[3] - to[1]));
++    Affine::translate((to[0], to[1])) * Affine::scale_non_uniform(sx, sy) * Affine::translate((-from[0], -from[1]))
++}
++
++/// `color` at `alpha` (0–1).
++fn alpha(color: Color32, alpha: f32) -> Color32 {
++    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), (alpha * 255.0).round() as u8)
++}
++
++/// The others on the document shown here, over the canvas (after the art, before this person's selection and tool
++/// overlays): their gestures in progress, their selected objects, their pointers with their names. Remote numbers that
++/// do not resolve or fit are skipped.
++pub(crate) fn draw(app: &VectorcraftApp, ctx: &egui::Context, painter: &Painter, xf: &Xf) {
++    let Some((st, doc)) = crate::playground::shown(app) else { return };
++    OTHERS.with_borrow(|others| {
++        let others: Vec<&Presence> = others.iter().filter(|o| o.state["doc"].as_u64() == Some(doc)).collect();
++        SHOWN.with_borrow_mut(|shown| {
++            // Someone back on this document shows at once where they are.
++            shown.retain(|id, _| others.iter().any(|o| o.id == *id));
++            if others.is_empty() {
++                return;
++            }
++            let symbols = st.doc.symbol_boxes();
++            let k = 1.0 - (-f64::from(ctx.input(|i| i.stable_dt).clamp(0.0, 0.1)) / EASE).exp();
++            let far = f64::from(xf.rect.width().min(xf.rect.height())) / 4.0;
++            let px = xf.zoom;
++            let mut moving = false;
++            let color = |o: &Presence| Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
++            for &o in &others {
++                let (s, color, state) = (shown.entry(o.id.clone()).or_default(), color(o), &o.state);
++                // Objects moved: as the others have them, through the affine so far.
++                let ids: Vec<u64> = state["move"]["ids"].as_array().into_iter().flatten().take(MAX_ITEMS).filter_map(Value::as_u64).collect();
++                let m: Option<Vec<f64>> = state["move"]["m"].as_array().and_then(|m| m.iter().map(Value::as_f64).collect());
++                let m = m.and_then(|m| <[f64; 6]>::try_from(m).ok()).filter(|m| m.iter().all(|v| v.abs() < FAR));
++                let nodes: Vec<&Node> = ids.iter().filter_map(|id| st.doc.node(NodeId(*id))).collect();
++                let size = nodes.iter().filter_map(|n| n.geometric_bounds_with(&symbols)).fold(1.0, |s: f64, b| s.max(b.width()).max(b.height()));
++                match (&mut s.moved, m.filter(|_| !nodes.is_empty())) {
++                    (Some((was, m)), Some(t)) if *was == ids => moving |= ease(m, t, k, [size * px, size * px, size * px, size * px, px, px], far),
++                    (moved, t) => *moved = t.map(|t| (ids.clone(), t)),
++                }
++                if let Some((_, m)) = s.moved {
++                    let boxes = too_many_anchors(nodes.iter().copied());
++                    for n in nodes {
++                        let mut outline = match boxes {
++                            true => n.geometric_bounds_with(&symbols).map(|b| vectorcraft_geom::shapes::rectangle(b).to_bezpath()).unwrap_or_default(),
++                            false => node_outline(n, &symbols),
++                        };
++                        outline.apply_affine(Affine::new(m));
++                        ghost(painter, to_screen_path(&outline, xf), color);
++                    }
++                }
++                // Ghosts and bands: drawn into their box as it eases.
++                let (ghosts, bands) = (lines(&state["ghosts"]), lines(&state["bands"]));
++                let target = bounds(&[ghosts.as_slice(), bands.as_slice()].concat());
++                moving |= step(&mut s.frame, target, k, [px; 4], far);
++                if let Some((from, to)) = target.zip(s.frame) {
++                    let at = fit(from, to);
++                    let screen = |l: &Vec<Point>| l.iter().map(|p| xf.to_screen(at * *p)).collect::<Vec<Pos2>>();
++                    ghost(painter, ghosts.iter().map(screen).collect(), color);
++                    for band in bands.iter().map(screen) {
++                        painter.extend(Shape::dashed_line(&band, Stroke::new(1.5, color), 4.0, 3.0));
++                    }
++                }
++                // Strokes: their newest point eases.
++                let mut strokes = lines(&state["strokes"]);
++                let head = strokes.last().and_then(|l| l.last()).map(|p| [p.x, p.y]);
++                moving |= step(&mut s.head, head, k, [px; 2], far);
++                if let (Some(last), Some([x, y])) = (strokes.last_mut().and_then(|l| l.last_mut()), s.head) {
++                    *last = Point::new(x, y);
++                }
++                let width = state["width"].as_f64().filter(|w| *w > 0.0 && *w < FAR).unwrap_or(1.0);
++                for l in &strokes {
++                    stroke(painter, l.iter().map(|p| xf.to_screen(*p)).collect(), (width * px).clamp(2.0, 400.0) as f32, color);
++                }
++            }
++            // Selected objects, outlined as the canvas outlines its own selection.
++            for &o in &others {
++                let ids = o.state["selection"].as_array().into_iter().flatten().take(MAX_ITEMS).filter_map(Value::as_u64);
++                let nodes: Vec<&Node> = ids.filter_map(|id| st.doc.node(NodeId(id))).collect();
++                let boxes = too_many_anchors(nodes.iter().copied());
++                for n in nodes {
++                    let outline = match boxes {
++                        true => n.geometric_bounds_with(&symbols).map(|b| vectorcraft_geom::shapes::rectangle(b).to_bezpath()),
++                        false => Some(node_outline(n, &symbols)),
++                    };
++                    outline.into_iter().for_each(|bp| stroke_path(painter, &bp, xf, Stroke::new(2.0, color(o))));
++                }
++            }
++            // Pointers, with their names.
++            for &o in &others {
++                let s = shown.entry(o.id.clone()).or_default();
++                let target = point(&o.state["pointer"][0], &o.state["pointer"][1]).map(|p| [p.x, p.y]);
++                moving |= step(&mut s.pointer, target, k, [px; 2], far);
++                if let Some([x, y]) = s.pointer {
++                    pointer(painter, xf.to_screen(Point::new(x, y)), color(o), &o.name);
++                }
++            }
++            if moving {
++                ctx.request_repaint();
++            }
++        });
++    });
++}
++
++/// Outlines being moved or changed (screen points): the closed ones filled with `color` at 28%, all edged at 85%.
++fn ghost(painter: &Painter, rings: Vec<Vec<Pos2>>, color: Color32) {
++    let closed = |r: &&Vec<Pos2>| r.len() > 3 && r.first() == r.last();
++    fill(painter, rings.iter().filter(closed), alpha(color, 0.28));
++    let edge = Stroke::new(1.5, alpha(color, 0.85));
++    for r in rings {
++        match closed(&&r) {
++            true => painter.add(Shape::closed_line(r[..r.len() - 1].to_vec(), edge)),
++            false => painter.add(Shape::line(r, edge)),
++        };
++    }
++}
++
++/// The inside of closed polylines (screen points, even-odd), in rows a point high across what the painter shows.
++fn fill<'a>(painter: &Painter, rings: impl Iterator<Item = &'a Vec<Pos2>>, color: Color32) {
++    let edges: Vec<(Pos2, Pos2)> = rings.flat_map(|r| r.windows(2).map(|w| (w[0], w[1]))).collect();
++    // ponytail: every edge per row; an active-edge table if ghosts of huge selections get slow.
++    if edges.is_empty() || edges.len() > 4_000 {
++        return;
++    }
++    let clip = painter.clip_rect();
++    let (top, bottom) = edges.iter().fold((f32::MAX, f32::MIN), |(t, b), (p, q)| (t.min(p.y).min(q.y), b.max(p.y).max(q.y)));
++    let (mut y, bottom) = (top.max(clip.top()).floor() + 0.5, bottom.min(clip.bottom()));
++    let (mut mesh, mut xs) = (Mesh::default(), Vec::new());
++    while y < bottom {
++        xs.clear();
++        xs.extend(edges.iter().filter(|(p, q)| (p.y <= y) != (q.y <= y)).map(|(p, q)| p.x + (y - p.y) / (q.y - p.y) * (q.x - p.x)));
++        xs.sort_by(f32::total_cmp);
++        for span in xs.chunks_exact(2) {
++            let (x0, x1) = (span[0].max(clip.left()), span[1].min(clip.right()));
++            if x1 > x0 {
++                mesh.add_colored_rect(egui::Rect::from_min_max(pos2(x0, y - 0.5), pos2(x1, y + 0.5)), color);
++            }
++        }
++        y += 1.0;
++    }
++    painter.add(mesh);
++}
++
++/// A stroke being drawn (screen points): `color` at 70%, `width` wide, with round ends.
++fn stroke(painter: &Painter, line: Vec<Pos2>, width: f32, color: Color32) {
++    let color = alpha(color, 0.7);
++    let ends = [(line[0], line[1]), (line[line.len() - 1], line[line.len() - 2])];
++    painter.add(Shape::line(line, Stroke::new(width, color)));
++    for (end, next) in ends {
++        let d = (end - next).normalized();
++        if d.is_finite() && width > 3.0 {
++            let half = (0..=12).map(|i| std::f32::consts::PI * i as f32 / 12.0);
++            painter.add(Shape::convex_polygon(half.map(|a| end + (d.rot90() * a.cos() + d * a.sin()) * width / 2.0).collect(), color, Stroke::NONE));
++        }
++    }
++}
++
++/// The pointer arrow, tip at (0, 0), in points; and the triangles that fill it.
++const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
++const ARROW_FILL: [[u32; 3]; 5] = [[0, 1, 2], [0, 2, 5], [0, 5, 6], [2, 3, 4], [2, 4, 5]];
++
++/// Another person's pointer at `tip`: an arrow in their color with a white edge and a soft shadow, and a tag with
++/// their name.
++fn pointer(painter: &Painter, tip: Pos2, color: Color32, name: &str) {
++    let at = |offset: Vec2| ARROW.map(|[x, y]| tip + offset + vec2(x, y)).to_vec();
++    painter.add(Shape::closed_line(at(vec2(0.0, 1.0)), Stroke::new(2.0, Color32::from_black_alpha(64))));
++    let mut mesh = Mesh::default();
++    at(Vec2::ZERO).into_iter().for_each(|p| mesh.colored_vertex(p, color));
++    ARROW_FILL.into_iter().for_each(|[a, b, c]| mesh.add_triangle(a, b, c));
++    painter.add(mesh);
++    painter.add(Shape::closed_line(at(Vec2::ZERO), Stroke::new(1.5, Color32::WHITE)));
++    let mut name: String = name.chars().take(25).collect();
++    if name.chars().count() > 24 {
++        name = name.chars().take(23).chain(['…']).collect();
++    }
++    if name.is_empty() {
++        return;
++    }
++    // Relative luminance: dark ink on light colors.
++    let linear = |c: u8| {
++        let c = f32::from(c) / 255.0;
++        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
++    };
++    let light = 0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b()) > 0.55;
++    let ink = if light { Color32::from_rgb(0x11, 0x11, 0x11) } else { Color32::WHITE };
++    let text = painter.layout_no_wrap(name, crate::theme::semibold(12.0), ink);
++    let tag = egui::Rect::from_min_size(tip + vec2(12.0, 15.0), text.size() + vec2(14.0, 6.0));
++    painter.rect_filled(tag, egui::CornerRadius::same(6), color);
++    painter.galley(tag.min + vec2(7.0, 3.0), text, ink);
++}
++
++/// Dots on tab `i` (`rect`) in the colors of the others on its document.
++pub(crate) fn tab(app: &VectorcraftApp, ui: &egui::Ui, i: usize, rect: egui::Rect) {
++    let Some(doc) = app.session.documents().get(i).and_then(|d| crate::playground::session_id(d.uid)) else { return };
++    OTHERS.with_borrow(|others| {
++        let here: Vec<&Presence> = others.iter().filter(|o| o.state["doc"].as_u64() == Some(doc)).take(8).collect();
++        let left = rect.center().x - 4.0 * (here.len().max(1) - 1) as f32;
++        for (k, o) in here.into_iter().enumerate() {
++            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
++            ui.painter().circle(pos2(left + 8.0 * k as f32, rect.bottom() - 5.0), 3.0, color, Stroke::new(1.0, Color32::WHITE));
++        }
++    });
++}
++
++/// Home's "In this session": the session's documents closed here, a row each that opens it again.
++pub(crate) fn home(app: &mut VectorcraftApp, ui: &mut egui::Ui) {
++    let closed = crate::playground::closed();
++    if closed.is_empty() {
++        return;
++    }
++    let t = crate::theme::Tokens::get(ui.ctx());
++    ui.add_space(28.0);
++    ui.label(egui::RichText::new("In this session").font(crate::theme::semibold(14.0)).color(t.text));
++    ui.add_space(8.0);
++    for (id, name) in closed {
++        ui.horizontal(|ui| {
++            crate::icons::icon(ui, "globe", 16.0, t.icon);
++            if ui.add(egui::Button::new(egui::RichText::new(&name).color(t.accent).size(13.0)).frame(false)).clicked() {
++                crate::playground::reopen(app, id);
++            }
++        });
 +    }
 +}
