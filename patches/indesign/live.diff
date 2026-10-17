@@ -1,9 +1,9 @@
 diff --git a/apps/designcraft-web/src/live.rs b/apps/designcraft-web/src/live.rs
 new file mode 100644
-index 0000000..d3d17c8
+index 0000000..26fc78e
 --- /dev/null
 +++ b/apps/designcraft-web/src/live.rs
-@@ -0,0 +1,496 @@
+@@ -0,0 +1,541 @@
 +//! Playground live editing (`playground_live`): the shared document is the set of documents open in the session,
 +//! `{ "documents": [{ "id", "name", … }] }`, each one's model as JSON with its embedded files' bytes and without this
 +//! person's views (selection, zoom, spread rotation on screen, a Data Merge preview), under an id of its own in the
@@ -48,6 +48,23 @@ index 0000000..d3d17c8
 +    /// The pointer is down or a text field has the keyboard.
 +    static BUSY: Cell<bool> = const { Cell::new(false) };
 +    static CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
++    /// Embedded files' base64 by their bytes (each kept, so its address stays its own): a document is projected on
++    /// every change and checkpoint, and installed on every remote change, without encoding or decoding its files again.
++    static BASE64: RefCell<Vec<(Arc<Vec<u8>>, String)>> = const { RefCell::new(Vec::new()) };
++}
++
++/// `data` in base64, encoded once per file.
++fn base64(data: &Arc<Vec<u8>>) -> String {
++    BASE64.with_borrow_mut(|cache| {
++        // Files no document holds any more.
++        cache.retain(|(d, _)| Arc::strong_count(d) > 1);
++        if let Some((_, s)) = cache.iter().find(|(d, _)| Arc::ptr_eq(d, data)) {
++            return s.clone();
++        }
++        let s = base64_encode(data);
++        cache.push((data.clone(), s.clone()));
++        s
++    })
 +}
 +
 +/// The end of a frame.
@@ -131,7 +148,7 @@ index 0000000..d3d17c8
 +    if let Some(assets) = v.get_mut("assets").and_then(Value::as_object_mut) {
 +        for (id, asset) in &doc.assets {
 +            if let Some(a) = assets.get_mut(&id.0.to_string()).and_then(Value::as_object_mut) {
-+                a.insert("data".into(), base64_encode(&asset.data).into());
++                a.insert("data".into(), base64(&asset.data).into());
 +            }
 +        }
 +    }
@@ -142,10 +159,30 @@ index 0000000..d3d17c8
 +    v
 +}
 +
-+/// The digest of a shared document.
++/// The digest of a shared document, hashed in place (writing it out would escape every file's base64).
 +fn digest(v: &Value) -> u64 {
++    fn walk(v: &Value, h: &mut std::collections::hash_map::DefaultHasher) {
++        std::mem::discriminant(v).hash(h);
++        match v {
++            Value::Null => {}
++            Value::Bool(b) => b.hash(h),
++            Value::Number(n) => (n.as_u64(), n.as_i64(), n.as_f64().map(f64::to_bits)).hash(h),
++            Value::String(s) => s.hash(h),
++            Value::Array(items) => {
++                items.len().hash(h);
++                items.iter().for_each(|v| walk(v, h));
++            }
++            Value::Object(m) => {
++                m.len().hash(h);
++                for (k, v) in m {
++                    k.hash(h);
++                    walk(v, h);
++                }
++            }
++        }
++    }
 +    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-+    playground_live::canonical(v).hash(&mut hasher);
++    walk(v, &mut hasher);
 +    hasher.finish()
 +}
 +
@@ -182,11 +219,19 @@ index 0000000..d3d17c8
 +/// change, so caches keyed by them stay warm.
 +fn fill(doc: &mut Document, files: &Files, old: Option<&Document>) {
 +    for (id, asset) in &mut doc.assets {
-+        let data = base64_decode(files.get(&id.0.to_string()).map_or("", String::as_str));
++        let text = files.get(&id.0.to_string()).map_or("", String::as_str);
 +        let o = old.and_then(|o| o.assets.get(id));
++        // The file this person has, unless its base64 differs: decoded only then.
++        let known = |o: &Arc<Vec<u8>>| BASE64.with_borrow(|cache| cache.iter().any(|(d, s)| Arc::ptr_eq(d, o) && s == text));
 +        Arc::make_mut(asset).data = match o {
-+            Some(o) if *o.data == data => o.data.clone(),
-+            _ => Arc::new(data),
++            Some(o) if known(&o.data) => o.data.clone(),
++            _ => {
++                let data = base64_decode(text);
++                match o {
++                    Some(o) if *o.data == data => o.data.clone(),
++                    _ => Arc::new(data),
++                }
++            }
 +        };
 +        keep(asset, o);
 +    }
