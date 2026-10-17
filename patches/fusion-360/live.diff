@@ -1,20 +1,23 @@
 diff --git a/apps/solidcraft-web/src/live.rs b/apps/solidcraft-web/src/live.rs
 new file mode 100644
-index 00000000..46ef52e7
+index 00000000..7880ac8e
 --- /dev/null
 +++ b/apps/solidcraft-web/src/live.rs
-@@ -0,0 +1,666 @@
-+//! Live editing in a Playground session (`playground_live` drives it). The shared document is a design's parametric
-+//! feature tree (`Session::doc`); every peer evaluates the bodies from it. The shared design is the one active when the
-+//! session started, marked ([`mark`]) so it is followed wherever its tab goes; while another design is active, or after
-+//! it closed, the session keeps its last state and remote changes wait for it. This person's own state stays out: the
-+//! camera, selection and tools (outside the document anyway), what is hidden, each sketch's Sketch Palette options and
-+//! the timeline position Edit Sketch rolled to. Each peer numbers new features, components and occurrences on from a
-+//! point of its own ([`jump`]), and keeps its own `next_id`.
+@@ -0,0 +1,1376 @@
++//! Live editing in a Playground session (`playground_live` drives it). The shared document is the set of designs open
++//! in the session, `{ documents: [{ id, ...design }] }`: the one shown when the session started and every design
++//! opened, created or imported here or by the others since (once it holds something), which reaches the others as a
++//! tab behind theirs. Each design is its parametric feature tree (`Session::doc`); every peer evaluates the bodies from
++//! it. A design's tab is found by a mark ([`mark`]) wherever it moves. Closing a tab is this person's own: the design
++//! stays in the session and up to date, and the start page lists it to open again. This person's own state stays out:
++//! the camera, selection and tools (outside the document anyway), what is hidden, each sketch's Sketch Palette options
++//! and the timeline position Edit Sketch rolled to. Each peer numbers new features, components and occurrences on from
++//! a point of its own ([`jump`]), and keeps its own `next_id`.
 +//!
-+//! Presence: the scope (active component and sketch), the pointer as a point in the model and the selection; the others'
-+//! show over the shared design's viewport in their colors, a pointer with their name and an outline around each item
-+//! they selected.
++//! Presence: the design and scope (component and sketch) each person is on, the pointer as a point in the model, the
++//! selection, and the gesture under way ([`gesture`]): a sketch shape's rubber band, sketch geometry being dragged, a
++//! feature dialog's value at its handle with the box its preview fills, a component being moved. The others' show
++//! over the viewport in their colours, eased toward where they are; dots on the tabs show who is on which design.
 +
 +#[path = "playground_live.rs"]
 +pub mod playground_live;
@@ -23,43 +26,82 @@ index 00000000..46ef52e7
 +use std::collections::{BTreeMap, BTreeSet};
 +use std::sync::Arc;
 +
-+use egui::{Color32, FontId, Rect, Shape, Stroke, StrokeKind, vec2};
++use egui::{Color32, FontId, Pos2, Rect, Shape, Stroke, pos2, vec2};
 +use serde_json::{Map, Value, json};
 +use solidcraft_engine::doc::{Document, FeatureKind};
-+use solidcraft_engine::geom::{Aabb3, Vec3};
++use solidcraft_engine::geom::{Aabb3, Plane, Vec2, Vec3};
 +use solidcraft_engine::{Sel, Session};
++use solidcraft_ui_egui::documents::{self, live as tabs};
 +use solidcraft_ui_egui::viewport::{self, Hit, Proj};
-+use solidcraft_ui_egui::{SolveApp, documents};
++use solidcraft_ui_egui::{SolveApp, canvas, scenario};
 +
 +use playground_live::{Live, Presence, canonical};
++
++/// A design of the session.
++struct Doc {
++    /// Its id in the session.
++    id: u64,
++    /// Its tab here ([`marker`]); `None` once this person closed it.
++    mark: Option<usize>,
++    /// Its tab's place as of the last frame.
++    at: usize,
++    /// As last seen (without the id): what the session goes on with while it is closed here.
++    last: Value,
++    /// What `last` was made from (the design, its revision and Edit Sketch's position), to skip unchanged ones.
++    seen: Option<(usize, u64, Option<Option<usize>>)>,
++}
++
++/// The session's designs as this page knows them, in the session's order.
++#[derive(Default)]
++struct Shared {
++    docs: Vec<Doc>,
++    /// Marks of the tabs open before the session started, which it does not share.
++    private: Vec<usize>,
++    /// The session started between frames: its first design is the active tab's, marked at the next frame.
++    claim: bool,
++    /// Tabs opened behind for the session and not shown yet: their view is fitted when they first are.
++    unfit: Vec<usize>,
++    /// For [`playground_live::fresh_id`].
++    next: u64,
++    /// Goes up whenever the list changes ([`Live::live_generation`]).
++    version: u64,
++}
++
++/// Another person, and their moving marks as last drawn here.
++struct Peer {
++    who: Presence,
++    /// `pointer`, `band`, `ghost`, `box` and `at` (their value's place), eased toward their presence.
++    shown: Value,
++}
 +
 +thread_local! {
 +    /// This frame's pointer is down or text is being typed (`live_quiet` has no context to ask).
 +    static INPUT_BUSY: Cell<bool> = const { Cell::new(false) };
-+    /// The shared design's mark ([`marker`]).
-+    static SHARED: Cell<Option<usize>> = const { Cell::new(None) };
-+    /// The active design is the shared one (or none is yet): Undo and Redo go to the session.
++    static SHARED: RefCell<Shared> = RefCell::default();
++    /// The active design is the session's (or none is yet): Undo and Redo go to the session.
 +    static ON_SHARED: Cell<bool> = const { Cell::new(true) };
-+    /// The shared document as last reported or adopted: what is reported while the shared design is not active.
-+    static LAST: RefCell<Option<Value>> = const { RefCell::new(None) };
-+    /// Remote changes that came while the shared design was not active: it takes them when it is again.
-+    static PENDING: RefCell<Option<(usize, Value)>> = const { RefCell::new(None) };
-+    /// Remote changes kept for later, counted (the generation).
-+    static KEPT: Cell<u64> = const { Cell::new(0) };
-+    /// The session ended while the shared design was not active: its Undo history goes when it is.
-+    static FORGET: Cell<Option<usize>> = const { Cell::new(None) };
-+    /// The shared design's next id as this person last left it: another value means an id was taken since.
-+    static NEXT: Cell<Option<u64>> = const { Cell::new(None) };
++    /// The active design's mark and next id as this person last left it: another value means an id was taken since.
++    static NEXT: Cell<Option<(usize, u64)>> = const { Cell::new(None) };
 +    /// The others in the session.
-+    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
++    static OTHERS: RefCell<Vec<Peer>> = const { RefCell::new(Vec::new()) };
++    /// This person's gesture under way, as of the last frame ([`gesture`]).
++    static GESTURE: RefCell<Map<String, Value>> = RefCell::default();
 +    static CTX: OnceCell<egui::Context> = const { OnceCell::new() };
 +}
 +
++#[cfg(target_arch = "wasm32")]
 +const FORMAT: &str = concat!("fusion-360:1:", env!("CARGO_PKG_VERSION"));
++/// The most bytes of a presence (the shell sends at most 4 KiB).
++const MAX_BYTES: usize = 3900;
++/// The most points of a gesture's lines, and the most lines.
++const MAX_POINTS: usize = 150;
++const MAX_ITEMS: usize = 50;
++/// Numbers beyond this are not drawn (remote data).
++const FAR_OUT: f64 = 1e9;
 +
-+/// Marks the shared design's session: a do-nothing callback in `open_preview`, which only `doc.open` reads (and takes,
-+/// as the design it was in is replaced). Its address names the design wherever its tab goes; closing or replacing the
-+/// design drops it.
++/// Marks a design's session: a do-nothing callback in `open_preview`, which only `doc.open` reads (and takes, as the
++/// design it was in is replaced). Its address names the design wherever its tab goes; closing or replacing the design
++/// drops it.
 +fn mark(s: &mut Session) -> Option<usize> {
 +    // A captured byte: the box is an allocation of its own, so each mark has its own address.
 +    let token = 0u8;
@@ -73,12 +115,24 @@ index 00000000..46ef52e7
 +    s.open_preview.as_deref().map(|f| f as *const _ as *const () as usize)
 +}
 +
-+fn on_shared(app: &SolveApp) -> bool {
-+    SHARED.get().is_none_or(|m| marker(&app.session) == Some(m))
++/// A design with nothing in it yet, which a session does not share until it has something (as the app's own test for
++/// a design it may replace).
++fn blank(s: &Session) -> bool {
++    s.path.is_none() && s.doc.features.is_empty() && s.doc.params.is_empty() && s.doc.components.is_empty() && !s.is_dirty()
 +}
 +
-+fn pending_for(app: &SolveApp) -> bool {
-+    PENDING.with_borrow(|p| p.as_ref().is_some_and(|(m, _)| marker(&app.session) == Some(*m)))
++/// A shared design as it was last seen with nothing in it.
++fn blank_value(v: &Value) -> bool {
++    ["features", "params", "components"].iter().all(|k| v[k].as_array().is_none_or(Vec::is_empty))
++}
++
++/// The session's id of the active design, when the session shares it.
++fn active_doc(app: &SolveApp) -> Option<u64> {
++    let m = marker(&app.session);
++    SHARED.with_borrow(|sh| match sh.docs.first() {
++        Some(first) if sh.claim => Some(first.id),
++        _ => sh.docs.iter().find(|d| d.mark.is_some() && d.mark == m).map(|d| d.id),
++    })
 +}
 +
 +/// The end of each frame.
@@ -87,49 +141,121 @@ index 00000000..46ef52e7
 +        c.get_or_init(|| ctx.clone());
 +    });
 +    INPUT_BUSY.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
-+    if FORGET.get().is_some() && FORGET.get() == marker(&app.session) {
-+        FORGET.set(None);
-+        forget(&mut app.session);
++    if playground_live::connected() {
++        settle(app);
++        ids_move_on(app);
++        let g = gesture(app, ctx);
++        GESTURE.set(g);
 +    }
-+    if pending_for(app)
-+        && app.live_quiet()
-+        && let Some((_, document)) = PENDING.take()
-+        && let Err(e) = install(app, document)
-+    {
-+        log::warn!("live editing: {e}");
-+    }
-+    ON_SHARED.set(on_shared(app));
++    ON_SHARED.set(active_doc(app).is_some() || SHARED.with_borrow(|sh| sh.docs.is_empty()));
 +    playground_live::frame(app);
-+    // An id was taken: the next one comes from further on.
-+    if playground_live::connected() && SHARED.get().is_some() && on_shared(app) {
-+        let next = app.session.doc.next_id;
-+        if NEXT.get().is_some_and(|n| n != next) {
-+            jump(&mut app.session.doc_mut().next_id);
-+        } else {
-+            NEXT.set(Some(next));
-+        }
-+    } else {
-+        NEXT.set(None);
-+    }
 +    draw(app, ctx);
++    tab_dots(app, ctx);
 +}
 +
-+/// While connected, the shared design's next id moves on by a random step after each id taken and each remote change,
++/// Brings the session's designs up to date with this page's tabs (no projections; [`collect`] makes those): marks the
++/// tabs when the session starts, notes the designs closed here, and adds each tab opened since that holds something.
++/// A blank design that a file or sample replaced in its tab (the start page does that) stays the session's.
++fn settle(app: &mut SolveApp) {
++    let active = app.docs.active;
++    let mut list = tabs::designs_mut(app);
++    SHARED.with_borrow_mut(|sh| {
++        if sh.docs.is_empty() {
++            return;
++        }
++        if std::mem::take(&mut sh.claim) {
++            for (i, (s, _)) in list.iter_mut().enumerate() {
++                let m = mark(s);
++                match sh.docs.first_mut() {
++                    Some(first) if i == active => (first.mark, first.at) = (m, i),
++                    _ => sh.private.extend(m),
++                }
++            }
++        }
++        let known = |sh: &Shared, m: Option<usize>| m.is_some_and(|m| sh.private.contains(&m) || sh.docs.iter().any(|d| d.mark == Some(m)));
++        let marks: Vec<Option<usize>> = list.iter().map(|(s, _)| marker(s)).collect();
++        for k in 0..sh.docs.len() {
++            let Some(m) = sh.docs[k].mark else { continue };
++            match marks.iter().position(|x| *x == Some(m)) {
++                Some(i) => sh.docs[k].at = i,
++                None => {
++                    let at = sh.docs[k].at;
++                    let replaced = blank_value(&sh.docs[k].last) && marks.get(at).is_some_and(|x| !known(sh, *x));
++                    sh.docs[k].mark = match list.get_mut(at) {
++                        Some((s, _)) if replaced => mark(s),
++                        _ => None,
++                    };
++                    sh.docs[k].seen = None;
++                    sh.version += 1;
++                }
++            }
++        }
++        for (i, (s, pre)) in list.iter_mut().enumerate() {
++            if known(sh, marker(s)) || blank(s) {
++                continue;
++            }
++            let id = playground_live::fresh_id(&mut sh.next);
++            let m = mark(s);
++            sh.docs.push(Doc { id, mark: m, at: i, last: projection(s, **pre), seen: None });
++            sh.version += 1;
++        }
++    });
++    // A design opened behind for the session is fitted to the view the first time it shows.
++    let m = marker(&app.session);
++    if SHARED.with_borrow_mut(|sh| m.is_some_and(|m| sh.unfit.contains(&m)).then(|| sh.unfit.retain(|x| Some(*x) != m)).is_some()) {
++        app.fit_view();
++    }
++}
++
++/// The session's designs' latest projections, from their tabs (the active one when the session just started).
++fn collect(app: &SolveApp) {
++    let list = tabs::designs(app);
++    let active = app.docs.active.min(list.len().saturating_sub(1));
++    SHARED.with_borrow_mut(|sh| {
++        if sh.docs.is_empty() {
++            let id = playground_live::fresh_id(&mut sh.next);
++            sh.docs.push(Doc { id, mark: None, at: active, last: Value::Null, seen: None });
++            sh.claim = true;
++            sh.version += 1;
++        }
++        let claim = sh.claim;
++        for (k, d) in sh.docs.iter_mut().enumerate() {
++            let tab = match d.mark {
++                Some(m) => list.iter().find(|(s, _)| marker(s) == Some(m)),
++                None if claim && k == 0 => list.get(active),
++                None => None,
++            };
++            if let Some((s, pre)) = tab {
++                let key = (Arc::as_ptr(&s.doc) as usize, s.revision, *pre);
++                if d.seen != Some(key) {
++                    (d.last, d.seen) = (projection(s, *pre), Some(key));
++                }
++            }
++        }
++    });
++}
++
++/// While connected, the active design's next id moves on by a random step after each id taken and each remote change,
 +/// so two people adding at once number from different points (one person's ids stay below their next id).
++fn ids_move_on(app: &mut SolveApp) {
++    let m = marker(&app.session).filter(|_| active_doc(app).is_some());
++    let next = app.session.doc.next_id;
++    match (m, NEXT.get()) {
++        (Some(m), Some((was, n))) if was == m && n != next => {
++            jump(&mut app.session.doc_mut().next_id);
++            NEXT.set(Some((m, app.session.doc.next_id)));
++        }
++        (Some(m), _) => NEXT.set(Some((m, next))),
++        (None, _) => NEXT.set(None),
++    }
++}
++
 +// ponytail: up to 2^28 per step, 2^24 steps before ids pass MAX_FEATURE_ID (2^52); a per-peer id range if that matters.
 +fn jump(next: &mut u64) {
 +    *next = next.saturating_add(1 + (playground_live::fresh_id(&mut 0) & ((1 << 28) - 1)));
-+    NEXT.set(Some(*next));
 +}
 +
-+/// The session's end, for the shared design: its Undo history goes (it holds others' edits) and so does the mark.
-+fn forget(s: &mut Session) {
-+    s.undo.clear();
-+    s.redo.clear();
-+    s.open_preview = None;
-+}
-+
-+/// Undo and Redo of the shared design go to the session (`SolveApp::run`, before anything else).
++/// Undo and Redo of a shared design go to the session (`SolveApp::run`, before anything else).
 +fn undo(id: &str) -> bool {
 +    matches!(id, "edit.undo" | "edit.redo") && ON_SHARED.get() && playground_live::undo(id == "edit.redo")
 +}
@@ -150,6 +276,7 @@ index 00000000..46ef52e7
 +#[cfg(target_arch = "wasm32")]
 +pub fn wrap<S: eframe::App + 'static>(app: fn(&mut S) -> &mut SolveApp, shell: S) -> Box<dyn eframe::App> {
 +    let _ = solidcraft_ui_egui::LIVE_UNDO.set(undo);
++    let _ = solidcraft_ui_egui::LIVE_HOME.set(session_list);
 +    let with_app = move |f: &mut dyn FnMut(&mut SolveApp)| {
 +        RUNNER.with(|r| r.get().and_then(|r| r.app_mut::<S>()).map(|mut s| f(app(&mut s))).is_some())
 +    };
@@ -195,45 +322,80 @@ index 00000000..46ef52e7
 +}
 +
 +impl Live for SolveApp {
++    /// `{ documents: [{ id, ...design }] }`: every design of the session, open here or not.
 +    fn live_document(&self) -> Value {
-+        if (!on_shared(self) || pending_for(self))
-+            && let Some(last) = LAST.with_borrow(Clone::clone)
-+        {
-+            return last;
-+        }
-+        let mut v = project(&self.session.doc);
-+        // Edit Sketch rolls the timeline for the person editing only.
-+        if let (Some(marker), Some(o)) = (self.pre_sketch_marker, v.as_object_mut()) {
-+            match marker {
-+                Some(m) => drop(o.insert("marker".into(), m.into())),
-+                None => drop(o.remove("marker")),
-+            }
-+        }
-+        if SHARED.get().is_some() {
-+            LAST.set(Some(v.clone()));
-+        }
-+        v
++        collect(self);
++        SHARED.with_borrow(|sh| {
++            let docs = sh.docs.iter().map(|d| {
++                let mut v = d.last.clone();
++                if let Some(o) = v.as_object_mut() {
++                    o.insert("id".into(), d.id.into());
++                }
++                v
++            });
++            json!({ "documents": docs.collect::<Vec<_>>() })
++        })
 +    }
 +
++    /// Each design goes into its tab here; one new to the session opens in a tab behind this person's, one they closed
++    /// stays closed. Joining, the session's first design goes into the tab this page shares when that is blank (or the
++    /// same), else into a tab of its own, which is shown; this person's own design stays theirs.
 +    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
-+        if SHARED.get().is_none() {
-+            // A joiner's own design stays theirs: the session's opens in a tab of its own, unless the active design
-+            // is blank or is the session's already (the owner's).
-+            if !documents::active_is_blank(self) && canonical(&self.live_document()) != canonical(&document) {
-+                documents::open_tab(self, Session::default())?;
++        let incoming = entries(&document)?;
++        let designs = incoming.iter().map(|(_, v)| design(v.clone())).collect::<Result<Vec<_>, _>>()?;
++        collect(self);
++        settle(self);
++        let mut sh = SHARED.take();
++        let joining = !incoming.iter().any(|(id, _)| sh.docs.iter().any(|d| d.id == *id));
++        let mut pool = std::mem::take(&mut sh.docs);
++        let mut docs = Vec::with_capacity(incoming.len());
++        for (k, ((id, value), doc)) in incoming.into_iter().zip(designs).enumerate() {
++            let old = if joining && k == 0 { (!pool.is_empty()).then(|| pool.remove(0)) } else { pool.iter().position(|d| d.id == id).map(|i| pool.remove(i)) };
++            let tab = old.as_ref().and_then(|d| d.mark).and_then(|m| tabs::designs(self).iter().position(|(s, _)| marker(s) == Some(m)));
++            // A tab opened here for it (its design arrives from the session: closing it unchanged asks nothing).
++            let mut opened = false;
++            let at = match (old.as_ref(), tab) {
++                (_, Some(i)) if !(joining && k == 0) => Some(i),
++                // Joining: into this page's tab if it is blank or the same design, else a tab of its own, shown.
++                (_, Some(i)) => {
++                    let (s, pre) = tabs::designs(self)[i];
++                    if blank(s) || canonical(&projection(s, pre)) == canonical(&value) {
++                        Some(i)
++                    } else {
++                        sh.private.extend(marker(s));
++                        opened = true;
++                        documents::open_tab(self, Session::default()).ok().map(|()| self.docs.active)
++                    }
++                }
++                // Closed here: it stays closed.
++                (Some(_), None) => None,
++                // New to this page: a tab behind this person's (none past the most designs open at once: as if closed).
++                (None, None) => {
++                    let i = tabs::open_behind(self, Session::default()).ok();
++                    opened = i.is_some();
++                    i
++                }
++            };
++            let mark = match at.and_then(|i| tabs::designs_mut(self).into_iter().nth(i)) {
++                Some((s, pre)) => {
++                    install(s, pre, doc);
++                    if opened {
++                        s.mark_saved();
++                    }
++                    marker(s).or_else(|| mark(s))
++                }
++                None => None,
++            };
++            if old.is_none() && tab.is_none() {
++                sh.unfit.extend(mark);
 +            }
-+            FORGET.set(None);
-+            SHARED.set(mark(&mut self.session));
++            docs.push(Doc { id, mark, at: at.unwrap_or_default(), last: value, seen: None });
 +        }
-+        if on_shared(self) {
-+            PENDING.take();
-+            install(self, document.clone())?;
-+        } else {
-+            design(document.clone())?;
-+            PENDING.set(SHARED.get().map(|m| (m, document.clone())));
-+            KEPT.set(KEPT.get() + 1);
-+        }
-+        LAST.set(Some(document));
++        // Designs the session no longer has stay open here as this person's own.
++        sh.private.extend(pool.iter().filter_map(|d| d.mark));
++        sh.docs = docs;
++        sh.version += 1;
++        SHARED.set(sh);
 +        Ok(())
 +    }
 +
@@ -252,22 +414,29 @@ index 00000000..46ef52e7
 +    fn live_generation(&self) -> Option<u64> {
 +        use std::hash::{Hash, Hasher};
 +        let mut h = std::hash::DefaultHasher::new();
-+        let s = &self.session;
-+        (marker(s), s.revision, Arc::as_ptr(&s.doc) as usize, self.pre_sketch_marker, KEPT.get()).hash(&mut h);
++        for (s, pre) in tabs::designs(self) {
++            (marker(s), s.revision, Arc::as_ptr(&s.doc) as usize, pre).hash(&mut h);
++        }
++        SHARED.with_borrow(|sh| (sh.version, sh.claim, self.docs.active).hash(&mut h));
 +        Some(h.finish())
 +    }
 +
++    /// The session's designs that are open here lose their Undo history (it holds others' edits) and their marks.
 +    fn live_disconnected(&mut self) {
-+        if let Some(m) = SHARED.take() {
-+            if marker(&self.session) == Some(m) {
-+                forget(&mut self.session);
-+            } else {
-+                FORGET.set(Some(m));
++        let sh = SHARED.take();
++        for (s, _) in tabs::designs_mut(self) {
++            let m = marker(s);
++            if m.is_some_and(|m| sh.docs.iter().any(|d| d.mark == Some(m))) {
++                s.undo.clear();
++                s.redo.clear();
++            }
++            if m.is_some_and(|m| sh.private.contains(&m) || sh.docs.iter().any(|d| d.mark == Some(m))) {
++                s.open_preview = None;
 +            }
 +        }
-+        LAST.set(None);
 +        ON_SHARED.set(true);
 +        NEXT.set(None);
++        GESTURE.take();
 +    }
 +
 +    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
@@ -275,8 +444,8 @@ index 00000000..46ef52e7
 +        take_counters(&mut base);
 +        // Sketch ids count up per prefix: the larger of each side's, so concurrent drawing and Undo reuse none.
 +        let mut counters = take_counters(&mut current);
-+        for (id, theirs) in take_counters(&mut edited) {
-+            let mine = counters.entry(id).or_default();
++        for (key, theirs) in take_counters(&mut edited) {
++            let mine = counters.entry(key).or_default();
 +            for (prefix, n) in theirs {
 +                if n.as_u64() > mine.get(&prefix).and_then(Value::as_u64) {
 +                    mine.insert(prefix, n);
@@ -284,144 +453,123 @@ index 00000000..46ef52e7
 +            }
 +        }
 +        let mut merged = playground_live::merge(&base, &current, &edited, Self::COUNTERS)?;
-+        for f in items(&mut merged, "features") {
-+            let id = f.get("id").and_then(Value::as_u64).unwrap_or_default();
-+            if let Some(s) = f.get_mut("sketch").and_then(Value::as_object_mut) {
-+                s.insert("counters".into(), Value::Object(counters.remove(&id).unwrap_or_default()));
++        for d in items(&mut merged, "documents") {
++            let doc = d.get("id").and_then(Value::as_u64).unwrap_or_default();
++            for f in items(d, "features") {
++                let id = f.get("id").and_then(Value::as_u64).unwrap_or_default();
++                if let Some(s) = f.get_mut("sketch").and_then(Value::as_object_mut) {
++                    s.insert("counters".into(), Value::Object(counters.remove(&(doc, id)).unwrap_or_default()));
++                }
 +            }
 +        }
-+        // Both sides adding a Box (Box1, d1…) merge as two features with one name.
-+        let before: BTreeSet<_> = named_twice(&current).union(&named_twice(&edited)).cloned().collect();
-+        if let Some(name) = named_twice(&merged).difference(&before).next() {
-+            return Err(format!("Conflict: two {name}"));
++        // Both sides adding a Box (Box1, d1…) to one design merge as two features with one name.
++        let of = |all: &Value, id: &Value| all["documents"].as_array().and_then(|l| l.iter().find(|d| d["id"] == *id).cloned()).unwrap_or_default();
++        for d in merged["documents"].as_array().into_iter().flatten() {
++            let before: BTreeSet<_> = named_twice(&of(&current, &d["id"])).union(&named_twice(&of(&edited, &d["id"]))).cloned().collect();
++            if let Some(name) = named_twice(d).difference(&before).next() {
++                return Err(format!("Conflict: two {name}"));
++            }
 +        }
 +        Ok(merged)
 +    }
 +
-+    /// The design opens, and as it is: one that reading repairs (a component left without an occurrence gets one,
++    /// Each design opens, and as it is: one that reading repairs (a component left without an occurrence gets one,
 +    /// with a new id) would come out differently on every peer.
 +    fn live_check(document: &Value) -> Result<(), String> {
-+        if canonical(&project(&design(document.clone())?)) != canonical(document) {
-+            return Err("Conflict: the merged design needs repairs".into());
++        for (_, d) in entries(document)? {
++            if canonical(&project(&design(d.clone())?)) != canonical(&d) {
++                return Err("Conflict: the merged design needs repairs".into());
++            }
 +        }
 +        Ok(())
 +    }
 +
-+    /// The scope (active component and sketch), the pointer as a point in the model while it is over the viewport, and
-+    /// the selection (up to 3 KB of it).
++    /// `{ doc, component, sketch, pointer?, selection, band?, ghost?, value?, box? }` (see [`gesture`]): the design and
++    /// scope shown, the pointer as a point in the model while it is over the viewport, the gesture under way and the
++    /// selection (as much of it as fits). Nothing on the start page or a design the session does not share.
 +    fn live_presence(&self) -> Value {
-+        if SHARED.get().is_none() || !on_shared(self) {
-+            return Value::Null;
-+        }
++        let Some(doc) = active_doc(self).filter(|_| !self.home.open) else { return Value::Null };
 +        let s = &self.session;
-+        let mut room = 3000usize;
-+        let selection: Vec<Value> = s
-+            .selection
-+            .iter()
-+            .filter_map(|x| serde_json::to_value(x).ok())
++        let mut p = json!({ "doc": doc, "component": s.active_component, "sketch": s.active_sketch });
++        if let Some(at) = pointer(self) {
++            p["pointer"] = json!([round(at.x), round(at.y), round(at.z)]);
++        }
++        GESTURE.with_borrow(|g| g.iter().for_each(|(k, v)| p[k] = v.clone()));
++        let mut room = MAX_BYTES.saturating_sub(p.to_string().len() + 16);
++        let selection: Vec<Value> = (s.selection.iter().filter_map(|x| serde_json::to_value(x).ok()))
 +            .take_while(|v| {
-+                room = room.saturating_sub(v.to_string().len());
++                let n = v.to_string().len() + 1;
++                room = room.checked_sub(n).unwrap_or(0);
 +                room > 0
 +            })
-+            .take(50)
++            .take(MAX_ITEMS)
 +            .collect();
-+        let mut p = json!({"component": s.active_component, "sketch": s.active_sketch, "selection": selection});
-+        if let Some(at) = pointer(self) {
-+            p["pointer"] = json!([at.x, at.y, at.z]);
-+        }
++        p["selection"] = selection.into();
 +        p
 +    }
 +
++    /// Who is still on the same design and sketch keeps their marks where they were drawn, to ease on from there.
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        OTHERS.set(others);
++        OTHERS.with_borrow_mut(|old| {
++            let place = |s: &Value| (s["doc"].clone(), s["sketch"].clone());
++            *old = (others.into_iter())
++                .map(|who| {
++                    let same = old.iter_mut().find(|o| o.who.id == who.id && place(&o.who.state) == place(&who.state));
++                    Peer { shown: same.map(|o| o.shown.take()).unwrap_or_default(), who }
++                })
++                .collect();
++        });
 +    }
 +}
 +
-+/// The model point under the pointer: where the pointer's ray meets what it is over, or else the point of the ray
-+/// nearest the view's target. `None` while the pointer is not over the viewport.
-+fn pointer(app: &SolveApp) -> Option<Vec3> {
-+    let v = &app.viewport;
-+    let (rect, mouse) = (v.rect?, v.mouse?);
-+    let at = match &v.hover {
-+        Some(Hit::Face { point, .. } | Hit::Vertex { point, .. } | Hit::Plane { point, .. }) => *point,
-+        _ => {
-+            let proj = viewport::projection(app, rect);
-+            let (o, d) = proj.ray(mouse);
-+            o + d * ((proj.cam.target - o).dot(d) / d.len2())
++/// The session's designs in a shared document, `(id, design without the id)`, ids distinct.
++fn entries(document: &Value) -> Result<Vec<(u64, Value)>, String> {
++    let list = document["documents"].as_array().ok_or("Invalid shared designs: no list")?;
++    let mut out: Vec<(u64, Value)> = Vec::with_capacity(list.len());
++    for v in list {
++        let (Some(id), Some(mut d)) = (v["id"].as_u64(), v.as_object().cloned()) else { return Err("Invalid shared design: no id".into()) };
++        if out.iter().any(|(other, _)| *other == id) {
++            return Err("Conflict: two designs with one id".into());
 +        }
-+    };
-+    at.is_finite().then_some(at)
++        d.remove("id");
++        out.push((id, Value::Object(d)));
++    }
++    Ok(out)
 +}
 +
-+/// The others' pointers (an arrow with their name) and selections (an outline around each item's bounds, as the app
-+/// bounds its own selection), in their colors, over the shared design's viewport. Their data come from other people:
-+/// whatever does not resolve is skipped.
-+fn draw(app: &mut SolveApp, ctx: &egui::Context) {
-+    let others = OTHERS.take();
-+    if let Some(rect) = app.viewport.rect.filter(|_| !others.is_empty() && SHARED.get().is_some() && on_shared(app)) {
-+        let proj = viewport::projection(app, rect);
-+        // Over the viewport (the root layer, after everything the app drew there), under dialogs and menus.
-+        let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(rect);
-+        let own = std::mem::take(&mut app.session.selection);
-+        for o in &others {
-+            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
-+            for sel in o.state["selection"].as_array().into_iter().flatten().take(50) {
-+                let Ok(sel) = serde_json::from_value::<Sel>(sel.clone()) else { continue };
-+                app.session.selection = vec![sel];
-+                if let Some(r) = viewport::selection_bounds(app).and_then(|b| screen_rect(&proj, &b)) {
-+                    painter.rect_stroke(r.expand(3.0), 3.0, Stroke::new(2.0, color), StrokeKind::Outside);
-+                }
-+            }
-+            let at: Option<Vec<f64>> = o.state["pointer"].as_array().and_then(|p| p.iter().map(Value::as_f64).collect());
-+            if let Some(&[x, y, z]) = at.as_deref()
-+                && let Some(p) = proj.to_screen(Vec3::new(x, y, z)).filter(|p| rect.expand(100.0).contains(*p))
-+            {
-+                painter.add(Shape::convex_polygon(vec![p, p + vec2(0.0, 17.0), p + vec2(12.0, 12.0)], color, Stroke::new(1.0, Color32::WHITE)));
-+                let name: String = o.name.chars().take(40).collect();
-+                let text = painter.layout_no_wrap(name, FontId::proportional(12.0), Color32::WHITE);
-+                let tag = Rect::from_min_size(p + vec2(12.0, 14.0), text.size() + vec2(8.0, 4.0));
-+                painter.rect_filled(tag, 3.0, color);
-+                painter.galley(tag.min + vec2(4.0, 2.0), text, Color32::WHITE);
-+            }
++/// A tab's design as shared, with the timeline where it is for everyone (Edit Sketch rolls it for the person editing).
++fn projection(s: &Session, pre_sketch_marker: Option<Option<usize>>) -> Value {
++    let mut v = project(&s.doc);
++    if let (Some(marker), Some(o)) = (pre_sketch_marker, v.as_object_mut()) {
++        match marker {
++            Some(m) => drop(o.insert("marker".into(), m.into())),
++            None => drop(o.remove("marker")),
 +        }
-+        app.session.selection = own;
 +    }
-+    OTHERS.set(others);
++    v
 +}
 +
-+/// A model box's outline on the screen (none behind the eye, or absurdly large).
-+fn screen_rect(proj: &Proj, b: &Aabb3) -> Option<Rect> {
-+    let mut r = Rect::NOTHING;
-+    for i in 0..8 {
-+        let pick = |bit: i32, lo: f64, hi: f64| if i & bit == 0 { lo } else { hi };
-+        r.extend_with(proj.to_screen(Vec3::new(pick(1, b.min.x, b.max.x), pick(2, b.min.y, b.max.y), pick(4, b.min.z, b.max.z)))?);
-+    }
-+    (r.is_finite() && r.width() < 1e5 && r.height() < 1e5).then_some(r)
-+}
-+
-+/// Installs the shared document in the active design, keeping this person's views; no undo step.
-+fn install(app: &mut SolveApp, document: Value) -> Result<(), String> {
-+    let mut doc = design(document)?;
-+    let local = &app.session.doc;
++/// Installs a shared design in a tab, keeping this person's views; no undo step.
++fn install(s: &mut Session, pre_sketch_marker: &mut Option<Option<usize>>, mut doc: Document) {
++    let local = &s.doc;
 +    doc.next_id = doc.next_id.max(local.next_id);
 +    for f in &mut doc.features {
 +        if let FeatureKind::Sketch { sketch, .. } = &mut f.kind {
 +            sketch.view = local.sketch(f.id).map(|s| s.view.clone()).unwrap_or_default();
 +        }
 +    }
-+    if let Some(marker) = &mut app.pre_sketch_marker {
++    if let Some(marker) = pre_sketch_marker {
 +        *marker = std::mem::replace(&mut doc.marker, local.marker);
 +    }
 +    // The same design (the owner adopting its own): nothing to do.
 +    if doc == **local {
-+        return Ok(());
++        return;
 +    }
 +    if playground_live::connected() {
 +        jump(&mut doc.next_id);
 +    }
-+    app.session.doc = Arc::new(doc);
-+    app.session.refresh();
-+    Ok(())
++    s.doc = Arc::new(doc);
++    s.refresh();
 +}
 +
 +/// A design as shared: without each peer's next id and what is hidden, sketches without their display options, and
@@ -449,18 +597,22 @@ index 00000000..46ef52e7
 +    v.get_mut(key).and_then(Value::as_array_mut).into_iter().flatten()
 +}
 +
-+fn take_counters(doc: &mut Value) -> BTreeMap<u64, Map<String, Value>> {
++/// Each sketch's id counters, by design and feature id, taken out of the shared designs.
++fn take_counters(all: &mut Value) -> BTreeMap<(u64, u64), Map<String, Value>> {
 +    let mut out = BTreeMap::new();
-+    for f in items(doc, "features") {
-+        let id = f.get("id").and_then(Value::as_u64).unwrap_or_default();
-+        if let Some(Value::Object(n)) = f.get_mut("sketch").and_then(Value::as_object_mut).and_then(|s| s.remove("counters")) {
-+            out.insert(id, n);
++    for d in items(all, "documents") {
++        let doc = d.get("id").and_then(Value::as_u64).unwrap_or_default();
++        for f in items(d, "features") {
++            let id = f.get("id").and_then(Value::as_u64).unwrap_or_default();
++            if let Some(Value::Object(n)) = f.get_mut("sketch").and_then(Value::as_object_mut).and_then(|s| s.remove("counters")) {
++                out.insert((doc, id), n);
++            }
 +        }
 +    }
 +    out
 +}
 +
-+/// Feature names and parameter names (user parameters and feature inputs) given twice.
++/// Feature names and parameter names (user parameters and feature inputs) given twice in a design.
 +fn named_twice(doc: &Value) -> BTreeSet<String> {
 +    let list = |v: &Value, key: &str| v.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
 +    let features = list(doc, "features");
@@ -472,7 +624,7 @@ index 00000000..46ef52e7
 +    names.chain(params).filter(|n| !seen.insert(n.clone())).collect()
 +}
 +
-+/// The shared document as a design, checked and upgraded as a design file is.
++/// A shared design as a design, checked and upgraded as a design file is.
 +fn design(mut document: Value) -> Result<Document, String> {
 +    for p in items(&mut document, "params") {
 +        if let Some(p) = p.as_object_mut() {
@@ -482,10 +634,528 @@ index 00000000..46ef52e7
 +    Document::from_json(&document.to_string()).map_err(|e| e.to_string())
 +}
 +
++/// A coordinate in presence: to a thousandth of a millimetre, which keeps it small.
++fn round(x: f64) -> f64 {
++    (x * 1e3).round() / 1e3
++}
++
++/// Millimetres per point at the view's target.
++fn mm_per_px(proj: &Proj) -> f64 {
++    proj.cam.half_height() * 2.0 / f64::from(proj.rect.height().max(1.0))
++}
++
++/// Where the view ray through `p` meets `plane`, in the plane's coordinates.
++fn on_plane(proj: &Proj, plane: &Plane, p: Pos2) -> Option<Vec2> {
++    let (o, d) = proj.ray(p);
++    let n = plane.normal();
++    let den = d.dot(n);
++    if den.abs() < 1e-12 {
++        return None;
++    }
++    let q = plane.to_local(o + d * ((plane.origin - o).dot(n) / den));
++    q.is_finite().then_some(q)
++}
++
++/// The point of the line `base + dir * t` nearest the view ray through `p`.
++fn on_line(proj: &Proj, p: Pos2, base: Vec3, dir: Vec3) -> Option<Vec3> {
++    let (o, r) = proj.ray(p);
++    let dir = dir.normalized()?;
++    let w = base - o;
++    let (b, d, e) = (dir.dot(r) / r.len(), dir.dot(w), r.dot(w) / r.len());
++    let den = 1.0 - b * b;
++    (den.abs() > 1e-6).then(|| base + dir * ((b * e - d) / den)).filter(|q| q.is_finite())
++}
++
++/// The lines the app paints with `paint` this frame, caught on a layer of their own that is emptied again (so never
++/// shown): paths and segments, one after another joined up.
++fn painted(ctx: &egui::Context, rect: Rect, paint: impl FnOnce(&egui::Painter)) -> Vec<Vec<Pos2>> {
++    fn walk(shape: &Shape, add: &mut dyn FnMut(&[Pos2])) {
++        match shape {
++            Shape::Path(p) => add(&p.points),
++            Shape::LineSegment { points, .. } => add(points),
++            Shape::Vec(v) => v.iter().for_each(|s| walk(s, add)),
++            _ => {}
++        }
++    }
++    let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("sc_live_caught"));
++    paint(&egui::Painter::new(ctx.clone(), layer, rect));
++    let list = ctx.graphics_mut(|g| std::mem::take(g.entry(layer)));
++    let mut lines: Vec<Vec<Pos2>> = Vec::new();
++    let mut add = |pts: &[Pos2]| match (lines.last_mut(), pts.split_first()) {
++        (Some(line), Some((first, rest))) if line.last().is_some_and(|q| q.distance(*first) < 0.5) => line.extend_from_slice(rest),
++        (_, Some(_)) => lines.push(pts.to_vec()),
++        _ => {}
++    };
++    list.all_entries().for_each(|c| walk(&c.shape, &mut add));
++    lines
++}
++
++/// Lines in presence: `[[x, y, x, y, …], …]`, at most [`MAX_POINTS`] points all told (every so many kept, and each
++/// line's ends) and [`MAX_ITEMS`] lines.
++fn lines_json(lines: Vec<Vec<Vec2>>) -> Option<Value> {
++    let lines: Vec<_> = lines.into_iter().filter(|l| l.len() >= 2).take(MAX_ITEMS).collect();
++    let total: usize = lines.iter().map(Vec::len).sum();
++    let step = total.div_ceil(MAX_POINTS).max(1);
++    let out: Vec<Value> = (lines.iter())
++        .map(|l| {
++            let kept = l.iter().enumerate().filter(|(i, _)| i % step == 0 || *i + 1 == l.len());
++            Value::Array(kept.flat_map(|(_, p)| [round(p.x).into(), round(p.y).into()]).collect())
++        })
++        .collect();
++    (!out.is_empty()).then_some(Value::Array(out))
++}
++
++/// The gesture under way, read from the app's own state, as presence fields: `band`, the rubber band of a sketch shape
++/// being drawn (what the app paints for its tool, on the sketch's plane), and `ghost`, the sketch curves a drag is
++/// moving (where they are now), both as lines in the active sketch's coordinates; `value`, a feature dialog's main
++/// value at its handle (`{ text: "Extrude 12.5 mm", at: [x, y, z] }`); `box`, what its preview fills or the bounds of
++/// a component being moved (`[x0, y0, z0, x1, y1, z1]`). Dimension and text-handle drags show no ghost.
++fn gesture(app: &mut SolveApp, ctx: &egui::Context) -> Map<String, Value> {
++    let mut out = Map::new();
++    let Some(rect) = app.viewport.rect.filter(|_| !app.home.open) else { return out };
++    let proj = viewport::projection(app, rect);
++    let st = app.session.world_state();
++    if let Some(sid) = app.session.active_sketch
++        && let Some(plane) = st.sketch(sid).map(|ss| ss.plane)
++    {
++        if let Some(t) = app.tool.as_ref().filter(|t| !t.pts.is_empty()) {
++            let seen = painted(ctx, rect, |p| solidcraft_ui_egui::tools::preview(app, t, p, &proj));
++            // Points a couple of pixels apart are enough for the others.
++            let lines = seen.into_iter().map(|l| {
++                let mut kept: Vec<Pos2> = Vec::new();
++                for (i, q) in l.iter().enumerate() {
++                    if kept.last().is_none_or(|k| k.distance(*q) >= 2.0) || i + 1 == l.len() {
++                        kept.push(*q);
++                    }
++                }
++                kept.into_iter().filter_map(|q| on_plane(&proj, &plane, q)).collect()
++            });
++            out.extend(lines_json(lines.collect()).map(|v| ("band".to_string(), v)));
++        }
++        if let Some((_, depth, _)) = &app.viewport.point_drag
++            && let Some(before) = app.session.undo.get(*depth).and_then(|u| u.doc.sketch(sid).ok())
++            && let Ok(now) = app.session.doc.sketch(sid)
++        {
++            let moved = (0..now.curves.len()).map(|i| now.polyline(i)).enumerate().filter(|(i, l)| before.polyline(*i) != *l);
++            out.extend(lines_json(moved.map(|(_, l)| l).collect()).map(|v| ("ghost".to_string(), v)));
++        }
++    }
++    if let Some(mut d) = app.dialog.take() {
++        let triad = solidcraft_ui_egui::dialogs_move::triad(app, &d).map(|t| t.center);
++        let anchor = canvas::anchor(app, &d);
++        let name = format!("{:?}", d.kind).split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default().to_owned();
++        let mut b = app.preview.bounds;
++        if let Some((label, _, value)) = d.primary()
++            && let Some((base, dir)) = anchor
++        {
++            let tip = dir.zip(scenario::handle_at("arrow")).and_then(|(dir, p)| on_line(&proj, p, base, dir));
++            // An extrude along an axis fills what lies past its face, toward the arrow (the rest is the body it joins).
++            if let (Some(dir), Some(tip), "Extrude") = (dir, tip, name.as_str()) {
++                let axes = |v: Vec3| [v.x, v.y, v.z];
++                let (d, t, o, mut lo, mut hi) = (axes(dir), axes(tip), axes(base), axes(b.min), axes(b.max));
++                for k in (0..3).filter(|k| d[*k].abs() > 0.999) {
++                    if t[k] >= o[k] { lo[k] = lo[k].max(o[k]) } else { hi[k] = hi[k].min(o[k]) }
++                }
++                (b.min, b.max) = (Vec3::new(lo[0], lo[1], lo[2]), Vec3::new(hi[0], hi[1], hi[2]));
++            }
++            let name = if name == "Fillet" && label == "Distance" { "Chamfer".into() } else { name };
++            let at = triad.or(tip).unwrap_or(base);
++            let text: String = format!("{name} {}", value.trim()).chars().take(40).collect();
++            out.insert("value".into(), json!({ "text": text, "at": [round(at.x), round(at.y), round(at.z)] }));
++        }
++        app.dialog = Some(d);
++        if app.preview.active && !b.is_empty() {
++            out.insert("box".into(), boxed(&b));
++        }
++    }
++    if let Some(m) = &app.tree.occurrence_move {
++        let path = if m.path.is_empty() { vec![m.occurrence] } else { m.path.clone() };
++        let own = std::mem::replace(&mut app.session.selection, vec![Sel::Occurrence { path }]);
++        if let Some(b) = viewport::selection_bounds(app).filter(|b| !b.is_empty()) {
++            out.insert("box".into(), boxed(&b));
++        }
++        app.session.selection = own;
++    }
++    out
++}
++
++fn boxed(b: &Aabb3) -> Value {
++    json!([b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z].map(round))
++}
++
++/// The model point under the pointer: where the pointer's ray meets what it is over, or else the point of the ray
++/// nearest the view's target. `None` while the pointer is not over the viewport.
++fn pointer(app: &SolveApp) -> Option<Vec3> {
++    let v = &app.viewport;
++    let (rect, mouse) = (v.rect?, v.mouse?);
++    let at = match &v.hover {
++        Some(Hit::Face { point, .. } | Hit::Vertex { point, .. } | Hit::Plane { point, .. }) => *point,
++        _ => {
++            let proj = viewport::projection(app, rect);
++            let (o, d) = proj.ray(mouse);
++            o + d * ((proj.cam.target - o).dot(d) / d.len2())
++        }
++    };
++    at.is_finite().then_some(at)
++}
++
++/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
++const EASE: f64 = 0.08;
++
++/// The moving part of a person's `state` (remote data: out-of-range values dropped), as [`Peer::shown`] holds it.
++fn marks(state: &Value) -> Value {
++    fn sane(v: &Value) -> bool {
++        match v {
++            Value::Number(n) => n.as_f64().is_some_and(|x| x.abs() < FAR_OUT),
++            Value::Array(items) => items.len() <= 4 * MAX_POINTS && items.iter().all(sane),
++            _ => false,
++        }
++    }
++    let picks = [("pointer", "/pointer"), ("band", "/band"), ("ghost", "/ghost"), ("box", "/box"), ("at", "/value/at")];
++    let m = picks.iter().filter_map(|(key, at)| Some((key.to_string(), state.pointer(at).filter(|v| sane(v))?.clone())));
++    Value::Object(m.collect())
++}
++
++/// `shown` moved `k` of the way to `to`, key by key and number by number; a new key, another shape or a jump of more
++/// than `far` goes there at once. Whether a number is still more than `near` away.
++fn ease(shown: &mut Value, to: Value, k: f64, near: f64, far: f64) -> bool {
++    let Value::Object(to) = to else { return false };
++    let Value::Object(s) = shown else {
++        *shown = Value::Object(to);
++        return false;
++    };
++    s.retain(|key, _| to.contains_key(key));
++    let mut moving = false;
++    for (key, t) in to {
++        match s.get_mut(&key) {
++            Some(v) if gap(v, &t).is_some_and(|g| g <= far) => {
++                lerp(v, &t, k);
++                if gap(v, &t).is_some_and(|g| g > near) {
++                    moving = true;
++                } else {
++                    *v = t;
++                }
++            }
++            _ => {
++                s.insert(key, t);
++            }
++        }
++    }
++    moving
++}
++
++/// The largest difference between numbers in the same place of `a` and `b`; `None` when they differ otherwise.
++fn gap(a: &Value, b: &Value) -> Option<f64> {
++    match (a, b) {
++        (Value::Number(x), Value::Number(y)) => Some((x.as_f64()? - y.as_f64()?).abs()),
++        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => x.iter().zip(y).try_fold(0.0, |g: f64, (x, y)| Some(g.max(gap(x, y)?))),
++        _ => (a == b).then_some(0.0),
++    }
++}
++
++/// `a`'s numbers moved `k` of the way to `b`'s.
++fn lerp(a: &mut Value, b: &Value, k: f64) {
++    match (a, b) {
++        (Value::Number(x), Value::Number(y)) => {
++            if let (Some(p), Some(q)) = (x.as_f64(), y.as_f64())
++                && let Some(n) = serde_json::Number::from_f64(p + (q - p) * k)
++            {
++                *x = n;
++            }
++        }
++        (Value::Array(x), Value::Array(y)) => x.iter_mut().zip(y).for_each(|(x, y)| lerp(x, y, k)),
++        _ => {}
++    }
++}
++
++/// `N` numbers in range, or none.
++fn numbers<const N: usize>(v: &Value) -> Option<[f64; N]> {
++    let items = v.as_array().filter(|a| a.len() == N)?;
++    let mut out = [0.0; N];
++    for (o, x) in out.iter_mut().zip(items) {
++        *o = x.as_f64().filter(|x| x.abs() < FAR_OUT)?;
++    }
++    Some(out)
++}
++
++/// A presence's lines (`[[x, y, …], …]`, in a sketch's coordinates) on the screen through `plane`.
++fn screen_lines(proj: &Proj, plane: &Plane, v: &Value) -> Vec<Vec<Pos2>> {
++    let line = |l: &Value| -> Option<Vec<Pos2>> {
++        let n = l.as_array()?;
++        let xy: Vec<f64> = n.iter().map(|x| x.as_f64().filter(|x| x.abs() < FAR_OUT)).collect::<Option<_>>()?;
++        xy.chunks_exact(2).map(|p| proj.to_screen(plane.to_world(Vec2::new(p[0], p[1])))).collect()
++    };
++    v.as_array().into_iter().flatten().take(MAX_ITEMS).filter_map(line).collect()
++}
++
++/// A ghost's fill and edge, in its person's colour at these opacities.
++const GHOST: f32 = 0.28;
++const GHOST_EDGE: f32 = 0.85;
++
++/// The others on the active design (when the session shares it), over its viewport (the root layer, after everything
++/// the app drew there, under dialogs and menus), in the session's look and their colours, eased toward their latest
++/// presence: everyone's ghosts, rubber bands and values first, then their selections outlined (a box around each
++/// item's bounds, as the app bounds its own selection), then their pointers with their names. Their data come from
++/// other people: whatever does not resolve is skipped.
++fn draw(app: &mut SolveApp, ctx: &egui::Context) {
++    let (Some(rect), Some(doc)) = (app.viewport.rect.filter(|_| !app.home.open), active_doc(app)) else { return };
++    let mut others = OTHERS.take();
++    if others.is_empty() {
++        return;
++    }
++    let proj = viewport::projection(app, rect);
++    let px = mm_per_px(&proj);
++    let k = 1.0 - (-f64::from(ctx.input(|i| i.stable_dt).clamp(0.0, 0.1)) / EASE).exp();
++    let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(rect);
++    let st = app.session.world_state();
++    let mut here: Vec<&mut Peer> = others.iter_mut().filter(|o| o.who.state["doc"].as_u64() == Some(doc)).collect();
++    let mut moving = false;
++    for o in &mut here {
++        moving |= ease(&mut o.shown, marks(&o.who.state), k, 0.5 * px, f64::from(rect.height()) / 4.0 * px);
++    }
++    let color = |o: &Peer| Color32::from_rgb(o.who.color[0], o.who.color[1], o.who.color[2]);
++    for o in &here {
++        let c = color(o);
++        if let Some(b) = numbers::<6>(&o.shown["box"]) {
++            ghost_box(&painter, &proj, b, c);
++        }
++        if let Some(plane) = o.who.state["sketch"].as_u64().and_then(|id| st.sketch(id)).map(|ss| ss.plane) {
++            for line in screen_lines(&proj, &plane, &o.shown["ghost"]) {
++                painter.add(Shape::line(line, Stroke::new(2.0, c.gamma_multiply(GHOST_EDGE))));
++            }
++            for line in screen_lines(&proj, &plane, &o.shown["band"]) {
++                painter.extend(Shape::dashed_line(&line, Stroke::new(1.5, c), 4.0, 3.0));
++            }
++        }
++        if let (Some([x, y, z]), Some(text)) = (numbers::<3>(&o.shown["at"]), o.who.state["value"]["text"].as_str())
++            && let Some(at) = proj.to_screen(Vec3::new(x, y, z))
++        {
++            painter.circle(at, 4.0, c, Stroke::new(1.5, Color32::WHITE));
++            tag(&painter, at + vec2(10.0, -30.0), c, text, 40);
++        }
++    }
++    let own = std::mem::take(&mut app.session.selection);
++    for o in &here {
++        for sel in o.who.state["selection"].as_array().into_iter().flatten().take(MAX_ITEMS) {
++            let Ok(sel) = serde_json::from_value::<Sel>(sel.clone()) else { continue };
++            app.session.selection = vec![sel];
++            if let Some(r) = viewport::selection_bounds(app).and_then(|b| screen_rect(&proj, &b)) {
++                painter.rect_stroke(r.expand(3.0), 3.0, Stroke::new(2.0, color(o)), egui::StrokeKind::Outside);
++            }
++        }
++    }
++    app.session.selection = own;
++    for o in &here {
++        if let Some(at) = numbers::<3>(&o.shown["pointer"]).and_then(|[x, y, z]| proj.to_screen(Vec3::new(x, y, z))).filter(|p| rect.expand(20.0).contains(*p)) {
++            cursor(&painter, at, color(o), &o.who.name);
++        }
++    }
++    drop(here);
++    OTHERS.set(others);
++    if moving {
++        ctx.request_repaint();
++    }
++}
++
++/// A model box's outline on the screen (none behind the eye, or absurdly large).
++fn screen_rect(proj: &Proj, b: &Aabb3) -> Option<Rect> {
++    let mut r = Rect::NOTHING;
++    for p in corners(b) {
++        r.extend_with(proj.to_screen(p)?);
++    }
++    (r.is_finite() && r.width() < 1e5 && r.height() < 1e5).then_some(r)
++}
++
++fn corners(b: &Aabb3) -> [Vec3; 8] {
++    std::array::from_fn(|i| {
++        let pick = |bit: usize, lo: f64, hi: f64| if i & bit == 0 { lo } else { hi };
++        Vec3::new(pick(1, b.min.x, b.max.x), pick(2, b.min.y, b.max.y), pick(4, b.min.z, b.max.z))
++    })
++}
++
++/// A box in the model as a ghost: its outline on the screen filled, its twelve edges drawn.
++fn ghost_box(p: &egui::Painter, proj: &Proj, [x0, y0, z0, x1, y1, z1]: [f64; 6], color: Color32) {
++    let b = Aabb3 { min: Vec3::new(x0, y0, z0), max: Vec3::new(x1, y1, z1) };
++    let Some(pts) = corners(&b).iter().map(|q| proj.to_screen(*q)).collect::<Option<Vec<Pos2>>>() else { return };
++    if pts.iter().any(|q| !q.is_finite() || q.x.abs() > 1e5 || q.y.abs() > 1e5) {
++        return;
++    }
++    p.add(Shape::convex_polygon(hull(&pts), color.gamma_multiply(GHOST), Stroke::NONE));
++    let edge = Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE));
++    for (i, j) in [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)] {
++        p.line_segment([pts[i], pts[j]], edge);
++    }
++}
++
++/// The convex hull of `pts`, in order (Andrew's monotone chain).
++fn hull(pts: &[Pos2]) -> Vec<Pos2> {
++    let mut v = pts.to_vec();
++    v.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
++    let turn = |o: Pos2, a: Pos2, b: Pos2| (a - o).x * (b - o).y - (a - o).y * (b - o).x;
++    let mut out: Vec<Pos2> = Vec::new();
++    for pass in [false, true] {
++        let start = out.len();
++        let points: Vec<Pos2> = if pass { v.iter().rev().copied().collect() } else { v.clone() };
++        for q in points {
++            while out.len() >= start + 2 && turn(out[out.len() - 2], out[out.len() - 1], q) <= 0.0 {
++                out.pop();
++            }
++            out.push(q);
++        }
++        out.pop();
++    }
++    out
++}
++
++/// The session's pointer arrow, tip first, in points.
++const ARROW: [(f32, f32); 7] = [(0.0, 0.0), (12.5, 11.0), (7.3, 11.0), (10.4, 17.3), (7.6, 18.6), (4.5, 12.2), (0.0, 16.0)];
++/// The most characters of a name tag, its ellipsis included.
++const MAX_NAME: usize = 24;
++
++/// White or near-black, whichever reads on `color`: near-black once its relative luminance passes 0.55.
++fn ink(color: Color32) -> Color32 {
++    let c = egui::Rgba::from(color);
++    if 0.2126 * c.r() + 0.7152 * c.g() + 0.0722 * c.b() > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE }
++}
++
++/// The session's pointer: an arrow with its tip at `tip` (white edge, soft shadow) and a name tag beside it.
++fn cursor(p: &egui::Painter, tip: Pos2, color: Color32, name: &str) {
++    let arrow = |at: Pos2| ARROW.iter().map(|&(x, y)| at + vec2(x, y)).collect::<Vec<_>>();
++    // Filled as a fan from the tip (the arrow is not convex, which egui's polygon fill needs), edged after.
++    let fan = |pts: &[Pos2], fill: Color32| {
++        let mut mesh = egui::Mesh::default();
++        pts.iter().for_each(|q| mesh.colored_vertex(*q, fill));
++        (1..pts.len() as u32 - 1).for_each(|i| mesh.add_triangle(0, i, i + 1));
++        mesh
++    };
++    p.add(fan(&arrow(tip + vec2(0.0, 1.0)), Color32::from_black_alpha(64)));
++    p.add(fan(&arrow(tip), color));
++    p.add(Shape::closed_line(arrow(tip), Stroke::new(1.5, Color32::WHITE)));
++    tag(p, tip + vec2(12.0, 15.0), color, name, MAX_NAME);
++}
++
++/// A tag in the session's look at `at` (its top left): `text` (cut to `max` characters with "…") in `color`.
++fn tag(p: &egui::Painter, at: Pos2, color: Color32, text: &str, max: usize) {
++    let text: String = match text.chars().nth(max) {
++        Some(_) => text.chars().take(max - 1).chain(['…']).collect(),
++        None => text.to_owned(),
++    };
++    if text.is_empty() {
++        return;
++    }
++    let galley = p.layout_no_wrap(text, FontId::proportional(12.0), ink(color));
++    let (ppp, pad) = (p.pixels_per_point(), vec2(7.0, 3.0));
++    let crisp = |x: f32| (x * ppp).round() / ppp;
++    let r = Rect::from_min_size(pos2(crisp(at.x), crisp(at.y)), galley.size() + 2.0 * pad);
++    p.rect_filled(r, 6.0, color);
++    p.galley(r.min + pad, galley, ink(color));
++}
++
++/// The others on each tab's design, as dots in their colours at the tab's right end, left of its × (where the app bar
++/// put the tabs this frame).
++fn tab_dots(app: &SolveApp, ctx: &egui::Context) {
++    let on: Vec<(u64, Color32)> = OTHERS.with_borrow(|o| {
++        o.iter().filter_map(|o| Some((o.who.state["doc"].as_u64()?, Color32::from_rgb(o.who.color[0], o.who.color[1], o.who.color[2])))).collect()
++    });
++    if on.is_empty() {
++        return;
++    }
++    let ids: Vec<Option<u64>> = SHARED.with_borrow(|sh| {
++        tabs::designs(app).iter().map(|(s, _)| marker(s).and_then(|m| sh.docs.iter().find(|d| d.mark == Some(m))).map(|d| d.id)).collect()
++    });
++    let centres: Vec<Option<Pos2>> = (0..ids.len()).map(|i| scenario::handle_at(&format!("tab:design:{i}"))).collect();
++    // The tabs are all one width: the step between two, or the widest a lone tab gets.
++    let w = centres.windows(2).find_map(|c| Some(c[1]?.x - c[0]?.x)).unwrap_or(220.0);
++    let painter = ctx.layer_painter(egui::LayerId::background());
++    for (id, centre) in ids.iter().zip(&centres) {
++        let (Some(id), Some(centre)) = (id, centre) else { continue };
++        for (k, (_, c)) in on.iter().filter(|(d, _)| d == id).take(4).enumerate() {
++            painter.circle(pos2(centre.x + w / 2.0 - 32.0 - 9.0 * k as f32, centre.y), 3.5, *c, Stroke::new(1.0, Color32::WHITE));
++        }
++    }
++}
++
++/// The start page's "In this session" (above Recent): a row for each design of the session, with dots in the colours
++/// of the others on it; a click goes to it, opening it again in a tab when this person closed it.
++#[cfg(target_arch = "wasm32")]
++fn session_list(app: &mut SolveApp, ui: &mut egui::Ui) {
++    if !playground_live::connected() {
++        return;
++    }
++    let rows: Vec<(u64, String, bool)> =
++        SHARED.with_borrow(|sh| sh.docs.iter().map(|d| (d.id, d.last["name"].as_str().unwrap_or_default().to_owned(), d.mark.is_some())).collect());
++    if rows.is_empty() {
++        return;
++    }
++    let t = solidcraft_ui_egui::theme::Tokens::get();
++    ui.label(egui::RichText::new("In this session").size(15.0).strong().color(t.text));
++    ui.add_space(8.0);
++    let mut chosen = None;
++    for (id, name, open) in rows {
++        let (r, resp) = ui.allocate_exact_size(vec2(320.0, 36.0), egui::Sense::click());
++        let hover = resp.hovered();
++        let p = ui.painter();
++        p.rect(r, 6.0, if hover { t.hover } else { t.field }, Stroke::new(1.0, if hover { t.accent } else { t.border }), egui::StrokeKind::Inside);
++        let name = if name.is_empty() || name == "Untitled" { "Untitled".to_owned() } else { name };
++        p.with_clip_rect(r.shrink2(vec2(12.0, 0.0)).with_max_x(r.right() - 110.0)).text(
++            r.left_center() + vec2(12.0, 0.0),
++            egui::Align2::LEFT_CENTER,
++            name,
++            FontId::proportional(14.0),
++            if open { t.text } else { t.text_dim },
++        );
++        p.text(r.right_center() - vec2(12.0, 0.0), egui::Align2::RIGHT_CENTER, if open { "Open" } else { "Closed here" }, FontId::proportional(11.5), t.text_dim);
++        OTHERS.with_borrow(|others| {
++            let on = others.iter().filter(|o| o.who.state["doc"].as_u64() == Some(id));
++            for (k, o) in on.take(4).enumerate() {
++                let c = Color32::from_rgb(o.who.color[0], o.who.color[1], o.who.color[2]);
++                p.circle(pos2(r.right() - 96.0 + 9.0 * k as f32, r.center().y), 3.5, c, Stroke::new(1.0, Color32::WHITE));
++            }
++        });
++        if hover {
++            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
++        }
++        if resp.clicked() {
++            chosen = Some(id);
++        }
++        ui.add_space(6.0);
++    }
++    ui.add_space(18.0);
++    if let Some(id) = chosen {
++        go_to(app, id);
++    }
++}
++
++/// Shows the session's design `id`, opening it again in a tab when this person closed it.
++#[cfg(target_arch = "wasm32")]
++fn go_to(app: &mut SolveApp, id: u64) {
++    let Some((was, last)) = SHARED.with_borrow(|sh| sh.docs.iter().find(|d| d.id == id).map(|d| (d.mark, d.last.clone()))) else { return };
++    let tab = was.and_then(|m| tabs::designs(app).iter().position(|(s, _)| marker(s) == Some(m)));
++    let i = match tab {
++        Some(i) => i,
++        None => {
++            let Ok(doc) = design(last) else { return };
++            let mut s = Session::default();
++            install(&mut s, &mut None, doc);
++            s.mark_saved();
++            let m = mark(&mut s);
++            let Ok(i) = tabs::open_behind(app, s) else { return };
++            SHARED.with_borrow_mut(|sh| {
++                sh.unfit.extend(m);
++                sh.docs.iter_mut().filter(|d| d.id == id).for_each(|d| (d.mark, d.at, d.seen) = (m, i, None));
++                sh.version += 1;
++            });
++            i
++        }
++    };
++    documents::switch(app, i);
++    app.home.open = false;
++}
++
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
-+    use playground_live::{checkpoint, connect, queue};
++    use playground_live::{checkpoint, connect, disconnect, queue};
 +    use solidcraft_ui_egui::Services;
 +
 +    fn app() -> SolveApp {
@@ -496,24 +1166,45 @@ index 00000000..46ef52e7
 +        app
 +    }
 +
-+    /// The app under test, its active design shared (as the owner's is).
++    /// The app under test, its active design shared (as the owner's is), on a page of its own.
 +    fn bound() -> SolveApp {
++        SHARED.take();
 +        let mut a = app();
 +        let doc = a.live_document();
 +        a.live_adopt(doc).unwrap();
 +        a
 +    }
 +
-+    /// Another peer: a design holding `document`, changed by `cmd`.
-+    fn peer(document: &[u8], cmd: &str, p: Value) -> Vec<u8> {
++    /// Another peer: a design holding `design` (one of a shared document's), changed by `cmd`.
++    fn peer(design: &Value, cmd: &str, p: Value) -> Value {
 +        let mut x = app();
-+        install(&mut x, serde_json::from_slice(document).unwrap()).unwrap();
++        install(&mut x.session, &mut None, super::design(design.clone()).unwrap());
 +        x.run(cmd, p).unwrap();
-+        canonical(&project(&x.session.doc))
++        project(&x.session.doc)
++    }
++
++    /// `document` with its first design replaced by `design`.
++    fn with_first(document: &Value, design: Value) -> Value {
++        let mut d = document.clone();
++        let id = d["documents"][0]["id"].clone();
++        d["documents"][0] = design;
++        d["documents"][0]["id"] = id;
++        d
++    }
++
++    fn first(app: &SolveApp) -> Value {
++        let mut d = app.live_document()["documents"][0].clone();
++        d.as_object_mut().unwrap().remove("id");
++        d
 +    }
 +
 +    fn shared(app: &SolveApp) -> Vec<u8> {
 +        canonical(&app.live_document())
++    }
++
++    /// Switches the test to another page: this page's session goes into `saved`, `saved`'s comes in.
++    fn swap(saved: &mut Shared) {
++        SHARED.with_borrow_mut(|sh| std::mem::swap(sh, saved));
 +    }
 +
 +    const BOX: (&str, fn() -> Value) = ("solid.box", || json!({"length": "10", "width": "10", "height": "10"}));
@@ -522,7 +1213,7 @@ index 00000000..46ef52e7
 +    fn the_shared_design_leaves_out_views_and_adopting_one_keeps_them_without_an_undo_step() {
 +        let mut a = bound();
 +        let before = shared(&a);
-+        let doc = a.live_document();
++        let doc = first(&a);
 +        assert!(doc.get("next_id").is_none() && doc["features"][0]["sketch"].get("view").is_none());
 +        // Views: the camera and a sketch's display options; below, Edit Sketch's rolled timeline.
 +        a.cam.target.x += 5.0;
@@ -533,46 +1224,46 @@ index 00000000..46ef52e7
 +        a.edit_sketch(sketch);
 +        assert_ne!(a.session.doc.marker, None, "Edit Sketch rolled the timeline");
 +        let with_box = shared(&a);
-+        assert_eq!(serde_json::from_slice::<Value>(&with_box).unwrap()["marker"], Value::Null, "the roll is this person's");
++        assert_eq!(first(&a)["marker"], Value::Null, "the roll is this person's");
 +        a.finish_sketch();
 +        assert_eq!(shared(&a), with_box);
 +        assert_ne!(with_box, before);
 +
 +        // Someone else's design: a cylinder added; adopting it keeps a's views, is no undo step and reads back the same.
-+        let theirs = peer(&with_box, "solid.cylinder", json!({"radius": "5", "height": "10"}));
++        let theirs = with_first(&a.live_document(), peer(&first(&a), "solid.cylinder", json!({"radius": "5", "height": "10"})));
 +        let undo = a.session.undo.len();
-+        a.live_adopt(serde_json::from_slice(&theirs).unwrap()).unwrap();
++        a.live_adopt(theirs.clone()).unwrap();
 +        assert_eq!(a.session.undo.len(), undo);
 +        assert!(a.session.doc.sketch(sketch).unwrap().view.hide_grid);
 +        assert_eq!(a.session.doc.features.len(), 3);
 +        assert!(a.session.doc.next_id > a.session.doc.features.iter().map(|f| f.id).max().unwrap());
-+        assert_eq!(shared(&a), theirs);
++        assert_eq!(shared(&a), canonical(&theirs));
 +    }
 +
 +    #[test]
 +    fn merges_refuse_twice_given_names_and_designs_that_need_repairs_and_sketch_counters_take_the_larger() {
-+        let base = canonical(&project(&app().session.doc));
-+        let one: Value = serde_json::from_slice(&peer(&base, BOX.0, BOX.1())).unwrap();
-+        let mut two: Value = serde_json::from_slice(&peer(&base, BOX.0, json!({"length": "20", "width": "20", "height": "20"}))).unwrap();
-+        let base: Value = serde_json::from_slice(&base).unwrap();
++        let a = bound();
++        let base = a.live_document();
++        let one = with_first(&base, peer(&first(&a), BOX.0, BOX.1()));
++        let mut two = with_first(&base, peer(&first(&a), BOX.0, json!({"length": "20", "width": "20", "height": "20"})));
 +        // Ids apart, as two people's are while connected.
-+        two["features"][1]["id"] = json!(1u64 << 40);
++        two["documents"][0]["features"][1]["id"] = json!(1u64 << 40);
 +        let error = SolveApp::live_merge(&base, &one, &two).unwrap_err();
 +        assert!(error.contains("two features named Box1"), "{error}");
 +        // Each side drew a line in the sketch: counters take the larger.
 +        let line = |n: u64| {
 +            let mut d = base.clone();
-+            d["features"][0]["sketch"]["counters"]["l"] = json!(n);
++            d["documents"][0]["features"][0]["sketch"]["counters"]["l"] = json!(n);
 +            d
 +        };
 +        let merged = SolveApp::live_merge(&line(1), &line(3), &line(2)).unwrap();
-+        assert_eq!(merged["features"][0]["sketch"]["counters"]["l"], 3);
++        assert_eq!(merged["documents"][0]["features"][0]["sketch"]["counters"]["l"], 3);
 +        // A component left without an occurrence would get a new random one on each peer that reads it.
 +        let mut x = app();
 +        x.run("component.create", json!({})).unwrap();
-+        let with: Value = project(&x.session.doc);
++        let with = with_first(&base, project(&x.session.doc));
 +        let mut without = with.clone();
-+        without.as_object_mut().unwrap().remove("occurrences");
++        without["documents"][0].as_object_mut().unwrap().remove("occurrences");
 +        assert!(SolveApp::live_check(&with).is_ok());
 +        let error = SolveApp::live_check(&without).unwrap_err();
 +        assert!(error.contains("repairs"), "{error}");
@@ -585,11 +1276,11 @@ index 00000000..46ef52e7
 +        connect();
 +        let ctx = egui::Context::default();
 +        frame(&mut a, &ctx);
-+        let base = shared(&a);
-+        let theirs = peer(&base, BOX.0, BOX.1());
++        let base = a.live_document();
++        let theirs = with_first(&base, peer(&first(&a), BOX.0, BOX.1()));
 +        let done = std::rc::Rc::new(Cell::new(false));
 +        let to = done.clone();
-+        queue(Some(base), theirs.clone(), Box::new(move |r| to.set(r.is_ok())));
++        queue(Some(canonical(&base)), canonical(&theirs), Box::new(move |r| to.set(r.is_ok())));
 +        a.start("solid.sphere");
 +        assert!(a.dialog.is_some());
 +        frame(&mut a, &ctx);
@@ -597,62 +1288,57 @@ index 00000000..46ef52e7
 +        a.dialog = None;
 +        frame(&mut a, &ctx);
 +        assert!(done.get());
-+        assert_eq!(shared(&a), theirs);
++        assert_eq!(shared(&a), canonical(&theirs));
 +        // Their box took the id after the sketch's; this person's next one is further on, and so after taking one.
 +        let last = |a: &SolveApp| a.session.doc.features.iter().map(|f| f.id).max().unwrap();
 +        assert!(a.session.doc.next_id > last(&a) + 1);
 +        a.run("solid.cylinder", json!({"radius": "5", "height": "10"})).unwrap();
 +        frame(&mut a, &ctx);
 +        assert!(a.session.doc.next_id > last(&a) + 1);
++        disconnect();
 +    }
 +
 +    #[test]
-+    fn the_shared_design_is_followed_wherever_its_tab_goes_and_outlives_it() {
-+        let mut a = app();
-+        // The session starts on the second of two designs.
-+        documents::new_design(&mut a);
-+        let doc = a.live_document();
-+        a.live_adopt(doc).unwrap();
++    fn a_design_opened_in_a_session_reaches_the_others_behind_their_own_and_stays_closed_where_closed() {
 +        connect();
 +        let ctx = egui::Context::default();
++        let mut a = bound();
 +        frame(&mut a, &ctx);
-+        let base = shared(&a);
-+        // On the other design: the session keeps the shared one, and Undo there is that design's own.
-+        documents::switch(&mut a, 0);
-+        frame(&mut a, &ctx);
-+        assert_eq!(shared(&a), base);
-+        assert!(!undo("edit.undo"));
-+        // A remote change waits for the shared design, not the open one.
-+        let theirs = peer(&base, BOX.0, BOX.1());
-+        let done = std::rc::Rc::new(Cell::new(false));
-+        let to = done.clone();
-+        queue(Some(base), theirs.clone(), Box::new(move |r| to.set(r.is_ok())));
-+        frame(&mut a, &ctx);
-+        assert!(done.get());
-+        assert_eq!(shared(&a), theirs);
-+        assert_eq!(a.session.doc.features.len(), 1, "the open design keeps its sketch alone");
-+        // The other design closes, so the shared one's tab moves from 1 to 0; it takes the change.
-+        documents::close(&mut a, 0, true);
-+        assert_eq!(a.docs.active, 0);
-+        frame(&mut a, &ctx);
-+        assert_eq!(canonical(&project(&a.session.doc)), theirs);
-+        assert!(undo("edit.undo"));
-+        // A new design opens next to it, then it closes, then the last one does (a blank design takes its place):
-+        // the session keeps the shared design as it was, never another one.
++        // A new design: shared once it holds something.
 +        documents::new_design(&mut a);
 +        frame(&mut a, &ctx);
-+        assert_eq!(shared(&a), theirs);
-+        documents::switch(&mut a, 0);
-+        for _ in 0..2 {
-+            documents::close(&mut a, 0, true);
-+            frame(&mut a, &ctx);
-+            assert_eq!(shared(&a), theirs);
-+        }
-+        assert!(a.session.doc.features.is_empty() && !undo("edit.undo"));
++        assert_eq!(a.live_document()["documents"].as_array().map(Vec::len), Some(1), "a blank design is not shared yet");
++        a.run(BOX.0, BOX.1()).unwrap();
++        frame(&mut a, &ctx);
++        let opened = a.live_document();
++        assert_eq!(opened["documents"].as_array().map(Vec::len), Some(2), "it joins the session");
++        assert_eq!(undo("edit.undo"), true, "its Undo is the session's");
++
++        // b joins with a design of its own: the session's first shows in a tab of its own, the second behind it.
++        let mut saved = Shared::default();
++        swap(&mut saved);
++        let mut b = app();
++        b.run(BOX.0, json!({"length": "3", "width": "3", "height": "3"})).unwrap();
++        b.live_document();
++        b.live_adopt(opened.clone()).unwrap();
++        assert_eq!((b.docs.count(), b.docs.active), (3, 1), "b's own, the session's first (shown), the second behind");
++        assert_eq!(shared(&b), canonical(&opened), "b's own design stays b's");
++        // b closes the second: it stays in the session, a change to it does not open it again but keeps it up to date.
++        documents::close(&mut b, 2, true);
++        frame(&mut b, &ctx);
++        assert_eq!(shared(&b), canonical(&opened), "closing it is b's own");
++        let mut edited = opened.clone();
++        edited["documents"][1]["name"] = json!("Renamed");
++        b.live_adopt(edited.clone()).unwrap();
++        assert_eq!(b.docs.count(), 2, "a change does not open it again");
++        assert_eq!(shared(&b), canonical(&edited), "but it keeps up to date");
++        assert!(SolveApp::live_check(&json!({ "documents": [{ "id": 1 }, { "id": 1 }] })).is_err());
++        swap(&mut saved);
++        disconnect();
 +    }
 +
 +    #[test]
-+    fn presence_gives_the_pointer_as_a_model_point_on_its_ray_and_the_selection() {
++    fn presence_gives_the_design_the_pointer_the_selection_and_a_shape_being_drawn() {
 +        let mut a = bound();
 +        a.run(BOX.0, BOX.1()).unwrap();
 +        let body = a.session.world_state().bodies[0].name.clone();
@@ -667,6 +1353,75 @@ index 00000000..46ef52e7
 +        let shown = viewport::projection(&a, rect).to_screen(Vec3::new(at[0], at[1], at[2])).unwrap();
 +        assert!((shown - mouse).length() < 0.5, "{shown:?}");
 +        assert_eq!(serde_json::from_value::<Vec<Sel>>(p["selection"].clone()).unwrap(), a.session.selection);
-+        assert_eq!(p["component"], 0);
++        assert_eq!((&p["component"], &p["doc"]), (&json!(0), &a.live_document()["documents"][0]["id"]));
++
++        // A rectangle being drawn from (0, 0) to (10, 5): its rubber band, in the sketch's coordinates.
++        connect();
++        a.run("sketch.create", json!({"plane": "XY"})).unwrap();
++        let mut t = solidcraft_ui_egui::tools::Tool::for_command("sketch.rectangle.two_point").unwrap();
++        t.pts.push((Vec2::new(0.0, 0.0), None));
++        t.hover = Some((Vec2::new(10.0, 5.0), None));
++        a.tool = Some(t);
++        let ctx = egui::Context::default();
++        ctx.run_ui(egui::RawInput::default(), |ui| frame(&mut a, ui.ctx())).textures_delta.clear();
++        let band = a.live_presence()["band"].clone();
++        let xy: Vec<f64> = band.as_array().unwrap().iter().flat_map(|l| l.as_array().unwrap().iter().map(|x| x.as_f64().unwrap())).collect();
++        let corners: Vec<(f64, f64)> = xy.chunks(2).map(|p| (p[0], p[1])).collect();
++        for c in [(0.0, 0.0), (10.0, 0.0), (10.0, 5.0), (0.0, 5.0)] {
++            assert!(corners.iter().any(|q| (q.0 - c.0).abs() < 0.05 && (q.1 - c.1).abs() < 0.05), "{c:?} in {corners:?}");
++        }
++        disconnect();
++
++        // The others' marks ease toward where they are; a jump wider than a quarter of the view goes at once.
++        let mut shown = json!({ "pointer": [0.0, 0.0, 0.0] });
++        assert!(ease(&mut shown, json!({ "pointer": [10.0, 0.0, 0.0] }), 0.5, 0.01, 20.0));
++        assert_eq!(shown["pointer"], json!([5.0, 0.0, 0.0]));
++        assert!(!ease(&mut shown, json!({ "pointer": [100.0, 0.0, 0.0] }), 0.5, 0.01, 20.0));
++        assert_eq!(shown["pointer"], json!([100.0, 0.0, 0.0]));
 +    }
++}
+diff --git a/crates/ui-egui/src/documents_live.rs b/crates/ui-egui/src/documents_live.rs
+new file mode 100644
+index 00000000..6e3a2537
+--- /dev/null
++++ b/crates/ui-egui/src/documents_live.rs
+@@ -0,0 +1,39 @@
++//! Live editing in a Playground session (the web app's `live` module): every open design, and a design opened in a tab
++//! behind the others. Nothing here runs unless that module calls it.
++
++use solidcraft_engine::Session;
++
++use super::{DocSlot, MAX_OPEN};
++use crate::SolveApp;
++
++/// Each open design's session and Edit Sketch's saved timeline position, in tab order (the active one is the app's).
++pub fn designs(app: &SolveApp) -> Vec<(&Session, Option<Option<usize>>)> {
++    let active = (&app.session, app.pre_sketch_marker);
++    if app.docs.slots.is_empty() {
++        return vec![active];
++    }
++    app.docs.slots.iter().map(|s| s.as_ref().map_or(active, |d| (&d.session, d.pre_sketch_marker))).collect()
++}
++
++/// [`designs`], to change.
++pub fn designs_mut(app: &mut SolveApp) -> Vec<(&mut Session, &mut Option<Option<usize>>)> {
++    let SolveApp { session, pre_sketch_marker, docs, .. } = app;
++    let mut active = Some((session, pre_sketch_marker));
++    if docs.slots.is_empty() {
++        return active.into_iter().collect();
++    }
++    docs.slots.iter_mut().filter_map(|s| s.as_mut().map(|d| (&mut d.session, &mut d.pre_sketch_marker)).or_else(|| active.take())).collect()
++}
++
++/// Opens `session` in a new last tab, leaving the active design as it is; its index.
++pub fn open_behind(app: &mut SolveApp, session: Session) -> Result<usize, String> {
++    if app.docs.slots.is_empty() {
++        app.docs.slots.push(None);
++        app.docs.active = 0;
++    }
++    if app.docs.slots.len() >= MAX_OPEN {
++        return Err(format!("at most {MAX_OPEN} designs can be open"));
++    }
++    app.docs.slots.push(Some(DocSlot::new(session)));
++    Ok(app.docs.slots.len() - 1)
 +}

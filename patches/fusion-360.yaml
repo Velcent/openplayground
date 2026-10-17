@@ -55,11 +55,13 @@
   replace: 'if design {'
 
 # Live editing in Playground sessions (patches/fusion-360/live.diff + patches/live/playground_live.rs)
-# The adapter lives in one new file, apps/solidcraft-web/src/live.rs (it declares the template): the shared design and
-# its merge, adoption, ids, Undo's hand-off, presence (drawn over the viewport at the end of each frame), and the app
-# the web runner starts, which ends each frame with the session's hook. The rules below only declare it and call in,
-# each one line at the end of a file, after a function's signature, or around a call in the web entry. Native builds
-# behave as before: the hooks compile on wasm only (the module also for the web crate's native tests).
+# The adapter lives in apps/solidcraft-web/src/live.rs (it declares the template): the session's designs and their
+# merge, adoption, ids, Undo's hand-off, presence and the gestures under way (drawn over the viewport at the end of
+# each frame, with dots on the tabs), the start page's "In this session" list, and the app the web runner starts, which
+# ends each frame with the session's hook. A second new file, crates/ui-egui/src/documents_live.rs, gives it the open
+# designs and a tab opened behind the others. The rules below only declare them and call in, each one line at the end
+# of a file, after a function's signature, before a statement or around a call in the web entry. Native builds behave
+# as before: the hooks compile on wasm only (the modules also for the web crate's native tests).
 # Verify all: node scripts/build.mjs check fusion-360 head|release, LIVE=0 the same, then the e2e
 # (tests/live-apps/fusion-360.mjs) and `cargo test -p solidcraft-web live::`. If upstream renames a function or type
 # named below, anchor on its new name.
@@ -85,14 +87,29 @@
   file: apps/*-web/Cargo.toml
   find: '(?![\s\S])'
   after: "\n[target.'cfg(all(not(target_arch = \"wasm32\")))'.dev-dependencies]\nserde_json = { workspace = true }\n"
-# Undo and Redo of the shared design go to the session, which takes back only this person's edits: first in
+# Undo and Redo of the session's designs go to the session, which takes back only this person's edits: first in
 # SolveApp::run, which every Undo goes through (the app bar, Ctrl+Z/Y, menus, the control channel). The web app sets
-# the hook. Verify: the e2e's undo step reverts only the owner's edit.
+# the hook (and the start page's, below). Verify: the e2e's undo step reverts only the owner's edit.
 - live: true
   file: crates/ui-egui/src/lib.rs
   find: '(?![\s\S])'
-  after: "\n// Live editing in a Playground session: Undo and Redo, while the web app's session takes them.\n#[cfg(target_arch = \"wasm32\")]\npub static LIVE_UNDO: std::sync::OnceLock<fn(&str) -> bool> = std::sync::OnceLock::new();\n"
+  after: "\n// Live editing in a Playground session: Undo and Redo, while the web app's session takes them.\n#[cfg(target_arch = \"wasm32\")]\npub static LIVE_UNDO: std::sync::OnceLock<fn(&str) -> bool> = std::sync::OnceLock::new();\n/// The start page's list of the session's designs, while the web app's session shows one.\n#[cfg(target_arch = \"wasm32\")]\npub static LIVE_HOME: std::sync::OnceLock<fn(&mut SolveApp, &mut egui::Ui)> = std::sync::OnceLock::new();\n"
 - live: true
   file: crates/ui-egui/src/lib.rs
   find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\s*,\s*id\s*:\s*&str\b[^{]*\{'
   after: "\n        #[cfg(target_arch = \"wasm32\")] if crate::LIVE_UNDO.get().is_some_and(|undo| undo(id)) { return Ok(Default::default()); }"
+# The open designs for the session (every tab's design, a tab opened behind the others): a child module of documents,
+# which keeps its tabs private. Verify: `cargo test -p solidcraft-web live::` (a design opened in a session reaches
+# the others behind their own). If upstream renames DocSlot's `session`/`pre_sketch_marker` or Documents' `slots`,
+# follow it in documents_live.rs.
+- live: true
+  file: crates/ui-egui/src/documents.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session: the open designs, for the web app.\n#[path = \"documents_live.rs\"]\npub mod live;\n"
+# The start page lists the session's designs ("In this session", one row each, a click shows it or opens it again
+# where it was closed) above Recent. Verify: in a session, close a shared design's tab, open Home: its row says
+# "Closed here" and a click opens it again. If upstream moves Recent, anchor on the start page's next section.
+- live: true
+  file: crates/ui-egui/src/home.rs
+  find: '^\s*section\(\s*ui\s*,[^;\n]*[Rr]ecent[^;\n]*;'
+  before: "#[cfg(target_arch = \"wasm32\")] if let Some(list) = crate::LIVE_HOME.get() { list(app, ui); }\n"
