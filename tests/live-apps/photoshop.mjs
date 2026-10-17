@@ -1,6 +1,8 @@
 // PhotoCraft (photoshop): each page makes a new 1920×1080 white document from the Home screen ("New document…",
 // then Enter). The owner paints a brush stroke (B, drag) over the left of the Background, the editor one over its
 // right: different 256×256 tiles of the same layer, which merge tile by tile. Ctrl+Z is the owner's Undo.
+// point(): the owner drags a marquee around where editA paints (M; the stroke stays inside it) and rests the pointer on
+// the canvas: the editor is shown their pointer, active layer and selection bounds.
 //
 // PhotoCraft's checkpoint is binary (canonical JSON, then the tiles): `ready` defines liveTestDocument(), which gives
 // the harness that JSON with each surface's tiles as {"tx,ty": hash}.
@@ -56,6 +58,18 @@ export default {
       await page.keyboard.press('Enter')
       await until(async () => !(await checkpoint(page)).startsWith('error'), 10000, 'a new document').catch(() => {})
     }
+  },
+  point: async (page) => {
+    await page.keyboard.press('m')
+    await page.mouse.move(150, 250)
+    await page.mouse.down()
+    await page.mouse.move(420, 420, { steps: 8 })
+    await page.mouse.up()
+    await page.mouse.move(600, 400, { steps: 4 })
+    await until(() => page.evaluate(() => {
+      const p = playgroundLiveAdapter.presence()
+      return !!(p?.pointer && p.selection)
+    }), 10000, 'the pointer and a selection on the canvas')
   },
   editA: (page) => stroke(page, 220, 300),
   editB: (page) => stroke(page, 850, 520),

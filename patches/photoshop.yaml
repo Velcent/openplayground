@@ -98,3 +98,77 @@
             call(&response, read, &Array::new()).await
         }
     }
+
+# Live editing in Playground sessions (patches/photoshop/live.diff + patches/live/playground_live.rs)
+# What it's for: people in a Playground session edit one document together (layers and settings merged per layer and
+#   field, pixels per 256×256 tile) and see each other's pointer, active layer and selection on the canvas in their
+#   color.
+# How: the adapter lives in new files: apps/photocraft-web/src/live.rs (the binary checkpoint, merge, adoption, Undo,
+#   presence; it declares the template, copied next to it), apps/photocraft-web/src/web/live_shell.rs (the kept runner
+#   and the shell that ends each frame with the session's frame hook and draws the others), crates/engine/src/live.rs
+#   (Session::install_remote: a shared document taken in with no history step), crates/format/src/store/live.rs (loads
+#   that reuse the tiles decoded before) and crates/ui-egui/src/live.rs (the Undo hook). These rules only declare them
+#   and call in, each one line at the end of a file or right after a function's signature, except the two in web.rs
+#   that keep the runner and wrap the app. Native builds behave as before: the hooks compile on wasm, and in debug
+#   builds (the native tests) where nothing connects.
+# Verify: node scripts/build.mjs check photoshop head|release, then the e2e (tests/live-apps/photoshop.mjs) and
+#   `cargo test -p photocraft-web live::`.
+# If upstream changes: if a function named below is renamed, anchor on its new signature; if WebShell or its `app`
+#   field is renamed, follow it in web/live_shell.rs; if the format's Loader changes, mirror store::load in
+#   store/live.rs.
+#
+# The web crate's dependencies for the adapter (the .pcraft codec; serde_json reading floats back exactly, so equal
+# documents give equal bytes on every peer), on wasm and for its native tests, under target spellings nobody else uses.
+- live: true
+  file: apps/photocraft-web/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nphotocraft-format = { workspace = true }\nserde_json = { workspace = true, features = [\"float_roundtrip\"] }\n\n[target.'cfg(all(not(target_arch = \"wasm32\")))'.dev-dependencies]\nphotocraft-format = { workspace = true }\nserde_json = { workspace = true, features = [\"float_roundtrip\"] }\n"
+# The adapter module (wasm, and the crate's native tests).
+- live: true
+  file: apps/photocraft-web/src/main.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web only).\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
+# The web entry keeps its runner for the adapter and wraps its app (web/live_shell.rs, a child module so it reaches
+# WebShell's fields).
+- live: true
+  file: apps/photocraft-web/src/web.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session.\nmod live_shell;\n"
+- live: true
+  file: apps/photocraft-web/src/web.rs
+  find: 'eframe::WebRunner::new\(\)'
+  replace: 'live_shell::runner()'
+- live: true
+  file: apps/photocraft-web/src/web.rs
+  find: 'Ok\(Box::new\((?=\s*WebShell\b)'
+  replace: 'Ok(live_shell::wrap('
+# Session::install_remote (engine/src/live.rs, a child of the crate root so it reaches the open documents).
+- live: true
+  file: crates/engine/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web, and debug builds for the native tests).\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))]\nmod live;\n"
+# load_reusing (format/src/store/live.rs, a child of store so it reaches the loader's byte source), and its export.
+- live: true
+  file: crates/format/src/store.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web, and debug builds for the native tests).\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))]\npub(crate) mod live;\n"
+- live: true
+  file: crates/format/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web, and debug builds for the native tests).\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))]\npub use store::live::{Tiles, load_reusing};\n"
+# The Undo hook (ui-egui/src/live.rs), asked first in PhotocraftApp::run, which every command goes through, and in
+# menus::is_enabled, which enables Edit › Undo and its shortcut: while connected, Undo and Redo of the shared document
+# go to the session (Free Transform and a crop box keep their own steps). Verify: the e2e's undo step reverts only the
+# owner's stroke after the editor's arrived.
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web, and debug builds for the native tests).\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))]\npub mod live;\n"
+- live: true
+  file: crates/ui-egui/src/lib.rs
+  find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\b[^{]*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", debug_assertions))] if crate::live::undo(self, id, true) { return Ok(serde_json::Value::Bool(true)); }"
+- live: true
+  file: crates/ui-egui/src/menus.rs
+  find: 'pub\s+fn\s+is_enabled\s*\(\s*app\s*:[^{]*\{'
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", debug_assertions))] if crate::live::undo(app, id, false) { return true; }"
