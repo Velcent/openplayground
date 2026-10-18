@@ -147,7 +147,7 @@ index 0000000..928f755
 +        g.links.push(Link { name: str_of(&l[0])?, path: str_of(&l[1])?, graph: l[2].as_str().map(str::to_owned) });
 +    }
 +    for (k, s) in entries(&v["resources"]) {
-+        g.resources.insert(k.clone(), b64_decode(s.as_str().unwrap_or_default())?);
++        g.resources.insert(k.clone(), b64_decode(s.as_str().unwrap_or_default())?.into());
 +    }
 +    for n in items(&v["nodes"]) {
 +        let mut node = Node { kind: str_of(&n["kind"])?, pos: pair_of(&n["pos"])?, ..Default::default() };

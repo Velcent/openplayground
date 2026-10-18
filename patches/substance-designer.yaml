@@ -59,6 +59,12 @@
   find: '^([ \t]*)gl\.shader_source\((\w+),\s*&?(\w+)\);'
   replace: "$1#[cfg(target_arch = \"wasm32\")] let $3 = &crate::playground::glsl_es(&$3);\n$&"
 
+# Rule 7b: glow's web context has no NativeFramebuffer; on wasm the 3D viewport rebinds the default framebuffer (None),
+# which is what eframe's canvas paints to. Verify: build.mjs check. If upstream cfg-gates fb_from itself, drop this.
+- file: src/gpu3d.rs
+  find: '^fn\s+fb_from\s*\('
+  before: "#[cfg(target_arch = \"wasm32\")]\nfn fb_from(_id: i32) -> Option<glow::Framebuffer> { None }\n#[cfg(not(target_arch = \"wasm32\"))]\n"
+
 # Rules 8-12/12: threads, files and the clock in the library's modules (see the top).
 - file: src/tex.rs
   find: '(?![\s\S])'
