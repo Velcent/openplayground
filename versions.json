@@ -6,7 +6,7 @@
   "indesign": "v0.8.0+98b07899",
   "indesign@head": "head-5aeb4dd+98b07899",
   "lightroom": "v0.8.0+049ffc3b",
-  "lightroom@head": "head-2218d97+049ffc3b",
+  "lightroom@head": "head-43a47e5+049ffc3b",
   "lightroom-classic": "v0.9.1+2b147aa8",
   "lightroom-classic@head": "head-23b1b87+2b147aa8",
   "premiere": "v0.8.0+100671b2",
@@ -18,9 +18,9 @@
   "word": "v0.7.0+4279add5",
   "word@head": "head-2f6311c+4279add5",
   "excel": "v0.7.0+68a7180e",
-  "excel@head": "head-823c565+68a7180e",
+  "excel@head": "head-19f4387+68a7180e",
   "powerpoint": "v0.7.0+a290aadf",
-  "powerpoint@head": "head-a178b99+a290aadf",
+  "powerpoint@head": "head-83f21e7+a290aadf",
   "outlook": "v0.1.1+6c3113ef",
   "outlook@head": "head-f1a33ea+6c3113ef",
   "autocad": "v0.8.0+f9572c97",
@@ -34,6 +34,6 @@
   "fl-studio-mobile": "v0.1.8+394aa42a",
   "fl-studio-mobile@head": "head-99db69b+394aa42a",
   "figma": "v0.6.0+bfef1be6",
-  "figma@head": "head-3f5f673+bfef1be6",
+  "figma@head": "head-84a86e1+bfef1be6",
   "artcraft-store": "dff1898"
 }
