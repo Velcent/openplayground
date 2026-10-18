@@ -249,6 +249,22 @@ groups:
         accent: "#FF7A1A"
         base: "#3A1A06"
 
+      - slug: substance-designer
+        name: MaterialCraft
+        alternative: Substance Designer
+        blurb: Build tileable procedural materials from nodes, with noises, patterns, filters and PBR maps.
+        # Material graphs (.mcg) and published packages (.mca). Upstream releases are desktop-only (no web zip), so
+        # like SubCraft it has the head channel only; patches/substance-designer.yaml adds the web build.
+        opens: [mcg, mca]
+        imports: []
+        repo: PiJellyPin/MaterialCraft
+        # What the web build compiles: README and docs commits don't rebuild it.
+        paths: [src, assets, build.rs, Cargo.toml]
+        patches: patches/substance-designer.yaml
+        icon: icons/materialcraft.png
+        accent: "#7A4ED6"
+        base: "#1C0E3A"
+
   - name: Music
     tools:
       - slug: pro-tools

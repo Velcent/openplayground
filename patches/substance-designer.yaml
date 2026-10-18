@@ -1,0 +1,77 @@
+# MaterialCraft in the browser. Upstream ships desktop builds only; these patches add the web build Playground serves.
+#
+# patches/substance-designer/web.diff adds new files only:
+#   apps/materialcraft-web/   the web crate build.mjs finds (Cargo.toml, Trunk.toml, index.html, src/main.rs). It
+#                             depends on the library with the `gui` feature and calls materialcraft::gui::web::start().
+#   src/playground.rs         web shims for the library: an in-memory `std::fs`, a `std::thread` that runs scoped
+#                             threads one after another and queues spawned jobs, web-time's clock, `std::env::temp_dir`,
+#                             `craft_atomic::atomic_write` into the in-memory files, and the 3D viewport's shaders as
+#                             GLSL ES (WebGL2).
+#   src/playground_gui.rs     the editor's browser side: rfd's blocking dialogs answered by Playground's
+#                             `globalThis.playgroundFiles` (Open/Save As/Publish through the file explorer, browser
+#                             storage and downloads; exports and bakes download), in-memory preferences instead of
+#                             craft-settings' folder, the queued jobs run between frames, and the WebRunner.
+# The editor (src/gui.rs, with gui_home/gui_params/gui_ui include!d into it) is a binary upstream. On wasm the rules
+# below also build it as a library module (`materialcraft::gui`), so the web crate (and `build.mjs check`) compiles it,
+# with every dependency spec taken from upstream's own Cargo.toml.
+# The modules that use threads, files or the clock take `std` from src/playground.rs on wasm through ONE `use` line
+# at their end (a local `std` shadows the standard library's name in that module; everything else in it still comes
+# from the real std). Native builds see none of this: every rule adds wasm-only lines or wasm-only cfg conditions.
+# If upstream starts using std::thread/std::fs/Instant in another module, give that module the same one-line rule.
+
+# Rule 1/12: the web dependencies of src/playground*.rs (all already in Cargo.lock through eframe).
+# Verify: build.mjs check. If upstream adds them itself, drop the duplicates here.
+- file: Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nweb-time = \"1\"\nwasm-bindgen = \"0.2\"\nwasm-bindgen-futures = \"0.4\"\njs-sys = \"0.3\"\nweb-sys = { version = \"0.3\", features = [\"Window\", \"Document\", \"Element\", \"HtmlCanvasElement\", \"console\"] }\n"
+
+# Rule 2/12: the shims, and the editor as a library module on wasm (`extern crate self` lets its
+# `use materialcraft::…` lines resolve inside the library).
+# If upstream turns the editor into a library itself, point apps/materialcraft-web at that instead.
+- file: src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build (patches/substance-designer.yaml): web shims, and the editor as a module for apps/materialcraft-web.\n#[cfg(target_arch = \"wasm32\")] #[doc(hidden)] pub mod playground;\n#[cfg(all(target_arch = \"wasm32\", feature = \"gui\"))] extern crate self as materialcraft;\n#[cfg(all(target_arch = \"wasm32\", feature = \"gui\"))] #[path = \"gui.rs\"] pub mod gui;\n"
+
+# Rule 3/12: the editor's browser side (src/playground_gui.rs), and its `std`, `rfd` and `craft_settings` names
+# pointing at the shims (for gui.rs and the files it include!s).
+- file: src/gui.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build (patches/substance-designer.yaml): files, dialogs, threads and settings in the browser.\n#[cfg(target_arch = \"wasm32\")] #[path = \"playground_gui.rs\"] pub mod web;\n#[cfg(target_arch = \"wasm32\")] use {crate::playground::std, web::{craft_settings, rfd}};\n"
+
+# Rule 4/12: the desktop entry point (NativeOptions, run_native) stays out of the web build.
+# If upstream changes: anchor on wherever the editor's `fn main` lives.
+- file: src/gui*.rs
+  find: '^fn\s+main\s*\('
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+
+# Rules 5-6/12: GPU compute (wgpu with Vulkan/DX12/Metal) is off in the browser: the CPU path upstream uses without
+# the `gpu` feature. Verify: the status bar says "Engine: CPU". If upstream's switch changes, keep `imp` CPU on wasm.
+- file: src/gpu.rs
+  find: '#\[cfg\(not\(feature\s*=\s*"gpu"\)\)\](?=\s*mod\s+imp\b)'
+  replace: '#[cfg(any(not(feature = "gpu"), target_arch = "wasm32"))]'
+- file: src/gpu.rs
+  find: '#\[cfg\(feature\s*=\s*"gpu"\)\](?=\s*mod\s+imp\b)'
+  replace: '#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]'
+
+# Rule 7/12: the 3D viewport's OpenGL 3.3 shaders as WebGL2 ones (#version 300 es + precision), where they are compiled.
+# Verify: the 3D view shows the material (no "shader compile failed" in the status bar).
+- file: src/gpu3d.rs
+  find: '^([ \t]*)gl\.shader_source\((\w+),\s*&?(\w+)\);'
+  replace: "$1#[cfg(target_arch = \"wasm32\")] let $3 = &crate::playground::glsl_es(&$3);\n$&"
+
+# Rules 8-12/12: threads, files and the clock in the library's modules (see the top).
+- file: src/tex.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: threads, files and the clock (patches/substance-designer.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/ops.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: threads, files and the clock (patches/substance-designer.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/graph.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: threads, files and the clock (patches/substance-designer.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/render3d.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: threads, files and the clock (patches/substance-designer.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/safeio.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: saves go to the in-memory files (patches/substance-designer.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::craft_atomic;\n"
