@@ -1,6 +1,6 @@
 {
   "photoshop": "v0.10.0+16f02c95",
-  "photoshop@head": "head-f8e4a13+16f02c95",
+  "photoshop@head": "head-f3fb578+16f02c95",
   "illustrator": "v0.13.1+181abcba",
   "illustrator@head": "head-a466625+181abcba",
   "indesign": "v0.9.0+98b07899",
@@ -8,7 +8,7 @@
   "lightroom": "v0.9.1+049ffc3b",
   "lightroom@head": "head-fb7ac08+049ffc3b",
   "lightroom-classic": "v0.9.3+5017676e",
-  "lightroom-classic@head": "head-d7e10c8+5017676e",
+  "lightroom-classic@head": "head-2fec9bd+5017676e",
   "premiere": "v0.9.0+100671b2",
   "premiere@head": "head-6c3948a+100671b2",
   "after-effects": "v0.11.1+70090165",
@@ -26,9 +26,9 @@
   "outlook@head": "head-f1a33ea+6c3113ef",
   "autocad": "v0.8.0+f9572c97",
   "autocad@head": "head-0cc66ad+f9572c97",
-  "fusion-360": "v0.16.0+2f4e7ef6",
+  "fusion-360": "v0.16.1+2f4e7ef6",
   "fusion-360@head": "head-dded272+2f4e7ef6",
-  "substance-painter@head": "head-f05b0f3+82668efa",
+  "substance-painter@head": "head-71e49fd+82668efa",
   "substance-designer@head": "head-e2b1bc2+15c122d4",
   "pro-tools": "v0.8.0+7e088015",
   "pro-tools@head": "head-c1bf044+7e088015",
@@ -36,6 +36,6 @@
   "fl-studio-mobile": "v0.1.9+394aa42a",
   "fl-studio-mobile@head": "head-85797c7+394aa42a",
   "figma": "v0.7.0+bfef1be6",
-  "figma@head": "head-7fcb193+bfef1be6",
+  "figma@head": "head-a0d1162+bfef1be6",
   "artcraft-store": "dff1898"
 }
