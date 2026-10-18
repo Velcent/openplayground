@@ -325,8 +325,8 @@ groups:
         name: Honeydew
         alternative: FL Studio Mobile
         blurb: Compose, sequence and mix music with built-in instruments.
-        opens: []
-        imports: []
+        opens: [flm, mid, midi]
+        imports: [flp, zip]
         repo: daijro/honeydew
         icon: icons/honeydew.svg
         patches: patches/fl-studio-mobile.yaml
