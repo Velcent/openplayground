@@ -34,6 +34,8 @@ export default {
   path: '/lemon-studio/',
   viewport: { width: 1920, height: 1080 },
   ready: async (page) => {
+    // The Early preview notice (tools.yaml notice) covers the app until it is dismissed.
+    await page.getByRole('button', { name: 'Continue' }).click({ timeout: 10000 }).catch(() => {})
     await quiet(page)
     await page.focus('#lemon-canvas')
   },
