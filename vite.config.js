@@ -81,7 +81,7 @@ const appsJson = () => ({
         if (!release && !head) return []
         const channel = (s) => s && { path: s.path, label: s.label, date: s.date ?? null }
         return [{
-          slug: t.slug, name: t.name, alternative: t.alternative ?? null, blurb: t.blurb, accent: t.accent, opens: t.opens ?? [], imports: t.imports ?? [],
+          slug: t.slug, name: t.name, alternative: t.alternative ?? null, blurb: t.blurb, accent: t.accent, opens: t.opens ?? [], imports: t.imports ?? [], notice: t.notice ?? null,
           icon: `${(release ?? head).path}site-icon${extname(t.icon)}`,
           alternativeIcon: alternativeIcon(t) ? `${(release ?? head).path}alternative-icon${extname(alternativeIcon(t))}` : null,
           release: channel(release) ?? null, head: channel(head) ?? null,

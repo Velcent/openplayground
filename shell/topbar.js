@@ -2,7 +2,7 @@
 import { appHref, currentApp, loadApps } from './apps.js'
 import { toggleStack } from './stack.js'
 import { mountShare } from './share.js'
-import { h, icon, isolate } from './ui.js'
+import { h, icon, isolate, modal } from './ui.js'
 
 const relative = new Intl.RelativeTimeFormat('en', { numeric: 'auto' })
 const UNITS = [['year', 31536e3], ['month', 2592e3], ['week', 6048e2], ['day', 864e2], ['hour', 3600], ['minute', 60]]
@@ -71,6 +71,7 @@ export async function mountTopbar() {
   const { groups } = await loadApps()
   const app = groups.flatMap((g) => g.apps).find((a) => here && a[here.channel]?.path === here.path)
   if (!app) return
+  if (app.notice) showNotice(app)
   mountShare(bar, app, here, groups).catch(() => {})
   const build = app[here.channel]
   // "Alternative naming": the tab goes by the alternative's name and icon too.
@@ -107,4 +108,21 @@ export async function mountTopbar() {
     ].filter(Boolean),
   )
   bar.append(menu)
+}
+
+// An app's notice (tools.yaml `notice`, e.g. a preview warning), each time it opens until "Don't show this again";
+// a changed notice shows again.
+function showNotice(app) {
+  const key = `pg-notice-${app.slug}`
+  try { if (localStorage.getItem(key) === app.notice.text) return } catch {}
+  modal((done) => {
+    const skip = h('input', { type: 'checkbox' })
+    const ok = h('button', { class: 'pg-btn pg-primary', type: 'button', onclick: () => done(true) }, 'Continue')
+    const el = h('div', { class: 'pg-choice' },
+      h('h2', { class: 'pg-title' }, app.notice.title),
+      h('p', { style: 'margin:0' }, app.notice.text),
+      h('label', { class: 'pg-check' }, skip, "Don't show this again"),
+      h('div', { class: 'pg-actions' }, h('a', { class: 'pg-btn', href: '/' }, 'Back to Playground'), ok))
+    return { el, focus: () => ok.focus(), destroy: () => { try { if (skip.checked) localStorage.setItem(key, app.notice.text) } catch {} } }
+  }, { label: app.notice.title })
 }

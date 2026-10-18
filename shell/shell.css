@@ -121,7 +121,9 @@ body > canvas:first-of-type, body > canvas#lemon-canvas {
   padding: 0; border: 0; border-radius: 0; background: var(--pg-panel); color: var(--pg-text);
   box-shadow: var(--pg-elevation); font: 14px/1.45 var(--pg-font); -webkit-font-smoothing: antialiased; overflow: hidden;
 }
-.pg-modal:has(.pg-choice) { width: min(460px, calc(100vw - 24px)); height: auto; }
+/* Centred and as tall as its content even where an app's own styles reset dialogs' margins or sizes. */
+.pg-modal { margin: auto; inset: 0; }
+.pg-modal:has(.pg-choice) { width: min(460px, calc(100vw - 24px)); height: fit-content; }
 .pg-modal[open] { display: flex; flex-direction: column; }
 .pg-modal > * { flex: 1; min-height: 0; }
 .pg-modal::backdrop { background: rgb(0 0 0 / 0.5); }
@@ -131,7 +133,7 @@ body > canvas:first-of-type, body > canvas#lemon-canvas {
   display: inline-flex; align-items: center; gap: 8px; height: 36px; padding: 0 16px; box-sizing: border-box;
   border: 0; border-radius: 0; background: transparent; color: var(--pg-accent);
   font: 600 12.5px var(--pg-font); letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer; white-space: nowrap;
-  transition: background-color 120ms;
+  text-decoration: none; transition: background-color 120ms;
 }
 .pg-btn .pg-icon { width: 18px; height: 18px; }
 .pg-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--pg-accent) 10%, transparent); }
