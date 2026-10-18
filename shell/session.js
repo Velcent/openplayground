@@ -73,7 +73,8 @@ export class PeerSession extends EventTarget {
   async remember() { await this.store.connection({ ...this.config, role: this.role, name: this.name, accepted: this.accepted }) }
   invite(role = 'editor') {
     if (!this.config.owner || !['editor', 'viewer'].includes(role)) throw new Error('Only the owner can create invitations')
-    return inviteURL(new URL(this.config.app, location.origin), { room: this.room, app: this.config.app, secret: this.config.secret, token: this.config[role] })
+    // The link opens the app the inviter is in now; the room keeps the app it was started in as its identity.
+    return inviteURL(new URL(this.page ?? this.config.app, location.origin), { room: this.room, app: this.config.app, secret: this.config.secret, token: this.config[role] })
   }
   async admin(action) {
     if (!this.config.owner) throw new Error('Only the owner can manage this session')

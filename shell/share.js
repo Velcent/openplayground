@@ -22,7 +22,9 @@ export async function mountShare(bar, app, here, groups = []) {
   try { PeerSession.preferRelay = localStorage.getItem('pg-relay-only') === '1' } catch {}
   const appName = path => groups.flatMap(g=>g.apps).find(a=>a.release?.path===path||a.head?.path===path)?.name ?? path
   let invite, issue
-  try { invite = readInvite(location.href); if (invite && invite.app !== here.path) throw new Error('This invitation belongs to another app or build') }
+  // A session spans apps: its link opens wherever the inviter is, and joins from any app (each app's document
+  // checks its own build).
+  try { invite = readInvite(location.href) }
   catch(e) { issue = e.message; invite = null }
   const config = await fetch('/api/session/config', {cache:'no-store'}).then(r=>r.ok?r.json():{}).catch(()=>({}))
   if (!config.enabled && !invite && !issue && !active.get() && !(await SessionStore.list().catch(()=>[])).length) return
