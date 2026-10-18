@@ -1,0 +1,74 @@
+# NoteCraft in the browser. Upstream ships a desktop window only; these patches add the web build Playground serves.
+#
+# patches/onenote/web.diff adds new files only:
+#   apps/notecraft-web/          the web crate build.mjs finds (Cargo.toml, Trunk.toml, index.html, src/main.rs): the
+#                                desktop window (crates/ui-egui) on the page's canvas; the notebooks folder kept in
+#                                Playground's Files as plain folders (browser:/NoteCraft/…), the sample notebooks on
+#                                the first start, pictures read from the folder, dropped files, "Open in NoteCraft".
+#   crates/model/src/playground.rs  web shims for the library: an in-memory `std::fs` that notes every change, and
+#                                web-time's clock (wasm32-unknown-unknown has neither; SystemTime::now panics there).
+# The modules that use files or the clock take `std` from crates/model/src/playground.rs on wasm through ONE `use`
+# line at their end (a local `std` shadows the standard library's name in that module; everything else in it still
+# comes from the real std). Path::is_file / is_dir ask the real file system, so the three calls the tree needs read
+# the same through `fs::metadata` (what those methods do). Native builds see none of this: every rule adds wasm-only
+# lines, or an expression that does exactly what it replaces.
+# If upstream starts using std::fs or Instant in another module, give that module the same one-line rule.
+
+# Rule 1/15: web-time for the shims (already in Cargo.lock through eframe).
+# Verify: build.mjs check. If upstream adds it itself, drop it here.
+- file: crates/model/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nweb-time = \"1\"\n"
+
+# Rule 2/15: the shims, as notecraft_model::playground on wasm.
+- file: crates/model/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build (patches/onenote.yaml): files and the clock in the browser.\n#[cfg(target_arch = \"wasm32\")] #[doc(hidden)] pub mod playground;\n"
+
+# Rules 3-11/15: the clock (ids, timestamps, the autosave timer) and the files (the tree, pages, attachments,
+# settings, the session's folder) of the library's modules (see the top).
+- file: crates/model/src/id.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: crates/model/src/time.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: crates/store/src/tree.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: files (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use notecraft_model::playground::std;\n"
+- file: crates/store/src/page.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: files and the clock (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use notecraft_model::playground::std;\n"
+- file: crates/store/src/ops.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: files (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use notecraft_model::playground::std;\n"
+- file: crates/store/src/assets.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: files (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use notecraft_model::playground::std;\n"
+- file: crates/store/src/settings.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: files (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use notecraft_model::playground::std;\n"
+- file: crates/engine/src/session.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: files (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use notecraft_model::playground::std;\n"
+- file: crates/ui-egui/src/app.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: files and the clock (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use notecraft_model::playground::std;\n"
+
+# Rules 12-15/15: the page file, the child folders, the attachments and the page open last, as `fs::metadata` reads them (Path::is_file
+# and is_dir are exactly that, through the real file system).
+# Verify: the tree shows the notebooks and a page with a picture lists it. If upstream changes: anchor on the
+# function that finds a page's file / lists child folders.
+- file: crates/store/src/tree.rs
+  find: '\|\(_,\s*p\)\|\s*p\.is_file\(\)'
+  replace: '|(_, p)| fs::metadata(p).is_ok_and(|m| m.is_file())'
+- file: crates/store/src/tree.rs
+  find: '\.filter\(\|p\|\s*p\.is_dir\(\)\)'
+  replace: '.filter(|p| fs::metadata(p).is_ok_and(|m| m.is_dir()))'
+- file: crates/store/src/assets.rs
+  find: '\.filter\(\|e\|\s*e\.path\(\)\.is_file\(\)\)'
+  replace: '.filter(|e| fs::metadata(e.path()).is_ok_and(|m| m.is_file()))'
+# The page the window closed on opens again (its check asks the file system).
+- file: crates/ui-egui/src/app.rs
+  find: 'if\s+!path\.is_dir\(\)'
+  replace: 'if !std::fs::metadata(&path).is_ok_and(|m| m.is_dir())'

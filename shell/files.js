@@ -8,6 +8,9 @@
 //                                    Keep → explorer Save; Download → the shell downloads `bytes` itself
 //   write(path, bytes)            queued store write; a failure shows "Download instead"
 //   read(path)                    → Promise<Uint8Array>
+//   files(folder)                 → Promise<[path]>: every file at or below a folder (none if it doesn't exist),
+//                                 for apps that keep a folder of their own in step (NoteCraft's notebooks)
+//   remove(path)                  removes a file or folder (after the writes queued for it); missing is fine
 //   download(name, bytes)
 //   setUnsaved(unsaved)           the app's own unsaved state, for the leave warning
 //   onOpen(callback)              files for this app: ?open=browser:/… at startup, and "Open in <app>" in
@@ -123,6 +126,22 @@ function read(appPath) {
   return path ? store.read(path) : Promise.reject(new Error(`${appPath} isn't a browser storage path`))
 }
 
+async function files(appFolder) {
+  const path = fromAppPath(appFolder)
+  if (!path || (await store.stat(path))?.kind !== 'folder') return []
+  const out = []
+  const walk = async (dir) => { for (const e of await store.list(dir)) e.kind === 'folder' ? await walk(e.path) : out.push(toAppPath(e.path)) }
+  await walk(path)
+  return out
+}
+
+function remove(appPath) {
+  const path = fromAppPath(appPath)
+  if (!path) throw new Error(`${appPath} isn't a browser storage path`)
+  mark()
+  return store.remove(path).catch(() => {})
+}
+
 // ?open=browser:/… (from the Files page or another app): hand it to this app once it can take it.
 const startupPath = fromAppPath(new URLSearchParams(location.search).get('open'))
 let startupDone = !startupPath
@@ -180,4 +199,4 @@ export async function openFilesPopup() {
   )
 }
 
-globalThis.playgroundFiles = Object.freeze({ open, saveAs, write, read, download, onOpen, setUnsaved })
+globalThis.playgroundFiles = Object.freeze({ open, saveAs, write, read, files, remove, download, onOpen, setUnsaved })
