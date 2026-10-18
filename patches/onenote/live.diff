@@ -1,0 +1,1271 @@
+diff --git a/apps/notecraft-web/src/live.rs b/apps/notecraft-web/src/live.rs
+new file mode 100644
+index 0000000..830a115
+--- /dev/null
++++ b/apps/notecraft-web/src/live.rs
+@@ -0,0 +1,59 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++//! Live editing in a Playground session, the web entry's side (patches/onenote.yaml): the kept web runner, and the
++//! app eframe runs (the window, then the session's frame hook, crates/ui-egui/src/app/live.rs), offered to the
++//! Playground shell as its adapter. While a session is connected, Ctrl+Z and Ctrl+Y (or Ctrl+Shift+Z) go to the
++//! session, which takes back only this person's edits; the text boxes' own undo would also take back what others
++//! typed into the same block.
++
++use crate::web::{Web, repaint};
++use eframe::egui;
++use notecraft_ui_egui::NoteCraftApp;
++use notecraft_ui_egui::app::live;
++use std::cell::OnceCell;
++
++thread_local! {
++    static RUNNER: OnceCell<eframe::WebRunner> = const { OnceCell::new() };
++}
++
++/// The page's web runner, kept for the adapter.
++pub fn runner() -> eframe::WebRunner {
++    RUNNER.with(|kept| kept.get_or_init(eframe::WebRunner::new).clone())
++}
++
++/// The app eframe runs: the page's window, then the session's frame.
++pub fn wrap(web: Web) -> Box<dyn eframe::App> {
++    let with_app = |f: &mut dyn FnMut(&mut NoteCraftApp)| runner().app_mut::<Shell>().map(|mut s| f(&mut s.0.app)).is_some();
++    if let Err(e) = live::attach(with_app, repaint) {
++        web_sys::console::warn_1(&format!("notecraft: no live editing: {e:?}").into());
++    }
++    Box::new(Shell(web))
++}
++
++struct Shell(Web);
++
++impl eframe::App for Shell {
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
++        if live::connected() {
++            raw_input.events.retain(|e| match e {
++                egui::Event::Key { key: key @ (egui::Key::Z | egui::Key::Y), pressed, modifiers, .. } if modifiers.command && !modifiers.alt => {
++                    if *pressed {
++                        live::undo(*key == egui::Key::Y || modifiers.shift);
++                    }
++                    false
++                }
++                _ => true,
++            });
++        }
++        self.0.raw_input_hook(ctx, raw_input);
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        self.0.ui(ui, frame);
++        live::frame(&mut self.0.app, ui.ctx());
++    }
++
++    /// The shell itself: the adapter reaches the window through it.
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
++    }
++}
+diff --git a/crates/ui-egui/src/app/live.rs b/crates/ui-egui/src/app/live.rs
+new file mode 100644
+index 0000000..629fda6
+--- /dev/null
++++ b/crates/ui-egui/src/app/live.rs
+@@ -0,0 +1,540 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++//! Live editing in a Playground session (the shell's `shell/live.js` drives it through `playground_live::web`);
++//! nothing here runs until the shell connects, and native builds never call it.
++//!
++//! The shared document is the notebooks folder as its files, nested like its folders: every notebook, section group
++//! and section (`_node.toml`) and every page (`index.html` / `index.md`) as text (`files`), and each picture or attached
++//! file of a page as a content id (`media`; its bytes travel as session media). The page being written
++//! counts as it is on screen, not as last saved, so every keystroke reaches the others. Each page's `updated` time
++//! stays out: it is each browser's own (when it last saw a change). Personal things stay out too: the settings
++//! (`.notecraft/`), which branches are open, the page shown, the caret, the source pane, the theme.
++//!
++//! The merge goes file by file: a file one side changed takes that change; a file both changed merges as text
++//! (`text.rs`: by line, then by character; never a conflict, never a lost character). A file one side removed while
++//! the other changed it, or both added with different content, conflicts. A remote change installs at the end of a
++//! quiet frame (no button held): the files are written, the tree is read again, and the open page takes the merged
++//! text with the caret moved to where its text went.
++//!
++//! While connected, Ctrl+Z and Ctrl+Y (the text boxes' own undo, which would also take back what others typed into
++//! the same block) go to the session, which takes back only this person's edits (the web entry routes the keys).
++// The page and tree hooks are web only; native tests use the rest.
++#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
++
++#[path = "live/peers.rs"]
++mod peers;
++// The template (patches/live/playground_live.rs, copied next to this file): its glue and canonical form.
++#[path = "playground_live.rs"]
++#[allow(dead_code)]
++mod playground_live;
++#[path = "live/text.rs"]
++mod text;
++
++use super::{Editor, NoteCraftApp};
++use crate::pageedit::{self, Caret};
++use crate::preview;
++use notecraft_formats::markdown::Block;
++use notecraft_formats::{frontmatter, html};
++use notecraft_model::{PageFormat, kv, time::iso_now};
++use playground_live::{Error, Live, Presence};
++use serde_json::{Map, Value, json};
++use std::cell::RefCell;
++use std::collections::BTreeMap;
++use std::path::Path;
++#[cfg(not(target_arch = "wasm32"))]
++use std::path::PathBuf;
++
++#[cfg(target_arch = "wasm32")]
++use notecraft_model::playground::std::fs;
++#[cfg(not(target_arch = "wasm32"))]
++use std::fs;
++
++pub use playground_live::{connected, undo};
++
++thread_local! {
++    /// Pictures and files the shared document names that have not arrived here yet: path -> content id.
++    static WANTED: RefCell<BTreeMap<String, String>> = const { RefCell::new(BTreeMap::new()) };
++    /// The egui context, for the input state (`live_quiet`, presence) and repaints after a remote change.
++    static CTX: std::cell::OnceCell<egui::Context> = const { std::cell::OnceCell::new() };
++}
++
++fn with_ctx<R>(f: impl FnOnce(&egui::Context) -> R) -> Option<R> {
++    CTX.with(|c| c.get().map(f))
++}
++
++// ---------------------------------------------------------------- the files
++
++/// What a file of the notebooks folder is to the shared document: a node's or a page's text, or a page's media.
++#[derive(PartialEq)]
++enum Kind {
++    Text,
++    Media,
++}
++
++fn kind(rel: &str) -> Option<Kind> {
++    let mut parts = rel.rsplit('/');
++    let (name, parent) = (parts.next()?, parts.next());
++    if parent == Some("assets") {
++        return Some(Kind::Media);
++    }
++    matches!(name, "_node.toml" | "index.html" | "index.md").then_some(Kind::Text)
++}
++
++/// A path the shared document may name: inside the notebooks folder, no dot folders, a file that belongs there.
++fn valid(rel: &str) -> bool {
++    rel.len() < 1024 && rel.split('/').all(|p| !p.is_empty() && !p.starts_with('.') && !p.contains(['\\', ':', '\0'])) && kind(rel).is_some()
++}
++
++/// A content id as `fs::content_id` gives it.
++fn valid_id(id: &str) -> bool {
++    id.split_once('-').is_some_and(|(h, n)| {
++        h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()) && !n.is_empty() && n.len() < 13 && n.bytes().all(|b| b.is_ascii_digit())
++    })
++}
++
++fn rel_of(root: &Path, path: &Path) -> Option<String> {
++    let rel = path.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/");
++    valid(&rel).then_some(rel)
++}
++
++/// Every file at or below `dir` with its bytes and content id.
++#[cfg(target_arch = "wasm32")]
++fn walk(dir: &Path, f: &mut dyn FnMut(&Path, &[u8], &str)) {
++    fs::walk(dir, f);
++}
++
++#[cfg(not(target_arch = "wasm32"))]
++fn walk(dir: &Path, f: &mut dyn FnMut(&Path, &[u8], &str)) {
++    let mut paths: Vec<PathBuf> = fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
++    paths.sort();
++    for p in paths {
++        if p.is_dir() {
++            walk(&p, f);
++        } else if let Ok(bytes) = fs::read(&p) {
++            f(&p, &bytes, &content_id(&bytes));
++        }
++    }
++}
++
++#[cfg(target_arch = "wasm32")]
++use fs::content_id;
++
++#[cfg(not(target_arch = "wasm32"))]
++fn content_id(bytes: &[u8]) -> String {
++    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
++    format!("{hash:016x}-{}", bytes.len())
++}
++
++/// The page's `updated` time set to `value` where the page has one (blank: as shared).
++fn stamp(rel: &str, text: &str, value: &str) -> String {
++    if rel.ends_with("index.html") && text.contains("name=\"notecraft:updated\" content=\"") {
++        html::set_meta(text, "notecraft:updated", value)
++    } else if rel.ends_with("index.md") {
++        let (front, body) = frontmatter::split_front(text);
++        if front.is_empty() {
++            return text.to_owned();
++        }
++        let line = if value.is_empty() { "updated:".to_owned() } else { format!("updated: {value}") };
++        format!("{}{body}", kv::replace_line(&front, "updated:", &line))
++    } else {
++        text.to_owned()
++    }
++}
++
++/// A page file with `body` in it, as `page.save` writes it (but for the time).
++fn with_body(text: &str, format: PageFormat, body: &str) -> String {
++    match format {
++        PageFormat::Html => html::replace_inner(text, body),
++        PageFormat::Cmgfm => format!("{}\n{}", frontmatter::split_front(text).0, body.trim_start_matches('\n')),
++    }
++}
++
++/// The editable part of a page file, as `page.load` reads it.
++fn body_of(text: &str, format: PageFormat) -> String {
++    match format {
++        PageFormat::Html => html::inner(text),
++        PageFormat::Cmgfm => frontmatter::split_front(text).1.trim_start_matches('\n').to_owned(),
++    }
++}
++
++/// Files by their path in the notebooks folder.
++type Flat = BTreeMap<String, Value>;
++
++/// Files as the shared document holds them: nested like their folders (`{"my-notebook": {"_node.toml": …}}`).
++fn nest(flat: Flat) -> Value {
++    let mut root = Map::new();
++    for (rel, v) in flat {
++        let (dirs, name) = rel.rsplit_once('/').map_or((None, rel.as_str()), |(d, n)| (Some(d), n));
++        let mut at = Some(&mut root);
++        for d in dirs.into_iter().flat_map(|d| d.split('/')) {
++            at = at.and_then(|m| m.entry(d).or_insert_with(|| Map::new().into()).as_object_mut());
++        }
++        if let Some(m) = at {
++            m.insert(name.to_owned(), v);
++        }
++    }
++    root.into()
++}
++
++/// The files of a nested part of the shared document, by path; a folder without files is refused.
++fn flat(tree: &Value, prefix: &str, out: &mut Flat) -> Result<(), Error> {
++    for (k, v) in tree.as_object().ok_or_else(|| format!("Invalid shared notebooks at {prefix}"))? {
++        let path = if prefix.is_empty() { k.clone() } else { format!("{prefix}/{k}") };
++        match v {
++            Value::Object(m) if !m.is_empty() => flat(v, &path, out)?,
++            Value::String(_) => {
++                out.insert(path, v.clone());
++            }
++            _ => return Err(format!("Invalid shared notebooks at {path}")),
++        }
++    }
++    Ok(())
++}
++
++/// The shared document's files and media, by path.
++fn parts(doc: &Value) -> Result<(Flat, Flat), Error> {
++    let (mut files, mut media) = (Flat::new(), Flat::new());
++    flat(&doc["files"], "", &mut files)?;
++    flat(&doc["media"], "", &mut media)?;
++    Ok((files, media))
++}
++
++fn document(app: &NoteCraftApp) -> Value {
++    let root = app.session.root();
++    let (mut files, mut media) = (Flat::new(), Flat::new());
++    walk(root, &mut |path, bytes, id| {
++        let Some(rel) = rel_of(root, path) else { return };
++        if kind(&rel) == Some(Kind::Text) {
++            let text = stamp(&rel, &String::from_utf8_lossy(bytes), "");
++            files.insert(rel, text.into());
++        } else {
++            media.insert(rel, id.into());
++        }
++    });
++    // The page being written, as it is on screen: the window saves it a moment later.
++    if let Some(ed) = app.editor.as_ref().filter(|e| e.dirty_since.is_some()) {
++        let file = ed.dir.join(ed.format.file_name());
++        if let (Some(rel), Ok(text)) = (rel_of(root, &file), fs::read_to_string(&file)) {
++            let text = stamp(&rel, &with_body(&text, ed.format, &ed.body), "");
++            files.insert(rel, text.into());
++        }
++    }
++    WANTED.with_borrow(|w| {
++        for (rel, id) in w {
++            media.entry(rel.clone()).or_insert_with(|| id.clone().into());
++        }
++    });
++    json!({ "files": nest(files), "media": nest(media) })
++}
++
++/// Whether every peer can install `doc`: files and media under paths that stay in the notebooks folder.
++fn check(doc: &Value) -> Result<(), Error> {
++    let (files, media) = parts(doc)?;
++    if doc.as_object().map_or(0, Map::len) != 2 {
++        return Err("Invalid shared notebooks: unknown parts".into());
++    }
++    for (rel, text) in &files {
++        if !valid(rel) || kind(rel) != Some(Kind::Text) || text.as_str().is_none_or(|t| t.len() > notecraft_store::page::MAX_PAGE_BYTES) {
++            return Err(format!("Invalid shared notebooks: {rel}"));
++        }
++    }
++    for (rel, id) in &media {
++        if !valid(rel) || kind(rel) != Some(Kind::Media) || !id.as_str().is_some_and(valid_id) || files.contains_key(rel) {
++            return Err(format!("Invalid shared notebooks: {rel}"));
++        }
++    }
++    Ok(())
++}
++
++/// The bytes of a file here with content `id`.
++fn find(root: &Path, id: &str) -> Option<Vec<u8>> {
++    let mut found = None;
++    walk(root, &mut |_, bytes, have| {
++        if found.is_none() && have == id {
++            found = Some(bytes.to_vec());
++        }
++    });
++    found
++}
++
++/// Removes `dir` and the folders above it (below `root`) while they are empty.
++fn prune(root: &Path, dir: Option<&Path>) {
++    let mut dir = dir;
++    while let Some(d) = dir.filter(|d| d.starts_with(root) && *d != root) {
++        if fs::read_dir(d).map(|mut r| r.next().is_some()).unwrap_or(true) || fs::remove_dir(d).is_err() {
++            return;
++        }
++        dir = d.parent();
++    }
++}
++
++fn adopt(app: &mut NoteCraftApp, doc: Value) -> Result<(), Error> {
++    check(&doc)?;
++    let current = document(app);
++    if current == doc {
++        return Ok(());
++    }
++    let root = app.session.root().to_path_buf();
++    let ((cf, cm), (df, dm)) = (parts(&current)?, parts(&doc)?);
++    let gone = cf.keys().filter(|k| !df.contains_key(*k)).chain(cm.keys().filter(|k| !dm.contains_key(*k)));
++    for rel in gone {
++        let path = root.join(rel);
++        let _ = fs::remove_file(&path);
++        WANTED.with_borrow_mut(|w| w.remove(rel));
++        prune(&root, path.parent());
++    }
++    let write = |rel: &str, bytes: &[u8]| {
++        let path = root.join(rel);
++        if let Some(dir) = path.parent() {
++            let _ = fs::create_dir_all(dir);
++        }
++        fs::write(path, bytes).map_err(|e| format!("Could not write {rel}: {e}"))
++    };
++    for (rel, text) in df.iter().filter(|(k, v)| cf.get(*k) != Some(*v)) {
++        write(rel, stamp(rel, text.as_str().unwrap_or_default(), &iso_now()).as_bytes())?;
++    }
++    for (rel, id) in dm.iter().filter(|(k, v)| cm.get(*k) != Some(*v)) {
++        let id = id.as_str().unwrap_or_default();
++        match find(&root, id) {
++            Some(bytes) => write(rel, &bytes)?,
++            None => {
++                let _ = fs::remove_file(root.join(rel));
++                WANTED.with_borrow_mut(|w| w.insert(rel.clone(), id.to_owned()));
++            }
++        }
++    }
++    app.session.refresh();
++    // The open page as merged (its file may still be the last save: what is on screen counts).
++    let page = app.editor.as_ref().and_then(|ed| rel_of(&root, &ed.dir.join(ed.format.file_name())));
++    follow_page(app, page.and_then(|rel| df.get(&rel)).and_then(Value::as_str));
++    with_ctx(egui::Context::request_repaint);
++    Ok(())
++}
++
++/// The open page after a remote change: its text as merged, the caret where its text went, its title and files.
++fn follow_page(app: &mut NoteCraftApp, text: Option<&str>) {
++    let Some(ed) = app.editor.as_mut() else { return };
++    let Some(text) = text else {
++        // Someone removed the page.
++        app.editor = None;
++        app.status = "Someone in the session removed this page".into();
++        return;
++    };
++    let body = body_of(text, ed.format);
++    if body.trim_matches('\n') != ed.body.trim_matches('\n') {
++        let blocks = preview::blocks_for(ed.format, &body);
++        ed.caret = ed.caret.take().and_then(|c| caret(&ed.blocks, &blocks, c));
++        // The text box takes its new cursor before the next key, not after it (that key would land where the text was).
++        if let Some(c) = ed.caret.as_mut().filter(|c| c.focus)
++            && with_ctx(|ctx| peers::place_caret(ctx, c.block, c.selection)) == Some(true)
++        {
++            (c.focus, c.place) = (false, None);
++        }
++        ed.writable = pageedit::round_trips(ed.format, &body);
++        (ed.blocks, ed.body) = (blocks, body);
++    }
++    if let Some(info) = notecraft_store::tree::read_node(&ed.dir) {
++        if ed.title_buf == ed.title {
++            ed.title_buf = info.title.clone();
++        }
++        ed.title = info.title;
++    }
++    ed.attachments = notecraft_store::assets::list(&ed.dir);
++}
++
++/// Where the caret in `old` goes in `new`: the same block where it is unchanged (only its index may move), else the
++/// changed block between the same unchanged neighbours that keeps most of its text, at the same place in its text.
++fn caret(old: &[Block], new: &[Block], c: Caret) -> Option<Caret> {
++    let m = text::matches(old, new, |a, b| a == b);
++    let to = |block: usize, text: String, at: usize| Caret { block, text, focus: true, selection: (at, at), place: Some(at) };
++    if let Some(j) = m.get(c.block).copied().flatten() {
++        // The text box is keyed by the block's place: one that moved takes the keyboard again where it was.
++        return Some(if j == c.block { c } else { Caret { block: j, focus: true, place: Some(c.selection.0), ..c } });
++    }
++    let lo = m.get(..c.block.min(m.len())).and_then(|before| before.iter().rev().find_map(|j| *j)).map_or(0, |j| j + 1);
++    let hi = m.get(c.block..).and_then(|after| after.iter().find_map(|j| *j)).unwrap_or(new.len());
++    let mine = old.get(c.block).map(pageedit::block_text).unwrap_or_default();
++    let kept = |b: &Block| {
++        let (a, t): (Vec<char>, Vec<char>) = (mine.chars().collect(), pageedit::block_text(b).chars().collect());
++        text::matches(&a, &t, |x, y| x == y).iter().flatten().count()
++    };
++    let j = (lo..hi.min(new.len()))
++        .filter(|j| new.get(*j).is_some_and(pageedit::is_writable))
++        .max_by_key(|j| (new.get(*j).map(kept), std::cmp::Reverse(*j)))?;
++    let text = new.get(j).map(pageedit::block_text)?;
++    let at = text::map_pos(&mine, &text, c.selection.0);
++    Some(to(j, text, at))
++}
++
++// ---------------------------------------------------------------- the app's side
++
++/// Merges two people's notebooks file by file (see the top); a folder left without files goes.
++fn merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
++    fn tree(b: Option<&Value>, c: Option<&Value>, e: Option<&Value>, text: bool, at: &str) -> Result<Option<Value>, Error> {
++        if e == b {
++            return Ok(c.cloned());
++        }
++        if c == b {
++            return Ok(e.cloned());
++        }
++        match (b, c, e) {
++            (Some(Value::String(bt)), Some(Value::String(ct)), Some(Value::String(et))) if text => Ok(Some(text::merge(bt, ct, et).into())),
++            (b, Some(Value::Object(co)), Some(Value::Object(eo))) if b.is_none_or(Value::is_object) => {
++                let none = Map::new();
++                let bo = b.and_then(Value::as_object).unwrap_or(&none);
++                let mut out = Map::new();
++                for k in bo.keys().chain(co.keys()).chain(eo.keys()) {
++                    if !out.contains_key(k)
++                        && let Some(v) = tree(bo.get(k), co.get(k), eo.get(k), text, &format!("{at}/{k}"))?
++                    {
++                        out.insert(k.clone(), v);
++                    }
++                }
++                Ok((!out.is_empty()).then(|| out.into()))
++            }
++            _ => Err(format!("Conflict at {at}")),
++        }
++    }
++    let mut out = Map::new();
++    for part in ["files", "media"] {
++        let merged = tree(base.get(part), current.get(part), edited.get(part), part == "files", part)?;
++        out.insert(part.to_owned(), merged.unwrap_or_else(|| Map::new().into()));
++    }
++    Ok(out.into())
++}
++
++impl Live for NoteCraftApp {
++    fn live_document(&self) -> Value {
++        document(self)
++    }
++
++    fn live_adopt(&mut self, document: Value) -> Result<(), Error> {
++        adopt(self, document)
++    }
++
++    /// No button held: a click, a text selection being dragged or a scroll bar being moved.
++    fn live_quiet(&self) -> bool {
++        !with_ctx(|ctx| ctx.input(|i| i.pointer.any_down())).unwrap_or(false)
++    }
++
++    /// The in-memory folder's change count and the page being written: a frame with neither changed reads nothing.
++    #[cfg(target_arch = "wasm32")]
++    fn live_generation(&self) -> Option<u64> {
++        use std::hash::{Hash, Hasher};
++        let mut h = std::collections::hash_map::DefaultHasher::new();
++        fs::generation().hash(&mut h);
++        self.editor.as_ref().map(|e| (&e.dir, &e.body, e.dirty_since.is_some())).hash(&mut h);
++        WANTED.with_borrow(|w| w.len()).hash(&mut h);
++        Some(h.finish())
++    }
++
++    fn live_disconnected(&mut self) {
++        WANTED.with_borrow_mut(BTreeMap::clear);
++    }
++
++    fn live_assets(&self) -> Vec<(String, String, bool)> {
++        let media = parts(&document(self)).map(|(_, media)| media).unwrap_or_default();
++        let wanted: Vec<String> = WANTED.with_borrow(|w| w.values().cloned().collect());
++        let mut out: Vec<(String, String, bool)> = Vec::new();
++        for (rel, id) in media {
++            let Some(id) = id.as_str() else { continue };
++            if out.iter().all(|(have, ..)| have != id) {
++                let name = rel.rsplit('/').next().unwrap_or("file").to_owned();
++                out.push((id.to_owned(), name, !wanted.iter().any(|w| w == id)));
++            }
++        }
++        out
++    }
++
++    fn live_assets_of(document: &Value) -> Vec<String> {
++        parts(document).map(|(_, media)| media.into_values().filter_map(|id| id.as_str().map(str::to_owned)).collect()).unwrap_or_default()
++    }
++
++    fn live_read_asset(&self, id: &str) -> Option<Vec<u8>> {
++        find(self.session.root(), id)
++    }
++
++    /// Someone's picture or file: every page that names it gets it (when the bytes are what the id says).
++    fn live_write_asset(&mut self, id: &str, _name: &str, bytes: Vec<u8>) {
++        if content_id(&bytes) != id {
++            return;
++        }
++        let root = self.session.root().to_path_buf();
++        let paths: Vec<String> = WANTED.with_borrow(|w| w.iter().filter(|(_, v)| *v == id).map(|(k, _)| k.clone()).collect());
++        for rel in paths {
++            let path = root.join(&rel);
++            let _ = path.parent().map(fs::create_dir_all);
++            if fs::write(&path, &bytes).is_ok() {
++                WANTED.with_borrow_mut(|w| w.remove(&rel));
++            }
++        }
++        if let Some(ed) = self.editor.as_mut() {
++            ed.attachments = notecraft_store::assets::list(&ed.dir);
++        }
++        // Pictures that failed to load before load again.
++        with_ctx(egui::Context::forget_all_images);
++    }
++
++    fn live_presence(&self) -> Value {
++        peers::mine(self)
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        peers::show(others);
++    }
++
++    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, Error> {
++        merge(base, current, edited)
++    }
++
++    fn live_check(document: &Value) -> Result<(), Error> {
++        check(document)
++    }
++}
++
++// ---------------------------------------------------------------- hooks
++
++/// The end of each frame, after the window's own: the others' marks in the tree, the page the others are on for
++/// someone who just joined, the session's frame (remote changes in, this person's out, once quiet), then this
++/// person's pointer for their presence.
++pub fn frame(app: &mut NoteCraftApp, ctx: &egui::Context) {
++    CTX.with(|c| {
++        c.get_or_init(|| ctx.clone());
++    });
++    peers::rows(app, ctx);
++    peers::join(app);
++    playground_live::frame(app);
++    peers::note(app, ctx);
++}
++
++/// Before the page's blocks are drawn (app.rs, around `pageedit::show`): where the page is.
++pub(crate) fn page_start(ui: &egui::Ui) {
++    peers::page_start(ui);
++}
++
++/// After the page's blocks: the others' carets and pointers on this page.
++pub(super) fn page_end(ui: &egui::Ui, ed: &Editor, tokens: &crate::theme::Tokens) {
++    peers::page_end(ui, ed, tokens);
++}
++
++/// The top of block `i` as the page draws it (pageedit.rs).
++pub(crate) fn block_top(i: usize, at: egui::Pos2) {
++    peers::block_top(i, at);
++}
++
++/// A row of the notebook tree as drawn (app.rs `draw_node`).
++pub(crate) fn row(path: &Path, rect: egui::Rect, clip: egui::Rect) {
++    peers::row(path, rect, clip);
++}
++
++/// Offers the adapter to the Playground shell (the web entry calls it once the window runs).
++#[cfg(target_arch = "wasm32")]
++pub fn attach(
++    with_app: impl Fn(&mut dyn FnMut(&mut NoteCraftApp)) -> bool + 'static,
++    repaint: impl Fn() + 'static,
++) -> Result<(), wasm_bindgen::JsValue> {
++    playground_live::web::attach::<NoteCraftApp>(concat!("onenote:1:", env!("CARGO_PKG_VERSION")), with_app, repaint)
++}
++
++#[cfg(test)]
++#[path = "live/tests.rs"]
++mod tests;
+diff --git a/crates/ui-egui/src/app/live/peers.rs b/crates/ui-egui/src/app/live/peers.rs
+new file mode 100644
+index 0000000..c354845
+--- /dev/null
++++ b/crates/ui-egui/src/app/live/peers.rs
+@@ -0,0 +1,374 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++//! Presence in a live session. Each person shares the page they are on (its path in the notebooks folder, or the
++//! notebook or section selected when no page is open), their pointer over the page (from the page's top left, so it
++//! lands on the same words at any scroll), their caret (block and character) and where their selection starts. Here,
++//! for the others: a dot in their colour on the tree row of the page they are on (on the nearest row shown when it is
++//! folded away), and on the same page their selection, their caret with their name and their pointer with its name
++//! tag. Pointers ease toward their latest place; carets jump with the typing. Someone who joins with no page open
++//! lands on the page the others are on.
++//! Everything in a state comes from another person: what doesn't read as a path or numbers in range is skipped.
++// The painting is web only (its hooks are); native tests use the projection.
++#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
++
++use super::super::{Editor, NoteCraftApp};
++use super::{Presence, connected, valid};
++use crate::pageedit;
++use crate::theme::Tokens;
++use egui::{Color32, FontId, LayerId, Pos2, Rect, Shape, Stroke, Vec2, vec2};
++use notecraft_formats::markdown::Block;
++use serde_json::{Value, json};
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::path::{Path, PathBuf};
++
++/// How long the others' pointers take to go most (1 - 1/e) of the way to where they last were, in seconds.
++const EASE: f32 = 0.08;
++
++/// Where the page is drawn this frame.
++#[derive(Default)]
++struct Page {
++    /// The top left of the page's text (it moves with the scroll), and the clip of the page's scroll area.
++    origin: Option<Pos2>,
++    width: f32,
++    clip: Option<Rect>,
++    /// The top left of each block, by index.
++    tops: Vec<Pos2>,
++}
++
++thread_local! {
++    static PAGE: RefCell<Page> = RefCell::default();
++    /// This person's pointer over the page (from its top left), as of the last frame.
++    static POINTER: RefCell<Option<[f32; 2]>> = const { RefCell::new(None) };
++    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
++    /// The others' pointers as last drawn.
++    static SHOWN: RefCell<HashMap<String, [f32; 2]>> = RefCell::default();
++    /// The tree rows drawn this frame: path, row, clip.
++    static ROWS: RefCell<Vec<(PathBuf, Rect, Rect)>> = const { RefCell::new(Vec::new()) };
++    /// Someone who joined has been taken to the others' page.
++    static JOINED: RefCell<bool> = const { RefCell::new(false) };
++    /// The notebooks folder.
++    static ROOT: RefCell<PathBuf> = RefCell::default();
++    /// The page's widget id, which its text boxes' ids derive from.
++    static PAGE_ID: RefCell<Option<egui::Id>> = const { RefCell::new(None) };
++}
++
++/// The page or node this person is on, as a path in the notebooks folder.
++fn place(app: &NoteCraftApp) -> Option<String> {
++    let root = app.session.root();
++    let dir = app.editor.as_ref().map(|e| &e.dir).or(app.selected.as_ref())?;
++    let rel = dir.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/");
++    (!rel.is_empty()).then_some(rel)
++}
++
++/// To a tenth of a point (presence stays small).
++fn r(v: f32) -> f64 {
++    (f64::from(v) * 10.0).round() / 10.0
++}
++
++pub(super) fn mine(app: &NoteCraftApp) -> Value {
++    if app.backstage.is_some() {
++        return Value::Null;
++    }
++    let Some(page) = place(app) else { return Value::Null };
++    let mut s = json!({ "page": page });
++    if let Some(p) = POINTER.with_borrow(|p| *p).filter(|_| app.editor.is_some()) {
++        s["pointer"] = json!([r(p[0]), r(p[1])]);
++    }
++    if let Some(c) = app.editor.as_ref().and_then(|e| e.caret.as_ref()) {
++        s["caret"] = json!([c.block, c.selection.0]);
++        // A selection (being dragged out or made): where it starts.
++        if c.selection.1 != c.selection.0 {
++            s["selection"] = json!([c.block, c.selection.1]);
++        }
++    }
++    s
++}
++
++pub(super) fn show(others: Vec<Presence>) {
++    if others.is_empty() {
++        JOINED.set(false);
++    }
++    OTHERS.set(others);
++}
++
++/// A path someone gave, when it is one these notebooks could have.
++fn page_of(o: &Presence) -> Option<&str> {
++    o.state["page"].as_str().filter(|p| p.len() < 1024 && p.split('/').all(|s| !s.is_empty() && !s.starts_with('.') && !s.contains(['\\', ':'])))
++}
++
++/// A finite number of a sane size (remote data).
++fn coord(v: &Value) -> Option<f32> {
++    v.as_f64().filter(|c| c.abs() < 1e6).map(|c| c as f32)
++}
++
++/// Someone who just joined, with no page open, goes to the page the others are on (once).
++pub(super) fn join(app: &mut NoteCraftApp) {
++    if !connected() || JOINED.with_borrow(|j| *j) || app.editor.is_some() {
++        return;
++    }
++    let pages: Vec<String> = OTHERS.with_borrow(|o| o.iter().filter_map(page_of).map(str::to_owned).collect());
++    let root = app.session.root().to_path_buf();
++    if let Some(page) = pages.iter().find(|p| valid(&format!("{p}/index.html")) && notecraft_store::tree::page_file(&root.join(p)).is_some()) {
++        JOINED.set(true);
++        app.open_path(page);
++    }
++}
++
++/// The end of a frame: this person's pointer over the page (not over a window or menu on it).
++pub(super) fn note(app: &NoteCraftApp, ctx: &egui::Context) {
++    let pointer = PAGE.with_borrow(|page| {
++        let origin = page.origin.filter(|_| connected() && app.editor.is_some())?;
++        let p = ctx.pointer_hover_pos().filter(|p| page.clip.is_some_and(|c| c.contains(*p)))?;
++        ctx.layer_id_at(p).is_none_or(|l| l.order == egui::Order::Background).then_some([p.x - origin.x, p.y - origin.y])
++    });
++    POINTER.set(pointer);
++    PAGE.with_borrow_mut(|page| page.origin = None);
++    ROWS.with_borrow_mut(Vec::clear);
++}
++
++pub(super) fn page_start(ui: &egui::Ui) {
++    PAGE_ID.set(Some(ui.id()));
++    PAGE.with_borrow_mut(|p| {
++        (p.origin, p.width, p.clip) = (Some(ui.next_widget_position()), ui.available_width(), Some(ui.clip_rect()));
++        p.tops.clear();
++    });
++}
++
++/// Puts this person's text box cursor (`selection`: the cursor, then where it started) in block `block` before the
++/// next frame's keys arrive: a remote change moved the text, or the block (the box is keyed by the block's place,
++/// pageedit's `("page-block", i)`). False when the page was never drawn.
++pub(super) fn place_caret(ctx: &egui::Context, block: usize, selection: (usize, usize)) -> bool {
++    let Some(page) = PAGE_ID.with_borrow(|p| *p) else { return false };
++    let id = page.with(("page-block", block));
++    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
++    let at = |n| egui::text::CCursor::new(n);
++    state.cursor.set_char_range(Some(egui::text::CCursorRange { primary: at(selection.0), secondary: at(selection.1), h_pos: None }));
++    state.store(ctx, id);
++    ctx.memory_mut(|m| m.request_focus(id));
++    true
++}
++
++pub(super) fn block_top(i: usize, at: Pos2) {
++    PAGE.with_borrow_mut(|p| {
++        if p.tops.len() == i && i < 100_000 {
++            p.tops.push(at);
++        }
++    });
++}
++
++pub(super) fn row(path: &Path, rect: Rect, clip: Rect) {
++    if connected() {
++        ROWS.with_borrow_mut(|rows| rows.push((path.to_path_buf(), rect, clip)));
++    }
++}
++
++fn rgb(c: [u8; 3]) -> Color32 {
++    Color32::from_rgb(c[0], c[1], c[2])
++}
++
++/// Relative luminance (sRGB) of `c`.
++fn luminance(c: Color32) -> f32 {
++    let lin = |v: u8| {
++        let v = f32::from(v) / 255.0;
++        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
++    };
++    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
++}
++
++fn cut(text: &str, n: usize) -> String {
++    match text.chars().nth(n) {
++        Some(_) => text.chars().take(n - 1).chain(['…']).collect(),
++        None => text.to_owned(),
++    }
++}
++
++const TAG_PAD: Vec2 = vec2(7.0, 3.0);
++
++/// A name tag filled with `color`, its top left at `at` (on a pixel).
++fn tag(painter: &egui::Painter, at: Pos2, name: &str, color: Color32) {
++    let ink = if luminance(color) > 0.55 { Color32::from_rgb(0x11, 0x11, 0x11) } else { Color32::WHITE };
++    let galley = painter.layout_no_wrap(cut(name, 24), FontId::proportional(12.0), ink);
++    let ppp = painter.pixels_per_point();
++    let at = (at.to_vec2() * ppp).round().to_pos2() / ppp;
++    painter.rect_filled(Rect::from_min_size(at, galley.size() + 2.0 * TAG_PAD), 6.0, color);
++    painter.galley(at + TAG_PAD, galley, color);
++}
++
++/// The pointer arrow, tip at (0, 0), in points.
++const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
++
++/// `points` filled as a fan from the first (the arrow is star-shaped around its tip).
++fn fan(points: &[Pos2], fill: Color32) -> Shape {
++    let mut mesh = egui::Mesh::default();
++    for p in points {
++        mesh.colored_vertex(*p, fill);
++    }
++    for i in 1..points.len() as u32 - 1 {
++        mesh.add_triangle(0, i, i + 1);
++    }
++    Shape::mesh(mesh)
++}
++
++/// A person's pointer: the arrow in their colour with a white outline and a soft shadow, and their name tag.
++fn pointer(painter: &egui::Painter, tip: Pos2, color: Color32, name: &str) {
++    let ppp = painter.pixels_per_point();
++    let tip = (tip.to_vec2() * ppp).round().to_pos2() / ppp;
++    let arrow = |off: Vec2| ARROW.map(|[x, y]| tip + off + vec2(x, y));
++    painter.add(fan(&arrow(vec2(0.0, 1.0)), Color32::from_black_alpha(64)));
++    painter.add(fan(&arrow(Vec2::ZERO), color));
++    painter.add(Shape::closed_line(arrow(Vec2::ZERO).to_vec(), Stroke::new(1.5, Color32::WHITE)));
++    tag(painter, tip + vec2(12.0, 15.0), name, color);
++}
++
++/// The type size of a block and whether it is strong, as the page draws it (pageedit's `size_of`).
++fn size_of(block: &Block) -> (f32, bool) {
++    match block {
++        Block::Heading { level, .. } => ([28.0, 22.0, 18.0].get(usize::from(*level).saturating_sub(1)).copied().unwrap_or(16.0), true),
++        Block::Code { .. } | Block::MathBlock(_) => (13.5, false),
++        _ => (14.5, false),
++    }
++}
++
++/// How far a block's text starts from the page's left edge (a bullet, a number, a box, a quote bar), as drawn.
++fn lead(block: &Block, editing: bool) -> f32 {
++    match block {
++        Block::Item { depth, .. } => 8.0 + *depth as f32 * 18.0 + 22.0,
++        Block::Quote(_) => {
++            if editing {
++                18.0
++            } else {
++                12.0
++            }
++        }
++        Block::Code { .. } | Block::MathBlock(_) => {
++            if editing {
++                0.0
++            } else {
++                8.0
++            }
++        }
++        _ => 0.0,
++    }
++}
++
++/// Where someone's caret (at character `b` of block `i`, with the selection from `a`) shows: the caret's rectangle
++/// and the selection's band on each line. While this person writes in that block it shows with its marks; otherwise
++/// the marks are not drawn, so the text is measured without them (a close guess for marked-up words).
++fn marks(ui: &egui::Ui, page: &Page, ed: &Editor, i: usize, (a, b): (usize, usize), t: &Tokens) -> Option<(Rect, Vec<Rect>)> {
++    let (block, top) = (ed.blocks.get(i)?, *page.tops.get(i)?);
++    let editing = ed.caret.as_ref().is_some_and(|c| c.block == i);
++    let text = ed.caret.as_ref().filter(|_| editing).map_or_else(|| pageedit::block_text(block), |c| c.text.clone());
++    // Character `n` of the block's text, as drawn.
++    let (mut shown, mut skip, mut x) = (text.clone(), 0, 0.0_f32);
++    if !editing {
++        shown = pageedit::without_marks(&text);
++        if let (Some(_), rest) = notecraft_model::Tag::split(&shown) {
++            (skip, shown, x) = (shown.chars().count() - rest.chars().count(), rest.to_owned(), 29.0);
++        }
++    }
++    let at = |n: usize| -> usize {
++        let before: String = text.chars().take(n).collect();
++        let n = if editing { before.chars().count() } else { pageedit::without_marks(&before).chars().count() };
++        n.saturating_sub(skip).min(shown.chars().count())
++    };
++    let (size, strong) = size_of(block);
++    let left = lead(block, editing) + x;
++    let galley = ui.fonts_mut(|f| f.layout_job(crate::pagetext::inline_job(&shown, size, strong, t, (page.width - left).max(1.0))));
++    let y = if !editing && matches!(block, Block::Heading { .. }) { 6.0 } else { 0.0 };
++    let place = |r: Rect| r.translate(top.to_vec2() + vec2(left, y));
++    let cursor = |n: usize| galley.pos_from_cursor(egui::text::CCursor::new(n));
++    let caret = place(cursor(at(b))).with_max_x(place(cursor(at(b))).min.x + 2.0);
++    let (from, to) = (cursor(at(a.min(b))), cursor(at(a.max(b))));
++    let mut bands = Vec::new();
++    if a != b {
++        for row in galley.rows.iter().map(|r| r.rect()).filter(|r| r.max.y > from.min.y + 0.5 && r.min.y < to.max.y - 0.5) {
++            let x0 = if row.min.y <= from.min.y + 0.5 { from.min.x } else { row.min.x };
++            let x1 = if row.max.y >= to.max.y - 0.5 { to.min.x } else { row.max.x };
++            bands.push(place(Rect::from_x_y_ranges(x0..=x1.max(x0), row.y_range())));
++        }
++    }
++    Some((caret, bands))
++}
++
++/// After the page's blocks: the others on this page, their carets with their names, then their pointers.
++pub(super) fn page_end(ui: &egui::Ui, ed: &Editor, t: &Tokens) {
++    OTHERS.with_borrow(|others| {
++        PAGE.with_borrow(|page| {
++            SHOWN.with_borrow_mut(|shown| {
++                let (Some(origin), Some(clip)) = (page.origin, page.clip) else { return };
++                let root = ROOT.with_borrow(Clone::clone);
++                let here: Vec<&Presence> = others.iter().filter(|o| page_of(o).is_some_and(|p| root.join(p) == ed.dir)).collect();
++                shown.retain(|id, _| here.iter().any(|o| o.id == *id));
++                let painter = ui.painter().with_clip_rect(clip);
++                for o in &here {
++                    let caret = &o.state["caret"];
++                    let n = |v: &Value| v.as_u64().and_then(|n| usize::try_from(n).ok()).map(|n| n.min(1_000_000));
++                    let (Some(i), Some(b)) = (n(&caret[0]), n(&caret[1])) else { continue };
++                    let a = n(&o.state["selection"][1]).filter(|_| n(&o.state["selection"][0]) == Some(i)).unwrap_or(b);
++                    if let Some((rect, bands)) = marks(ui, page, ed, i, (a, b), t) {
++                        let color = rgb(o.color);
++                        for band in bands {
++                            painter.rect_filled(band, 2.0, color.gamma_multiply(0.28));
++                        }
++                        painter.rect_filled(rect, 1.0, color);
++                        tag(&painter, rect.left_top() - vec2(0.0, 19.0), &o.name, color);
++                    }
++                }
++                let k = 1.0 - (-ui.input(|i| i.stable_dt).clamp(0.0, 0.1) / EASE).exp();
++                let far = clip.width().max(clip.height()) / 4.0;
++                let mut moving = false;
++                for o in &here {
++                    let Some(to) = coord(&o.state["pointer"][0]).zip(coord(&o.state["pointer"][1])).map(|(x, y)| [x, y]) else {
++                        shown.remove(&o.id);
++                        continue;
++                    };
++                    let s = shown.entry(o.id.clone()).or_insert(to);
++                    if (to[0] - s[0]).abs().max((to[1] - s[1]).abs()) > far {
++                        *s = to;
++                    }
++                    s[0] += (to[0] - s[0]) * k;
++                    s[1] += (to[1] - s[1]) * k;
++                    if (to[0] - s[0]).abs().max((to[1] - s[1]).abs()) < 0.5 {
++                        *s = to;
++                    } else {
++                        moving = true;
++                    }
++                    pointer(&painter, origin + vec2(s[0], s[1]), rgb(o.color), &o.name);
++                }
++                if moving {
++                    ui.ctx().request_repaint();
++                }
++            });
++        });
++    });
++}
++
++/// The tree: a dot in each other person's colour on the row of the page or node they are on, or on the nearest row
++/// above it that shows when its branch is folded.
++pub(super) fn rows(app: &NoteCraftApp, ctx: &egui::Context) {
++    let root = app.session.root();
++    ROOT.with_borrow_mut(|r| r.clone_from(&root.to_path_buf()));
++    ROWS.with_borrow(|rows| {
++        OTHERS.with_borrow(|others| {
++            let mut dots: HashMap<usize, usize> = HashMap::new();
++            for o in others {
++                let Some(page) = page_of(o).map(|p| root.join(p)) else { continue };
++                let Some(at) = rows
++                    .iter()
++                    .enumerate()
++                    .filter(|(_, (path, ..))| page.starts_with(path))
++                    .max_by_key(|(_, (path, ..))| path.components().count())
++                    .map(|(i, _)| i)
++                else {
++                    continue;
++                };
++                let n = dots.entry(at).or_insert(0);
++                let (_, rect, clip) = &rows[at];
++                let painter = ctx.layer_painter(LayerId::background()).with_clip_rect(*clip);
++                let c = egui::pos2(rect.max.x - 62.0 - *n as f32 * 11.0, rect.center().y);
++                painter.circle(c, 4.5, rgb(o.color), Stroke::new(1.5, Color32::WHITE));
++                *n += 1;
++            }
++        });
++    });
++}
+diff --git a/crates/ui-egui/src/app/live/tests.rs b/crates/ui-egui/src/app/live/tests.rs
+new file mode 100644
+index 0000000..5a65963
+--- /dev/null
++++ b/crates/ui-egui/src/app/live/tests.rs
+@@ -0,0 +1,92 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++use super::*;
++use notecraft_engine::Session;
++use notecraft_store::Settings;
++use notecraft_store::testing::TempDir;
++
++#[test]
++fn two_people_typing_in_one_page_merge_without_losing_a_character() {
++    let base = "<h1>T</h1>\n<p>Hello world</p>\n<p>Second</p>\n";
++    // Different places of one line, and another line.
++    let alice = "<h1>T</h1>\n<p>Hello brave world</p>\n<p>Second</p>\n";
++    let bob = "<h1>T</h1>\n<p>Hello world!</p>\n<p>Second line</p>\n";
++    let want = "<h1>T</h1>\n<p>Hello brave world!</p>\n<p>Second line</p>\n";
++    assert_eq!(text::merge(base, alice, bob), want);
++    assert_eq!(text::merge(base, bob, alice), want);
++    // The same place: both keep their letters, in one order whichever came first.
++    let (a, b) = ("<h1>T</h1>\n<p>Hello Aworld</p>\n<p>Second</p>\n", "<h1>T</h1>\n<p>Hello Bworld</p>\n<p>Second</p>\n");
++    assert_eq!(text::merge(base, a, b), "<h1>T</h1>\n<p>Hello ABworld</p>\n<p>Second</p>\n");
++    assert_eq!(text::merge(base, b, a), text::merge(base, a, b));
++    // The same change from both (a page written back the same way on both sides) counts once.
++    let rewritten = "<h1>T</h1>\n<p>Hello world</p>\n\n<p>Second</p>\n";
++    assert_eq!(text::merge(base, rewritten, &rewritten.replace("Hello", "Hello A")), rewritten.replace("Hello", "Hello A"));
++    // A word deleted on one side while the other types into it: the typing stays, the rest of the word goes.
++    let deleted = "<h1>T</h1>\n<p>Hello </p>\n<p>Second</p>\n";
++    let typed = "<h1>T</h1>\n<p>Hello woXrld</p>\n<p>Second</p>\n";
++    assert_eq!(text::merge(base, deleted, typed), "<h1>T</h1>\n<p>Hello X</p>\n<p>Second</p>\n");
++
++    // The notebooks merge file by file: pages both changed merge as text, a page removed while changed conflicts.
++    let doc = |page: &str, other: Option<&str>| {
++        let mut files = Flat::from([("nb/_node.toml".to_owned(), "kind = \"notebook\"\n".into()), ("nb/s/p/index.html".to_owned(), page.into())]);
++        if let Some(o) = other {
++            files.insert("nb/s/q/index.md".to_owned(), o.into());
++        }
++        json!({ "files": nest(files), "media": {} })
++    };
++    let merged = NoteCraftApp::live_merge(&doc(base, Some("x")), &doc(alice, Some("x")), &doc(bob, Some("y"))).expect("merge");
++    assert_eq!(merged, doc(want, Some("y")));
++    assert!(NoteCraftApp::live_merge(&doc(base, Some("x")), &doc(alice, Some("x")), &doc(base, None)).is_ok_and(|m| m == doc(alice, None)));
++    assert!(NoteCraftApp::live_merge(&doc(base, Some("x")), &doc(base, Some("z")), &doc(base, None)).is_err());
++    // A path that leaves the notebooks folder is never installed.
++    let mut bad = doc(base, None);
++    bad["files"][".."] = json!({ "escape": { "index.html": "x" } });
++    assert!(NoteCraftApp::live_check(&bad).is_err());
++}
++
++#[test]
++fn a_remote_change_to_the_page_being_written_keeps_the_typing_and_moves_the_caret() {
++    let t = TempDir::new("live1");
++    let root = t.path().join("notes");
++    let mut session = Session::new(&root, Settings::at(root.join(".notecraft").join("settings.toml"))).expect("session");
++    notecraft_engine::sample::create_sample(&mut session, None).expect("sample");
++    let mut app = NoteCraftApp::new(session);
++    app.open_path("my-notebook/work/projects/project-x");
++    app.expand_all();
++    let open = app.open.clone();
++    // The page as NoteCraft writes it once someone has written on it.
++    let ed = app.editor.as_mut().expect("page");
++    ed.body = pageedit::to_body(ed.format, &ed.blocks);
++    ed.dirty_since = Some(std::time::Instant::now());
++    app.save_page_now();
++    let base = app.live_document();
++    assert!(parts(&base).expect("parts").0.keys().all(|k| !k.contains(".notecraft")), "settings stay personal");
++
++    // This person types "Hi " at the start of the paragraph under the title, not saved yet: it is shared already.
++    let ed = app.editor.as_mut().expect("page");
++    let mut c = Caret { block: 1, text: pageedit::block_text(&ed.blocks[1]), focus: false, selection: (0, 0), place: None };
++    c.text.insert_str(0, "Hi ");
++    c.selection = (3, 3);
++    pageedit::set_block_text(&mut ed.blocks[1], &c.text);
++    ed.caret = Some(c);
++    ed.body = pageedit::to_body(ed.format, &ed.blocks);
++    ed.dirty_since = Some(std::time::Instant::now());
++    let mine = app.live_document();
++    let page = |doc: &Value| parts(doc).expect("parts").0["my-notebook/work/projects/project-x/index.html"].as_str().expect("page").to_owned();
++    assert!(page(&mine).contains("Hi Kickoff"));
++
++    // Meanwhile someone adds a paragraph above it and types at the end of the same paragraph.
++    let theirs_text = page(&base).replacen("</h1>\n", "</h1>\n<p>Top</p>\n", 1).replacen(".</p>\n", ".!</p>\n", 1);
++    let mut theirs = base.clone();
++    theirs["files"]["my-notebook"]["work"]["projects"]["project-x"]["index.html"] = theirs_text.into();
++    let merged = NoteCraftApp::live_merge(&base, &mine, &theirs).expect("merge");
++    app.live_adopt(merged.clone()).expect("adopt");
++
++    let ed = app.editor.as_ref().expect("still open");
++    let c = ed.caret.as_ref().expect("caret");
++    assert_eq!(pageedit::block_text(&ed.blocks[1]), "Top");
++    assert_eq!(c.block, 2, "the caret went down with its paragraph");
++    assert!(c.text.starts_with("Hi Kickoff") && c.text.ends_with(".!"), "{}", c.text);
++    assert_eq!((c.selection, c.place), ((3, 3), Some(3)), "and stayed after what this person typed");
++    assert_eq!(app.open, open, "the tree stays as this person left it");
++    assert_eq!(playground_live::canonical(&app.live_document()), playground_live::canonical(&merged), "no change of its own");
++}
+diff --git a/crates/ui-egui/src/app/live/text.rs b/crates/ui-egui/src/app/live/text.rs
+new file mode 100644
+index 0000000..8cd1dde
+--- /dev/null
++++ b/crates/ui-egui/src/app/live/text.rs
+@@ -0,0 +1,176 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++//! The three-way merge of a page's text (or any file of the notebooks) for live editing: as git merges, first by
++//! line, then, where both sides changed the same lines, character by character. It never conflicts and never drops a
++//! character someone typed: a character either side deleted goes, everything either side inserted stays (the same
++//! text inserted at one place by both counts once: the same change), and two insertions at one place go in a fixed
++//! order (the smaller text first), so `merge(b, c, e) == merge(b, e, c)` and every browser comes to the same page
++//! whichever change it saw first.
++
++/// Edit distance [`matches`] works out exactly; past it the middle counts as all changed (both sides' text is kept,
++/// so nothing typed is lost, but a delete on the other side inside that stretch may come back).
++// ponytail: O(D²) memory for the trace (about 8 MB at the cap); a linear-space Myers if bigger edits must merge.
++const MAX_EDITS: isize = 1000;
++
++pub fn merge(base: &str, current: &str, edited: &str) -> String {
++    if edited == base {
++        return current.to_owned();
++    }
++    if current == base {
++        return edited.to_owned();
++    }
++    fn lines(s: &str) -> Vec<&str> {
++        s.split_inclusive('\n').collect()
++    }
++    let (b, c, e) = (lines(base), lines(current), lines(edited));
++    let (mc, me) = (matches(&b, &c, |x, y| x == y), matches(&b, &e, |x, y| x == y));
++    let (mut i, mut j, mut k) = (0, 0, 0);
++    let mut out = String::new();
++    loop {
++        while i < b.len() && mc[i] == Some(j) && me[i] == Some(k) {
++            out.push_str(b[i]);
++            (i, j, k) = (i + 1, j + 1, k + 1);
++        }
++        let next = (i..b.len()).find_map(|x| Some((x, mc[x]?, me[x]?))).unwrap_or((b.len(), c.len(), e.len()));
++        if next == (i, j, k) {
++            return out;
++        }
++        let (bb, cc, ee) = (b[i..next.0].concat(), c[j..next.1].concat(), e[k..next.2].concat());
++        if cc == bb {
++            out.push_str(&ee);
++        } else if ee == bb {
++            out.push_str(&cc);
++        } else {
++            out.push_str(&chars(&bb, &cc, &ee));
++        }
++        (i, j, k) = next;
++    }
++}
++
++/// What one side did to the base, character by character: which base characters it kept, and what it inserted in
++/// each gap (gap `g` is before base character `g`; the last one is at the end).
++struct Edit {
++    kept: Vec<bool>,
++    inserted: Vec<String>,
++}
++
++fn edit(b: &[char], x: &[char]) -> Edit {
++    let m = matches(b, x, |p, q| p == q);
++    let mut inserted = vec![String::new(); b.len() + 1];
++    let mut at = 0;
++    // Characters of `x` between two kept base characters go in the gap before the next kept one.
++    for (i, j) in m.iter().enumerate().filter_map(|(i, j)| Some((i, (*j)?))).chain([(b.len(), x.len())]) {
++        inserted[i].extend(&x[at..j]);
++        at = j + 1;
++    }
++    let kept: Vec<bool> = m.iter().map(Option::is_some).collect();
++    // One place for an insertion among equal characters (`a|ab` and `aa|b` insert the same `a`): the furthest right,
++    // so the same insertion from both sides meets in one gap and counts once.
++    for g in (0..b.len()).rev() {
++        let mut at = g;
++        while at < b.len() && kept[at] && inserted[at + 1].is_empty() && inserted[at].starts_with(b[at]) {
++            let mut ins: String = inserted[at].chars().skip(1).collect();
++            ins.push(b[at]);
++            inserted[at].clear();
++            inserted[at + 1] = ins;
++            at += 1;
++        }
++    }
++    // New lines go in at a line's start: `<p>|Top</p>\n<p>|Kick` (the diff's pick) reads `|<p>Top</p>\n|<p>Kick`, the
++    // same text, so that what the other side typed at the start of the next line stays on that line.
++    for g in 1..=b.len() {
++        let ins: Vec<char> = inserted[g].chars().collect();
++        if !ins.contains(&'\n') || ins.last() == Some(&'\n') {
++            continue;
++        }
++        let fits = |k: usize| (1..=k).all(|t| kept[g - t] && b[g - t] == ins[ins.len() - t] && inserted[g - t].is_empty());
++        if let Some(k) = (1..ins.len().min(g + 1)).take_while(|k| fits(*k)).find(|k| ins[ins.len() - 1 - k] == '\n') {
++            inserted[g - k] = b[g - k..g].iter().chain(&ins[..ins.len() - k]).collect();
++            inserted[g].clear();
++        }
++    }
++    Edit { kept, inserted }
++}
++
++/// Both sides changed this stretch: each base character stays unless either side deleted it, and both sides'
++/// insertions stay, the smaller first where they meet.
++fn chars(base: &str, current: &str, edited: &str) -> String {
++    let (b, c, e): (Vec<char>, Vec<char>, Vec<char>) = (base.chars().collect(), current.chars().collect(), edited.chars().collect());
++    let (ec, ee) = (edit(&b, &c), edit(&b, &e));
++    let mut out = String::new();
++    for g in 0..=b.len() {
++        let (x, y) = (&ec.inserted[g], &ee.inserted[g]);
++        // The same text from both (both pages written back the same way): once.
++        let (first, second) = if x <= y { (x, y) } else { (y, x) };
++        out.push_str(first);
++        if second != first {
++            out.push_str(second);
++        }
++        if g < b.len() && ec.kept[g] && ee.kept[g] {
++            out.push(b[g]);
++        }
++    }
++    out
++}
++
++/// Where position `pos` of `a` (a character index, a caret) is in `b`: after the last character before it that both
++/// have.
++pub fn map_pos(a: &str, b: &str, pos: usize) -> usize {
++    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
++    let m = matches(&a, &b, |x, y| x == y);
++    m.iter().take(pos.min(a.len())).rev().find_map(|j| j.map(|j| j + 1)).unwrap_or(0).min(b.len())
++}
++
++/// For each item of `a`, the item of `b` it is paired with in a longest common subsequence (Myers' O(ND) diff after
++/// the common start and end).
++pub fn matches<T>(a: &[T], b: &[T], same: impl Fn(&T, &T) -> bool) -> Vec<Option<usize>> {
++    let mut out = vec![None; a.len()];
++    let pre = a.iter().zip(b).take_while(|(x, y)| same(x, y)).count();
++    let suf = a[pre..].iter().rev().zip(b[pre..].iter().rev()).take_while(|(x, y)| same(x, y)).count();
++    for (i, o) in out.iter_mut().enumerate().take(pre) {
++        *o = Some(i);
++    }
++    for s in 1..=suf {
++        out[a.len() - s] = Some(b.len() - s);
++    }
++    let (a, b) = (&a[pre..a.len() - suf], &b[pre..b.len() - suf]);
++    let (n, m) = (a.len() as isize, b.len() as isize);
++    if n == 0 || m == 0 {
++        return out;
++    }
++    let off = n + m + 1;
++    let mut v = vec![0isize; 2 * off as usize + 1];
++    let mut trace = Vec::new();
++    'search: for d in 0..=n + m {
++        if d > MAX_EDITS {
++            return out;
++        }
++        // The furthest x on diagonals -d-1..=d+1 before this step, for the way back.
++        trace.push(v[(off - d - 1) as usize..=(off + d + 1) as usize].to_vec());
++        for k in (-d..=d).step_by(2) {
++            let at = |k: isize| v[(off + k) as usize];
++            let mut x = if k == -d || (k != d && at(k - 1) < at(k + 1)) { at(k + 1) } else { at(k - 1) + 1 };
++            let mut y = x - k;
++            while x < n && y < m && same(&a[x as usize], &b[y as usize]) {
++                (x, y) = (x + 1, y + 1);
++            }
++            v[(off + k) as usize] = x;
++            if x >= n && y >= m {
++                break 'search;
++            }
++        }
++    }
++    let (mut x, mut y) = (n, m);
++    for (d, t) in trace.iter().enumerate().rev() {
++        let d = d as isize;
++        let at = |k: isize| t[(k + d + 1) as usize];
++        let k = x - y;
++        let prev = if k == -d || (k != d && at(k - 1) < at(k + 1)) { k + 1 } else { k - 1 };
++        let (px, py) = (at(prev), at(prev) - prev);
++        while x > px && y > py {
++            (x, y) = (x - 1, y - 1);
++            out[pre + x as usize] = Some(pre + y as usize);
++        }
++        (x, y) = (px, py);
++    }
++    out
++}

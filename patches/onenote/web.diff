@@ -71,10 +71,10 @@ index 0000000..f48814d
 +</html>
 diff --git a/apps/notecraft-web/src/main.rs b/apps/notecraft-web/src/main.rs
 new file mode 100644
-index 0000000..b74facb
+index 0000000..a7a3fb6
 --- /dev/null
 +++ b/apps/notecraft-web/src/main.rs
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,250 @@
 +// SPDX-License-Identifier: MIT OR Apache-2.0
 +//! NoteCraft in the browser, for Playground (patches/onenote.yaml in github.com/daijro/openplayground): the desktop
 +//! window (crates/ui-egui) on the page's canvas.
@@ -129,7 +129,7 @@ index 0000000..b74facb
 +        wasm_bindgen_futures::JsFuture::from(promise).await.ok()
 +    }
 +
-+    fn repaint() {
++    pub fn repaint() {
 +        CTX.with(|c| c.get().map(egui::Context::request_repaint));
 +    }
 +
@@ -205,11 +205,21 @@ index 0000000..b74facb
 +            let notebook = s.tree().iter().find(|n| n.info.title == "Quick Notes").map(|n| n.path.to_string_lossy().into_owned());
 +            let notebook = notebook.or_else(|| s.run("notebook.create", &params(&[("name", "Quick Notes"), ("empty", "true")])).ok().and_then(path));
 +            let Some(notebook) = notebook else { return };
-+            let section = s.tree().iter().find(|n| n.path.to_string_lossy() == notebook).and_then(|n| n.children.iter().find(|c| c.info.kind == notecraft_model::NodeKind::Section));
++            let section = s
++                .tree()
++                .iter()
++                .find(|n| n.path.to_string_lossy() == notebook)
++                .and_then(|n| n.children.iter().find(|c| c.info.kind == notecraft_model::NodeKind::Section));
 +            let section = section.map(|c| c.path.to_string_lossy().into_owned());
-+            let section = section.or_else(|| s.run("node.create", &params(&[("parent", &notebook), ("kind", "section"), ("title", "Opened files")])).ok().and_then(path));
++            let section = section.or_else(|| {
++                s.run("node.create", &params(&[("parent", &notebook), ("kind", "section"), ("title", "Opened files")])).ok().and_then(path)
++            });
 +            let Some(section) = section else { return };
-+            let Some(page) = s.run("node.create", &params(&[("parent", &section), ("kind", "page"), ("title", stem), ("format", format)])).ok().and_then(path) else { return };
++            let Some(page) =
++                s.run("node.create", &params(&[("parent", &section), ("kind", "page"), ("title", stem), ("format", format)])).ok().and_then(path)
++            else {
++                return;
++            };
 +            let _ = s.run("page.save", &params(&[("path", &page), ("body", &body)]));
 +            self.app.open_path(&page);
 +        }
@@ -247,7 +257,7 @@ index 0000000..b74facb
 +            raw_input.events.extend(self.app.take_events());
 +            // A dropped file is only a name on the web: its bytes go where that name points in the in-memory
 +            // folder, so the window's "Insert the picture" / "Attach the file" copy it into the page.
-+            for f in raw_input.dropped_files.iter().cloned() {
++            for f in raw_input.dropped_files.clone() {
 +                wasm_bindgen_futures::spawn_local(async move {
 +                    if let Ok(bytes) = f.bytes_async().await {
 +                        fs::put(f.path(), bytes);
@@ -276,7 +286,10 @@ index 0000000..b74facb
 +            let persist = !invited() && ["files", "write", "remove"].iter().all(|m| api().is_some_and(|a| get(&a, m).is_function()));
 +            let had = persist && load().await;
 +            let document = web_sys::window().and_then(|w| w.document()).expect("no document");
-+            let canvas = document.get_element_by_id("notecraft_canvas").and_then(|c| c.dyn_into::<web_sys::HtmlCanvasElement>().ok()).expect("no #notecraft_canvas");
++            let canvas = document
++                .get_element_by_id("notecraft_canvas")
++                .and_then(|c| c.dyn_into::<web_sys::HtmlCanvasElement>().ok())
++                .expect("no #notecraft_canvas");
 +            let started = eframe::WebRunner::new()
 +                .start(
 +                    canvas,
@@ -314,10 +327,10 @@ index 0000000..b74facb
 +}
 diff --git a/crates/model/src/playground.rs b/crates/model/src/playground.rs
 new file mode 100644
-index 0000000..4142e76
+index 0000000..295f3b0
 --- /dev/null
 +++ b/crates/model/src/playground.rs
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,277 @@
 +// SPDX-License-Identifier: MIT OR Apache-2.0
 +//! NoteCraft's browser build in Playground (patches/onenote.yaml in github.com/daijro/openplayground).
 +//! wasm32-unknown-unknown has no files and no clock, so the modules that use them take `std` from here instead (one
@@ -589,7 +602,8 @@ index 0000000..4142e76
 +            if !metadata(&dir)?.is_dir() {
 +                return Err(io::Error::other(format!("{} is not a folder", dir.display())));
 +            }
-+            let entries = TREE.with(|t| t.borrow().below(&dir).into_iter().filter(|k| k.parent() == Some(&dir)).map(|k| Ok(DirEntry(k))).collect::<Vec<_>>());
++            let entries =
++                TREE.with(|t| t.borrow().below(&dir).into_iter().filter(|k| k.parent() == Some(&dir)).map(|k| Ok(DirEntry(k))).collect::<Vec<_>>());
 +            Ok(entries.into_iter())
 +        }
 +    }

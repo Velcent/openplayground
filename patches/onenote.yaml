@@ -55,8 +55,8 @@
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: files and the clock (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use notecraft_model::playground::std;\n"
 
-# Rules 12-15/15: the page file, the child folders, the attachments and the page open last, as `fs::metadata` reads them (Path::is_file
-# and is_dir are exactly that, through the real file system).
+# Rules 12-15/15: the page file, the child folders, the attachments and the page open last, as `fs::metadata` reads
+# them (Path::is_file and is_dir are exactly that, through the real file system).
 # Verify: the tree shows the notebooks and a page with a picture lists it. If upstream changes: anchor on the
 # function that finds a page's file / lists child folders.
 - file: crates/store/src/tree.rs
@@ -72,3 +72,59 @@
 - file: crates/ui-egui/src/app.rs
   find: 'if\s+!path\.is_dir\(\)'
   replace: 'if !std::fs::metadata(&path).is_ok_and(|m| m.is_dir())'
+
+# Live editing in Playground sessions (patches/onenote/live.diff + patches/live/playground_live.rs)
+# What it's for: people in a Playground session write in the same notebooks at once: every keystroke reaches the
+#   others, two people typing in one page merge character by character, each person's Ctrl+Z takes back only their
+#   own edits, and each sees where the others are (a dot in the tree), their caret and their pointer, in their colour.
+# How: the adapter lives in new files: crates/ui-egui/src/app/live.rs (the shared document: the notebooks folder's
+#   files; merge, adopt, media; it declares the template, copied next to it), app/live/text.rs (the text merge),
+#   app/live/peers.rs (presence) and apps/notecraft-web/src/live.rs (the kept runner, the app wrapped with the
+#   session's frame hook, Ctrl+Z/Ctrl+Y to the session). These rules only declare them and call in, one line each.
+# Verify: node scripts/build.mjs check onenote head (and LIVE=0), the e2e (tests/live-apps/onenote.mjs) and
+#   `cargo test -p notecraft-ui-egui live`.
+# If upstream changes: when a line named below changes, anchor on its new spelling; if NoteCraftApp or Editor rename
+#   the fields live.rs uses (session, editor, selected, backstage, status; dir, format, body, blocks, caret,
+#   dirty_since, title, title_buf, writable, attachments), follow them there.
+#
+# The adapter's web dependencies, under a target spelling nobody else uses (serde_json is already a dependency).
+- live: true
+  file: crates/ui-egui/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(any(target_arch = \"wasm32\"))'.dependencies]\nwasm-bindgen = \"0.2\"\njs-sys = \"0.3\"\n"
+# The adapter module, a child of the window's module so it reaches NoteCraftApp and the page editor.
+- live: true
+  file: crates/ui-egui/src/app.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web only, and its native tests).\n#[cfg(any(target_arch = \"wasm32\", test))]\npub mod live;\n"
+# The page: where it is drawn before its blocks, and the others' carets and pointers after them.
+- live: true
+  file: crates/ui-egui/src/app.rs
+  find: 'let\s+what\s*=\s*pageedit::show\([^;]*\);'
+  before: "#[cfg(target_arch = \"wasm32\")] live::page_start(ui);\n                            "
+  after: "\n                            #[cfg(target_arch = \"wasm32\")] live::page_end(ui, ed, &tokens);"
+# Where each block of the page starts (for the others' carets).
+- live: true
+  file: crates/ui-egui/src/pageedit.rs
+  find: 'for\s+i\s+in\s+0\.\.count\s*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] crate::app::live::block_top(i, ui.next_widget_position());"
+# Each tree row as drawn (the others' dots go on it).
+- live: true
+  file: crates/ui-egui/src/app.rs
+  find: 'let\s*\(\s*rect\s*,\s*resp\s*\)\s*=\s*ui\.allocate_exact_size\(\s*vec2\(\s*width\s*,\s*ROW_HEIGHT\s*\)[^;]*;'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] live::row(&node.path, rect, ui.clip_rect());"
+# The web entry (apps/notecraft-web/src/main.rs, from web.diff): its live module, the runner kept for the adapter,
+# and the app eframe runs wrapped (live::wrap: the window's frame, then the session's). If that file changes: the
+# runner is the one `start` creates, and `wrap` takes the `Web` the creator returns.
+- live: true
+  file: apps/notecraft-web/src/main.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session.\n#[cfg(target_arch = \"wasm32\")]\nmod live;\n"
+- live: true
+  file: apps/notecraft-web/src/main.rs
+  find: 'eframe::WebRunner::new\(\)'
+  replace: 'crate::live::runner()'
+- live: true
+  file: apps/notecraft-web/src/main.rs
+  find: 'Ok\(Box::new\((Web\s*\{[^}]*\})\)\)'
+  replace: 'Ok(crate::live::wrap($1))'
