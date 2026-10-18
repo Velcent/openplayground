@@ -75,3 +75,65 @@
 - file: src/safeio.rs
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: saves go to the in-memory files (patches/substance-designer.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::craft_atomic;\n"
+
+# Live editing in Playground sessions (patches/substance-designer/live.diff + patches/live/playground_live.rs)
+# What it's for: people in a Playground session edit one package's node graphs together and see where the others
+#   point, what they select and what they drag (nodes, wires, boxes, sliders, the add-node menu), in their colour.
+# How: the adapter lives in new files next to the editor: src/gui_live.rs (the shared document and its merge, the
+#   frame hook, the guards below and the web wrapper; it declares the template, copied next to it) and
+#   src/gui_live/peers.rs (presence: this person's, and the others' marks over the graph). These rules only declare
+#   the module and call in, each one line after a function's signature or at the end of a file.
+# Verify: node scripts/build.mjs check substance-designer head (and LIVE=0), the e2e (tests/live-apps/substance-designer.mjs)
+#   and `cargo test --features gui --bin materialcraft-gui gui_live`.
+# If upstream changes: if a function named below is renamed, anchor on its new signature; if App renames the fields
+#   gui_live.rs uses (g, parents, sel, active, pan, zoom, pkgs, pkg_active, screen, connecting, rubber, search...),
+#   follow them there.
+#
+# The adapter's dependencies, for the web and for native tests, under target spellings nobody else uses.
+- live: true
+  file: Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(any(target_arch = \"wasm32\"))'.dependencies]\nserde_json = { version = \"1\", features = [\"float_roundtrip\"] }\nwasm-bindgen = \"0.2\"\njs-sys = \"0.3\"\n\n[target.'cfg(any(not(target_arch = \"wasm32\")))'.dev-dependencies]\nserde_json = { version = \"1\", features = [\"float_roundtrip\"] }\n"
+# The adapter module, a child of the editor's root (gui.rs, which includes the other gui_*.rs) so it reaches App.
+- live: true
+  file: src/gui.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web only, and its native tests).\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod gui_live;\n"
+# App::undo and App::redo: in a session they go to the session.
+- live: true
+  file: src/gui.rs
+  find: '\bfn\s+undo\s*\(\s*&mut\s+self\s*\)\s*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if gui_live::undo(false) { return; }"
+- live: true
+  file: src/gui.rs
+  find: '\bfn\s+redo\s*\(\s*&mut\s+self\s*\)\s*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if gui_live::undo(true) { return; }"
+# The workspace's packages: in a session the editor stays on the shared one (switching, adding or closing it waits).
+- live: true
+  file: src/gui.rs
+  find: '\bfn\s+switch_pkg\s*\(\s*&mut\s+self\s*,\s*(\w+)\s*:\s*usize\s*\)\s*\{'
+  replace: "$&\n        #[cfg(any(target_arch = \"wasm32\", test))] if gui_live::hold_switch(self, $1) { return; }"
+- live: true
+  file: src/gui.rs
+  find: '\bfn\s+add_pkg_active\s*\(\s*&mut\s+self\b[^{]*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if gui_live::hold_add(self) { return; }"
+- live: true
+  file: src/gui.rs
+  find: '\bfn\s+close_pkg\s*\(\s*&mut\s+self\s*,\s*(\w+)\s*:\s*usize\s*\)\s*\{'
+  replace: "$&\n        #[cfg(any(target_arch = \"wasm32\", test))] if gui_live::hold_close(self, $1) { return; }"
+# The Edit menu's and the toolbar's Undo/Redo stay enabled in a session.
+- live: true
+  file: src/gui_home.rs
+  find: '\blet\s*\(\s*can_undo\s*,\s*can_redo\b[^;]*;'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] let (can_undo, can_redo) = (can_undo || gui_live::connected(), can_redo || gui_live::connected());"
+# The web entry (src/playground_gui.rs, from web.diff): it keeps its runner for the adapter, and eframe runs the page's
+# app wrapped (gui_live::web::Shell: the app's frame, then the session's). If that file changes: the runner is the
+# one `start` creates, and `wrap` takes the app `start` hands to eframe plus how to reach the editor (App) in it.
+- live: true
+  file: src/playground_gui.rs
+  find: 'eframe::WebRunner::new\(\)'
+  replace: 'super::gui_live::web::runner()'
+- live: true
+  file: src/playground_gui.rs
+  find: 'Ok\(Box::new\(Web\((\w+)\)\)\)'
+  replace: 'Ok(super::gui_live::web::wrap(Web($1), |web: &mut Web| &mut web.0))'

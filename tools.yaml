@@ -261,6 +261,7 @@ groups:
         # What the web build compiles: README and docs commits don't rebuild it.
         paths: [src, assets, build.rs, Cargo.toml]
         patches: patches/substance-designer.yaml
+        live: src
         icon: icons/materialcraft.png
         accent: "#7A4ED6"
         base: "#1C0E3A"
