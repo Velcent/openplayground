@@ -186,6 +186,10 @@
   find: 'pub\s+fn\s+run(?:_typed)?\s*\(\s*&mut\s+self\s*,\s*(\w+)\s*:\s*&str\s*,\s*(\w+)\s*:\s*Value\s*\)[^{]*\{'
   replace: "$&\n        if let Some(r) = crate::live::command(self, $1, &$2) { return r; }"
 - live: true
+  file: crates/ui-egui/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\npub(crate) mod live_crop;\n"
+- live: true
   file: crates/ui-egui/src/menubar.rs
   find: 'fn\s+item\s*\(\s*id\s*:\s*&str\s*,[^)]*\)\s*->\s*MenuNode\s*\{'
   after: "\n    let (label, enabled) = crate::live::menu_item(id, label.into(), enabled);"
