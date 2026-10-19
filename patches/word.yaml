@@ -127,16 +127,14 @@
 #   with its path, so it stays bound to that file.
 # Verify: save a document to browser storage, then within the same session (the Recent list isn't kept
 #   across reloads on the web) File → Open: it's under Recent; clicking it opens it.
-# If upstream changes: anchor on the Recent list's click handler.
+# If upstream changes: anchor on the Recent list's click handler. The anchor is the `file.open {path}` call
+#   itself, in either spelling: the click handler's `let _ = app.run(…);` (releases) or open_recent's
+#   `app.run(…)?;` (head since 2026-10-19); the original call stays as the `else`.
 - file: crates/ui-egui/src/backstage.rs
-  find: 'let _ = app\.run\("file\.open", json!\(\{"path": p\}\)\);'
+  find: '(?:let\s+_\s*=\s*)?app\.run\(\s*"file\.open"\s*,\s*json!\(\{\s*"path"\s*:\s*(\w+)\s*\}\)\s*\)\??;'
   replace: |-
     // playground (patches/word.yaml): a browser-storage document reopens through the browser.
-                if let (true, Some(open)) = (p.starts_with("browser:"), &app.services.open_path_async) {
-                    open(&p);
-                } else {
-                    let _ = app.run("file.open", json!({"path": p}));
-                }
+        if let (true, Some(open)) = ($1.starts_with("browser:"), &app.services.open_path_async) { open(&$1); } else { $& }
 
 # Rule 6/9: switch it on at startup.
 # What it's for: AutoSave back on (the desktop default; the browser build turned it off because it had

@@ -428,7 +428,7 @@ index 0000000..3838b04
 +/// changed block between the same unchanged neighbours that keeps most of its text, at the same place in its text.
 +fn caret(old: &[Block], new: &[Block], c: Caret) -> Option<Caret> {
 +    let m = text::matches(old, new, |a, b| a == b);
-+    let to = |block: usize, text: String, at: usize| Caret { block, text, focus: true, selection: (at, at), place: Some(at) };
++    let to = |block: usize, text: String, at: usize| Caret { block, text, focus: true, selection: (at, at), place: Some(at), ..Default::default() };
 +    if let Some(j) = m.get(c.block).copied().flatten() {
 +        // The text box is keyed by the block's place: one that moved takes the keyboard again where it was.
 +        return Some(if j == c.block { c } else { Caret { block: j, focus: true, place: Some(c.selection.0), ..c } });
@@ -1132,7 +1132,7 @@ index 0000000..92f61d5
 +
 +    // This person types "Hi " at the start of the paragraph under the title, not saved yet: it is shared already.
 +    let ed = app.editor.as_mut().expect("page");
-+    let mut c = Caret { block: 1, text: pageedit::block_text(&ed.blocks[1]), focus: false, selection: (0, 0), place: None };
++    let mut c = Caret { block: 1, text: pageedit::block_text(&ed.blocks[1]), focus: false, selection: (0, 0), place: None, ..Default::default() };
 +    c.text.insert_str(0, "Hi ");
 +    c.selection = (3, 3);
 +    pageedit::set_block_text(&mut ed.blocks[1], &c.text);
