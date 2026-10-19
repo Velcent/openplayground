@@ -233,8 +233,11 @@ async function install(t, channel, name) {
     }
   }
 
-  for (const f of readdirSync(dir, { recursive: true })) {
-    if (statSync(join(dir, f)).size > MAX_FILE) console.warn(`${name}: ${f} is over 25 MiB, the host will reject it`)
+  // The host refuses the whole deploy over one such file: leave this channel out until its build fits.
+  const big = readdirSync(dir, { recursive: true }).find((f) => statSync(join(dir, f)).size > MAX_FILE)
+  if (big) {
+    rmSync(dir, { recursive: true, force: true })
+    console.warn(`::warning::${name}: ${big} is over 25 MiB, which the host rejects: left out of the site`)
   }
 }
 
