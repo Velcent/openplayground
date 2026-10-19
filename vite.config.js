@@ -51,7 +51,6 @@ export const card = (t) => {
         </span>
         ${t.alternative ? `<span class="alt as-own">${altIcon ? `<span class="glitch small" style="--icon:url('${altIcon}');--glitch-delay:${glitchDelay(t)}s"><img src="${altIcon}" alt="" width="14" height="14"></span>` : ''}Alternative to ${t.alternative}</span>
         <span class="alt as-alt"><img src="/${t.icon}" alt="" width="14" height="14">Using ${t.name}</span>` : ''}
-        <span class="blurb">${t.blurb}</span>
       </div>`
 }
 
