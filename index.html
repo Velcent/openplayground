@@ -182,6 +182,13 @@
     .naming input:checked { background: color-mix(in srgb, var(--text) 30%, var(--line)); }
     .naming input:checked::before { background: var(--text); }
     .switches { display: flex; flex-wrap: wrap; gap: 12px 28px; margin-bottom: clamp(32px, 5vw, 56px); }
+    /* Under the switches while "Alternative naming" is on: what the commercial names on the cards mean. */
+    .alt-note {
+      max-width: 620px; margin: calc(-1 * clamp(16px, 3vw, 32px)) 0 clamp(28px, 4.5vw, 48px); padding-left: 12px;
+      border-left: 2px solid var(--line); font-size: 13px; line-height: 1.55; color: var(--muted);
+    }
+    .alt-note strong { color: var(--text); font-weight: 500; }
+    .alt-note a { color: inherit; text-underline-offset: 2px; }
     /* "Alternative naming": each card shows one of its two names and icons (the app's, or the one it's an
        alternative to). */
     :root[data-naming="alternative"] .as-own, :root:not([data-naming="alternative"]) .as-alt { display: none; }
@@ -221,13 +228,16 @@
       <label class="switch naming"><input type="checkbox" role="switch" id="naming">Alternative naming</label>
       <label class="switch"><input type="checkbox" role="switch" id="latest">Use latest commits</label>
     </div>
+    <p class="alt-note as-alt">Each card is named after the commercial app it's an <strong>open-source alternative to</strong>.
+      The projects here aren't made by, affiliated with or endorsed by those companies, and the names are
+      <a href="#trademarks">trademarks of their owners</a>.</p>
     <nav aria-label="Apps">
       <!-- groups -->
     </nav>
     <footer>
       <p>Each app is a one-time download of a few dozen megabytes, then runs in your browser. Sound libraries load as needed. Files stay on your device unless you choose an app's online sharing.</p>
       <p>Open-source apps by <a href="https://github.com/storytold">ArtCraft</a>, and SolidCraft by <a href="https://github.com/bherbruck">bherbruck</a>, LightCraft Classic by <a href="https://github.com/emmertex">emmertex</a>, MailCraft by <a href="https://github.com/MonkeySaint">MonkeySaint</a>, Honeydew by <a href="https://github.com/daijro">daijro</a> and SubCraft by <a href="https://github.com/Aalzard">Aalzard</a>. <strong>This website checks for new versions every 15 minutes.</strong></p>
-      <p>This site and these projects are <u>not</u> affiliated with, endorsed by or sponsored by Adobe, Microsoft, Autodesk, Avid, Image-Line, Ableton or Figma, Inc. Photoshop, Illustrator, InDesign, Lightroom, Premiere Pro, After Effects, Acrobat and Substance Painter are trademarks of Adobe; Word, Excel, PowerPoint and Outlook of Microsoft; AutoCAD and Fusion 360 of Autodesk; Pro Tools of Avid; FL Studio Mobile of Image-Line; Ableton Live of Ableton AG; Figma of Figma, Inc. Their names appear here only to say which product each open-source app is an alternative to.</p>
+      <p id="trademarks">This site and these projects are <u>not</u> affiliated with, endorsed by or sponsored by Adobe, Microsoft, Autodesk, Avid, Image-Line, Ableton or Figma, Inc. Photoshop, Illustrator, InDesign, Lightroom, Premiere Pro, After Effects, Acrobat and Substance Painter are trademarks of Adobe; Word, Excel, PowerPoint and Outlook of Microsoft; AutoCAD and Fusion 360 of Autodesk; Pro Tools of Avid; FL Studio Mobile of Image-Line; Ableton Live of Ableton AG; Figma of Figma, Inc. Their names appear here only to say which product each open-source app is an alternative to.</p>
       <p>This site's source: <a href="https://github.com/daijro/openplayground">daijro/openplayground</a>.</p>
     </footer>
   </main>
