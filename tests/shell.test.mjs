@@ -46,7 +46,7 @@ test('alternative naming keeps an app icon when no commercial icon is supplied',
     await page.goto(site.url)
     const fixture = card({ ...tools.find((t) => t.slug === 'word'), slug: 'missing-commercial-icon' })
     await page.locator('.tool').first().evaluate((element, html) => element.outerHTML = html, fixture)
-    const cards = page.locator('.tool').filter({ hasNot: page.locator(':scope > img.as-alt') })
+    const cards = page.locator('.tool').filter({ hasNot: page.locator(':scope > .glitch') })
     assert.ok(await cards.count() > 0)
     await page.evaluate(() => document.documentElement.dataset.naming = 'alternative')
     for (const card of await cards.all()) {

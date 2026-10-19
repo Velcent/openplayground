@@ -28,9 +28,9 @@
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400..700&family=Geist+Mono:wght@400;500&display=swap">
   <style>
     :root {
-      --bg: #17181c;
-      --card: #1f2026;
-      --line: #2c2e36;
+      --bg: #000;
+      --card: #0c0c0e;
+      --line: #222227;
       --text: #ececef;
       --muted: #91939c;
       --warn: #f5a524;
@@ -52,6 +52,12 @@
       font: 15px/1.5 var(--display); -webkit-font-smoothing: antialiased;
       transition: background-color 0.6s ease;
     }
+    /* The normal theme's moving background (home-background.js); the night theme fades it out for its stars. */
+    .shader-bg {
+      position: fixed; inset: 0; z-index: -3; display: block; width: 100%; height: 100%; pointer-events: none;
+      transition: opacity 0.8s ease;
+    }
+    :root[data-channel="head"] .shader-bg { opacity: 0; }
     body::before, body::after {
       content: ""; position: fixed; inset: 0; z-index: -2; pointer-events: none;
       opacity: 0; transition: opacity 0.8s ease;
@@ -78,12 +84,12 @@
     :root[data-channel="head"] .moon { opacity: 1; transform: none; }
     section + section { margin-top: 48px; }
     h2 { margin: 0 0 14px; font: 500 12px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
-    .tools { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+    .tools { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
 
     /* The signature: hovering an app floods the page with that app's icon background. */
     .tool {
-      position: relative; display: grid; gap: 4px; align-content: start; padding: 22px 22px 18px;
-      background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+      position: relative; display: grid; gap: 4px; align-content: start; padding: 18px 19px 16px;
+      background: var(--card); border: 1px solid var(--line); border-radius: 0;
       color: inherit; text-decoration: none;
       transition: border-color 0.2s, background-color 0.2s;
     }
@@ -99,20 +105,60 @@
     .open::after { content: ""; position: absolute; inset: 0; border-radius: inherit; }
     .repo { position: relative; z-index: 1; color: inherit; text-decoration: none; outline: none; }
     .repo:hover { color: var(--text); }
-    .repo:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+    .repo:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 0; }
     .repo svg { display: inline-block; vertical-align: -2px; }
     .tool > img {
-      width: 64px; height: 64px; object-fit: contain; margin-bottom: 18px;
+      width: 52px; height: 52px; object-fit: contain; margin-bottom: 13px;
       transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1);
     }
     .tool:hover > img { transform: translateY(-3px) rotate(-3deg); }
+    /* An alternative app's icon (icons/alternatives/<slug>.png): live film grain over it, and every few seconds a
+       tear: copies of the icon in one colour channel flash in, sliced and shifted, while the icon jitters. */
+    .glitch {
+      --g: 0.8; position: relative; display: inline-block; width: 52px; height: 52px; margin-bottom: 13px; isolation: isolate;
+      transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .glitch.small { --g: 0.3; width: 14px; height: 14px; margin: 0; flex: none; }
+    .glitch img { display: block; width: 100%; height: 100%; object-fit: contain; border-radius: 0;
+      animation: glitch-jitter 3.4s steps(1, end) infinite var(--glitch-delay, 0s); }
+    .tool:hover > .glitch { transform: translateY(-3px) rotate(-3deg); }
+    .glitch::before, .glitch::after { content: ""; position: absolute; inset: 0; pointer-events: none; }
+    .glitch::before {
+      background: var(--icon) center / contain no-repeat; mix-blend-mode: screen; opacity: 0;
+      animation: glitch-tear 3.4s steps(1, end) infinite var(--glitch-delay, 0s);
+    }
+    .glitch::after {
+      /* Grain: turbulence thresholded to black and light grey specks. */
+      background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='80'%3E%3Cfilter id='n' x='0' y='0'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.95' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3CfeComponentTransfer%3E%3CfeFuncR type='discrete' tableValues='0 0 0.75 0.75'/%3E%3CfeFuncG type='discrete' tableValues='0 0 0.75 0.75'/%3E%3CfeFuncB type='discrete' tableValues='0 0 0.75 0.75'/%3E%3CfeFuncA type='linear' slope='0' intercept='1'/%3E%3C/feComponentTransfer%3E%3C/filter%3E%3Crect width='80' height='80' filter='url(%23n)'/%3E%3C/svg%3E");
+      background-size: 80px; opacity: 0.26;
+      -webkit-mask: var(--icon) center / contain no-repeat; mask: var(--icon) center / contain no-repeat;
+      animation: glitch-grain 0.45s steps(1, end) infinite;
+    }
+    @keyframes glitch-grain {
+      0% { background-position: 0 0; } 17% { background-position: -31px 17px; } 33% { background-position: 23px -41px; }
+      50% { background-position: -13px -27px; } 67% { background-position: 37px 9px; } 83% { background-position: -45px 33px; }
+    }
+    @keyframes glitch-tear {
+      0%, 82%, 100% { opacity: 0; transform: none; clip-path: inset(0 0 100% 0); }
+      84% { opacity: 0.95; transform: translateX(calc(-5px * var(--g))); clip-path: inset(16% 0 62% 0); filter: grayscale(1) sepia(1) saturate(9) hue-rotate(-45deg); }
+      86% { opacity: 0.95; transform: translateX(calc(6px * var(--g))); clip-path: inset(52% 0 28% 0); filter: grayscale(1) sepia(1) saturate(9) hue-rotate(150deg); }
+      88% { opacity: 0.95; transform: translateX(calc(-3px * var(--g))); clip-path: inset(6% 0 78% 0); filter: grayscale(1) sepia(1) saturate(9) hue-rotate(-45deg); }
+      90% { opacity: 0.95; transform: translate(calc(7px * var(--g)), calc(1px * var(--g))); clip-path: inset(68% 0 10% 0); filter: grayscale(1) sepia(1) saturate(9) hue-rotate(150deg); }
+      92% { opacity: 0; }
+    }
+    @keyframes glitch-jitter {
+      0%, 82%, 100% { transform: none; }
+      85% { transform: translateX(calc(2px * var(--g))); }
+      87% { transform: translateX(calc(-3px * var(--g))) skewX(6deg); }
+      89% { transform: translate(calc(1px * var(--g)), calc(-1px * var(--g))); }
+      91% { transform: translateX(calc(-2px * var(--g))); }
+    }
+    @media (prefers-reduced-motion: reduce) { .glitch img, .glitch::before, .glitch::after { animation: none; } }
     .title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; }
-    .name { font-size: 22px; font-weight: 600; letter-spacing: -0.025em; }
-    /* "Alternative to …", after a small icon of that app (icons/alternatives/<slug>.svg). */
+    .name { font-size: 20px; font-weight: 600; letter-spacing: -0.025em; }
+    /* "Alternative to …", after a small icon of that app (icons/alternatives/<slug>.png). */
     .alt { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 500; color: color-mix(in srgb, var(--text) 70%, var(--muted)); }
-    .alt img { width: 14px; height: 14px; border-radius: 3px; }
-    .blurb { color: var(--muted); }
-    .tool:is(:hover, :focus-within) .blurb { color: color-mix(in srgb, var(--text) 78%, var(--accent)); }
+    .alt img { width: 14px; height: 14px; border-radius: 0; }
     .source { font: 12px var(--mono); color: var(--muted); }
     .tool:is(:hover, :focus-within) .source { color: var(--accent); }
 
@@ -133,14 +179,14 @@
     .files-link { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 13px; font-weight: 500; text-decoration: none; }
     .files-link svg { width: 15px; height: 15px; flex: none; }
     .files-link:hover { color: var(--text); }
-    .files-link:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; border-radius: 2px; }
+    .files-link:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; border-radius: 0; }
 
-    dialog { max-width: min(480px, calc(100vw - 32px)); padding: 24px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); color: var(--text); }
+    dialog { max-width: min(480px, calc(100vw - 32px)); padding: 24px; border: 1px solid var(--line); border-radius: 0; background: var(--card); color: var(--text); }
     dialog::backdrop { background: rgb(0 0 0 / 0.6); }
     dialog h2 { margin: 0 0 8px; font: 600 18px var(--display); letter-spacing: -0.015em; text-transform: none; color: var(--text); }
     dialog p { margin: 0 0 20px; font-size: 14px; color: var(--muted); }
     .actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
-    .actions button { padding: 9px 14px; border: 1px solid var(--line); border-radius: 9px; font: 500 14px var(--display); cursor: pointer; }
+    .actions button { padding: 9px 14px; border: 1px solid var(--line); border-radius: 0; font: 500 14px var(--display); cursor: pointer; }
     .actions button[value="release"] { border-color: transparent; background: var(--text); color: var(--bg); }
     .actions button[value="head"] { background: transparent; color: var(--muted); }
     .actions button:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
@@ -237,5 +283,6 @@
       })
     }
   </script>
+  <script type="module" src="/home-background.js"></script>
 </body>
 </html>
