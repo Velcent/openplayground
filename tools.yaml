@@ -195,8 +195,9 @@ groups:
         opens: [html, md]
         imports: []
         repo: AlienTechSoftware/notecraft
-        # What the web build compiles (Cargo.lock: dependency changes): README, docs and CI commits don't rebuild it.
-        paths: [crates, assets/brand, Cargo.toml, Cargo.lock]
+        # What the web build compiles (Cargo.lock: dependency changes; the engine embeds docs/demo/DemoNotebook):
+        # README, other docs and CI commits don't rebuild it.
+        paths: [crates, assets, docs/demo/DemoNotebook, Cargo.toml, Cargo.lock, rust-toolchain.toml]
         patches: patches/onenote.yaml
         live: crates/ui-egui/src/app
         icon: icons/notecraft.png

@@ -44,10 +44,10 @@ index 0000000..0b57fe8
 +filehash = true
 diff --git a/apps/notecraft-web/index.html b/apps/notecraft-web/index.html
 new file mode 100644
-index 0000000..f48814d
+index 0000000..34c6e8c
 --- /dev/null
 +++ b/apps/notecraft-web/index.html
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,24 @@
 +<!DOCTYPE html>
 +<html lang="en">
 +<head>
@@ -56,6 +56,9 @@ index 0000000..f48814d
 +  <title>NoteCraft</title>
 +  <link data-trunk rel="icon" href="../../assets/brand/notecraft-64.png" />
 +  <link data-trunk rel="rust" data-bin="notecraft-web" data-wasm-opt="0" />
++  <!-- The CJK face, loaded when a page needs it (src/main.rs), with its licence -->
++  <link data-trunk rel="copy-file" href="../../assets/fonts/NotoSansCJKsc-Regular.otf" />
++  <link data-trunk rel="copy-file" href="../../assets/fonts/OFL-NotoSansCJKsc.txt" />
 +  <style>
 +    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #f3f1f8; }
 +    #notecraft_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
@@ -71,10 +74,10 @@ index 0000000..f48814d
 +</html>
 diff --git a/apps/notecraft-web/src/main.rs b/apps/notecraft-web/src/main.rs
 new file mode 100644
-index 0000000..a7a3fb6
+index 0000000..f4394fb
 --- /dev/null
 +++ b/apps/notecraft-web/src/main.rs
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,342 @@
 +// SPDX-License-Identifier: MIT OR Apache-2.0
 +//! NoteCraft in the browser, for Playground (patches/onenote.yaml in github.com/daijro/openplayground): the desktop
 +//! window (crates/ui-egui) on the page's canvas.
@@ -85,7 +88,9 @@ index 0000000..a7a3fb6
 +//! start makes the sample notebooks. A page opened from a Playground invitation (`?pg-session=<room>`) keeps its
 +//! notebooks in the tab only, so joining someone's session never touches this browser's own notebooks.
 +//! Also: pictures in pages load from the in-memory folder, files dropped on the page can be inserted, and "Open in
-+//! NoteCraft" on a page file opens it (one of these notebooks') or copies it into a Quick Notes notebook.
++//! NoteCraft" on a page file opens it (one of these notebooks') or copies it into a Quick Notes notebook. The CJK face
++//! (16 MB) is a file next to the page, fetched the first time a page or a title needs it, and a pen's pressure
++//! (pointer events, which eframe passes on without it) reaches the window as the touch force its ink reads.
 +
 +#[cfg(target_arch = "wasm32")]
 +mod web {
@@ -107,6 +112,54 @@ index 0000000..a7a3fb6
 +        /// Files Playground handed in ("Open in NoteCraft"), for the next frame.
 +        static OPENED: RefCell<Vec<JsValue>> = const { RefCell::new(Vec::new()) };
 +        static CTX: std::cell::OnceCell<egui::Context> = const { std::cell::OnceCell::new() };
++        static CJK: RefCell<Face> = const { RefCell::new(Face::Wanted) };
++        static PEN: RefCell<Vec<PenReading>> = const { RefCell::new(Vec::new()) };
++    }
++
++    /// A pen's reading from the canvas's pointer events: phase, pointer, where (CSS pixels), pressure.
++    type PenReading = (egui::TouchPhase, f64, f64, f64, f32);
++
++    /// The CJK face, which crates/text leaves out of the wasm (patches/onenote.yaml): its file beside the page.
++    const CJK_FILE: &str = "NotoSansCJKsc-Regular.otf";
++    /// The name crates/text gives it, so the window has one face of that name either way.
++    const CJK_NAME: &str = "noto-sans-cjk-sc";
++
++    enum Face {
++        Wanted,
++        Loading,
++        Arrived(Vec<u8>),
++        Added,
++    }
++
++    /// Chinese, Japanese or Korean letters (and their punctuation and full-width forms).
++    fn cjk(text: &str) -> bool {
++        text.chars().any(|c| matches!(c as u32, 0x2E80..=0x9FFF | 0xA960..=0xA97F | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFFEF | 0x20000..=0x3FFFF))
++    }
++
++    /// `fetch(url)`'s bytes.
++    async fn fetch(url: &str) -> Option<Vec<u8>> {
++        let global = js_sys::global();
++        let response = wait(get(&global, "fetch").dyn_into::<js_sys::Function>().ok()?.call1(&global, &url.into()).ok()).await?;
++        if !get(&response, "ok").is_truthy() {
++            return None;
++        }
++        let read = get(&response, "arrayBuffer").dyn_into::<js_sys::Function>().ok()?;
++        Some(js_sys::Uint8Array::new(&wait(read.call0(&response).ok()).await?).to_vec())
++    }
++
++    /// Follows the canvas's pen pointers: eframe turns them into mouse events and drops their pressure.
++    fn listen_to_the_pen(canvas: &web_sys::HtmlCanvasElement) {
++        use egui::TouchPhase::{Cancel, End, Move, Start};
++        for (name, phase) in [("pointerdown", Start), ("pointermove", Move), ("pointerup", End), ("pointercancel", Cancel)] {
++            let read = Closure::<dyn Fn(JsValue)>::new(move |e: JsValue| {
++                if get(&e, "pointerType").as_string().as_deref() == Some("pen") {
++                    let n = |k: &str| get(&e, k).as_f64().unwrap_or(0.0);
++                    PEN.with_borrow_mut(|p| p.push((phase, n("pointerId"), n("offsetX"), n("offsetY"), n("pressure") as f32)));
++                }
++            });
++            let _ = canvas.add_event_listener_with_callback(name, read.as_ref().unchecked_ref());
++            read.forget();
++        }
 +    }
 +
 +    fn api() -> Option<JsValue> {
@@ -224,6 +277,39 @@ index 0000000..a7a3fb6
 +            self.app.open_path(&page);
 +        }
 +
++        /// The CJK face: fetched once the open page or a title in the tree has those letters, then added behind the
++        /// window's faces (after the window has put its own in, which would replace it).
++        fn faces(&mut self) {
++            let ready = CJK.with_borrow_mut(|face| match face {
++                Face::Wanted => {
++                    fn titles(n: &notecraft_store::tree::Node) -> bool {
++                        cjk(&n.info.title) || n.children.iter().any(titles)
++                    }
++                    if self.app.body().is_some_and(cjk) || self.app.session().tree().iter().any(titles) {
++                        *face = Face::Loading;
++                        wasm_bindgen_futures::spawn_local(async {
++                            let bytes = fetch(CJK_FILE).await;
++                            CJK.set(bytes.map_or(Face::Added, Face::Arrived));
++                            repaint();
++                        });
++                    }
++                    None
++                }
++                Face::Arrived(_) => match std::mem::replace(face, Face::Added) {
++                    Face::Arrived(bytes) => Some(bytes),
++                    _ => None,
++                },
++                _ => None,
++            });
++            if let (Some(bytes), Some(ctx)) = (ready, CTX.with(|c| c.get().cloned())) {
++                use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
++                notecraft_ui_egui::fonts::install_once(&ctx);
++                let families = [egui::FontFamily::Proportional, egui::FontFamily::Monospace];
++                let families = families.map(|family| InsertFontFamily { family, priority: FontPriority::Lowest }).to_vec();
++                ctx.add_font(FontInsert::new(CJK_NAME, egui::FontData::from_owned(bytes), families));
++            }
++        }
++
 +        /// After the window's frame: files handed in, the in-memory folder's changes to Files, the unsaved state.
 +        fn after(&mut self) {
 +            for file in OPENED.take() {
@@ -245,6 +331,7 @@ index 0000000..a7a3fb6
 +                    }
 +                }
 +            }
++            self.faces();
 +            let unsaved = self.app.is_dirty();
 +            if self.unsaved.replace(unsaved) != Some(unsaved) {
 +                call("setUnsaved", &[unsaved.into()]);
@@ -253,8 +340,15 @@ index 0000000..a7a3fb6
 +    }
 +
 +    impl eframe::App for Web {
-+        fn raw_input_hook(&mut self, _: &egui::Context, raw_input: &mut egui::RawInput) {
++        fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
 +            raw_input.events.extend(self.app.take_events());
++            // The pen's pressure, as the touch force the window's stylus reader takes (as it gets it on Windows).
++            let zoom = f64::from(ctx.zoom_factor());
++            for (phase, id, x, y, pressure) in PEN.take() {
++                let pos = egui::pos2((x / zoom) as f32, (y / zoom) as f32);
++                let (device_id, id) = (egui::TouchDeviceId(1), egui::TouchId(id as u64));
++                raw_input.events.push(egui::Event::Touch { device_id, id, phase, pos, force: Some(pressure) });
++            }
 +            // A dropped file is only a name on the web: its bytes go where that name points in the in-memory
 +            // folder, so the window's "Insert the picture" / "Attach the file" copy it into the page.
 +            for f in raw_input.dropped_files.clone() {
@@ -290,6 +384,7 @@ index 0000000..a7a3fb6
 +                .get_element_by_id("notecraft_canvas")
 +                .and_then(|c| c.dyn_into::<web_sys::HtmlCanvasElement>().ok())
 +                .expect("no #notecraft_canvas");
++            listen_to_the_pen(&canvas);
 +            let started = eframe::WebRunner::new()
 +                .start(
 +                    canvas,

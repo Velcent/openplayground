@@ -4,7 +4,9 @@
 #   apps/notecraft-web/          the web crate build.mjs finds (Cargo.toml, Trunk.toml, index.html, src/main.rs): the
 #                                desktop window (crates/ui-egui) on the page's canvas; the notebooks folder kept in
 #                                Playground's Files as plain folders (browser:/NoteCraft/…), the sample notebooks on
-#                                the first start, pictures read from the folder, dropped files, "Open in NoteCraft".
+#                                the first start, pictures read from the folder, dropped files, "Open in NoteCraft",
+#                                the CJK face as a file beside the page (fetched when a page needs it), and a pen's
+#                                pressure from pointer events (eframe passes them on without it).
 #   crates/model/src/playground.rs  web shims for the library: an in-memory `std::fs` that notes every change, and
 #                                web-time's clock (wasm32-unknown-unknown has neither; SystemTime::now panics there).
 # The modules that use files or the clock take `std` from crates/model/src/playground.rs on wasm through ONE `use`
@@ -14,18 +16,18 @@
 # lines, or an expression that does exactly what it replaces.
 # If upstream starts using std::fs or Instant in another module, give that module the same one-line rule.
 
-# Rule 1/15: web-time for the shims (already in Cargo.lock through eframe).
+# Rule 1/24: web-time for the shims (already in Cargo.lock through eframe).
 # Verify: build.mjs check. If upstream adds it itself, drop it here.
 - file: crates/model/Cargo.toml
   find: '(?![\s\S])'
   after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nweb-time = \"1\"\n"
 
-# Rule 2/15: the shims, as notecraft_model::playground on wasm.
+# Rule 2/24: the shims, as notecraft_model::playground on wasm.
 - file: crates/model/src/lib.rs
   find: '(?![\s\S])'
   after: "\n// Playground's browser build (patches/onenote.yaml): files and the clock in the browser.\n#[cfg(target_arch = \"wasm32\")] #[doc(hidden)] pub mod playground;\n"
 
-# Rules 3-11/15: the clock (ids, timestamps, the autosave timer) and the files (the tree, pages, attachments,
+# Rules 3-11/24: the clock (ids, timestamps, the autosave timer) and the files (the tree, pages, attachments,
 # settings, the session's folder) of the library's modules (see the top).
 - file: crates/model/src/id.rs
   find: '(?![\s\S])'
@@ -55,7 +57,7 @@
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: files and the clock (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use notecraft_model::playground::std;\n"
 
-# Rules 12-15/15: the page file, the child folders, the attachments and the page open last, as `fs::metadata` reads
+# Rules 12-15/24: the page file, the child folders, the attachments and the page open last, as `fs::metadata` reads
 # them (Path::is_file and is_dir are exactly that, through the real file system).
 # Verify: the tree shows the notebooks and a page with a picture lists it. If upstream changes: anchor on the
 # function that finds a page's file / lists child folders.
@@ -73,17 +75,56 @@
   find: 'if\s+!path\.is_dir\(\)'
   replace: 'if !std::fs::metadata(&path).is_ok_and(|m| m.is_dir())'
 
-# Rule 16: rfd has no FileDialog on wasm; the folder chooser (choose_notebooks_folder) picks nothing there (the
+# Rule 16/24: rfd has no FileDialog on wasm; the folder chooser (choose_notebooks_folder) picks nothing there (the
 # notebooks folder is Playground's Files). Native builds keep the dialog.
 # Verify: build.mjs check. If upstream moves the dialog: anchor on the new rfd call.
 - file: crates/ui-egui/src/app.rs
   find: 'rfd::FileDialog::new\(\)[^;]*?\.pick_folder\(\)'
   replace: '({ #[cfg(not(target_arch = "wasm32"))] { $& } #[cfg(target_arch = "wasm32")] { None::<std::path::PathBuf> } })'
 
+# Rule 17/24: upstream pins its toolchain (rust-toolchain.toml, profile minimal), which rustup installs without the
+# wasm target: CI then fails with "can't find crate for `core`". The pin also asks for the target here.
+# If upstream lists `targets` itself (or drops the pin), delete this rule.
+- file: rust-toolchain.toml
+  find: '^\[toolchain\]'
+  after: "\ntargets = [\"wasm32-unknown-unknown\"]"
+
+# Rules 18-19/24: the CJK face (16 MB, two copies in the binary: one per crate that names the const) stays out of the
+# wasm, which would otherwise be 46 MB, over the host's 25 MiB per file once gzipped. apps/notecraft-web copies the
+# file next to the page and loads it when a page needs those scripts (Arabic, Hebrew and Devanagari, 1 MB, stay in);
+# the window skips a face it has no bytes for (egui panics on one).
+# Verify: the wasm.gz is a few MB, a page in Chinese draws its letters a moment after it opens. If upstream renames
+# the const or the font list, follow it (and the file name in apps/notecraft-web/src/main.rs).
+- file: crates/text/src/lib.rs
+  find: 'pub\s+const\s+CJK\s*:\s*&\[u8\]\s*=\s*include_bytes!\(([^)]*)\);'
+  replace: "#[cfg(not(target_arch = \"wasm32\"))] pub const CJK: &[u8] = include_bytes!($1);\n    #[cfg(target_arch = \"wasm32\")] pub const CJK: &[u8] = &[];"
+- file: crates/ui-egui/src/fonts.rs
+  find: 'for\s*\(\s*name\s*,\s*bytes\s*\)\s*in\s+BUNDLED\s*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] if bytes.is_empty() { continue; }"
+
+# Rules 20-24/24: files in the modules upstream added since: the page's ink (ink.svg beside the page), the Welcome
+# notebook (File screen), and links between pages (which ask whether a path is a folder or a file).
+- file: crates/ui-egui/src/inkpad.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: files (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use notecraft_model::playground::std;\n"
+- file: crates/engine/src/welcome.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: files (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use notecraft_model::playground::std;\n"
+- file: crates/store/src/links.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: files (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use notecraft_model::playground::std;\n"
+- file: crates/store/src/links.rs
+  find: '\bif\s+full\.is_dir\(\)'
+  replace: 'if std::fs::metadata(&full).is_ok_and(|m| m.is_dir())'
+- file: crates/store/src/links.rs
+  find: '\bif\s+full\.is_file\(\)'
+  replace: 'if std::fs::metadata(&full).is_ok_and(|m| m.is_file())'
+
 # Live editing in Playground sessions (patches/onenote/live.diff + patches/live/playground_live.rs)
-# What it's for: people in a Playground session write in the same notebooks at once: every keystroke reaches the
-#   others, two people typing in one page merge character by character, each person's Ctrl+Z takes back only their
-#   own edits, and each sees where the others are (a dot in the tree), their caret and their pointer, in their colour.
+# What it's for: people in a Playground session write and draw in the same notebooks at once: every keystroke reaches
+#   the others, two people typing in one page merge character by character, two people's strokes on one page both
+#   stay, each person's Ctrl+Z (and the Draw tab's Undo stroke) takes back only their own edits, and each sees where
+#   the others are (a dot in the tree), their caret, the stroke they are drawing and their pointer, in their colour.
 # How: the adapter lives in new files: crates/ui-egui/src/app/live.rs (the shared document: the notebooks folder's
 #   files; merge, adopt, media; it declares the template, copied next to it), app/live/text.rs (the text merge),
 #   app/live/peers.rs (presence) and apps/notecraft-web/src/live.rs (the kept runner, the app wrapped with the
@@ -91,8 +132,8 @@
 # Verify: node scripts/build.mjs check onenote head (and LIVE=0), the e2e (tests/live-apps/onenote.mjs) and
 #   `cargo test -p notecraft-ui-egui live`.
 # If upstream changes: when a line named below changes, anchor on its new spelling; if NoteCraftApp or Editor rename
-#   the fields live.rs uses (session, editor, selected, backstage, status; dir, format, body, blocks, caret,
-#   dirty_since, title, title_buf, writable, attachments), follow them there.
+#   the fields live.rs uses (session, editor, selected, backstage, status, pad; dir, format, body, blocks, caret,
+#   dirty_since, title, title_buf, writable, attachments, boxes, page_dir), follow them there.
 #
 # The adapter's web dependencies, under a target spelling nobody else uses (serde_json is already a dependency).
 - live: true
@@ -110,16 +151,27 @@
   find: 'let\s+moved\s*=\s*crate::containers::show\([^;]*\);'
   before: "#[cfg(target_arch = \"wasm32\")] live::page_start(ui);\n                            "
   after: "\n                            #[cfg(target_arch = \"wasm32\")] live::page_end(ui, ed, &tokens);"
-# Where each block of the page starts (for the others' carets).
+# Where each block of the page starts, how wide its column is and which ui it is in (for the others' carets, and
+# this person's text box after a remote change).
 - live: true
   file: crates/ui-egui/src/pageedit.rs
   find: 'for\s+i\s+in\s+(?:0|range\.start)\.\.[^{;]*\{'
-  after: "\n        #[cfg(target_arch = \"wasm32\")] crate::app::live::block_top(i, ui.next_widget_position());"
+  after: "\n        #[cfg(target_arch = \"wasm32\")] crate::app::live::block_top(i, ui);"
 # Each tree row as drawn (the others' dots go on it).
 - live: true
   file: crates/ui-egui/src/app.rs
   find: 'let\s*\(\s*rect\s*,\s*resp\s*\)\s*=\s*ui\.allocate_exact_size\(\s*vec2\(\s*width\s*,\s*ROW_HEIGHT\s*\)[^;]*;'
   after: "\n        #[cfg(target_arch = \"wasm32\")] live::row(&node.path, rect, ui.clip_rect());"
+# The Draw tab's Undo stroke: in a session it goes to the session too (it would take back whoever drew last).
+- live: true
+  file: crates/ui-egui/src/app.rs
+  find: '\bfn\s+ink_undo\s*\(\s*&mut\s+self\s*\)\s*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] if live::undo(false) { return; }"
+# The stroke being drawn, which the presence carries so the others see it as it goes.
+- live: true
+  file: crates/ui-egui/src/inkpad.rs
+  find: '\bdrawing_now(\s*:\s*Option<Stroke>\s*,)'
+  replace: 'pub(crate) drawing_now$1'
 # The web entry (apps/notecraft-web/src/main.rs, from web.diff): its live module, the runner kept for the adapter,
 # and the app eframe runs wrapped (live::wrap: the window's frame, then the session's). If that file changes: the
 # runner is the one `start` creates, and `wrap` takes the `Web` the creator returns.

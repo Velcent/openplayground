@@ -65,24 +65,25 @@ index 0000000..830a115
 +}
 diff --git a/crates/ui-egui/src/app/live.rs b/crates/ui-egui/src/app/live.rs
 new file mode 100644
-index 0000000..629fda6
+index 0000000..3838b04
 --- /dev/null
 +++ b/crates/ui-egui/src/app/live.rs
-@@ -0,0 +1,540 @@
+@@ -0,0 +1,553 @@
 +// SPDX-License-Identifier: MIT OR Apache-2.0
 +//! Live editing in a Playground session (the shell's `shell/live.js` drives it through `playground_live::web`);
 +//! nothing here runs until the shell connects, and native builds never call it.
 +//!
 +//! The shared document is the notebooks folder as its files, nested like its folders: every notebook, section group
-+//! and section (`_node.toml`) and every page (`index.html` / `index.md`) as text (`files`), and each picture or attached
-+//! file of a page as a content id (`media`; its bytes travel as session media). The page being written
++//! and section (`_node.toml`), every page (`index.html` / `index.md`) and its ink (`ink.svg`) as text (`files`), and
++//! each picture or attached file of a page as a content id (`media`; its bytes travel as session media). The page being written
 +//! counts as it is on screen, not as last saved, so every keystroke reaches the others. Each page's `updated` time
 +//! stays out: it is each browser's own (when it last saw a change). Personal things stay out too: the settings
 +//! (`.notecraft/`), which branches are open, the page shown, the caret, the source pane, the theme.
 +//!
 +//! The merge goes file by file: a file one side changed takes that change; a file both changed merges as text
-+//! (`text.rs`: by line, then by character; never a conflict, never a lost character). A file one side removed while
-+//! the other changed it, or both added with different content, conflicts. A remote change installs at the end of a
++//! (`text.rs`: by line, then by character; never a conflict, never a lost character), and so does one both added (over
++//! the lines they share: two people's first strokes on a page). A file one side removed while the other changed it
++//! conflicts. A remote change installs at the end of a
 +//! quiet frame (no button held): the files are written, the tree is read again, and the open page takes the merged
 +//! text with the caret moved to where its text went.
 +//!
@@ -147,7 +148,7 @@ index 0000000..629fda6
 +    if parent == Some("assets") {
 +        return Some(Kind::Media);
 +    }
-+    matches!(name, "_node.toml" | "index.html" | "index.md").then_some(Kind::Text)
++    matches!(name, "_node.toml" | "index.html" | "index.md" | "ink.svg").then_some(Kind::Text)
 +}
 +
 +/// A path the shared document may name: inside the notebooks folder, no dot folders, a file that belongs there.
@@ -374,6 +375,13 @@ index 0000000..629fda6
 +        }
 +    }
 +    app.session.refresh();
++    // The open page's ink, when it changed: read again from its file (nothing is being drawn: this is a quiet frame).
++    let ink = app.editor.as_ref().and_then(|ed| rel_of(&root, &ed.dir.join(crate::inkpad::FILE)));
++    if let (Some(rel), Some(ed)) = (ink, app.editor.as_ref())
++        && cf.get(&rel) != df.get(&rel)
++    {
++        app.pad = Some(crate::inkpad::Pad::of_page(&ed.dir));
++    }
 +    // The open page as merged (its file may still be the last save: what is on screen counts).
 +    let page = app.editor.as_ref().and_then(|ed| rel_of(&root, &ed.dir.join(ed.format.file_name())));
 +    follow_page(app, page.and_then(|rel| df.get(&rel)).and_then(Value::as_str));
@@ -393,10 +401,11 @@ index 0000000..629fda6
 +    let body = body_of(text, ed.format);
 +    if body.trim_matches('\n') != ed.body.trim_matches('\n') {
 +        let blocks = preview::blocks_for(ed.format, &body);
++        let was = ed.caret.as_ref().map(|c| c.block);
 +        ed.caret = ed.caret.take().and_then(|c| caret(&ed.blocks, &blocks, c));
 +        // The text box takes its new cursor before the next key, not after it (that key would land where the text was).
-+        if let Some(c) = ed.caret.as_mut().filter(|c| c.focus)
-+            && with_ctx(|ctx| peers::place_caret(ctx, c.block, c.selection)) == Some(true)
++        if let (Some(c), Some(was)) = (ed.caret.as_mut().filter(|c| c.focus), was)
++            && with_ctx(|ctx| peers::place_caret(ctx, was, c.block, c.selection)) == Some(true)
 +        {
 +            (c.focus, c.place) = (false, None);
 +        }
@@ -410,6 +419,9 @@ index 0000000..629fda6
 +        ed.title = info.title;
 +    }
 +    ed.attachments = notecraft_store::assets::list(&ed.dir);
++    // The boxes the blocks sit in and the page's direction travel in the page's own file.
++    ed.boxes = notecraft_store::page::containers(&ed.dir).unwrap_or_default();
++    ed.page_dir = notecraft_store::page::load_page(&ed.dir).ok().and_then(|p| p.dir);
 +}
 +
 +/// Where the caret in `old` goes in `new`: the same block where it is unchanged (only its index may move), else the
@@ -449,6 +461,7 @@ index 0000000..629fda6
 +        }
 +        match (b, c, e) {
 +            (Some(Value::String(bt)), Some(Value::String(ct)), Some(Value::String(et))) if text => Ok(Some(text::merge(bt, ct, et).into())),
++            (None, Some(Value::String(ct)), Some(Value::String(et))) if text => Ok(Some(text::merge_added(ct, et).into())),
 +            (b, Some(Value::Object(co)), Some(Value::Object(eo))) if b.is_none_or(Value::is_object) => {
 +                let none = Map::new();
 +                let bo = b.and_then(Value::as_object).unwrap_or(&none);
@@ -588,8 +601,8 @@ index 0000000..629fda6
 +}
 +
 +/// The top of block `i` as the page draws it (pageedit.rs).
-+pub(crate) fn block_top(i: usize, at: egui::Pos2) {
-+    peers::block_top(i, at);
++pub(crate) fn block_top(i: usize, ui: &egui::Ui) {
++    peers::block_top(i, ui);
 +}
 +
 +/// A row of the notebook tree as drawn (app.rs `draw_node`).
@@ -611,17 +624,17 @@ index 0000000..629fda6
 +mod tests;
 diff --git a/crates/ui-egui/src/app/live/peers.rs b/crates/ui-egui/src/app/live/peers.rs
 new file mode 100644
-index 0000000..c354845
+index 0000000..59b0721
 --- /dev/null
 +++ b/crates/ui-egui/src/app/live/peers.rs
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,410 @@
 +// SPDX-License-Identifier: MIT OR Apache-2.0
 +//! Presence in a live session. Each person shares the page they are on (its path in the notebooks folder, or the
 +//! notebook or section selected when no page is open), their pointer over the page (from the page's top left, so it
 +//! lands on the same words at any scroll), their caret (block and character) and where their selection starts. Here,
 +//! for the others: a dot in their colour on the tree row of the page they are on (on the nearest row shown when it is
-+//! folded away), and on the same page their selection, their caret with their name and their pointer with its name
-+//! tag. Pointers ease toward their latest place; carets jump with the typing. Someone who joins with no page open
++//! folded away), and on the same page the stroke they are drawing, their selection, their caret with their name and
++//! their pointer with its name tag. Pointers ease toward their latest place; carets jump with the typing. Someone who joins with no page open
 +//! lands on the page the others are on.
 +//! Everything in a state comes from another person: what doesn't read as a path or numbers in range is skipped.
 +// The painting is web only (its hooks are); native tests use the projection.
@@ -638,6 +651,8 @@ index 0000000..c354845
 +use std::collections::HashMap;
 +use std::path::{Path, PathBuf};
 +
++/// The most readings of a stroke being drawn that a presence carries (the newest).
++const INK_POINTS: usize = 150;
 +/// How long the others' pointers take to go most (1 - 1/e) of the way to where they last were, in seconds.
 +const EASE: f32 = 0.08;
 +
@@ -648,8 +663,9 @@ index 0000000..c354845
 +    origin: Option<Pos2>,
 +    width: f32,
 +    clip: Option<Rect>,
-+    /// The top left of each block, by index.
-+    tops: Vec<Pos2>,
++    /// Each block as drawn, by index: its top left, how wide its column is, and the id of the ui it was drawn in
++    /// (a container's: its text box's id derives from it).
++    tops: Vec<(Pos2, f32, egui::Id)>,
 +}
 +
 +thread_local! {
@@ -697,6 +713,18 @@ index 0000000..c354845
 +        if c.selection.1 != c.selection.0 {
 +            s["selection"] = json!([c.block, c.selection.1]);
 +        }
++    }
++    // The stroke being drawn: its width and its readings (the newest, a point every 2 points of travel).
++    if let Some(stroke) = app.pad.as_ref().and_then(|p| p.drawing_now.as_ref()) {
++        let mut points: Vec<[f32; 3]> = Vec::new();
++        for d in &stroke.dabs {
++            if points.last().is_none_or(|q| (q[0] - d.x).abs().max((q[1] - d.y).abs()) >= 2.0) {
++                points.push([d.x, d.y, d.pressure]);
++            }
++        }
++        let from = points.len().saturating_sub(INK_POINTS);
++        let pts: Vec<Value> = points[from..].iter().map(|p| json!([p[0].round(), p[1].round(), (p[2] * 100.0).round() / 100.0])).collect();
++        s["ink"] = json!({ "width": r(stroke.width), "points": pts });
 +    }
 +    s
 +}
@@ -754,9 +782,10 @@ index 0000000..c354845
 +/// Puts this person's text box cursor (`selection`: the cursor, then where it started) in block `block` before the
 +/// next frame's keys arrive: a remote change moved the text, or the block (the box is keyed by the block's place,
 +/// pageedit's `("page-block", i)`). False when the page was never drawn.
-+pub(super) fn place_caret(ctx: &egui::Context, block: usize, selection: (usize, usize)) -> bool {
-+    let Some(page) = PAGE_ID.with_borrow(|p| *p) else { return false };
-+    let id = page.with(("page-block", block));
++pub(super) fn place_caret(ctx: &egui::Context, was: usize, block: usize, selection: (usize, usize)) -> bool {
++    // The container the caret was in (a block that moved stays in its container).
++    let Some(ui) = PAGE.with_borrow(|p| p.tops.get(was).map(|t| t.2)).or_else(|| PAGE_ID.with_borrow(|p| *p)) else { return false };
++    let id = ui.with(("page-block", block));
 +    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
 +    let at = |n| egui::text::CCursor::new(n);
 +    state.cursor.set_char_range(Some(egui::text::CCursorRange { primary: at(selection.0), secondary: at(selection.1), h_pos: None }));
@@ -765,10 +794,10 @@ index 0000000..c354845
 +    true
 +}
 +
-+pub(super) fn block_top(i: usize, at: Pos2) {
++pub(super) fn block_top(i: usize, ui: &egui::Ui) {
 +    PAGE.with_borrow_mut(|p| {
 +        if p.tops.len() == i && i < 100_000 {
-+            p.tops.push(at);
++            p.tops.push((ui.next_widget_position(), ui.available_width(), ui.id()));
 +        }
 +    });
 +}
@@ -872,7 +901,7 @@ index 0000000..c354845
 +/// and the selection's band on each line. While this person writes in that block it shows with its marks; otherwise
 +/// the marks are not drawn, so the text is measured without them (a close guess for marked-up words).
 +fn marks(ui: &egui::Ui, page: &Page, ed: &Editor, i: usize, (a, b): (usize, usize), t: &Tokens) -> Option<(Rect, Vec<Rect>)> {
-+    let (block, top) = (ed.blocks.get(i)?, *page.tops.get(i)?);
++    let (block, (top, column, _)) = (ed.blocks.get(i)?, *page.tops.get(i)?);
 +    let editing = ed.caret.as_ref().is_some_and(|c| c.block == i);
 +    let text = ed.caret.as_ref().filter(|_| editing).map_or_else(|| pageedit::block_text(block), |c| c.text.clone());
 +    // Character `n` of the block's text, as drawn.
@@ -890,7 +919,7 @@ index 0000000..c354845
 +    };
 +    let (size, strong) = size_of(block);
 +    let left = lead(block, editing) + x;
-+    let galley = ui.fonts_mut(|f| f.layout_job(crate::pagetext::inline_job(&shown, size, strong, t, (page.width - left).max(1.0), Default::default())));
++    let galley = ui.fonts_mut(|f| f.layout_job(crate::pagetext::inline_job(&shown, size, strong, t, (column - left).max(1.0), Default::default())));
 +    let y = if !editing && matches!(block, Block::Heading { .. }) { 6.0 } else { 0.0 };
 +    let place = |r: Rect| r.translate(top.to_vec2() + vec2(left, y));
 +    let cursor = |n: usize| galley.pos_from_cursor(egui::text::CCursor::new(n));
@@ -917,6 +946,26 @@ index 0000000..c354845
 +                let here: Vec<&Presence> = others.iter().filter(|o| page_of(o).is_some_and(|p| root.join(p) == ed.dir)).collect();
 +                shown.retain(|id, _| here.iter().any(|o| o.id == *id));
 +                let painter = ui.painter().with_clip_rect(clip);
++                // What they are drawing, at its pen's width, in their colour, see-through.
++                for o in &here {
++                    let ink = &o.state["ink"];
++                    let width = coord(&ink["width"]).unwrap_or(3.0).clamp(0.5, 60.0);
++                    let points: Vec<Pos2> = ink["points"]
++                        .as_array()
++                        .into_iter()
++                        .flatten()
++                        .take(INK_POINTS)
++                        .filter_map(|p| Some(origin + vec2(coord(&p[0])?, coord(&p[1])?)))
++                        .collect();
++                    let color = rgb(o.color).gamma_multiply(0.7);
++                    if let [first, ..] = points.as_slice() {
++                        painter.circle_filled(*first, width / 2.0, color);
++                    }
++                    if points.len() > 1 {
++                        painter.add(Shape::line(points.clone(), Stroke::new(width, color)));
++                        painter.circle_filled(points[points.len() - 1], width / 2.0, color);
++                    }
++                }
 +                for o in &here {
 +                    let caret = &o.state["caret"];
 +                    let n = |v: &Value| v.as_u64().and_then(|n| usize::try_from(n).ok()).map(|n| n.min(1_000_000));
@@ -991,10 +1040,10 @@ index 0000000..c354845
 +}
 diff --git a/crates/ui-egui/src/app/live/tests.rs b/crates/ui-egui/src/app/live/tests.rs
 new file mode 100644
-index 0000000..5a65963
+index 0000000..92f61d5
 --- /dev/null
 +++ b/crates/ui-egui/src/app/live/tests.rs
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,115 @@
 +// SPDX-License-Identifier: MIT OR Apache-2.0
 +use super::*;
 +use notecraft_engine::Session;
@@ -1034,6 +1083,29 @@ index 0000000..5a65963
 +    assert_eq!(merged, doc(want, Some("y")));
 +    assert!(NoteCraftApp::live_merge(&doc(base, Some("x")), &doc(alice, Some("x")), &doc(base, None)).is_ok_and(|m| m == doc(alice, None)));
 +    assert!(NoteCraftApp::live_merge(&doc(base, Some("x")), &doc(base, Some("z")), &doc(base, None)).is_err());
++    // Ink (the page's ink.svg): two people drawing on one page at once both keep their strokes.
++    use notecraft_ink::{Dab, Drawing, Rgb, Stroke, Tool, svg};
++    let sheet = |xs: &[f32]| {
++        let mut d = Drawing::new(820.0, 1100.0);
++        for x in xs {
++            let mut s = Stroke::new(Tool::Pen, Rgb::BLACK, 3.0);
++            for i in 0..5 {
++                s.add(Dab::new(x + i as f32 * 10.0, 20.0, 0.5));
++            }
++            d.add(s);
++        }
++        svg::write(&d, svg::Flavour::Editable)
++    };
++    let drawn = text::merge(&sheet(&[0.0]), &sheet(&[0.0, 100.0]), &sheet(&[0.0, 200.0]));
++    assert_eq!(svg::read(&drawn).expect("still a drawing").0.strokes.len(), 3);
++    // Also the first strokes on a page, the file new on both sides.
++    let first = Flat::from([("nb/s/p/ink.svg".to_owned(), sheet(&[100.0]).into())]);
++    let other = Flat::from([("nb/s/p/ink.svg".to_owned(), sheet(&[200.0]).into())]);
++    let (none, a, b) =
++        (json!({ "files": {}, "media": {} }), json!({ "files": nest(first), "media": {} }), json!({ "files": nest(other), "media": {} }));
++    let merged = NoteCraftApp::live_merge(&none, &a, &b).expect("both drew");
++    let ink = merged["files"]["nb"]["s"]["p"]["ink.svg"].as_str().expect("ink");
++    assert_eq!(svg::read(ink).expect("one drawing").0.strokes.len(), 2);
 +    // A path that leaves the notebooks folder is never installed.
 +    let mut bad = doc(base, None);
 +    bad["files"][".."] = json!({ "escape": { "index.html": "x" } });
@@ -1089,10 +1161,10 @@ index 0000000..5a65963
 +}
 diff --git a/crates/ui-egui/src/app/live/text.rs b/crates/ui-egui/src/app/live/text.rs
 new file mode 100644
-index 0000000..8cd1dde
+index 0000000..ca83877
 --- /dev/null
 +++ b/crates/ui-egui/src/app/live/text.rs
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,184 @@
 +// SPDX-License-Identifier: MIT OR Apache-2.0
 +//! The three-way merge of a page's text (or any file of the notebooks) for live editing: as git merges, first by
 +//! line, then, where both sides changed the same lines, character by character. It never conflicts and never drops a
@@ -1139,6 +1211,14 @@ index 0000000..8cd1dde
 +        }
 +        (i, j, k) = next;
 +    }
++}
++
++/// A file both sides added at once (the first strokes on a page, from two pens): merged over the lines they share, so
++/// what they have in common is there once and what each added is kept.
++pub fn merge_added(current: &str, edited: &str) -> String {
++    let (c, e): (Vec<&str>, Vec<&str>) = (current.split_inclusive('\n').collect(), edited.split_inclusive('\n').collect());
++    let common: String = c.iter().zip(matches(&c, &e, |x, y| x == y)).filter_map(|(line, m)| m.map(|_| *line)).collect();
++    merge(&common, current, edited)
 +}
 +
 +/// What one side did to the base, character by character: which base characters it kept, and what it inserted in
