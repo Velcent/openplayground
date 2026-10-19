@@ -95,7 +95,23 @@ export function explorer({ mode = 'browse', types = [], name = '', apps = [], cl
     store.usage().then(({ usage: used }) => {
       if (used) usage.textContent = `This site uses ${formatSize(used)} of browser storage. Files stay until you clear this site’s data.`
     })
-    foot.append(usage)
+    // Start over: the downloaded apps (they download again), or everything this site keeps in the browser.
+    const clearCache = async () => {
+      if (!(await confirmIn(root, 'Clear the downloaded apps? They download again the next time you open them. Your files stay.', 'Clear app cache'))) return
+      await store.clearSiteData()
+      location.reload()
+    }
+    const clearAll = async () => {
+      if (!(await confirmIn(root, 'Delete all of this site’s data in this browser? This removes every file in Files, your settings and the downloaded apps. It can’t be undone.', 'Delete everything', { danger: true }))) return
+      await store.clearSiteData({ everything: true })
+      location.reload()
+    }
+    foot.append(
+      usage,
+      h('div', { class: 'pg-ex-clear' },
+        h('button', { class: 'pg-btn pg-quiet', type: 'button', onclick: clearCache }, 'Clear app cache'),
+        h('button', { class: 'pg-btn pg-quiet', type: 'button', onclick: clearAll }, 'Delete all site data')),
+    )
     if (closable) foot.append(h('button', { class: 'pg-btn', type: 'button', onclick: () => onDone(null) }, 'Close'))
   }
 

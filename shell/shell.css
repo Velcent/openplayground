@@ -190,6 +190,8 @@ body > canvas:first-of-type, body > canvas#lemon-canvas {
 .pg-ex-status.pg-error { color: var(--pg-danger); }
 .pg-ex-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px 10px 24px; border-top: 1px solid var(--pg-line); }
 .pg-ex-usage { color: var(--pg-muted); font-size: 12px; }
+.pg-ex-clear { display: flex; gap: 4px; margin-left: auto; }
+.pg-ex-clear .pg-btn { font-size: 12px; }
 .pg-check { display: inline-flex; align-items: center; gap: 8px; color: var(--pg-muted); font-size: 13px; }
 .pg-name { display: flex; flex: 1; align-items: center; gap: 10px; min-width: 220px; }
 .pg-name > span { color: var(--pg-muted); font-size: 13px; }

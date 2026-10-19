@@ -1,7 +1,8 @@
 Fixes the newest commit crashing at start in the browser ("no pids on this platform"): recovery::instance_id
 hashed std::process::id(), which wasm32 lacks (upstream 241ecd5, 2026-10-13). On the web it hashes a random number
-instead, so each tab still gets its own id. Head only: the newest release has no instance_id yet. Delete once upstream
-fixes it (this then applies in reverse, or no longer applies and a repair empties it).
+instead, so each tab still gets its own id. Both channels: release v0.8.0 has instance_id too, and stuck at "Loading
+DeckCraft…" without this (openplayground#5). Delete once upstream fixes it (this then applies in reverse, or no longer
+applies and a repair empties it).
 
 diff --git a/crates/engine/src/recovery.rs b/crates/engine/src/recovery.rs
 index 707d0aa..ef73ee1 100644

@@ -8,8 +8,22 @@ export { SessionRoom } from './session-room.js'
 // Needs the GITHUB_TOKEN secret: a fine-grained token for daijro/openplayground with Actions: read and write.
 const WORKFLOWS = ['build.yml', 'store.yml', 'fetch.yml']
 
+// POST /api/clear-site-data?what=cache|all: the browser drops this site's HTTP cache (the downloaded apps; they download
+// again on next open) or, for `all`, its storage too (Files, settings, sessions). Scripts can't empty the HTTP cache
+// themselves; the Clear-Site-Data header can (shell/store.js clearSiteData).
+const clearSiteData = (url) =>
+  new Response(null, {
+    status: 204,
+    headers: { 'clear-site-data': url.searchParams.get('what') === 'all' ? '"cache", "storage"' : '"cache"', 'cache-control': 'no-store' },
+  })
+
 export default {
-  fetch: (request, env) => new URL(request.url).pathname.startsWith('/api/session/') ? sessionRequest(request, env) : env.ASSETS.fetch(request),
+  fetch(request, env) {
+    const url = new URL(request.url)
+    if (url.pathname.startsWith('/api/session/')) return sessionRequest(request, env)
+    if (url.pathname === '/api/clear-site-data' && request.method === 'POST') return clearSiteData(url)
+    return env.ASSETS.fetch(request)
+  },
 
   async scheduled(event, env) {
     if (!env.GITHUB_TOKEN) return console.error('GITHUB_TOKEN secret is not set: not starting the workflows')

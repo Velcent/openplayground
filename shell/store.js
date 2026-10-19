@@ -183,4 +183,19 @@ export const usage = async () => {
   return { usage, quota }
 }
 /** Ask the browser not to clear the storage when the disk runs low. */
+// "Clear app cache": the downloaded apps are in the browser's HTTP cache, which only the server's Clear-Site-Data
+// header can empty (worker.js). "Delete all site data" also empties this origin's storage here, for browsers that
+// don't act on the header's "storage": Files, sessions, settings and any caches.
+export async function clearSiteData({ everything = false } = {}) {
+  await fetch(`/api/clear-site-data?what=${everything ? 'all' : 'cache'}`, { method: 'POST', cache: 'no-store' }).catch(() => {})
+  if (!everything) return
+  try {
+    const root = await navigator.storage.getDirectory()
+    for await (const name of root.keys()) await root.removeEntry(name, { recursive: true }).catch(() => {})
+  } catch {}
+  try { localStorage.clear(); sessionStorage.clear() } catch {}
+  try { for (const db of (await indexedDB.databases?.()) ?? []) if (db.name) indexedDB.deleteDatabase(db.name) } catch {}
+  try { for (const key of await caches.keys()) await caches.delete(key) } catch {}
+}
+
 export const persist = () => navigator.storage.persist?.().catch(() => false) ?? Promise.resolve(false)
