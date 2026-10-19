@@ -693,7 +693,7 @@ index 0000000..2ada60a
 +use serde_json::Value;
 +use subcraft_core::{AnchorId, ChannelKind, ChannelValue, EffectId, LayerId, ResourceId, TextureSetId};
 +use subcraft_doc::{
-+    ChannelBlend, ChannelDef, Document, FillChannel, FillContent, GroupContent, Layer, LayerContent, Mask, MaskEffect,
++    ChannelBlend, ChannelDef, ContentEffect, ContentEffectKind, Document, FillChannel, FillContent, GroupContent, Layer, LayerContent, Mask, MaskEffect,
 +    MaskEffectKind, PaintContent, PartMask, PenAnchor, PenPath, RESOLUTIONS, Resource, ResourceKind, ResourceStore,
 +    TextureSet,
 +};
@@ -710,6 +710,7 @@ index 0000000..2ada60a
 +const END: u32 = u32::MAX;
 +const MASK: u8 = 0x40;
 +const EFFECT: u8 = 0x80;
++const CONTENT: u8 = 0xC0;
 +
 +type Error = String;
 +
@@ -761,6 +762,8 @@ index 0000000..2ada60a
 +    Channel(u8),
 +    Mask,
 +    Effect(Uuid),
++    /// A channel (its index) of a content paint effect.
++    Content(Uuid, u8),
 +}
 +
 +#[derive(Clone, Debug, PartialEq)]
@@ -828,6 +831,7 @@ index 0000000..2ada60a
 +        Slot::Channel(i) => i,
 +        Slot::Mask => MASK,
 +        Slot::Effect(_) => EFFECT,
++        Slot::Content(..) => CONTENT,
 +    }
 +}
 +
@@ -885,6 +889,13 @@ index 0000000..2ada60a
 +                i if (i as usize) < ChannelKind::ALL.len() => Slot::Channel(i),
 +                MASK => Slot::Mask,
 +                EFFECT => Slot::Effect(r.uuid()?),
++                CONTENT => {
++                    let (effect, channel) = (r.uuid()?, r.u8()?);
++                    if channel as usize >= ChannelKind::ALL.len() {
++                        return Err(invalid("raster slot"));
++                    }
++                    Slot::Content(effect, channel)
++                }
 +                _ => return Err(invalid("raster slot")),
 +            };
 +            let (comps, size) = (r.u8()?, r.u32()?);
@@ -936,7 +947,7 @@ index 0000000..2ada60a
 +        + cp.resources.values().map(|r| 16 + 1 + 8 + r.name.len() + r.bytes.len()).sum::<usize>()
 +        + cp.layers.values().map(|images| {
 +            let image = |(s, i): (&Slot, &Image)| {
-+                22 + if matches!(s, Slot::Effect(_)) { 16 } else { 0 } + i.tiles.values().map(|t| 9 + t.len()).sum::<usize>()
++                22 + match s { Slot::Effect(_) => 16, Slot::Content(..) => 17, _ => 0 } + i.tiles.values().map(|t| 9 + t.len()).sum::<usize>()
 +            };
 +            22 + images.iter().map(image).sum::<usize>()
 +        }).sum::<usize>()
@@ -969,8 +980,13 @@ index 0000000..2ada60a
 +        out.push(images.len() as u8);
 +        for (slot, image) in images {
 +            out.push(slot_byte(*slot));
-+            if let Slot::Effect(effect) = slot {
-+                out.extend_from_slice(effect.as_bytes());
++            match slot {
++                Slot::Effect(effect) => out.extend_from_slice(effect.as_bytes()),
++                Slot::Content(effect, channel) => {
++                    out.extend_from_slice(effect.as_bytes());
++                    out.push(*channel);
++                }
++                _ => {}
 +            }
 +            out.push(image.comps);
 +            u32(&mut out, image.size as usize);
@@ -1098,6 +1114,11 @@ index 0000000..2ada60a
 +            }
 +        }
 +    }
++    for e in &l.content_effects {
++        if let ContentEffectKind::Paint { channels } = &e.kind {
++            out.extend(channels.iter().map(|(&k, image)| (Slot::Content(e.id.0, channel_index(k)), image)));
++        }
++    }
 +    out
 +}
 +
@@ -1163,7 +1184,31 @@ index 0000000..2ada60a
 +        LayerContent::Group(g) => ContentV1::Folder { expanded: true, children: g.children.iter().map(|c| layer_json(c)).collect() },
 +    };
 +    let parts = l.parts.as_ref().map(|p| PartsV1 { enabled: p.enabled, kind: p.kind, parts: p.parts.iter().copied().collect() });
-+    LayerV1 { id: l.id.0, name: l.name.clone(), visible: l.visible, blend, mask, parts, content }
++    let content_effects = l
++        .content_effects
++        .iter()
++        .map(|e| ContentEffectV5 {
++            id: e.id.0,
++            name: e.name.clone(),
++            visible: e.visible,
++            blend: e.blend.iter().map(|(&channel, b)| BlendV1 { channel, mode: b.mode, opacity: b.opacity }).collect(),
++            kind: match &e.kind {
++                ContentEffectKind::Paint { channels } => ContentEffectKindV5::Paint {
++                    channels: channels.keys().map(|&channel| PaintChannelV1 { channel, raster: String::new() }).collect(),
++                },
++                ContentEffectKind::Fill(f) => ContentEffectKindV5::Fill {
++                    projection: f.projection,
++                    channels: f
++                        .channels
++                        .iter()
++                        .map(|(&channel, c)| FillChannelV1 { channel, enabled: c.enabled, source: c.source.clone(), strength: c.strength })
++                        .collect(),
++                },
++                ContentEffectKind::Levels { channel, levels } => ContentEffectKindV5::Levels { channel: *channel, levels: *levels },
++            },
++        })
++        .collect();
++    LayerV1 { id: l.id.0, name: l.name.clone(), visible: l.visible, blend, mask, parts, content, content_effects }
 +}
 +
 +fn json(doc: &Document) -> Value {
@@ -1310,6 +1355,28 @@ index 0000000..2ada60a
 +                children: children.iter().map(|c| self.layer(c, resolution).map(Arc::new)).collect::<Result<_, _>>()?,
 +            }),
 +        };
++        let mut content_effects = Vec::new();
++        for e in &l.content_effects {
++            self.unique(e.id)?;
++            let kind = match &e.kind {
++                ContentEffectKindV5::Paint { channels } => {
++                    let mut images = BTreeMap::new();
++                    for c in channels {
++                        let slot = Slot::Content(e.id, channel_index(c.channel));
++                        let image = self.take(l.id, slot, resolution, Some(c.channel.components() + 1))?.ok_or_else(|| invalid("a paint effect without its raster"))?;
++                        images.insert(c.channel, image);
++                    }
++                    ContentEffectKind::Paint { channels: images }
++                }
++                ContentEffectKindV5::Fill { projection, channels } => ContentEffectKind::Fill(FillContent {
++                    projection: *projection,
++                    channels: channels.iter().map(|c| (c.channel, FillChannel { enabled: c.enabled, source: c.source.clone(), strength: c.strength })).collect(),
++                }),
++                ContentEffectKindV5::Levels { channel, levels } => ContentEffectKind::Levels { channel: *channel, levels: *levels },
++            };
++            let blend = e.blend.iter().map(|b| (b.channel, ChannelBlend { mode: b.mode, opacity: b.opacity })).collect();
++            content_effects.push(Arc::new(ContentEffect { id: EffectId(e.id), name: e.name.clone(), visible: e.visible, blend, kind }));
++        }
 +        Ok(Layer {
 +            id: LayerId(l.id),
 +            name: l.name.clone(),
@@ -1318,6 +1385,7 @@ index 0000000..2ada60a
 +            mask,
 +            parts: l.parts.as_ref().map(|p| PartMask { enabled: p.enabled, kind: p.kind, parts: p.parts.iter().copied().collect() }),
 +            content,
++            content_effects,
 +        })
 +    }
 +}
