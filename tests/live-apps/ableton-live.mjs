@@ -27,8 +27,6 @@ export default {
   path: '/suhina/',
   viewport: { width: 1400, height: 1000 },
   ready: async (page) => {
-    // The Early preview notice (tools.yaml notice) covers the app until it is dismissed.
-    await page.getByRole('button', { name: 'Continue' }).click({ timeout: 10000 }).catch(() => {})
     await until(async () => !(await checkpoint(page)).startsWith('error'), 60000, 'the demo project')
     await page.mouse.click(650, 158)
     await page.waitForTimeout(500)

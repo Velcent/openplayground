@@ -338,10 +338,6 @@ groups:
         name: Suhina
         alternative: Ableton Live
         blurb: Launch clips, arrange and mix music with built-in instruments and effects.
-        # Shown when the app opens (shell/topbar.js), until someone ticks "Don't show this again".
-        notice:
-          title: Early preview
-          text: Suhina is pre-alpha software. Features are missing, things will break, and your work may be lost. Plug-ins and audio recording don't run in the browser.
         # Its own projects and Live Sets (imported). Upstream publishes desktop nightlies only, so like NoteCraft it
         # has the head channel only; patches/ableton-live.yaml adds the web build.
         opens: [suhina, als]
