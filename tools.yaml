@@ -9,8 +9,8 @@
 #   paths:  only commits changing these paths count as new head versions (optional; default: any)
 #   asset:  regex matching the release asset name (optional; default: "-web-.*\.zip$")
 #   alternative: the commercial app it's an open-source alternative to, shown as "Alternative to …" and
-#           under the dashboard's "Alternative naming". Its icon there is icons/alternatives/<slug>.svg: the product's
-#           logo with a glitch effect over it.
+#           under the dashboard's "Alternative naming". Its icon there is icons/alternatives/<slug>.svg: our own
+#           tile, a short abbreviation in white on the app's colour (no part of the product's logo).
 #   icon:   dashboard icon: the project's own, also copied in as the tool page's favicon
 #   accent, base: a light and a dark brand color, used for the dashboard hover
 #   theme:  script that makes the app follow the browser's light/dark preference (optional; see themes/)
