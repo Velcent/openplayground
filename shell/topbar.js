@@ -74,11 +74,13 @@ export async function mountTopbar() {
   if (app.notice) showNotice(app)
   mountShare(bar, app, here, groups).catch(() => {})
   const build = app[here.channel]
-  // "Alternative naming": the tab goes by the alternative's name and icon too.
-  if (app.own) {
-    document.title = app.name
-    document.querySelector('link[rel="icon"]')?.setAttribute('href', app.icon)
-  }
+  // The tab reads "<app> - Playground", by the alternative's name under "Alternative naming" (which also swaps the
+  // tab's icon). Apps that retitle themselves later are put back.
+  const title = `${app.name} - Playground`
+  const keepTitle = () => { if (document.title !== title) document.title = title }
+  keepTitle()
+  new MutationObserver(keepTitle).observe(document.head, { subtree: true, childList: true, characterData: true })
+  if (app.own) document.querySelector('link[rel="icon"]')?.setAttribute('href', app.icon)
 
   const menu = h(
     'div',
