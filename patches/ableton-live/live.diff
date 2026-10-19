@@ -477,10 +477,10 @@ index 0000000..b50e749
 +}
 diff --git a/crates/ui/src/app/live.rs b/crates/ui/src/app/live.rs
 new file mode 100644
-index 0000000..552c1b3
+index 0000000..0766b7a
 --- /dev/null
 +++ b/crates/ui/src/app/live.rs
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,154 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +//! Live editing in a Playground session (patches/ableton-live.yaml in github.com/daijro/openplayground), the window's
 +//! side: the window is the app the session's kit (crates/session `live`) runs on. The shared document is the project
@@ -610,7 +610,11 @@ index 0000000..552c1b3
 +    fn live_write_asset(&mut self, id: &str, _name: &str, bytes: Vec<u8>) {
 +        let Some(session) = self.live_session_mut() else { return };
 +        match session.live_add_audio(id, bytes) {
-+            Ok(()) => self.live_waveforms(),
++            Ok(()) => {
++                // The missing-files bar looks again, and the clip shows its waveform.
++                self.note_outside_change();
++                self.live_waveforms();
++            }
 +            Err(e) => self.set_status(crate::Status::Error(format!("could not use {id}: {e}"))),
 +        }
 +    }
