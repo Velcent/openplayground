@@ -31,12 +31,12 @@ test('/shell/apps.json lists the installed apps with their channels and file typ
 })
 
 test('the dashboard and the Files page use the Playground logo as their favicon', async () => {
-  const icon = await fetch(`${site.url}/icons/playground-logo.svg`)
+  const icon = await fetch(`${site.url}/shell/playground-logo.svg`)
   assert.equal(icon.status, 200)
   assert.match(icon.headers.get('content-type'), /image\/svg\+xml/)
   for (const path of ['/', '/files/']) {
     const html = await (await fetch(`${site.url}${path}`)).text()
-    assert.match(html, /<link rel="icon"[^>]*href="\/icons\/playground-logo\.svg"/, path)
+    assert.match(html, /<link rel="icon"[^>]*href="\/shell\/playground-logo\.svg"/, path)
   }
 })
 

@@ -52,7 +52,7 @@ export async function mountTopbar() {
   })
 
   // Everything that doesn't need apps.json goes up at once; the switcher and version join when the list arrives.
-  const home = h('a', { class: 'pg-home', href: '/' }, h('img', { class: 'pg-mark', src: '/icons/playground-logo.svg', alt: '' }), h('span', { class: 'pg-label' }, 'Playground'))
+  const home = h('a', { class: 'pg-home', href: '/' }, h('img', { class: 'pg-mark', src: '/shell/playground-logo.svg', alt: '' }), h('span', { class: 'pg-label' }, 'Playground'))
   const bar = isolate(
     h(
       'header',

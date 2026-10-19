@@ -203,7 +203,7 @@ test('an app that reports its own state is warned about only when it has unsaved
 test('the bar’s Playground link carries the ArtCraft icon', async () => {
   const page = await openPage(browser, `${site.url}${wordPath()}`)
   const home = page.getByRole('link', { name: 'Playground' })
-  assert.equal(await home.locator('img').getAttribute('src'), '/icons/playground-logo.svg')
+  assert.equal(await home.locator('img').getAttribute('src'), '/shell/playground-logo.svg')
 })
 
 test('the bar folds away with its arrow, comes back from the tab at the top center, and remembers', async () => {
