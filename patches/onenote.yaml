@@ -73,6 +73,13 @@
   find: 'if\s+!path\.is_dir\(\)'
   replace: 'if !std::fs::metadata(&path).is_ok_and(|m| m.is_dir())'
 
+# Rule 16: rfd has no FileDialog on wasm; the folder chooser (choose_notebooks_folder) picks nothing there (the
+# notebooks folder is Playground's Files). Native builds keep the dialog.
+# Verify: build.mjs check. If upstream moves the dialog: anchor on the new rfd call.
+- file: crates/ui-egui/src/app.rs
+  find: 'rfd::FileDialog::new\(\)[^;]*?\.pick_folder\(\)'
+  replace: '({ #[cfg(not(target_arch = "wasm32"))] { $& } #[cfg(target_arch = "wasm32")] { None::<std::path::PathBuf> } })'
+
 # Live editing in Playground sessions (patches/onenote/live.diff + patches/live/playground_live.rs)
 # What it's for: people in a Playground session write in the same notebooks at once: every keystroke reaches the
 #   others, two people typing in one page merge character by character, each person's Ctrl+Z takes back only their
@@ -100,13 +107,13 @@
 # The page: where it is drawn before its blocks, and the others' carets and pointers after them.
 - live: true
   file: crates/ui-egui/src/app.rs
-  find: 'let\s+what\s*=\s*pageedit::show\([^;]*\);'
+  find: 'let\s+moved\s*=\s*crate::containers::show\([^;]*\);'
   before: "#[cfg(target_arch = \"wasm32\")] live::page_start(ui);\n                            "
   after: "\n                            #[cfg(target_arch = \"wasm32\")] live::page_end(ui, ed, &tokens);"
 # Where each block of the page starts (for the others' carets).
 - live: true
   file: crates/ui-egui/src/pageedit.rs
-  find: 'for\s+i\s+in\s+0\.\.count\s*\{'
+  find: 'for\s+i\s+in\s+(?:0|range\.start)\.\.[^{;]*\{'
   after: "\n        #[cfg(target_arch = \"wasm32\")] crate::app::live::block_top(i, ui.next_widget_position());"
 # Each tree row as drawn (the others' dots go on it).
 - live: true

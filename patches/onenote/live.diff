@@ -890,7 +890,7 @@ index 0000000..c354845
 +    };
 +    let (size, strong) = size_of(block);
 +    let left = lead(block, editing) + x;
-+    let galley = ui.fonts_mut(|f| f.layout_job(crate::pagetext::inline_job(&shown, size, strong, t, (page.width - left).max(1.0))));
++    let galley = ui.fonts_mut(|f| f.layout_job(crate::pagetext::inline_job(&shown, size, strong, t, (page.width - left).max(1.0), Default::default())));
 +    let y = if !editing && matches!(block, Block::Heading { .. }) { 6.0 } else { 0.0 };
 +    let place = |r: Rect| r.translate(top.to_vec2() + vec2(left, y));
 +    let cursor = |n: usize| galley.pos_from_cursor(egui::text::CCursor::new(n));

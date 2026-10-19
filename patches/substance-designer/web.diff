@@ -346,6 +346,9 @@ index 0000000..b217a51
 +            self.name = name.into();
 +            self
 +        }
++        pub fn set_directory(self, _dir: impl AsRef<std::path::Path>) -> Self {
++            self
++        }
 +        fn ask(self, ask: Ask) -> Option<Vec<PathBuf>> {
 +            with(|s| match s.answer.take() {
 +                Some((a, paths)) if a == ask => Some(paths),
