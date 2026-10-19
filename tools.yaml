@@ -353,8 +353,12 @@ groups:
 
       - slug: mspaint
         name: SelfPaint
-        alternative: Microsoft Paint
+        alternative: Microsoft Paint (experimental)
         blurb: Draw and paint with a pencil, brushes, an eraser, fills, shapes and text.
+        # Shown when the app opens (shell/topbar.js), until someone ticks "Don't show this again".
+        notice:
+          title: Early preview
+          text: This app is still under heavy development and is only available as an early preview. It isn't meant for real-world use yet. Features are missing, things will break, and your work may be lost. Don't rely on it for anything important.
         # Its release's web zip is selfpaint-web.zip (not -web-<version>.zip), built from files that aren't in the
         # repository; patches/mspaint.yaml adds the web build Playground makes from the sources on both channels.
         opens: [png, jpg, jpeg, sproj]

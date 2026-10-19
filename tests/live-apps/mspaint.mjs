@@ -26,6 +26,8 @@ export default {
   path: '/selfpaint/',
   viewport: { width: 1280, height: 800 },
   ready: async (page) => {
+    // The Early preview notice (tools.yaml notice) covers the app until it is dismissed.
+    await page.getByRole('button', { name: 'Continue' }).click({ timeout: 10000 }).catch(() => {})
     await page.evaluate(() => {
       globalThis.liveTestDocument = () => {
         const bytes = playgroundLiveAdapter.checkpoint()
