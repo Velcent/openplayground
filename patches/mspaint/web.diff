@@ -1,0 +1,366 @@
+diff --git a/Trunk.toml b/Trunk.toml
+new file mode 100644
+index 0000000..d1cee0e
+--- /dev/null
++++ b/Trunk.toml
+@@ -0,0 +1,6 @@
++# SelfPaint in the browser, for Playground (patches/mspaint.yaml in github.com/daijro/openplayground).
++# Build with: trunk build --release
++[build]
++target = "index.html"
++public_url = "./"
++filehash = true
+diff --git a/index.html b/index.html
+new file mode 100644
+index 0000000..52c6947
+--- /dev/null
++++ b/index.html
+@@ -0,0 +1,19 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
++  <title>SelfPaint</title>
++  <link data-trunk rel="rust" data-bin="selfpaint" data-wasm-opt="0" />
++  <style>
++    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #f3f3f3; }
++    #selfpaint_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
++    #selfpaint_loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
++      color: #555; font: 14px system-ui, sans-serif; pointer-events: none; }
++  </style>
++</head>
++<body>
++  <canvas id="selfpaint_canvas"></canvas>
++  <div id="selfpaint_loading">Loading SelfPaint&hellip;</div>
++</body>
++</html>
+diff --git a/src/app/web.rs b/src/app/web.rs
+new file mode 100644
+index 0000000..7354ddc
+--- /dev/null
++++ b/src/app/web.rs
+@@ -0,0 +1,323 @@
++// SPDX-License-Identifier: MIT
++//! SelfPaint in the browser, for Playground (patches/mspaint.yaml in github.com/daijro/openplayground). wasm only: a
++//! child of the app module (src/app.rs declares it), so it reaches the app's state like the app's own methods do.
++//!
++//! wasm32-unknown-unknown has no clock, file dialogs, threads or settings folder, so in src/app.rs
++//!   std::time       is web-time's (std's Instant::now panics in the browser);
++//!   rfd             is a stand-in that is never shown: Open, Save and Save project come here first;
++//!   craft_settings  keeps the preferences in the browser's localStorage.
++//! Files go through Playground's `globalThis.playgroundFiles` (browser storage, "From computer…" and downloads):
++//! Open picks a PNG, JPEG or .sproj; Save (PNG) and Save project ask where the first time, then save back to that
++//! browser file; Files' "Open in SelfPaint" hands a file in. Results reach the app as the desktop dialogs' do.
++
++use super::{DragState, FileResult, SelfPaintApp};
++use crate::project;
++use eframe::egui;
++use std::cell::{Cell, OnceCell, RefCell};
++use std::path::PathBuf;
++use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
++
++/// std, with web-time's clock.
++pub mod std_web {
++    pub use ::std::*;
++    pub mod time {
++        pub use web_time::*;
++    }
++}
++
++/// rfd's FileDialog, never shown: on the web, Open and the saves return to this module before they build one.
++pub mod rfd {
++    use std::path::{Path, PathBuf};
++
++    pub struct FileDialog;
++
++    impl FileDialog {
++        pub fn new() -> Self {
++            Self
++        }
++        pub fn add_filter(self, _name: &str, _exts: &[&str]) -> Self {
++            self
++        }
++        pub fn set_file_name(self, _name: impl Into<String>) -> Self {
++            self
++        }
++        pub fn set_directory(self, _dir: impl AsRef<Path>) -> Self {
++            self
++        }
++        pub fn save_file(self) -> Option<PathBuf> {
++            None
++        }
++        pub fn pick_file(self) -> Option<PathBuf> {
++            None
++        }
++    }
++}
++
++/// craft-settings without a settings folder: the preferences live in localStorage (`selfpaint-settings`, JSON).
++pub mod craft_settings {
++    pub use ::craft_settings::*;
++    use crate::settings::Prefs;
++
++    const KEY: &str = "selfpaint-settings";
++
++    pub enum Location {
++        Auto,
++    }
++
++    pub struct TickResult {
++        pub status: SaveStatus,
++        pub next_deadline: Option<web_time::Instant>,
++    }
++
++    pub struct SettingsStore<T>(T);
++
++    fn storage() -> Option<web_sys::Storage> {
++        web_sys::window()?.local_storage().ok()?
++    }
++
++    impl SettingsStore<Prefs> {
++        /// The stored preferences; the first time, the defaults in English unless the browser asks for Portuguese.
++        pub fn open(_: Location) -> (Self, ()) {
++            let stored = storage().and_then(|s| s.get_item(KEY).ok()?).and_then(|t| serde_json::from_str(&t).ok());
++            let prefs = stored.unwrap_or_else(|| {
++                let mut prefs = Prefs::default();
++                let lang = web_sys::window().and_then(|w| w.navigator().language()).unwrap_or_default();
++                if !lang.starts_with("pt") {
++                    prefs.general.language = "en".into();
++                }
++                prefs
++            });
++            (Self(prefs), ())
++        }
++        pub fn get(&self) -> &Prefs {
++            &self.0
++        }
++        pub fn update(&mut self, f: impl FnOnce(&mut Prefs)) {
++            let before = self.0.clone();
++            f(&mut self.0);
++            if self.0 != before
++                && let (Some(s), Ok(text)) = (storage(), serde_json::to_string(&self.0))
++            {
++                let _ = s.set_item(KEY, &text);
++            }
++        }
++        pub fn tick<I>(&mut self, _now: I) -> TickResult {
++            TickResult { status: SaveStatus::Idle, next_deadline: None }
++        }
++        pub fn flush(&mut self) -> Result<(), ()> {
++            Ok(())
++        }
++    }
++}
++
++thread_local! {
++    static CTX: OnceCell<egui::Context> = const { OnceCell::new() };
++    /// Files and saves the page has finished with, for the app's next frame.
++    static ARRIVED: RefCell<Vec<FileResult>> = const { RefCell::new(Vec::new()) };
++    /// A dialog of the page's is open.
++    static ASKING: Cell<bool> = const { Cell::new(false) };
++}
++
++pub(super) fn repaint() {
++    CTX.with(|c| c.get().map(egui::Context::request_repaint));
++}
++
++fn arrive(result: FileResult) {
++    ARRIVED.with_borrow_mut(|a| a.push(result));
++    repaint();
++}
++
++// ---------------------------------------------------------------- the page's playgroundFiles
++
++/// `playgroundFiles[method](...args)`; None when the page has no playgroundFiles or the call threw.
++fn call(method: &str, args: &[JsValue]) -> Option<JsValue> {
++    let api = js_sys::Reflect::get(&js_sys::global(), &"playgroundFiles".into()).ok().filter(JsValue::is_object)?;
++    let f = js_sys::Reflect::get(&api, &method.into()).ok()?.dyn_into::<js_sys::Function>().ok()?;
++    f.apply(&api, &args.iter().collect::<js_sys::Array>()).ok()
++}
++
++fn object(fields: &[(&str, JsValue)]) -> JsValue {
++    let o = js_sys::Object::new();
++    for (k, v) in fields {
++        let _ = js_sys::Reflect::set(&o, &(*k).into(), v);
++    }
++    o.into()
++}
++
++fn get(o: &JsValue, k: &str) -> JsValue {
++    js_sys::Reflect::get(o, &k.into()).unwrap_or(JsValue::UNDEFINED)
++}
++
++fn types(exts: &[&str]) -> JsValue {
++    exts.iter().map(|e| JsValue::from_str(e)).collect::<js_sys::Array>().into()
++}
++
++fn bytes(b: &[u8]) -> JsValue {
++    js_sys::Uint8Array::from(b).into()
++}
++
++/// Awaits `playgroundFiles[method](...)` without holding up the app, then hands the result (null on failure) to
++/// `done`. Only one at a time.
++fn ask(method: &'static str, args: JsValue, done: impl FnOnce(JsValue) + 'static) {
++    if ASKING.replace(true) {
++        return;
++    }
++    let promise = call(method, &[args]).and_then(|p| p.dyn_into::<js_sys::Promise>().ok());
++    wasm_bindgen_futures::spawn_local(async move {
++        let result = match promise {
++            Some(p) => wasm_bindgen_futures::JsFuture::from(p).await.unwrap_or(JsValue::NULL),
++            None => JsValue::NULL,
++        };
++        ASKING.set(false);
++        done(result);
++        repaint();
++    });
++}
++
++/// A file the page handed in (`{ path, name, bytes }`), read as the desktop Open reads one: a project or an image.
++/// A file from the computer has no browser path: it goes by its name, so saving it asks where.
++fn opened(file: &JsValue) -> FileResult {
++    let path = PathBuf::from(get(file, "path").as_string().or_else(|| get(file, "name").as_string()).unwrap_or_default());
++    let data = js_sys::Uint8Array::new(&get(file, "bytes")).to_vec();
++    let failed = |e: String| FileResult::Failed { message: e };
++    if project::is_project(&data) {
++        match project::decode(&data) {
++            Ok((pixels, meta)) => FileResult::OpenedProject { path, pixels, meta },
++            Err(e) => failed(e.to_string()),
++        }
++    } else {
++        match image::load_from_memory(&data) {
++            Ok(img) => FileResult::OpenedImage { path, pixels: img.into_rgba8() },
++            Err(e) => failed(e.to_string()),
++        }
++    }
++}
++
++/// Open (the ribbon's, Ctrl+O): the page's Open dialog.
++pub(super) fn open(_app: &mut SelfPaintApp) {
++    let args = object(&[("types", types(&["png", "jpg", "jpeg", "sproj"]))]);
++    ask("open", args, |v| {
++        if let Some(file) = v.dyn_ref::<js_sys::Array>().map(|a| a.get(0)).filter(JsValue::is_object) {
++            arrive(opened(&file));
++        }
++    });
++}
++
++/// Save (PNG) or Save project: back to the browser file of that type it came from or was saved to, else the page's
++/// Save As (browser storage or a download).
++pub(super) fn save(app: &mut SelfPaintApp, as_project: bool) {
++    let (encoded, ext, current) = if as_project {
++        let encoded = project::encode(&app.doc.pixels, &app.project_meta()).map_err(|e| e.to_string());
++        (encoded, "sproj", app.current_project.clone())
++    } else {
++        let mut png = Vec::new();
++        let encoded = app.doc.pixels.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map(|()| png).map_err(|e| e.to_string());
++        (encoded, "png", app.current_png.clone())
++    };
++    let data = match encoded {
++        Ok(data) => data,
++        Err(message) => return arrive(FileResult::Failed { message }),
++    };
++    let saved = move |path: PathBuf| if as_project { FileResult::SavedProject(path) } else { FileResult::SavedPng(path) };
++    let same_type = |p: &&PathBuf| p.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext));
++    if let Some(path) = current.as_ref().filter(same_type).and_then(|p| p.to_str()).filter(|p| p.starts_with("browser:")) {
++        call("write", &[path.into(), bytes(&data)]);
++        return arrive(saved(PathBuf::from(path)));
++    }
++    let name = current.as_ref().and_then(|p| p.file_stem()).map_or_else(|| app.l10n.untitled.to_owned(), |s| s.to_string_lossy().into_owned());
++    let args = object(&[("name", format!("{name}.{ext}").into()), ("types", types(&[ext])), ("bytes", bytes(&data))]);
++    ask("saveAs", args, move |v| {
++        // Kept in browser storage: written there (a download was the page's to make).
++        if let Some(path) = get(&v, "path").as_string() {
++            call("write", &[path.as_str().into(), bytes(&data)]);
++            arrive(saved(PathBuf::from(path)));
++        }
++    });
++}
++
++// ---------------------------------------------------------------- the app on the page
++
++/// The app as eframe runs it in the browser: what the page finished with goes in before each frame, and the stroke
++/// being drawn shows as it goes.
++pub struct Web(pub SelfPaintApp, Option<(f32, f32)>);
++
++impl Web {
++    pub fn new(app: SelfPaintApp) -> Self {
++        Self(app, None)
++    }
++
++    /// Upstream uploads the picture only once a stroke ends; this puts the part drawn this frame (from where the
++    /// stroke was last frame to where it is now) on screen.
++    fn show_stroke(&mut self) {
++        let app = &mut self.0;
++        let DragState::Stroke { last, .. } = app.drag else {
++            self.1 = None;
++            return;
++        };
++        let from = self.1.replace(last).unwrap_or(last);
++        let (w, h) = (app.doc.width() as usize, app.doc.height() as usize);
++        let r = app.brush_radius() + 2.0;
++        let Some(texture) = app.texture.as_mut().filter(|t| t.size() == [w, h]) else { return };
++        let clamp = |v: f32, max: usize| (v.max(0.0) as usize).min(max);
++        let (x0, x1) = (clamp(from.0.min(last.0) - r, w), clamp(from.0.max(last.0) + r + 1.0, w));
++        let (y0, y1) = (clamp(from.1.min(last.1) - r, h), clamp(from.1.max(last.1) + r + 1.0, h));
++        if x0 >= x1 || y0 >= y1 {
++            return;
++        }
++        let raw = app.doc.pixels.as_raw();
++        let rows: Vec<u8> = (y0..y1).flat_map(|y| &raw[(y * w + x0) * 4..(y * w + x1) * 4]).copied().collect();
++        texture.set_partial([x0, y0], egui::ColorImage::from_rgba_unmultiplied([x1 - x0, y1 - y0], &rows), egui::TextureOptions::LINEAR);
++    }
++}
++
++impl eframe::App for Web {
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        let arrived = ARRIVED.take();
++        if !arrived.is_empty() && self.0.file_rx.is_none() {
++            let (tx, rx) = std::sync::mpsc::channel();
++            arrived.into_iter().for_each(|r| drop(tx.send(r)));
++            self.0.file_rx = Some(rx);
++        }
++        eframe::App::ui(&mut self.0, ui, frame);
++        self.show_stroke();
++    }
++
++    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
++        eframe::App::clear_color(&self.0, visuals)
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
++    }
++}
++
++/// Starts the app on the page's canvas (#selfpaint_canvas), as the desktop `main` starts its window.
++pub fn start() {
++    // Files' "Open in SelfPaint" (and ?open=browser:/…) hands a stored file in.
++    let open = Closure::<dyn Fn(JsValue)>::new(|file: JsValue| arrive(opened(&file)));
++    call("onOpen", &[open.into_js_value()]);
++    wasm_bindgen_futures::spawn_local(async {
++        let document = web_sys::window().and_then(|w| w.document()).expect("no document");
++        let canvas = document.get_element_by_id("selfpaint_canvas").and_then(|c| c.dyn_into::<web_sys::HtmlCanvasElement>().ok()).expect("no #selfpaint_canvas");
++        let started = eframe::WebRunner::new()
++            .start(
++                canvas,
++                eframe::WebOptions::default(),
++                Box::new(|cc| {
++                    CTX.with(|c| c.set(cc.egui_ctx.clone()).ok());
++                    egui_extras::install_image_loaders(&cc.egui_ctx);
++                    let mut visuals = egui::Visuals::light();
++                    crate::palette::apply_theme(&mut visuals);
++                    cc.egui_ctx.set_visuals(visuals);
++                    Ok(Box::new(Web::new(SelfPaintApp::new())))
++                }),
++            )
++            .await;
++        if let Some(loading) = document.get_element_by_id("selfpaint_loading") {
++            match started {
++                Ok(()) => loading.remove(),
++                Err(e) => loading.set_text_content(Some(&format!("SelfPaint could not start: {e:?}"))),
++            }
++        }
++    });
++}

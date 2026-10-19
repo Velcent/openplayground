@@ -349,3 +349,21 @@ groups:
         live: crates/engine/src
         accent: "#02DA96"
         base: "#062E22"
+
+      - slug: mspaint
+        name: SelfPaint
+        alternative: Microsoft Paint
+        blurb: Draw and paint with a pencil, brushes, an eraser, fills, shapes and text.
+        # Its release's web zip is selfpaint-web.zip (not -web-<version>.zip), built from files that aren't in the
+        # repository; patches/mspaint.yaml adds the web build Playground makes from the sources on both channels.
+        opens: [png, jpg, jpeg, sproj]
+        imports: []
+        repo: selfbin/selfpaint
+        asset: '-web\.zip$'
+        # What the web build compiles (Cargo.lock: dependency changes): README, CI and icon commits don't rebuild it.
+        paths: [src, assets, Cargo.toml, Cargo.lock]
+        patches: patches/mspaint.yaml
+        live: src/app
+        icon: icons/selfpaint.png
+        accent: "#A77BF0"
+        base: "#410D7C"
