@@ -43,7 +43,7 @@ test('Lemon uses the supplied icons and starts under its canonical URL with the 
   assert.equal(await card.locator('img:visible').first().getAttribute('src'), '/icons/lemon-studio.png')
   await page.getByRole('switch', { name: 'Alternative naming' }).click()
   assert.equal(await card.locator('.name').innerText(), 'FL Studio')
-  assert.equal(await card.locator('img:visible').first().getAttribute('src'), '/icons/alternatives/fl-studio.png')
+  assert.equal(await card.locator('img:visible').first().getAttribute('src'), '/icons/alternatives/fl-studio.svg')
   await page.goto(`${site.url}/fl-studio/?alt=true#editor`)
   await page.locator('html[data-lemon-ready=true]').waitFor({ timeout: 30000 })
   assert.equal(new URL(page.url()).pathname, '/lemon-studio/')
