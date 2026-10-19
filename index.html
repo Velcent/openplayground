@@ -122,8 +122,8 @@
       animation: glitch-tear 3.4s steps(1, end) infinite var(--glitch-delay, 0s);
     }
     .glitch::after {
-      /* Salt-and-pepper grain: turbulence thresholded to black or white specks. */
-      background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='80'%3E%3Cfilter id='n' x='0' y='0'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.95' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3CfeComponentTransfer%3E%3CfeFuncR type='discrete' tableValues='0 0 1 1'/%3E%3CfeFuncG type='discrete' tableValues='0 0 1 1'/%3E%3CfeFuncB type='discrete' tableValues='0 0 1 1'/%3E%3CfeFuncA type='linear' slope='0' intercept='1'/%3E%3C/feComponentTransfer%3E%3C/filter%3E%3Crect width='80' height='80' filter='url(%23n)'/%3E%3C/svg%3E");
+      /* Grain: turbulence thresholded to dark and light grey specks. */
+      background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='80'%3E%3Cfilter id='n' x='0' y='0'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.95' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3CfeComponentTransfer%3E%3CfeFuncR type='discrete' tableValues='0.3 0.3 0.7 0.7'/%3E%3CfeFuncG type='discrete' tableValues='0.3 0.3 0.7 0.7'/%3E%3CfeFuncB type='discrete' tableValues='0.3 0.3 0.7 0.7'/%3E%3CfeFuncA type='linear' slope='0' intercept='1'/%3E%3C/feComponentTransfer%3E%3C/filter%3E%3Crect width='80' height='80' filter='url(%23n)'/%3E%3C/svg%3E");
       background-size: 80px; opacity: 0.26;
       -webkit-mask: var(--icon) center / contain no-repeat; mask: var(--icon) center / contain no-repeat;
       animation: glitch-grain 0.45s steps(1, end) infinite;
