@@ -100,15 +100,6 @@
     .tool:is(:hover, :focus-within)::before { opacity: 0.3; }
     .tool:is(:hover, :focus-within) { border-color: var(--accent); background: color-mix(in srgb, var(--base) 40%, var(--card)); }
     .tool:has(:focus-visible) { outline: 2px solid var(--accent); outline-offset: 3px; }
-    /* The hovered card's liquid-metal border (card-metal.js): its shader, masked to a 2 px ring over the card's edge. */
-    .metal-ring {
-      position: absolute; inset: -1px; padding: 2px; pointer-events: none; opacity: 0; transition: opacity 0.25s ease;
-      -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor;
-      mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
-    }
-    .tool:is(:hover, :focus-within) > .metal-ring { opacity: 1; }
-    .metal-surface { position: absolute; inset: 0; }
-    .metal-surface canvas { position: absolute; inset: 0; width: 100% !important; height: 100% !important; display: block; }
     /* The app's name links the whole card; the repo name is a separate link above it. */
     .open { color: inherit; text-decoration: none; outline: none; }
     .open::after { content: ""; position: absolute; inset: 0; border-radius: inherit; }
@@ -307,6 +298,5 @@
     }
   </script>
   <script type="module" src="/home-background.js"></script>
-  <script type="module" src="/card-metal.js"></script>
 </body>
 </html>
