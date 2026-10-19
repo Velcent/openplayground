@@ -1,0 +1,1229 @@
+diff --git a/apps/suhina-web/Cargo.toml b/apps/suhina-web/Cargo.toml
+new file mode 100644
+index 0000000..9a0b1f0
+--- /dev/null
++++ b/apps/suhina-web/Cargo.toml
+@@ -0,0 +1,31 @@
++# Suhina in the browser, for Playground (patches/ableton-live.yaml in github.com/daijro/openplayground).
++# The window is crates/ui; crates/playground gives the crates their clock, files and threads on wasm.
++# Build with: trunk build --release   (from apps/suhina-web)
++[package]
++name = "suhina-web"
++description = "Suhina in the browser"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++rust-version.workspace = true
++publish = false
++
++[[bin]]
++name = "suhina-web"
++path = "src/main.rs"
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++suhina-engine.workspace = true
++suhina-session.workspace = true
++suhina-media.workspace = true
++suhina-ui.workspace = true
++suhina-playground = { path = "../../crates/playground" }
++serde_json.workspace = true
++cpal = { workspace = true, features = ["wasm-bindgen"] }
++eframe = { version = "0.36", default-features = false, features = ["glow", "persistence", "default_fonts"] }
++# accesskit's ids want the browser's random numbers on wasm.
++uuid = { version = "1", features = ["js"] }
++wasm-bindgen = "0.2"
++wasm-bindgen-futures = "0.4"
++js-sys = "0.3"
++web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "Location", "Storage", "console"] }
+diff --git a/apps/suhina-web/Trunk.toml b/apps/suhina-web/Trunk.toml
+new file mode 100644
+index 0000000..0b57fe8
+--- /dev/null
++++ b/apps/suhina-web/Trunk.toml
+@@ -0,0 +1,4 @@
++[build]
++target = "index.html"
++public_url = "./"
++filehash = true
+diff --git a/apps/suhina-web/index.html b/apps/suhina-web/index.html
+new file mode 100644
+index 0000000..7db999c
+--- /dev/null
++++ b/apps/suhina-web/index.html
+@@ -0,0 +1,20 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
++  <title>Suhina</title>
++  <link data-trunk rel="icon" href="../../assets/brand/suhina-mark.svg" />
++  <link data-trunk rel="rust" data-bin="suhina-web" data-wasm-opt="0" data-cargo-profile="playground-web" />
++  <style>
++    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #1b1c1f; }
++    #suhina_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
++    #suhina_loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
++      color: #bbb; font: 14px system-ui, sans-serif; pointer-events: none; }
++  </style>
++</head>
++<body>
++  <canvas id="suhina_canvas"></canvas>
++  <div id="suhina_loading">Loading Suhina&hellip;</div>
++</body>
++</html>
+diff --git a/apps/suhina-web/src/audio.rs b/apps/suhina-web/src/audio.rs
+new file mode 100644
+index 0000000..bc98228
+--- /dev/null
++++ b/apps/suhina-web/src/audio.rs
+@@ -0,0 +1,141 @@
++//! The browser's audio output: the engine renders inside the page's WebAudio callback (cpal's `webaudio` host), on
++//! the one thread a page has. The desktop output (crates/output) renders ahead on a real-time thread of its own,
++//! which a browser without shared memory cannot start.
++
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
++
++use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
++use suhina_engine::model::Project;
++use suhina_engine::{AudioPool, DeviceAssets, Plugins, Renderer};
++use suhina_session::Player;
++use suhina_session::audio::{AudioSystem, DeviceInfo, HostInfo, LiveOutput, Opened, OutputChoice, OutputInfo};
++
++/// Frames per WebAudio buffer: two are queued, so about 85 ms at 48 kHz. Shorter ones break up while the page draws.
++const BUFFER_FRAMES: u32 = 2048;
++const HOST: &str = "Web Audio";
++const DEVICE: &str = "This browser";
++
++thread_local! {
++    /// The streams playing, so the first click or key can start them (browsers keep audio off until then).
++    static STREAMS: std::cell::RefCell<Vec<std::sync::Weak<cpal::Stream>>> = const { std::cell::RefCell::new(Vec::new()) };
++}
++
++/// Starts the streams the page could not start before the person did anything.
++pub fn resume() {
++    STREAMS.with_borrow_mut(|streams| {
++        streams.retain(|s| s.strong_count() > 0);
++        for stream in streams.iter().filter_map(std::sync::Weak::upgrade) {
++            let _ = stream.play();
++        }
++    });
++}
++
++#[derive(Default)]
++struct Progress {
++    frames: AtomicU64,
++    callback_frames: AtomicUsize,
++    failed: AtomicBool,
++}
++
++struct Live {
++    progress: Arc<Progress>,
++    sample_rate: u32,
++}
++
++impl LiveOutput for Live {
++    fn info(&self) -> OutputInfo {
++        let buffer = self.progress.callback_frames.load(Ordering::Relaxed) as u32;
++        OutputInfo {
++            host: HOST.into(),
++            device: DEVICE.into(),
++            sample_rate: self.sample_rate,
++            buffer_frames: buffer,
++            engine_block: buffer,
++            latency_ms: f64::from(buffer * 2) * 1000.0 / f64::from(self.sample_rate.max(1)),
++            failed: self.progress.failed.load(Ordering::Relaxed),
++            channels: 2,
++            ..OutputInfo::default()
++        }
++    }
++}
++
++/// What keeps a player's stream playing: dropping it stops the stream.
++struct Keep(#[allow(dead_code)] Arc<cpal::Stream>);
++
++#[derive(Default)]
++pub struct WebOutput;
++
++impl AudioSystem for WebOutput {
++    fn hosts(&self) -> Vec<HostInfo> {
++        vec![HostInfo {
++            name: HOST.into(),
++            default: true,
++            devices: vec![DeviceInfo {
++                name: DEVICE.into(),
++                default: true,
++                channels: 2,
++                sample_rates: vec![48_000],
++                default_sample_rate: Some(48_000),
++                buffer_sizes: vec![BUFFER_FRAMES],
++                ..DeviceInfo::default()
++            }],
++            inputs: Vec::new(),
++            error: None,
++        }]
++    }
++
++    fn open(
++        &self,
++        project: &Project,
++        audio: &AudioPool,
++        assets: &DeviceAssets,
++        _choice: &OutputChoice,
++        previous: Option<Player>,
++    ) -> Result<Opened, String> {
++        // One stream at a time: the old one stops before the new one starts.
++        drop(previous);
++        let host = cpal::default_host();
++        let device = host.default_output_device().ok_or("this browser has no audio output")?;
++        let sample_rate = device.default_output_config().map(|c| c.sample_rate()).unwrap_or(48_000);
++        let mut renderer = Renderer::stopped_with_assets(project, audio, assets, sample_rate, Plugins::new())
++            .map_err(|e| e.to_string())?;
++        // No stretch worker thread: the renderer stretches clips itself, as an offline render does.
++        let controller = renderer.controller();
++        let progress = Arc::new(Progress::default());
++        let config = cpal::StreamConfig {
++            channels: 2,
++            sample_rate,
++            buffer_size: cpal::BufferSize::Fixed(BUFFER_FRAMES),
++        };
++        let (watching, failing) = (Arc::clone(&progress), Arc::clone(&progress));
++        let mut cue = Vec::new();
++        let stream = device
++            .build_output_stream(
++                config,
++                move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
++                    cue.resize(out.len(), 0.0);
++                    renderer.set_live_clock(suhina_engine::live_now(), (out.len() / 2) as u32);
++                    renderer.process_with_cue(out, &mut cue);
++                    watching.callback_frames.store(out.len() / 2, Ordering::Relaxed);
++                    watching.frames.fetch_add((out.len() / 2) as u64, Ordering::Relaxed);
++                },
++                move |_| failing.failed.store(true, Ordering::Relaxed),
++                None,
++            )
++            .map_err(|e| format!("could not open the browser's audio: {e}"))?;
++        let stream = Arc::new(stream);
++        // Refused until the person clicks or types; resume() tries again then.
++        let _ = stream.play();
++        STREAMS.with_borrow_mut(|s| s.push(Arc::downgrade(&stream)));
++        let live = Live { progress, sample_rate };
++        let mut player = Player::with_output(controller, Some(Box::new(Keep(stream))), Arc::new(live));
++        // Takes are written on a thread of their own, which a page cannot start: no audio recording here.
++        drop(player.take_recorder());
++        Ok(Opened { player, notice: None, plugins_kept: false })
++    }
++
++    fn chosen_present(&self, _: &OutputChoice) -> Option<bool> {
++        Some(true)
++    }
++}
+diff --git a/apps/suhina-web/src/main.rs b/apps/suhina-web/src/main.rs
+new file mode 100644
+index 0000000..52bbd28
+--- /dev/null
++++ b/apps/suhina-web/src/main.rs
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! Suhina in the browser, for Playground (patches/ableton-live.yaml in github.com/daijro/openplayground): the
++//! desktop window (crates/ui) on the page's canvas, playing through the browser's audio.
++
++#[cfg(target_arch = "wasm32")]
++mod audio;
++#[cfg(target_arch = "wasm32")]
++mod web;
++
++fn main() {
++    #[cfg(target_arch = "wasm32")]
++    web::start();
++}
+diff --git a/apps/suhina-web/src/web.rs b/apps/suhina-web/src/web.rs
+new file mode 100644
+index 0000000..edb1009
+--- /dev/null
++++ b/apps/suhina-web/src/web.rs
+@@ -0,0 +1,343 @@
++//! The page side: the window (crates/ui) on the canvas, settings in localStorage, projects and samples through
++//! Playground's Files (`globalThis.playgroundFiles`), and the browser's audio (audio.rs).
++//!
++//! Files live in memory (crates/playground's `std::fs`). A project opened from Files comes in with the files beside
++//! it (its samples), at the same path: `browser:/Music/Song/Song.als` is `/Music/Song/Song.als` here. A sample or
++//! MIDI file opened in Suhina becomes a clip on a new track. Whatever Suhina writes (a save, a rendered file) goes
++//! back to Files at its path after the frame. Projects saved without a folder go to `/Suhina/Projects`, so
++//! `browser:/Suhina/Projects` in Files.
++
++use std::cell::RefCell;
++use std::path::{Path, PathBuf};
++
++use eframe::egui;
++use suhina_playground::std::fs;
++use suhina_session::Session;
++use suhina_ui::interaction::pick::PickField;
++use suhina_ui::settings::Settings;
++use suhina_ui::settings::keymap::Keymap;
++use suhina_ui::{App, NewProject, OpenAs, Status};
++use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
++
++const SETTINGS_KEY: &str = "suhina.settings";
++const KEYMAP_KEY: &str = "suhina.keymap";
++const PROJECTS: &str = "/Suhina/Projects";
++const TEMPLATES: &str = "/Suhina/Templates";
++/// Where dropped files are kept.
++const DROPS: &str = "/Suhina/Dropped";
++/// The project types Suhina opens.
++const TYPES: [&str; 2] = ["suhina", "als"];
++
++thread_local! {
++    static CTX: std::cell::OnceCell<egui::Context> = const { std::cell::OnceCell::new() };
++    /// Files that came in from Playground (Open, "Open in Suhina"), with how to open them, for the next frame.
++    static OPENED: RefCell<Vec<(PathBuf, OpenAs)>> = const { RefCell::new(Vec::new()) };
++    /// Dropped files whose bytes are in memory now, for the next frame.
++    static DROPPED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
++}
++
++pub fn repaint() {
++    CTX.with(|c| c.get().map(egui::Context::request_repaint));
++}
++
++fn get(o: &JsValue, k: &str) -> JsValue {
++    js_sys::Reflect::get(o, &k.into()).unwrap_or(JsValue::UNDEFINED)
++}
++
++fn api() -> Option<JsValue> {
++    Some(get(&js_sys::global(), "playgroundFiles")).filter(JsValue::is_object)
++}
++
++/// `playgroundFiles[method](...args)`; None when the page has none or it threw.
++fn call(method: &str, args: &[JsValue]) -> Option<JsValue> {
++    let api = api()?;
++    let f = get(&api, method).dyn_into::<js_sys::Function>().ok()?;
++    f.apply(&api, &args.iter().collect::<js_sys::Array>()).ok()
++}
++
++async fn wait(v: Option<JsValue>) -> Option<JsValue> {
++    let promise = v?.dyn_into::<js_sys::Promise>().ok()?;
++    wasm_bindgen_futures::JsFuture::from(promise).await.ok()
++}
++
++fn storage() -> Option<web_sys::Storage> {
++    web_sys::window()?.local_storage().ok().flatten()
++}
++
++fn stored(key: &str) -> Option<String> {
++    storage()?.get_item(key).ok().flatten()
++}
++
++fn store(key: &str, text: &str) {
++    if let Some(s) = storage() {
++        let _ = s.set_item(key, text);
++    }
++}
++
++/// Whether `path` names a project Suhina opens.
++fn is_project(path: &Path) -> bool {
++    path.extension().is_some_and(|e| TYPES.iter().any(|t| e.eq_ignore_ascii_case(t)))
++}
++
++/// A file from Files (`{ path, name, bytes }`) into memory; a project with the files of its folder (its samples).
++/// Files without a path (From computer…) go to `/Suhina/Opened`. Returns its path here.
++async fn bring_in(file: &JsValue) -> Option<PathBuf> {
++    let name = get(file, "name").as_string()?;
++    let bytes = js_sys::Uint8Array::new(&get(file, "bytes")).to_vec();
++    let path = match get(file, "path").as_string().and_then(|p| p.strip_prefix("browser:").map(str::to_owned)) {
++        Some(local) => {
++            let path = PathBuf::from(local);
++            if let Some(folder) = path.parent().filter(|f| f.parent().is_some() && is_project(&path)) {
++                let listed = wait(call("files", &[format!("browser:{}", folder.display()).into()])).await;
++                let paths: Vec<String> =
++                    listed.map(|l| js_sys::Array::from(&l).iter().filter_map(|p| p.as_string()).collect()).unwrap_or_default();
++                for p in paths {
++                    let Some(local) = p.strip_prefix("browser:") else { continue };
++                    if fs::metadata(local).is_ok() {
++                        continue;
++                    }
++                    if let Some(bytes) = wait(call("read", &[p.as_str().into()])).await {
++                        fs::put(Path::new(local), js_sys::Uint8Array::new(&bytes).to_vec());
++                    }
++                }
++            }
++            path
++        }
++        None => Path::new("/Suhina/Opened").join(&name),
++    };
++    fs::put(&path, bytes);
++    Some(path)
++}
++
++fn take_in(file: JsValue) {
++    wasm_bindgen_futures::spawn_local(async move {
++        if let Some(path) = bring_in(&file).await {
++            OPENED.with_borrow_mut(|o| o.push((path, OpenAs::NewTab)));
++            repaint();
++        }
++    });
++}
++
++/// File › Open…: Playground's Open dialog.
++fn pick_project() {
++    let types = js_sys::Array::new();
++    for t in TYPES {
++        types.push(&t.into());
++    }
++    let options = js_sys::Object::new();
++    let _ = js_sys::Reflect::set(&options, &"types".into(), &types);
++    let asked = call("open", &[options.into()]);
++    wasm_bindgen_futures::spawn_local(async move {
++        let Some(picked) = wait(asked).await.filter(|p| !p.is_null() && !p.is_undefined()) else { return };
++        if let Some(file) = js_sys::Array::from(&picked).iter().next()
++            && let Some(path) = bring_in(&file).await
++        {
++            OPENED.with_borrow_mut(|o| o.push((path, OpenAs::NewTab)));
++            repaint();
++        }
++    });
++}
++
++/// A dropped file, in memory.
++#[derive(Debug)]
++struct InMemory(PathBuf);
++
++impl egui::DroppedFile for InMemory {
++    fn path(&self) -> &Path {
++        &self.0
++    }
++    fn bytes_async(&self) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + '_>> {
++        let bytes = fs::read(&self.0).map_err(|e| e.to_string());
++        Box::pin(async move { bytes })
++    }
++}
++
++/// `session`'s project playing on the browser's audio, stopped.
++fn play(session: &Session) -> Result<suhina_session::audio::Opened, String> {
++    use suhina_session::audio::{AudioSystem as _, OutputChoice};
++    crate::audio::WebOutput.open(session.project(), session.audio(), session.device_assets(), &OutputChoice::default(), None)
++}
++
++pub struct Web {
++    pub app: App,
++    unsaved: Option<bool>,
++    started: bool,
++}
++
++impl Web {
++    fn new(cc: &eframe::CreationContext<'_>) -> Self {
++        CTX.with(|c| c.set(cc.egui_ctx.clone()).ok());
++        suhina_ui::kit::theme::install(&cc.egui_ctx);
++        let mut app = App::new();
++        app.projects_mut().set_audio_system(std::sync::Arc::new(crate::audio::WebOutput));
++        let (settings, mut warnings) = stored(SETTINGS_KEY).map_or_else(|| (Settings::default(), Vec::new()), |t| Settings::from_text(&t));
++        let (keymap, keymap_warnings) = stored(KEYMAP_KEY).map_or_else(|| (Keymap::default(), Vec::new()), |t| Keymap::from_json(&t));
++        warnings.extend(keymap_warnings);
++        app.projects_mut().set_output_choice(settings.output_choice());
++        app.set_default_folders(PROJECTS.into(), TEMPLATES.into());
++        let _ = fs::create_dir_all(PROJECTS);
++        let _ = fs::create_dir_all(TEMPLATES);
++        app.set_settings(&cc.egui_ctx, settings);
++        app.set_keymap(keymap);
++        if let Some(warning) = warnings.first() {
++            app.set_status(Status::Hint(warning.clone()));
++        }
++        Self { app, unsaved: None, started: false }
++    }
++
++    /// The demo project, the first time a frame runs.
++    fn start(&mut self) {
++        let session = Session::new(suhina_ui::demo::demo_project());
++        self.show_session(session, Vec::new(), OpenAs::NewTab);
++    }
++
++    fn open(&mut self, path: &Path, how: OpenAs) {
++        match Session::open(path) {
++            Ok((session, warnings)) => self.show_session(session, warnings, how),
++            Err(e) => self.app.set_status(Status::Error(e.0)),
++        }
++    }
++
++    /// Decodes a session's audio, starts it playing (stopped) and shows it (the desktop app's `show_session`).
++    fn show_session(&mut self, mut session: Session, mut warnings: Vec<String>, how: OpenAs) {
++        let folder = session.audio_folder().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
++        let (audio, audio_warnings) = suhina_media::load_project_audio(session.project(), &folder);
++        warnings.extend(audio_warnings);
++        let waveforms = suhina_ui::kit::waveform::from_pool(&audio);
++        session.set_audio(audio);
++        self.app.projects_mut().close_preview_output();
++        match play(&session) {
++            Ok(opened) => session.attach_player(opened.player),
++            Err(e) => warnings.push(format!("no audio output: {e}")),
++        }
++        if self.app.open_project(session, &warnings, how).is_some() {
++            self.app.set_waveforms(waveforms);
++        }
++        let _closed = self.app.take_closed();
++    }
++
++    /// After the window's frame: what it asked of the app, and what it wrote, to Files.
++    fn after(&mut self) {
++        for (path, how) in OPENED.take() {
++            if is_project(&path) {
++                self.open(&path, how);
++            } else {
++                // A sample or MIDI file: a clip in the first scene, on a track of its own.
++                let paths = serde_json::json!({ "paths": [path.display().to_string()], "scene": 1 });
++                self.app.run(&suhina_ui::kit::widgets::Action::new("clip.addFiles", paths));
++            }
++        }
++        if let Some((path, how)) = self.app.take_open_request() {
++            self.open(&path, how);
++        }
++        if let Some(new) = self.app.take_new_request() {
++            let made = match new {
++                NewProject::Blank => Ok((Session::new(suhina_session::blank_project()), Vec::new())),
++                NewProject::Template(path) => Session::from_template(&path),
++            };
++            match made {
++                Ok((session, warnings)) => self.show_session(session, warnings, OpenAs::NewTab),
++                Err(e) => self.app.set_status(Status::Error(e.0)),
++            }
++        }
++        let _ = self.app.take_recovery_request();
++        let _ = self.app.take_reveal_request();
++        let _ = self.app.take_saved_path();
++        let _ = self.app.take_forget_request();
++        if let Some(request) = self.app.take_pick_request()
++            && request.field == PickField::OpenProject
++        {
++            pick_project();
++        }
++        if self.app.take_lists_wanted().is_some() {
++            self.app.set_project_lists(Vec::new(), Vec::new());
++        }
++        let _closed = self.app.take_closed();
++        if let Some(id) = self.app.take_player_request() {
++            match self.app.projects().get(id).map(play) {
++                Some(Ok(opened)) => self.app.attach_player(id, opened.player),
++                Some(Err(e)) => self.app.set_status(Status::Error(format!("no audio output: {e}"))),
++                None => {}
++            }
++        }
++        if let Some(settings) = self.app.take_changed_settings() {
++            store(SETTINGS_KEY, &settings.to_text());
++        }
++        if let Some(keymap) = self.app.take_changed_keymap() {
++            store(KEYMAP_KEY, &keymap.to_json());
++        }
++        let _ = self.app.take_theme_actions();
++        for p in fs::changes() {
++            let target = JsValue::from(format!("browser:{}", p.display()));
++            match fs::metadata(&p) {
++                Ok(m) if m.is_file() => {
++                    let bytes = fs::read(&p).unwrap_or_default();
++                    call("write", &[target, js_sys::Uint8Array::from(bytes.as_slice()).into()]);
++                }
++                Ok(_) => {}
++                Err(_) => {
++                    call("remove", &[target]);
++                }
++            }
++        }
++        let projects = self.app.projects();
++        let unsaved = projects.ids().into_iter().any(|id| projects.get(id).is_some_and(Session::has_unsaved_changes));
++        if self.unsaved.replace(unsaved) != Some(unsaved) {
++            call("setUnsaved", &[unsaved.into()]);
++        }
++    }
++}
++
++impl eframe::App for Web {
++    fn raw_input_hook(&mut self, _: &egui::Context, raw_input: &mut egui::RawInput) {
++        // Browsers keep audio off until the person does something on the page.
++        if raw_input.events.iter().any(|e| matches!(e, egui::Event::PointerButton { pressed: true, .. } | egui::Event::Key { pressed: true, .. })) {
++            crate::audio::resume();
++        }
++        // A dropped file is only a name on the web: once its bytes are in memory at /Suhina/Dropped/<name>, a later
++        // frame drops that file instead, as the desktop window gets it.
++        raw_input.dropped_files.extend(DROPPED.take().into_iter().map(|p| std::sync::Arc::new(InMemory(p)) as _));
++        for f in std::mem::take(&mut raw_input.dropped_files).into_iter().filter(|f| f.path().parent() != Some(Path::new(DROPS))) {
++            wasm_bindgen_futures::spawn_local(async move {
++                if let Ok(bytes) = f.bytes_async().await
++                    && let Some(name) = f.path().file_name()
++                {
++                    let path = Path::new(DROPS).join(name);
++                    fs::put(&path, bytes);
++                    DROPPED.with_borrow_mut(|d| d.push(path));
++                    repaint();
++                }
++            });
++        }
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
++        if !self.started {
++            self.started = true;
++            self.start();
++        }
++        self.app.ui(ui);
++        self.after();
++    }
++}
++
++pub fn start() {
++    let open = Closure::<dyn Fn(JsValue)>::new(take_in);
++    call("onOpen", &[open.into_js_value()]);
++    wasm_bindgen_futures::spawn_local(async {
++        let document = web_sys::window().and_then(|w| w.document()).expect("no document");
++        let canvas = document
++            .get_element_by_id("suhina_canvas")
++            .and_then(|c| c.dyn_into::<web_sys::HtmlCanvasElement>().ok())
++            .expect("no #suhina_canvas");
++        let started = eframe::WebRunner::new()
++            .start(canvas, eframe::WebOptions::default(), Box::new(|cc| Ok(Box::new(Web::new(cc)))))
++            .await;
++        if let Some(loading) = document.get_element_by_id("suhina_loading") {
++            match started {
++                Ok(()) => loading.remove(),
++                Err(e) => loading.set_text_content(Some(&format!("Suhina could not start: {e:?}"))),
++            }
++        }
++    });
++}
+diff --git a/crates/playground/Cargo.toml b/crates/playground/Cargo.toml
+new file mode 100644
+index 0000000..d3a89ac
+--- /dev/null
++++ b/crates/playground/Cargo.toml
+@@ -0,0 +1,14 @@
++# Playground's browser build of Suhina (patches/ableton-live.yaml in github.com/daijro/openplayground): std's clock,
++# files and threads as wasm32-unknown-unknown can have them. Native builds compile it empty.
++[package]
++name = "suhina-playground"
++description = "Suhina in the browser: the clock, files and threads std lacks on wasm32-unknown-unknown"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++rust-version.workspace = true
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++web-time = "1"
++# A file here is a source symphonia decodes, as std's File is (crates/media). Keep in step with crates/media.
++symphonia-core = "0.6"
+diff --git a/crates/playground/src/lib.rs b/crates/playground/src/lib.rs
+new file mode 100644
+index 0000000..5217e7a
+--- /dev/null
++++ b/crates/playground/src/lib.rs
+@@ -0,0 +1,615 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! Suhina in the browser, for Playground (patches/ableton-live.yaml in github.com/daijro/openplayground).
++//!
++//! wasm32-unknown-unknown has no clock, no files and no threads: `Instant::now` and `SystemTime::now` panic there,
++//! every file call fails, and `thread::scope`'s spawn and `thread::sleep` panic. The modules that use them take `std`
++//! from here instead, through one `#[cfg(target_arch = "wasm32")] use suhina_playground::std;` line at each one's end
++//! (a local `std` shadows the standard library's name in that module; everything else in it still comes from the real
++//! std):
++//!   time    web-time's Instant and SystemTime;
++//!   fs      an in-memory file system (projects, samples, settings), each change noted for the page to mirror;
++//!   thread  `scope` runs what it spawns at once, on this thread, and `sleep` returns at once; `Builder::spawn` still
++//!           fails, which its callers handle (they do the work in place or go without).
++//! And [`interprocess`], the plug-in hosts' sockets, which always fail: a browser runs no plug-in hosts.
++#![cfg(target_arch = "wasm32")]
++
++/// crates/media's `locate` with the in-memory files: `file` (or `absolute`) inside `project_dir`, with no `..`, when
++/// it is a file there.
++pub fn locate(file: &str, absolute: Option<&str>, project_dir: &::std::path::Path) -> Option<::std::path::PathBuf> {
++    [Some(file), absolute].into_iter().flatten().find_map(|name| {
++        let path = ::std::path::Path::new(name);
++        if path.components().any(|c| matches!(c, ::std::path::Component::ParentDir)) {
++            return None;
++        }
++        let candidate = project_dir.join(path);
++        (candidate.starts_with(project_dir) && std::fs::metadata(&candidate).is_ok_and(|m| m.is_file())).then_some(candidate)
++    })
++}
++
++/// The page's time as std's `SystemTime`, for crates that take that one (chrono).
++pub fn std_time(t: web_time::SystemTime) -> ::std::time::SystemTime {
++    ::std::time::UNIX_EPOCH + t.duration_since(web_time::UNIX_EPOCH).unwrap_or_default()
++}
++
++pub mod std {
++    pub use ::std::*;
++
++    pub mod time {
++        pub use web_time::*;
++    }
++
++    pub mod process {
++        pub use ::std::process::*;
++
++        /// The page is one process (std's panics on wasm).
++        pub fn id() -> u32 {
++            1
++        }
++    }
++
++    pub mod thread {
++        pub use ::std::thread::*;
++        use ::std::marker::PhantomData;
++
++        /// Returns at once: one thread can only wait by returning to the page.
++        pub fn sleep(_: ::std::time::Duration) {}
++
++        /// [`::std::thread::scope`], where each spawn runs to its end before `spawn` returns.
++        pub fn scope<'env, F, T>(f: F) -> T
++        where
++            F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> T,
++        {
++            f(&Scope(PhantomData))
++        }
++
++        pub struct Scope<'scope, 'env: 'scope>(PhantomData<(&'scope mut &'scope (), &'env mut &'env ())>);
++
++        impl<'scope> Scope<'scope, '_> {
++            pub fn spawn<F, T>(&'scope self, f: F) -> ScopedJoinHandle<'scope, T>
++            where
++                F: FnOnce() -> T + Send + 'scope,
++                T: Send + 'scope,
++            {
++                ScopedJoinHandle(f(), PhantomData)
++            }
++        }
++
++        pub struct ScopedJoinHandle<'scope, T>(T, PhantomData<&'scope ()>);
++
++        impl<T> ScopedJoinHandle<'_, T> {
++            pub fn join(self) -> Result<T> {
++                Ok(self.0)
++            }
++            pub fn is_finished(&self) -> bool {
++                true
++            }
++        }
++    }
++
++    pub mod fs {
++        pub use ::std::fs::*;
++        use ::std::cell::RefCell;
++        use ::std::collections::{BTreeMap, BTreeSet};
++        use ::std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
++        use ::std::path::{Component, Path, PathBuf};
++
++        enum Entry {
++            Dir,
++            File(Vec<u8>, web_time::SystemTime),
++        }
++
++        #[derive(Default)]
++        struct Tree {
++            entries: BTreeMap<PathBuf, Entry>,
++            /// Paths written, created or removed since the last [`changes`].
++            changed: BTreeSet<PathBuf>,
++            /// Goes up with every change.
++            generation: u64,
++        }
++
++        thread_local! {
++            static TREE: RefCell<Tree> = RefCell::default();
++        }
++
++        fn with<T>(f: impl FnOnce(&mut Tree) -> T) -> T {
++            TREE.with(|t| f(&mut t.borrow_mut()))
++        }
++
++        /// `/a/./b/../c` -> `/a/c`: one spelling per file (relative paths start at `/`).
++        pub fn key(p: &Path) -> PathBuf {
++            let mut out = PathBuf::from("/");
++            for c in p.components() {
++                match c {
++                    Component::ParentDir => {
++                        out.pop();
++                    }
++                    Component::Normal(n) => out.push(n),
++                    _ => {}
++                }
++            }
++            out
++        }
++
++        fn missing(p: &Path) -> io::Error {
++            io::Error::new(io::ErrorKind::NotFound, format!("{} does not exist", p.display()))
++        }
++
++        impl Tree {
++            fn mark(&mut self, p: PathBuf) {
++                self.generation += 1;
++                self.changed.insert(p);
++            }
++            fn parents(&mut self, p: &Path) {
++                for dir in p.ancestors().skip(1) {
++                    self.entries.entry(dir.to_path_buf()).or_insert(Entry::Dir);
++                }
++            }
++            fn put(&mut self, p: PathBuf, bytes: Vec<u8>) {
++                self.parents(&p);
++                self.entries.insert(p, Entry::File(bytes, web_time::SystemTime::now()));
++            }
++            /// `p` and everything below it.
++            fn below(&self, p: &Path) -> Vec<PathBuf> {
++                self.entries.range(p.to_path_buf()..).map(|(k, _)| k).take_while(|k| k.starts_with(p)).cloned().collect()
++            }
++        }
++
++        /// Stores a file without noting a change (files the page loads from its storage or a session).
++        pub fn put(p: &Path, bytes: Vec<u8>) {
++            with(|t| t.put(key(p), bytes));
++        }
++
++        /// The paths changed since the last call: each now holds what the page's storage should hold, or is gone.
++        pub fn changes() -> Vec<PathBuf> {
++            with(|t| ::std::mem::take(&mut t.changed).into_iter().collect())
++        }
++
++        /// Goes up with every change, so a caller can tell nothing changed.
++        pub fn generation() -> u64 {
++            with(|t| t.generation)
++        }
++
++        pub fn exists<P: AsRef<Path>>(p: P) -> io::Result<bool> {
++            Ok(metadata(p).is_ok())
++        }
++
++        pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(p: P, bytes: C) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                t.put(p.clone(), bytes.as_ref().to_vec());
++                t.mark(p);
++            });
++            Ok(())
++        }
++
++        pub fn read<P: AsRef<Path>>(p: P) -> io::Result<Vec<u8>> {
++            TREE.with(|t| match t.borrow().entries.get(&key(p.as_ref())) {
++                Some(Entry::File(bytes, _)) => Ok(bytes.clone()),
++                _ => Err(missing(p.as_ref())),
++            })
++        }
++
++        pub fn read_to_string<P: AsRef<Path>>(p: P) -> io::Result<String> {
++            String::from_utf8(read(p)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
++        }
++
++        pub fn create_dir_all<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                if !t.entries.contains_key(&p) {
++                    t.parents(&p);
++                    t.entries.insert(p.clone(), Entry::Dir);
++                    t.mark(p);
++                }
++            });
++            Ok(())
++        }
++
++        pub fn create_dir<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            if metadata(p.as_ref()).is_ok() {
++                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists", p.as_ref().display())));
++            }
++            create_dir_all(p)
++        }
++
++        pub fn remove_file<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| match t.entries.get(&p) {
++                Some(Entry::File(..)) => {
++                    t.entries.remove(&p);
++                    t.mark(p);
++                    Ok(())
++                }
++                _ => Err(missing(&p)),
++            })
++        }
++
++        /// Removes an empty folder.
++        pub fn remove_dir<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                if t.below(&p).len() != 1 || !matches!(t.entries.get(&p), Some(Entry::Dir)) {
++                    return Err(io::Error::other(format!("{} is not an empty folder", p.display())));
++                }
++                t.entries.remove(&p);
++                t.mark(p);
++                Ok(())
++            })
++        }
++
++        pub fn remove_dir_all<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                let gone = t.below(&p);
++                if gone.is_empty() {
++                    return Err(missing(&p));
++                }
++                for g in gone {
++                    t.entries.remove(&g);
++                    t.mark(g);
++                }
++                Ok(())
++            })
++        }
++
++        pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
++            let (from, to) = (key(from.as_ref()), key(to.as_ref()));
++            let bytes = read(&from)?;
++            with(|t| {
++                t.entries.remove(&from);
++                t.mark(from);
++                t.put(to.clone(), bytes);
++                t.mark(to);
++            });
++            Ok(())
++        }
++
++        pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
++            let bytes = read(from)?;
++            let n = bytes.len() as u64;
++            write(to, bytes)?;
++            Ok(n)
++        }
++
++        pub fn canonicalize<P: AsRef<Path>>(p: P) -> io::Result<PathBuf> {
++            let p = key(p.as_ref());
++            metadata(&p).map(|_| p)
++        }
++
++        /// There are no links here.
++        pub fn read_link<P: AsRef<Path>>(p: P) -> io::Result<PathBuf> {
++            Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} is not a link", p.as_ref().display())))
++        }
++
++        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++        pub struct FileType(bool);
++        impl FileType {
++            pub fn is_file(&self) -> bool {
++                self.0
++            }
++            pub fn is_dir(&self) -> bool {
++                !self.0
++            }
++            pub fn is_symlink(&self) -> bool {
++                false
++            }
++        }
++
++        #[derive(Clone, Debug)]
++        pub struct Metadata(Option<(u64, web_time::SystemTime)>);
++        impl Metadata {
++            pub fn len(&self) -> u64 {
++                self.0.map_or(0, |(n, _)| n)
++            }
++            pub fn is_file(&self) -> bool {
++                self.0.is_some()
++            }
++            pub fn is_dir(&self) -> bool {
++                self.0.is_none()
++            }
++            pub fn is_symlink(&self) -> bool {
++                false
++            }
++            pub fn file_type(&self) -> FileType {
++                FileType(self.is_file())
++            }
++            pub fn modified(&self) -> io::Result<web_time::SystemTime> {
++                Ok(self.0.map_or(web_time::SystemTime::UNIX_EPOCH, |(_, t)| t))
++            }
++        }
++
++        pub fn metadata<P: AsRef<Path>>(p: P) -> io::Result<Metadata> {
++            TREE.with(|t| match t.borrow().entries.get(&key(p.as_ref())) {
++                Some(Entry::File(bytes, at)) => Ok(Metadata(Some((bytes.len() as u64, *at)))),
++                Some(Entry::Dir) => Ok(Metadata(None)),
++                None => Err(missing(p.as_ref())),
++            })
++        }
++
++        pub fn symlink_metadata<P: AsRef<Path>>(p: P) -> io::Result<Metadata> {
++            metadata(p)
++        }
++
++        pub struct DirEntry(PathBuf);
++        impl DirEntry {
++            pub fn path(&self) -> PathBuf {
++                self.0.clone()
++            }
++            pub fn file_name(&self) -> ::std::ffi::OsString {
++                self.0.file_name().unwrap_or_default().to_os_string()
++            }
++            pub fn metadata(&self) -> io::Result<Metadata> {
++                metadata(&self.0)
++            }
++            pub fn file_type(&self) -> io::Result<FileType> {
++                Ok(metadata(&self.0)?.file_type())
++            }
++        }
++
++        pub type ReadDir = ::std::vec::IntoIter<io::Result<DirEntry>>;
++
++        pub fn read_dir<P: AsRef<Path>>(p: P) -> io::Result<ReadDir> {
++            let dir = key(p.as_ref());
++            if !metadata(&dir)?.is_dir() {
++                return Err(io::Error::other(format!("{} is not a folder", dir.display())));
++            }
++            let entries = TREE.with(|t| {
++                t.borrow().below(&dir).into_iter().filter(|k| k.parent() == Some(&dir)).map(|k| Ok(DirEntry(k))).collect::<Vec<_>>()
++            });
++            Ok(entries.into_iter())
++        }
++
++        /// A file's bytes, read whole when it opens; one opened for writing is stored back when flushed or dropped.
++        pub struct File {
++            data: Cursor<Vec<u8>>,
++            /// Where written bytes go, for a file opened to write.
++            to: Option<PathBuf>,
++            dirty: bool,
++        }
++
++        impl File {
++            pub fn open<P: AsRef<Path>>(p: P) -> io::Result<File> {
++                Ok(File { data: Cursor::new(read(p)?), to: None, dirty: false })
++            }
++            pub fn create<P: AsRef<Path>>(p: P) -> io::Result<File> {
++                write(p.as_ref(), [])?;
++                Ok(File { data: Cursor::new(Vec::new()), to: Some(key(p.as_ref())), dirty: false })
++            }
++            pub fn options() -> OpenOptions {
++                OpenOptions::new()
++            }
++            pub fn metadata(&self) -> io::Result<Metadata> {
++                Ok(Metadata(Some((self.data.get_ref().len() as u64, web_time::SystemTime::now()))))
++            }
++            pub fn sync_all(&self) -> io::Result<()> {
++                Ok(())
++            }
++            pub fn sync_data(&self) -> io::Result<()> {
++                Ok(())
++            }
++            fn store(&mut self) {
++                if let (true, Some(to)) = (self.dirty, &self.to) {
++                    let _ = write(to, self.data.get_ref());
++                    self.dirty = false;
++                }
++            }
++        }
++
++        impl Read for File {
++            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++                self.data.read(buf)
++            }
++        }
++
++        impl Seek for File {
++            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
++                self.data.seek(pos)
++            }
++        }
++
++        impl Write for File {
++            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++                if self.to.is_none() {
++                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the file is open to read"));
++                }
++                self.dirty = true;
++                self.data.write(buf)
++            }
++            fn flush(&mut self) -> io::Result<()> {
++                self.store();
++                Ok(())
++            }
++        }
++
++        impl symphonia_core::io::MediaSource for File {
++            fn is_seekable(&self) -> bool {
++                true
++            }
++            fn byte_len(&self) -> Option<u64> {
++                Some(self.data.get_ref().len() as u64)
++            }
++        }
++
++        impl Drop for File {
++            fn drop(&mut self) {
++                self.store();
++            }
++        }
++
++        #[derive(Clone, Debug, Default)]
++        pub struct OpenOptions {
++            write: bool,
++            append: bool,
++            truncate: bool,
++            create: bool,
++            create_new: bool,
++        }
++
++        impl OpenOptions {
++            pub fn new() -> Self {
++                Self::default()
++            }
++            pub fn read(&mut self, _: bool) -> &mut Self {
++                self
++            }
++            pub fn write(&mut self, on: bool) -> &mut Self {
++                self.write = on;
++                self
++            }
++            pub fn append(&mut self, on: bool) -> &mut Self {
++                self.append = on;
++                self
++            }
++            pub fn truncate(&mut self, on: bool) -> &mut Self {
++                self.truncate = on;
++                self
++            }
++            pub fn create(&mut self, on: bool) -> &mut Self {
++                self.create = on;
++                self
++            }
++            pub fn create_new(&mut self, on: bool) -> &mut Self {
++                self.create_new = on;
++                self
++            }
++            pub fn open<P: AsRef<Path>>(&self, p: P) -> io::Result<File> {
++                let p = key(p.as_ref());
++                let had = read(&p).ok();
++                if self.create_new && had.is_some() {
++                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists", p.display())));
++                }
++                let bytes = match had {
++                    Some(_) if self.truncate => Vec::new(),
++                    Some(bytes) => bytes,
++                    None if self.create || self.create_new => {
++                        write(&p, [])?;
++                        Vec::new()
++                    }
++                    None => return Err(missing(&p)),
++                };
++                let mut data = Cursor::new(bytes);
++                if self.append {
++                    data.set_position(data.get_ref().len() as u64);
++                }
++                let writes = self.write || self.append;
++                Ok(File { data, to: writes.then_some(p), dirty: writes && self.truncate })
++            }
++        }
++    }
++}
++
++/// The plug-in hosts' sockets (the `interprocess` crate's local sockets, as crates/plugins uses them), which never
++/// connect: a browser runs no plug-in hosts, so starting one fails with a message and the project plays without it.
++pub mod interprocess {
++    use std::io;
++
++    fn unsupported() -> io::Error {
++        io::Error::new(io::ErrorKind::Unsupported, "plug-ins do not run in the browser")
++    }
++
++    pub trait TryClone: Sized {
++        fn try_clone(&self) -> io::Result<Self>;
++    }
++
++    pub mod local_socket {
++        use super::unsupported;
++        use std::io;
++        use std::marker::PhantomData;
++        use std::path::PathBuf;
++
++        pub mod traits {
++            pub trait Listener {}
++            pub trait Stream {}
++        }
++
++        pub struct Name<'a>(PhantomData<&'a ()>);
++
++        pub trait NameType {
++            fn is_supported() -> bool {
++                false
++            }
++        }
++        pub struct GenericNamespaced;
++        pub struct GenericFilePath;
++        impl NameType for GenericNamespaced {}
++        impl NameType for GenericFilePath {}
++
++        pub trait ToNsName {
++            fn to_ns_name<T: NameType>(self) -> io::Result<Name<'static>>;
++        }
++        impl ToNsName for String {
++            fn to_ns_name<T: NameType>(self) -> io::Result<Name<'static>> {
++                Ok(Name(PhantomData))
++            }
++        }
++        pub trait ToFsName {
++            fn to_fs_name<T: NameType>(self) -> io::Result<Name<'static>>;
++        }
++        impl ToFsName for PathBuf {
++            fn to_fs_name<T: NameType>(self) -> io::Result<Name<'static>> {
++                Ok(Name(PhantomData))
++            }
++        }
++
++        pub enum ListenerNonblockingMode {
++            Neither,
++            Accept,
++            Stream,
++            Both,
++        }
++
++        #[derive(Default)]
++        pub struct ListenerOptions;
++        impl ListenerOptions {
++            pub fn new() -> Self {
++                Self
++            }
++            pub fn name(self, _: Name<'_>) -> Self {
++                self
++            }
++            pub fn nonblocking(self, _: ListenerNonblockingMode) -> Self {
++                self
++            }
++            pub fn create_sync(self) -> io::Result<Listener> {
++                Err(unsupported())
++            }
++        }
++
++        pub struct Listener(());
++        impl traits::Listener for Listener {}
++        impl Listener {
++            pub fn accept(&self) -> io::Result<Stream> {
++                Err(unsupported())
++            }
++        }
++
++        pub struct Stream(());
++        impl traits::Stream for Stream {}
++        impl Stream {
++            pub fn connect(_: Name<'_>) -> io::Result<Stream> {
++                Err(unsupported())
++            }
++            pub fn set_nonblocking(&self, _: bool) -> io::Result<()> {
++                Err(unsupported())
++            }
++        }
++        impl super::TryClone for Stream {
++            fn try_clone(&self) -> io::Result<Self> {
++                Err(unsupported())
++            }
++        }
++        impl io::Read for Stream {
++            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
++                Err(unsupported())
++            }
++        }
++        impl io::Write for Stream {
++            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
++                Err(unsupported())
++            }
++            fn flush(&mut self) -> io::Result<()> {
++                Err(unsupported())
++            }
++        }
++    }
++}

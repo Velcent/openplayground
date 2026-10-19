@@ -1,0 +1,1194 @@
+diff --git a/apps/suhina-web/src/live.rs b/apps/suhina-web/src/live.rs
+new file mode 100644
+index 0000000..e41d0fd
+--- /dev/null
++++ b/apps/suhina-web/src/live.rs
+@@ -0,0 +1,45 @@
++//! Live editing in a Playground session (patches/ableton-live.yaml in github.com/daijro/openplayground), the page's
++//! side: the web runner kept for the adapter, and the app eframe runs wrapped: the window's frame, then the session's
++//! (remote changes in, this person's changes reported) and the others' marks over the window. The shared document and
++//! the merge are crates/session's `live`, the window's side crates/ui's `app::live`.
++
++use crate::web::Web;
++use eframe::egui;
++use suhina_session::live::{FORMAT, kit};
++
++thread_local! {
++    static RUNNER: std::cell::OnceCell<eframe::WebRunner> = const { std::cell::OnceCell::new() };
++}
++
++/// The page's web runner, kept for the adapter.
++pub fn runner() -> eframe::WebRunner {
++    RUNNER.with(|kept| kept.get_or_init(eframe::WebRunner::new).clone())
++}
++
++/// The app eframe runs, and the adapter offered to the shell.
++pub fn wrap(web: Web) -> Box<dyn eframe::App> {
++    let with_app = |f: &mut dyn FnMut(&mut suhina_ui::App)| runner().app_mut::<Shell>().map(|mut shell| f(&mut shell.0.app)).is_some();
++    if let Err(e) = kit::web::attach::<suhina_ui::App>(FORMAT, with_app, crate::web::repaint) {
++        web_sys::console::warn_1(&format!("Suhina: no live editing: {e:?}").into());
++    }
++    Box::new(Shell(web))
++}
++
++struct Shell(Web);
++
++impl eframe::App for Shell {
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
++        eframe::App::raw_input_hook(&mut self.0, ctx, raw_input);
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        eframe::App::ui(&mut self.0, ui, frame);
++        suhina_ui::app::live::set_busy(ui.input(|i| i.pointer.any_down()));
++        kit::frame(&mut self.0.app);
++        suhina_ui::app::live::overlay(ui, &self.0.app);
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
++    }
++}
+diff --git a/crates/session/src/live.rs b/crates/session/src/live.rs
+new file mode 100644
+index 0000000..3e7b919
+--- /dev/null
++++ b/crates/session/src/live.rs
+@@ -0,0 +1,357 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! Live editing in a Playground session (patches/ableton-live.yaml in github.com/daijro/openplayground), the session's
++//! side: the shared document a project makes, putting one back into the session, and the merge. Playground's
++//! `shell/live.js` drives it through the adapter `kit::web::attach` offers (the window, crates/ui `app::live`, is the
++//! app the kit runs on). Nothing here runs until a session connects. Web only, and its native tests.
++//!
++//! The shared document is the project as its `.suhina` file has it (`project` in the file), shaped so two people's
++//! edits merge: the kit merges objects by key and lists of objects by their `id`, and here every list of objects
++//! without ids gets one: a note's is the note itself (a note moved or changed is the old one gone and a new one added,
++//! so two people changing different notes of one clip both keep theirs), anything else's is its place in the list
++//! (two people turning different devices of one track both keep theirs; adding or removing one beside another's edit
++//! is a conflict, never a mix-up). These ids are strings beginning with `~`, which the file never has, and are taken
++//! off again before the project is read. Notes are kept in time order, so every peer has the same bytes.
++
++#[path = "playground_live.rs"]
++#[allow(dead_code)]
++pub mod kit;
++
++use crate::Session;
++use serde_json::{Map, Value};
++use suhina_model::{LaneData, Project};
++
++/// The document's format: peers whose formats differ do not share a document.
++pub const FORMAT: &str = "suhina:1";
++/// The allocator the kit merges by maximum: the clip, lane and scene ids' counter.
++pub const COUNTERS: &[&str] = &["next_id"];
++
++const NOTE: &str = "~n:";
++const AT: &str = "~i:";
++
++fn note_order(note: &Value) -> (f64, i64) {
++    (note["time"].as_f64().unwrap_or(0.0), note["key"].as_i64().unwrap_or(0))
++}
++
++/// Notes in time order (then key, then id), the order every peer keeps them in.
++fn sort_notes(notes: &mut [Value]) {
++    notes.sort_by(|a, b| {
++        let (ta, ka) = note_order(a);
++        let (tb, kb) = note_order(b);
++        ta.total_cmp(&tb).then(ka.cmp(&kb)).then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
++    });
++}
++
++fn keyed(items: &[Value]) -> bool {
++    let mut seen = std::collections::HashSet::new();
++    items.iter().all(|i| match i.get("id") {
++        Some(Value::Number(n)) => seen.insert(n.to_string()),
++        Some(Value::String(s)) => seen.insert(s.clone()),
++        _ => false,
++    })
++}
++
++/// The file's project as the shared document (see the top).
++pub fn shape(value: &mut Value, key: &str) {
++    match value {
++        Value::Object(map) => {
++            for (k, v) in map.iter_mut() {
++                shape(v, k);
++            }
++        }
++        Value::Array(items) if !items.is_empty() && items.iter().all(Value::is_object) => {
++            if key == "notes" {
++                let mut seen = std::collections::HashMap::<String, usize>::new();
++                for note in items.iter_mut() {
++                    let text = String::from_utf8(kit::canonical(note)).unwrap_or_default();
++                    let n = seen.entry(text.clone()).or_default();
++                    *n += 1;
++                    note["id"] = Value::String(format!("{NOTE}{text}#{n}"));
++                }
++                sort_notes(items);
++                return;
++            }
++            if !keyed(items) && items.iter().all(|i| i.get("id").is_none()) {
++                for (n, item) in items.iter_mut().enumerate() {
++                    item["id"] = Value::String(format!("{AT}{n}"));
++                }
++            }
++            for item in items.iter_mut() {
++                shape(item, "");
++            }
++        }
++        _ => {}
++    }
++}
++
++/// The shared document back as the file's project: the ids [`shape`] gave taken off.
++fn unshape(value: &mut Value) {
++    match value {
++        Value::Object(map) => {
++            if map.get("id").and_then(Value::as_str).is_some_and(|id| id.starts_with('~')) {
++                map.remove("id");
++            }
++            map.values_mut().for_each(unshape);
++        }
++        Value::Array(items) => items.iter_mut().for_each(unshape),
++        _ => {}
++    }
++}
++
++/// Notes back in order after a merge, which keeps each side's additions next to their neighbours.
++fn order(value: &mut Value, key: &str) {
++    match value {
++        Value::Object(map) => map.iter_mut().for_each(|(k, v)| order(v, k)),
++        Value::Array(items) => {
++            if key == "notes" {
++                sort_notes(items);
++            }
++            items.iter_mut().for_each(|v| order(v, ""));
++        }
++        _ => {}
++    }
++}
++
++/// A project as the shared document.
++pub fn document_of(project: &Project) -> Value {
++    let file: Value = serde_json::from_str(&suhina_project_file::to_json(project)).unwrap_or_default();
++    let mut doc = file.get("project").cloned().unwrap_or_else(|| Value::Object(Map::new()));
++    shape(&mut doc, "");
++    doc
++}
++
++/// The project a shared document holds; it must read and validate as a file's does.
++pub fn project_of(document: &Value) -> Result<Project, String> {
++    let mut doc = document.clone();
++    if !doc.is_object() {
++        return Err("Conflict: not a project".into());
++    }
++    unshape(&mut doc);
++    let file = serde_json::json!({ "format": "suhina", "version": suhina_project_file::VERSION, "project": doc });
++    suhina_project_file::from_json(&file.to_string()).map_err(|e| format!("Conflict: {e}"))
++}
++
++/// The three-way merge: the kit's, then the notes back in order, then the result must read as a project. Objects both
++/// sides added under the same id (two people adding a clip, or making their first edit to clips whose notes another
++/// clip shares, which copies them, at once) are no conflict: `edited`'s get new ids first ([`renumber`]).
++pub fn merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
++    let merge = |edited: &Value| -> Result<Value, String> {
++        let mut merged = kit::merge(base, current, edited, COUNTERS)?;
++        order(&mut merged, "");
++        project_of(&merged)?;
++        Ok(merged)
++    };
++    merge(edited).or_else(|e| renumber(base, current, edited).map_or(Err(e), |edited| merge(&edited)))
++}
++
++/// The kinds of ids, each with the lists its objects are in and the fields that name one (as JSON pointers with `*`
++/// for every item of a list). Clips, arrangement lanes and scenes share one counter, so one kind.
++const KINDS: [(&[&str], &[&str]); 4] = [
++    (&["/contents/*"], &["/arrangement/lanes/*/clips/*/content", "/launcher/columns/*/slots/*/clip/content"]),
++    (&["/arrangement/lanes/*", "/arrangement/lanes/*/clips/*", "/launcher/columns/*/slots/*/clip", "/launcher/scenes/*"], &[]),
++    (
++        &["/tracks/*"],
++        &["/tracks/*/parent", "/arrangement/lanes/*/track", "/launcher/columns/*/track", "/contents/*/lanes/*/target", "/launcher/mappings/*/track"],
++    ),
++    (&["/channels/*"], &["/tracks/*/channel", "/channels/*/output", "/channels/*/sends/*/target"]),
++];
++
++/// The values at `pointer` (with `*` for every item of a list).
++fn at_all<'a>(value: &'a mut Value, pointer: &[&str], out: &mut Vec<&'a mut Value>) {
++    match pointer.split_first() {
++        None => out.push(value),
++        Some((&"*", rest)) => {
++            if let Value::Array(items) = value {
++                items.iter_mut().for_each(|v| at_all(v, rest, out));
++            }
++        }
++        Some((key, rest)) => {
++            if let Some(v) = value.get_mut(*key) {
++                at_all(v, rest, out);
++            }
++        }
++    }
++}
++
++fn ids(doc: &Value, lists: &[&str]) -> Vec<u64> {
++    let mut doc = doc.clone();
++    let mut out = Vec::new();
++    for list in lists {
++        let parts: Vec<&str> = list.split('/').skip(1).collect();
++        let mut found = Vec::new();
++        at_all(&mut doc, &parts, &mut found);
++        out.extend(found.into_iter().filter_map(|v| v["id"].as_u64()));
++    }
++    out
++}
++
++/// `edited` with new ids for the objects it added under an id `current` also added, and every field naming them; `None`
++/// when there are none.
++fn renumber(base: &Value, current: &Value, edited: &Value) -> Option<Value> {
++    let mut edited = edited.clone();
++    let mut changed = false;
++    for (kind, (lists, refs)) in KINDS.iter().enumerate() {
++        let (b, c, e) = (ids(base, lists), ids(current, lists), ids(&edited, lists));
++        let clashes: Vec<u64> = e.iter().copied().filter(|id| !b.contains(id) && c.contains(id)).collect();
++        if clashes.is_empty() {
++            continue;
++        }
++        let counter = |d: &Value| if kind == 1 { d["next_id"].as_u64().unwrap_or(0) } else { 0 };
++        let mut next = c.iter().chain(&e).copied().max().unwrap_or(0).max(counter(current)).max(counter(&edited)) + 1;
++        let fresh: std::collections::HashMap<u64, u64> = clashes
++            .into_iter()
++            .map(|id| {
++                next += 1;
++                (id, next - 1)
++            })
++            .collect();
++        let swap = |v: &mut Value| {
++            if let Some(new) = v.as_u64().and_then(|id| fresh.get(&id)) {
++                *v = Value::from(*new);
++            }
++        };
++        for pointer in lists.iter().map(|l| format!("{l}/id")).chain(refs.iter().map(|r| (*r).to_owned())) {
++            let parts: Vec<&str> = pointer.split('/').skip(1).collect();
++            let mut found = Vec::new();
++            at_all(&mut edited, &parts, &mut found);
++            found.into_iter().for_each(|v| swap(v));
++        }
++        if kind == 1 {
++            edited["next_id"] = Value::from(next);
++        }
++        changed = true;
++    }
++    changed.then_some(edited)
++}
++
++/// The audio files a project plays, by the name its clips give them (the key its decoded audio is kept under).
++pub fn audio_files(project: &Project) -> Vec<String> {
++    let mut files: Vec<String> = project
++        .contents
++        .iter()
++        .flat_map(|c| &c.lanes)
++        .filter_map(|l| match &l.data {
++            LaneData::Audio(region) if !region.file.is_empty() => Some(region.file.clone()),
++            _ => None,
++        })
++        .chain(project.channels.iter().flat_map(|c| &c.devices).filter_map(|d| d.sample_file().map(str::to_owned)))
++        .collect();
++    files.sort();
++    files.dedup();
++    files
++}
++
++/// An audio file's name as a shared document gives it, where it is kept in this browser: inside the project's
++/// folder, never above it. `None` for a name that would leave it.
++pub fn file_at(folder: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
++    let path = std::path::Path::new(name);
++    if name.is_empty() || name.len() > 1024 || path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
++        return None;
++    }
++    Some(folder.join(path))
++}
++
++impl Session {
++    /// The shared document: this project (see the top).
++    pub fn live_document(&self) -> Value {
++        document_of(&self.project)
++    }
++
++    /// Changes whenever the project may have.
++    pub fn live_generation(&self) -> u64 {
++        self.changes
++    }
++
++    /// The folder the project's audio names start from here.
++    pub fn live_folder(&self) -> std::path::PathBuf {
++        self.audio_folder.clone().unwrap_or_else(|| std::path::PathBuf::from("/"))
++    }
++
++    /// Puts a shared document's project in: no step of the undo history, the playing engine follows, and audio files
++    /// already here are decoded for it (the others arrive as the session's media, [`Session::live_add_audio`]).
++    pub fn live_adopt(&mut self, document: &Value) -> Result<(), String> {
++        let project = project_of(document)?;
++        if project == self.project {
++            return Ok(());
++        }
++        let scenes = std::mem::replace(&mut self.project, project).launcher;
++        self.changes = self.changes.wrapping_add(1);
++        self.open_step = None;
++        self.param_gesture = None;
++        self.live_decode();
++        let shift = suhina_engine::SceneShift::between(&scenes, &self.project.launcher);
++        self.update_player(shift).map_err(|e| e.0)?;
++        self.send_armed();
++        Ok(())
++    }
++
++    /// Decodes the project's audio files that are here and not decoded yet. Whether any was.
++    fn live_decode(&mut self) -> bool {
++        let folder = self.live_folder();
++        let mut added = false;
++        for name in audio_files(&self.project) {
++            if self.audio.files.contains_key(&name) {
++                continue;
++            }
++            let Some(path) = file_at(&folder, &name).filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file())) else {
++                continue;
++            };
++            if let Ok(data) = suhina_media::decode_file(&path) {
++                self.audio.files.insert(name, std::sync::Arc::new(data));
++                added = true;
++            }
++        }
++        self.audio_changed |= added;
++        added
++    }
++
++    /// An audio file someone else in the session shared: kept in memory where the project names it, decoded, and
++    /// heard from now on. `name` comes from another person: one that would leave the project's folder is refused.
++    pub fn live_add_audio(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), String> {
++        let path = file_at(&self.live_folder(), name).ok_or("not a file name")?;
++        live_files_impl::put(&path, bytes);
++        if self.live_decode() {
++            self.update_player(None).map_err(|e| e.0)?;
++        }
++        Ok(())
++    }
++
++    /// Whether an audio file the project plays is here.
++    pub fn live_has_audio(&self, name: &str) -> bool {
++        file_at(&self.live_folder(), name).is_some_and(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
++    }
++
++    /// The bytes of an audio file the project plays, when it is here.
++    pub fn live_audio_bytes(&self, name: &str) -> Option<Vec<u8>> {
++        audio_files(&self.project).iter().any(|f| f == name).then_some(())?;
++        std::fs::read(file_at(&self.live_folder(), name)?).ok()
++    }
++
++    /// The session ended: Undo starts again from the project as it is.
++    pub fn live_disconnected(&mut self) {
++        self.undo.clear();
++        self.redo.clear();
++        self.open_step = None;
++    }
++}
++
++/// Storing a shared file without it counting as this browser's own change (which the page would copy into Files).
++mod live_files_impl {
++    #[cfg(target_arch = "wasm32")]
++    pub fn put(path: &std::path::Path, bytes: Vec<u8>) {
++        suhina_playground::std::fs::put(path, bytes);
++    }
++    #[cfg(not(target_arch = "wasm32"))]
++    pub fn put(path: &std::path::Path, bytes: Vec<u8>) {
++        if let Some(dir) = path.parent() {
++            let _ = std::fs::create_dir_all(dir);
++        }
++        let _ = std::fs::write(path, bytes);
++    }
++}
++
++// The clock and files, as the session's other modules have them on wasm (patches/ableton-live.yaml).
++#[cfg(target_arch = "wasm32")]
++use suhina_playground::std;
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/session/src/live/tests.rs b/crates/session/src/live/tests.rs
+new file mode 100644
+index 0000000..b50e749
+--- /dev/null
++++ b/crates/session/src/live/tests.rs
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#![allow(clippy::unwrap_used)]
++
++use super::*;
++use serde_json::json;
++
++#[test]
++fn two_people_changing_different_notes_of_one_clip_both_keep_theirs() {
++    let mut session = Session::new(crate::blank_project());
++    let track = session.project().tracks[0].id.0;
++    session.execute("clip.create", &json!({ "track": track, "scene": 1 })).unwrap();
++    let notes = json!([{ "time": 0.0, "length": 1.0, "key": 60 }, { "time": 1.0, "length": 1.0, "key": 62 }]);
++    session.execute("note.add", &json!({ "track": track, "scene": 1, "notes": notes })).unwrap();
++    let base = session.live_document();
++    // The note ids are the notes themselves, so the document reads back to the same bytes.
++    assert_eq!(kit::canonical(&document_of(&project_of(&base).unwrap())), kit::canonical(&base));
++
++    session.execute("note.move", &json!({ "track": track, "scene": 1, "notes": [0], "semitones": 1 })).unwrap();
++    let moved = session.live_document();
++    session.live_adopt(&base).unwrap();
++    session.execute("note.setVelocity", &json!({ "track": track, "scene": 1, "notes": [1], "velocity": 100 })).unwrap();
++    let louder = session.live_document();
++
++    let merged = merge(&base, &moved, &louder).unwrap();
++    session.live_adopt(&merged).unwrap();
++    let mut keys: Vec<(u8, f32)> = session.project().contents.iter().flat_map(|c| &c.lanes).filter_map(|l| match &l.data {
++        LaneData::Notes(notes) => Some(notes.iter().map(|n| (n.key, n.velocity)).collect::<Vec<_>>()),
++        _ => None,
++    }).flatten().collect();
++    keys.sort_by_key(|k| k.0);
++    assert_eq!(keys.iter().map(|k| k.0).collect::<Vec<_>>(), [61, 62]);
++    assert!((keys[1].1 - 100.0 / 127.0).abs() < 0.01, "{keys:?}");
++    // The same note changed by both is a conflict, not a mix of the two.
++    session.live_adopt(&base).unwrap();
++    session.execute("note.move", &json!({ "track": track, "scene": 1, "notes": [0], "semitones": -1 })).unwrap();
++    assert!(merge(&base, &moved, &session.live_document()).is_err());
++}
++
++#[test]
++fn two_people_adding_clips_at_once_both_keep_theirs() {
++    let mut session = Session::new(crate::blank_project());
++    let track = session.project().tracks[0].id.0;
++    let base = session.live_document();
++    session.execute("clip.create", &json!({ "track": track, "scene": 1 })).unwrap();
++    let first = session.live_document();
++    session.live_adopt(&base).unwrap();
++    session.execute("clip.create", &json!({ "track": track, "scene": 2 })).unwrap();
++    let second = session.live_document();
++    // Both took the same content id and the same clip id; the second side's are renumbered.
++    let merged = merge(&base, &first, &second).unwrap();
++    let project = project_of(&merged).unwrap();
++    let column = project.launcher.columns.iter().find(|c| c.track.0 == track).unwrap();
++    let clips: Vec<_> = column.slots.iter().filter_map(|s| s.clip.as_ref()).collect();
++    assert_eq!(clips.len(), 2);
++    assert_ne!(clips[0].id, clips[1].id);
++    assert_ne!(clips[0].content, clips[1].content);
++}
+diff --git a/crates/ui/src/app/live.rs b/crates/ui/src/app/live.rs
+new file mode 100644
+index 0000000..552c1b3
+--- /dev/null
++++ b/crates/ui/src/app/live.rs
+@@ -0,0 +1,150 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! Live editing in a Playground session (patches/ableton-live.yaml in github.com/daijro/openplayground), the window's
++//! side: the window is the app the session's kit (crates/session `live`) runs on. The shared document is the project
++//! of the tab shown when the session connected; a remote change goes into it at the end of a frame with no pointer
++//! down, and is no step of its undo history. Audio files travel as the session's media, by the name the clips give
++//! them. Each person's pointer and the gesture under way go to the others (`peers`). Web only; a child of the app
++//! module, so it reads the window's state.
++
++mod peers;
++
++pub use peers::{clip_shown, column, drawn_notes, fader, lanes, moving_note, overlay, pan, param, piano};
++
++use super::App;
++use serde_json::Value;
++use std::cell::Cell;
++use suhina_session::ProjectId;
++use suhina_session::live::{self as doc, kit::Live};
++
++thread_local! {
++    /// The project the session shares: the one shown when it connected.
++    static BOUND: Cell<Option<ProjectId>> = const { Cell::new(None) };
++    /// A pointer is down this frame (a drag, a stroke, a click under way): nothing goes in or out until it is up.
++    static BUSY: Cell<bool> = const { Cell::new(false) };
++}
++
++/// Whether a pointer is down, from the page before the session's frame.
++pub fn set_busy(busy: bool) {
++    BUSY.set(busy);
++}
++
++impl App {
++    /// The shared project's id (the one shown, the first time).
++    fn live_id(&self) -> Option<ProjectId> {
++        let id = BOUND.get().filter(|id| self.projects.get(*id).is_some()).or_else(|| self.projects.active());
++        BOUND.set(id);
++        id
++    }
++
++    fn live_session(&self) -> Option<&suhina_session::Session> {
++        self.projects.get(self.live_id()?)
++    }
++
++    fn live_session_mut(&mut self) -> Option<&mut suhina_session::Session> {
++        let id = self.live_id()?;
++        self.projects.get_mut(id)
++    }
++
++    /// The notes of the clip the clip editor shows, if it shows one.
++    fn live_shown_notes(&self) -> Option<Vec<suhina_engine::model::Note>> {
++        use crate::detail::detail_view::ClipRef;
++        let clip = match self.shown {
++            super::View::Session => self.view.selected_slot.map(|(t, s)| ClipRef::Slot(t, s)),
++            super::View::Arrangement => self.arrangement.selected_clip().map(|(t, i)| ClipRef::Arrangement(t, i)),
++        };
++        self.piano_clip(clip).map(|c| c.notes)
++    }
++
++    /// The waveforms of the shared project's audio, after audio came in.
++    fn live_waveforms(&mut self) {
++        if let Some(session) = self.live_session() {
++            let waveforms = crate::kit::waveform::from_pool(session.audio());
++            self.set_waveforms(waveforms);
++        }
++    }
++}
++
++impl Live for App {
++    fn live_document(&self) -> Value {
++        self.live_session().map_or_else(|| Value::Object(serde_json::Map::new()), suhina_session::Session::live_document)
++    }
++
++    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
++        let shown = self.live_shown_notes();
++        let session = self.live_session_mut().ok_or("no project is open")?;
++        let decoded = session.audio().files.len();
++        session.live_adopt(&document)?;
++        let more = session.audio().files.len() != decoded;
++        self.note_outside_change();
++        // The clip editor's selection is by place in the list, which a remote change can reorder: the same notes stay
++        // selected.
++        if let (Some(old), Some(new)) = (shown, self.live_shown_notes()) {
++            let selected = std::mem::take(&mut self.piano_roll.selected);
++            self.piano_roll.selected = selected.iter().filter_map(|&i| old.get(i)).filter_map(|n| new.iter().position(|m| m == n)).collect();
++        }
++        if more {
++            self.live_waveforms();
++        }
++        Ok(())
++    }
++
++    fn live_quiet(&self) -> bool {
++        !BUSY.get() && self.live_session().is_some()
++    }
++
++    fn live_generation(&self) -> Option<u64> {
++        let id = self.live_id()?;
++        Some((u64::from(id.0) << 40) ^ self.projects.get(id)?.live_generation())
++    }
++
++    fn live_disconnected(&mut self) {
++        if let Some(session) = self.live_session_mut() {
++            session.live_disconnected();
++        }
++        BOUND.set(None);
++    }
++
++    fn live_assets(&self) -> Vec<(String, String, bool)> {
++        let Some(session) = self.live_session() else { return Vec::new() };
++        doc::audio_files(session.project())
++            .into_iter()
++            .map(|id| {
++                let name = std::path::Path::new(&id).file_name().map_or_else(|| id.clone(), |n| n.to_string_lossy().into());
++                let have = session.live_has_audio(&id);
++                (id, name, have)
++            })
++            .collect()
++    }
++
++    fn live_assets_of(document: &Value) -> Vec<String> {
++        doc::project_of(document).map(|p| doc::audio_files(&p)).unwrap_or_default()
++    }
++
++    fn live_read_asset(&self, id: &str) -> Option<Vec<u8>> {
++        self.live_session()?.live_audio_bytes(id)
++    }
++
++    fn live_write_asset(&mut self, id: &str, _name: &str, bytes: Vec<u8>) {
++        let Some(session) = self.live_session_mut() else { return };
++        match session.live_add_audio(id, bytes) {
++            Ok(()) => self.live_waveforms(),
++            Err(e) => self.set_status(crate::Status::Error(format!("could not use {id}: {e}"))),
++        }
++    }
++
++    fn live_presence(&self) -> Value {
++        peers::mine(self)
++    }
++
++    fn live_show_presence(&mut self, others: Vec<doc::kit::Presence>) {
++        peers::show(others);
++    }
++
++    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
++        doc::merge(base, current, edited)
++    }
++
++    fn live_check(document: &Value) -> Result<(), String> {
++        doc::project_of(document).map(drop)
++    }
++}
+diff --git a/crates/ui/src/app/live/peers.rs b/crates/ui/src/app/live/peers.rs
+new file mode 100644
+index 0000000..5318ec4
+--- /dev/null
++++ b/crates/ui/src/app/live/peers.rs
+@@ -0,0 +1,555 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! Presence in a Playground session: where each person is and the gesture under way, in the project's terms, so it
++//! shows in the same place for everyone whatever their zoom, scroll or window size.
++//!
++//! This person's state (`mine`, at most a few KiB of JSON):
++//!   `at`      the pointer: `{ "in": "slots", "track", "fx", "scene" }` (the Session view's clip grid: a track's
++//!             column, the fraction across it, and the scene row as a number, 0 at the top of the first),
++//!             `{ "in": "mixer", "track", "fx", "fy" }` (its mixer strip, fractions across and down),
++//!             `{ "in": "lanes", "track", "fy", "beat" }` (the Arrangement view), or `{ "in": "piano", "clip", "beat",
++//!             "key" }` (the clip editor: the clip's address, a beat of its content and a key as a number);
++//!   `notes`   with `clip`: the notes a drag in the clip editor is moving, resizing or drawing, as they are now,
++//!             `[time, length, key]` each;
++//!   `clips`   the arrangement clips a drag is moving or trimming, as they are now, `[track, start, end]`;
++//!   `fader`   a mixer value being dragged: `{ "track", "control": "volume" | "pan" | "send", "value" }`;
++//!   `param`   a device parameter being dragged: `{ "track", "device", "param", "value", "min", "max" }`.
++//! The views record where things are as they draw (the hooks [`column`], [`lanes`], [`clip_shown`], [`piano`],
++//! [`moving_note`], [`drawn_notes`]), so the pointer can be read in those terms and the others drawn back: their
++//! pointers with name tags, ghosts of what their drags are doing, in their colour, eased toward where they are; the
++//! mixer's and the device panels' controls ([`fader`], [`pan`], [`param`]) show the others turning them.
++
++use super::super::App;
++use crate::session::session_view::Control;
++use egui::{Color32, Id, LayerId, Order, Painter, Pos2, Rangef, Rect, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
++use serde_json::{Value, json};
++use std::cell::RefCell;
++use suhina_engine::model::{ClipId, Note, TrackId};
++use suhina_session::live::kit::{self, Presence};
++
++/// The most notes or clips a presence carries.
++const MAX_ITEMS: usize = 50;
++/// The most characters of a name tag, its ellipsis included.
++const MAX_NAME: usize = 24;
++/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
++const EASE: f64 = 0.08;
++/// The session's pointer arrow, tip first, in points.
++const ARROW: [(f32, f32); 7] = [(0.0, 0.0), (12.5, 11.0), (7.3, 11.0), (10.4, 17.3), (7.6, 18.6), (4.5, 12.2), (0.0, 16.0)];
++const GHOST: f32 = 0.28;
++const GHOST_EDGE: f32 = 0.85;
++
++/// Where things were drawn this frame.
++#[derive(Default)]
++struct Frame {
++    /// Session view columns: track, x span, the top of scene 0, a scene's height, the grid's and the mixer's areas.
++    columns: Vec<(TrackId, Rangef, f32, f32, Rect, Rect)>,
++    /// Arrangement rows: track, the row, the part of it shown; and x of beat 0 and points a beat.
++    rows: Vec<(TrackId, Rect, Rect)>,
++    beat: (f32, f32),
++    /// Arrangement clips as drawn (where a drag has them): id and rect.
++    clips: Vec<(ClipId, Rect)>,
++    /// Notes a clip-editor drag moves or draws, as shown.
++    notes: Vec<[f64; 3]>,
++    /// The others' marks on mixer and device controls, drawn over everything at the frame's end (a strip's own area
++    /// would cut their tags off).
++    marks: Vec<(Color32, String, Marks)>,
++}
++
++/// This person's state as of the last frame.
++#[derive(Default)]
++struct Mine {
++    at: Value,
++    piano: Option<(Value, Vec<[f64; 3]>)>,
++    clips: Vec<[f64; 3]>,
++    param: Value,
++}
++
++/// Someone else, with their marks eased toward their latest state.
++struct Peer {
++    id: String,
++    name: String,
++    color: Color32,
++    state: Value,
++    /// Their pointer's scope (`slots:<track>`, `lanes:<track>`, `piano:<clip>`) and position in it.
++    pointer: Option<(String, [f64; 2])>,
++    notes: Vec<[f64; 3]>,
++    clips: Vec<[f64; 3]>,
++}
++
++thread_local! {
++    static FRAME: RefCell<Frame> = RefCell::default();
++    static MINE: RefCell<Mine> = RefCell::default();
++    static OTHERS: RefCell<Vec<Peer>> = const { RefCell::new(Vec::new()) };
++}
++
++fn on() -> bool {
++    kit::connected()
++}
++
++fn num(v: &Value) -> Option<f64> {
++    v.as_f64().filter(|n| n.is_finite() && n.abs() < 1.0e7)
++}
++
++fn track_of(v: &Value) -> Option<TrackId> {
++    v.as_u64().and_then(|n| u32::try_from(n).ok()).map(TrackId)
++}
++
++// ---------------------------------------------------------------- the views' hooks
++
++/// The Session view drew `track`'s column at `span` (scene 0 at `top`, `pitch` a scene).
++pub fn column(track: TrackId, span: Rangef, top: f32, pitch: f32, body: Rect, mixer: Rect) {
++    if on() {
++        FRAME.with_borrow_mut(|f| f.columns.push((track, span, top, pitch, body, mixer)));
++    }
++}
++
++/// The Arrangement view's rows this frame (track, row, the part shown), beat 0 at `x0`, `beat_width` points a beat.
++pub fn lanes(rows: impl Iterator<Item = (TrackId, Rect, Rect)>, x0: f32, beat_width: f32) {
++    if on() {
++        FRAME.with_borrow_mut(|f| {
++            f.rows = rows.collect();
++            f.beat = (x0, beat_width);
++        });
++    }
++}
++
++/// An arrangement clip, drawn at `rect` (a drag's place for it, while one is under way).
++pub fn clip_shown(clip: ClipId, rect: Rect) {
++    if on() {
++        FRAME.with_borrow_mut(|f| f.clips.push((clip, rect)));
++    }
++}
++
++/// A note a clip-editor drag is moving or resizing, as it shows.
++pub fn moving_note(note: &Note) {
++    if on() {
++        FRAME.with_borrow_mut(|f| f.notes.push([note.time, note.duration, f64::from(note.key)]));
++    }
++}
++
++/// The notes a draw or paint drag is making.
++pub fn drawn_notes(notes: &[Note]) {
++    if on() {
++        FRAME.with_borrow_mut(|f| f.notes.extend(notes.iter().map(|n| [n.time, n.duration, f64::from(n.key)])));
++    }
++}
++
++/// The clip editor drew `address`'s notes over `grid`: this person's pointer and drag there, and the others' on the
++/// same clip, drawn now with the editor's own mapping.
++#[allow(clippy::too_many_arguments)]
++pub fn piano(
++    ui: &Ui,
++    address: &Value,
++    grid: Rect,
++    key_height: f32,
++    x_of: &dyn Fn(f64) -> f32,
++    beat_at: &dyn Fn(f32) -> f64,
++    y_of: &dyn Fn(u8) -> f32,
++    key_at: &dyn Fn(f32) -> Option<u8>,
++) {
++    if !on() {
++        return;
++    }
++    let notes: Vec<[f64; 3]> = FRAME.with_borrow_mut(|f| std::mem::take(&mut f.notes)).into_iter().take(MAX_ITEMS).collect();
++    let pointer = ui.ctx().pointer_latest_pos().filter(|p| grid.contains(*p));
++    MINE.with_borrow_mut(|m| {
++        m.piano = Some((address.clone(), notes));
++        if let Some(p) = pointer
++            && let Some(key) = key_at(p.y)
++        {
++            let top = y_of(key);
++            let key = f64::from(key) + 1.0 - f64::from(((p.y - top) / key_height.max(1.0)).clamp(0.0, 1.0));
++            m.at = json!({ "in": "piano", "clip": address, "beat": beat_at(p.x), "key": key });
++        } else if m.at["in"] == "piano" {
++            m.at = Value::Null;
++        }
++    });
++    let scope = format!("piano:{address}");
++    // A key as a number: its row's bottom at the whole number, its top a key higher.
++    let y = |key: f64| {
++        let k = key.floor().clamp(0.0, 127.0);
++        y_of(k as u8) + key_height * (1.0 - (key - k) as f32)
++    };
++    let note_rect = |n: &[f64; 3]| {
++        let k = n[2].round().clamp(0.0, 127.0) as u8;
++        let left = x_of(n[0]);
++        Rect::from_min_max(pos2(left, y_of(k) + 1.0), pos2(x_of(n[0] + n[1].max(0.0)).max(left + 2.0) - 1.0, y_of(k) + key_height))
++    };
++    let mut all = Vec::new();
++    OTHERS.with_borrow(|others| {
++        for peer in others {
++            let mut marks = Marks::default();
++            if peer.state["clip"] == *address {
++                marks.ghosts = peer.notes.iter().map(note_rect).collect();
++            }
++            if let Some((s, [beat, key])) = &peer.pointer
++                && *s == scope
++            {
++                marks.tip = Some(pos2(x_of(*beat), y(*key)));
++            }
++            all.push((peer.color, peer.name.clone(), marks));
++        }
++    });
++    paint(&ui.painter_at(grid), &all);
++}
++
++/// The mixer drew `track`'s volume fader at `fader`: the others' drags of it, as ghost caps with their value.
++pub fn fader(painter: &Painter, track: TrackId, fader: Rect) {
++    // Only the strip's part that shows.
++    if !fader.intersects(painter.clip_rect()) {
++        return;
++    }
++    if !on() {
++        return;
++    }
++    let mut all = Vec::new();
++    OTHERS.with_borrow(|others| {
++        for peer in others {
++            let f = &peer.state["fader"];
++            if track_of(&f["track"]) != Some(track) || f["control"] != "volume" {
++                continue;
++            }
++            let Some(db) = num(&f["value"]) else { continue };
++            let travel = Rangef::new(fader.bottom() - 4.0, fader.top() + 4.0);
++            let y = travel.min + (travel.max - travel.min) * crate::kit::widgets::volume_position(db);
++            let cap = Rect::from_center_size(pos2(fader.center().x, y), vec2(fader.width().min(26.0), 8.0));
++            let cap = cap.intersect(painter.clip_rect());
++            let value = format!("{} dB", crate::kit::widgets::format_db(db));
++            let marks = Marks { ghosts: vec![cap], tag_at: Some(cap.right_top()), value: Some(value), ..Marks::default() };
++            all.push((peer.color, peer.name.clone(), marks));
++        }
++    });
++    FRAME.with_borrow_mut(|f| f.marks.extend(all));
++}
++
++/// The mixer drew `track`'s pan knob at `knob`: the others' drags of it, as rings with their value.
++pub fn pan(painter: &Painter, track: TrackId, knob: Rect) {
++    if !on() || !knob.intersects(painter.clip_rect()) {
++        return;
++    }
++    let mut all = Vec::new();
++    OTHERS.with_borrow(|others| {
++        for peer in others {
++            let f = &peer.state["fader"];
++            if track_of(&f["track"]) != Some(track) || f["control"] != "pan" {
++                continue;
++            }
++            let Some(pan) = num(&f["value"]).filter(|v| v.abs() <= 1.0) else { continue };
++            let ring = knob.expand(2.0);
++            let marks = Marks { rings: vec![ring], tag_at: Some(ring.right_bottom()), value: Some(crate::kit::widgets::format_pan(pan)), ..Marks::default() };
++            all.push((peer.color, peer.name.clone(), marks));
++        }
++    });
++    FRAME.with_borrow_mut(|f| f.marks.extend(all));
++}
++
++/// A device panel drew a parameter's control at `rect`: this person's drag of it, and the others', as a ring with
++/// their value.
++#[allow(clippy::too_many_arguments)]
++pub fn param(painter: &Painter, track: TrackId, device: &Value, param: &str, rect: Rect, value: f64, min: f64, max: f64, dragging: bool) {
++    if !on() {
++        return;
++    }
++    let key = json!({ "track": track.0, "device": device, "param": param });
++    MINE.with_borrow_mut(|m| {
++        let same = m.param["track"] == key["track"] && m.param["device"] == key["device"] && m.param["param"] == key["param"];
++        if dragging {
++            m.param = json!({ "track": track.0, "device": device, "param": param, "value": value, "min": min, "max": max });
++        } else if same {
++            m.param = Value::Null;
++        }
++    });
++    let mut all = Vec::new();
++    OTHERS.with_borrow(|others| {
++        for peer in others {
++            let p = &peer.state["param"];
++            if p["track"] != key["track"] || p["device"] != key["device"] || p["param"] != key["param"] {
++                continue;
++            }
++            let Some(v) = num(&p["value"]) else { continue };
++            let ring = rect.expand(2.0).intersect(painter.clip_rect());
++            let marks = Marks { rings: vec![ring], tag_at: Some(ring.right_bottom()), value: Some(format!("{v:.2}")), ..Marks::default() };
++            all.push((peer.color, peer.name.clone(), marks));
++        }
++    });
++    FRAME.with_borrow_mut(|f| f.marks.extend(all));
++}
++
++// ---------------------------------------------------------------- the frame's end
++
++/// After the window's frame: this person's pointer and drags read in the project's terms, the others' marks eased
++/// and drawn over the views (under menus and dialogs), and the recorded places cleared for the next frame.
++pub fn overlay(ui: &Ui, app: &App) {
++    if !on() {
++        return;
++    }
++    let mut frame = FRAME.with_borrow_mut(std::mem::take);
++    let pointer = ui.ctx().pointer_latest_pos();
++    let down = ui.input(|i| i.pointer.any_down());
++    let in_slots = |p: Pos2| {
++        frame.columns.iter().find(|c| c.1.contains(p.x) && c.4.contains(p)).map(|&(track, span, top, pitch, ..)| {
++            json!({ "in": "slots", "track": track.0, "fx": (p.x - span.min) / span.span().max(1.0), "scene": (p.y - top) / pitch.max(1.0) })
++        })
++    };
++    let in_mixer = |p: Pos2| {
++        frame.columns.iter().find(|c| c.1.contains(p.x) && c.5.contains(p)).map(|&(track, span, .., mixer)| {
++            json!({ "in": "mixer", "track": track.0, "fx": (p.x - span.min) / span.span().max(1.0), "fy": (p.y - mixer.top()) / mixer.height().max(1.0) })
++        })
++    };
++    let (x0, bw) = frame.beat;
++    let beat_of = |x: f32| f64::from((x - x0) / bw.max(1.0e-3));
++    let in_lanes = |p: Pos2| {
++        frame.rows.iter().find(|r| r.2.contains(p)).map(|&(track, row, _)| {
++            json!({ "in": "lanes", "track": track.0, "fy": (p.y - row.top()) / row.height().max(1.0), "beat": beat_of(p.x) })
++        })
++    };
++    // The arrangement clips a drag has somewhere else than the project does.
++    let mut dragged = Vec::new();
++    if down && !frame.rows.is_empty() {
++        if let Some(project) = app.live_session().map(|s| s.project()) {
++            for lane in &project.arrangement.lanes {
++                for clip in &lane.clips {
++                    let Some((_, rect)) = frame.clips.iter().rev().find(|(id, _)| *id == clip.id) else { continue };
++                    // As drawn, to a point (a clip's right edge is drawn a point short of its end).
++                    let px = f64::from(bw.max(1.0e-3));
++                    let (start, end) = (beat_of(rect.left()), beat_of(rect.right()));
++                    let moved = ((start - clip.start) * px).abs() > 1.0;
++                    let resized = ((end - start - clip.length) * px).abs() > 2.0;
++                    let row = frame.rows.iter().find(|r| r.1.y_range().contains(rect.center().y)).map(|r| r.0);
++                    if (moved || resized || row != lane.track) && let Some(track) = row.or(lane.track) {
++                        let start = if moved { start } else { clip.start };
++                        let end = if resized { end } else { start + clip.length };
++                        dragged.push([f64::from(track.0), start, end]);
++                    }
++                }
++            }
++        }
++    }
++    dragged.truncate(MAX_ITEMS);
++    MINE.with_borrow_mut(|m| {
++        let over = pointer.and_then(|p| in_slots(p).or_else(|| in_mixer(p)).or_else(|| in_lanes(p)));
++        match over {
++            Some(at) => m.at = at,
++            None if m.at["in"] != "piano" || pointer.is_none() => m.at = Value::Null,
++            None => {}
++        }
++        m.clips = dragged;
++    });
++    // The others' marks: eased, then drawn.
++    let dt = ui.input(|i| f64::from(i.stable_dt));
++    let moving = OTHERS.with_borrow_mut(|others| others.iter_mut().fold(false, |moving, p| p.step(dt) | moving));
++    if moving {
++        ui.ctx().request_repaint();
++    }
++    let x_of = |beat: f64| x0 + beat as f32 * bw;
++    let mut all = Vec::new();
++    let mut area = Rect::NOTHING;
++    for c in &frame.columns {
++        area = area.union(c.4).union(c.5);
++    }
++    for r in &frame.rows {
++        area = area.union(r.2);
++    }
++    OTHERS.with_borrow(|others| {
++        for peer in others {
++            let mut marks = Marks::default();
++            for c in &peer.clips {
++                let Some(row) = frame.rows.iter().find(|r| Some(r.0) == track_of(&json!(c[0] as u64))) else { continue };
++                marks.ghosts.push(Rect::from_x_y_ranges(Rangef::new(x_of(c[1]), x_of(c[2])), row.1.y_range()));
++            }
++            if let Some((scope, [a, b])) = &peer.pointer {
++                let (kind, track) = scope.split_once(':').unwrap_or_default();
++                let track = track.parse::<u32>().ok().map(TrackId);
++                marks.tip = match kind {
++                    "slots" => frame.columns.iter().find(|c| Some(c.0) == track).map(|&(_, span, top, pitch, ..)| {
++                        pos2(span.min + span.span() * *a as f32, top + pitch * *b as f32)
++                    }),
++                    "mixer" => frame.columns.iter().find(|c| Some(c.0) == track).map(|&(_, span, .., mixer)| {
++                        pos2(span.min + span.span() * *a as f32, mixer.top() + mixer.height() * *b as f32)
++                    }),
++                    "lanes" => frame.rows.iter().find(|r| Some(r.0) == track).map(|r| pos2(x_of(*b), r.1.top() + r.1.height() * *a as f32)),
++                    _ => None,
++                };
++            }
++            all.push((peer.color, peer.name.clone(), marks));
++        }
++    });
++    let layer = ui.ctx().layer_painter(LayerId::new(Order::Middle, Id::new("suhina-live-presence")));
++    if area.is_positive() && all.iter().any(|(_, _, m)| m.tip.is_some() || !m.ghosts.is_empty()) {
++        paint(&layer.with_clip_rect(area), &all);
++    }
++    if !frame.marks.is_empty() {
++        paint(&layer.with_clip_rect(ui.max_rect()), &std::mem::take(&mut frame.marks));
++    }
++}
++
++/// This person's presence for the others.
++pub fn mine(app: &App) -> Value {
++    MINE.with_borrow(|m| {
++        let mut out = serde_json::Map::new();
++        out.insert("view".into(), json!(if app.shown == super::super::View::Arrangement { "arrangement" } else { "session" }));
++        if !m.at.is_null() {
++            out.insert("at".into(), m.at.clone());
++        }
++        if let Some((clip, notes)) = m.piano.as_ref().filter(|(_, n)| !n.is_empty()) {
++            out.insert("clip".into(), clip.clone());
++            out.insert("notes".into(), json!(notes));
++        }
++        if !m.clips.is_empty() {
++            out.insert("clips".into(), json!(m.clips));
++        }
++        if let Some((track, control, value)) = app.view.drag {
++            let control = match control {
++                Control::Volume => "volume",
++                Control::Pan => "pan",
++                Control::Send(_) => "send",
++            };
++            out.insert("fader".into(), json!({ "track": track.0, "control": control, "value": value }));
++        }
++        if !m.param.is_null() {
++            out.insert("param".into(), m.param.clone());
++        }
++        Value::Object(out)
++    })
++}
++
++/// The others, all of them each time any changes (empty when the session ends).
++pub fn show(list: Vec<Presence>) {
++    OTHERS.with_borrow_mut(|others| {
++        let mut next = Vec::with_capacity(list.len());
++        for p in list {
++            let mut peer = match others.iter().position(|o| o.id == p.id) {
++                Some(i) => others.swap_remove(i),
++                None => Peer { id: p.id.clone(), name: String::new(), color: Color32::GRAY, state: Value::Null, pointer: None, notes: Vec::new(), clips: Vec::new() },
++            };
++            peer.name = short(&p.name);
++            peer.color = Color32::from_rgb(p.color[0], p.color[1], p.color[2]);
++            peer.state = p.state;
++            // What is new shows at once; the frame's end eases the rest.
++            peer.step(0.0);
++            next.push(peer);
++        }
++        *others = next;
++    });
++}
++
++fn short(name: &str) -> String {
++    if name.chars().count() <= MAX_NAME { name.to_owned() } else { name.chars().take(MAX_NAME - 1).chain(['…']).collect() }
++}
++
++impl Peer {
++    /// Where their state puts their marks.
++    fn targets(&self) -> (Option<(String, [f64; 2])>, Vec<[f64; 3]>, Vec<[f64; 3]>) {
++        let at = &self.state["at"];
++        let pointer = match at["in"].as_str() {
++            Some("slots") => track_of(&at["track"]).zip(num(&at["fx"]).zip(num(&at["scene"]))).map(|(t, (a, b))| (format!("slots:{}", t.0), [a, b])),
++            Some("mixer") => track_of(&at["track"]).zip(num(&at["fx"]).zip(num(&at["fy"]))).map(|(t, (a, b))| (format!("mixer:{}", t.0), [a, b])),
++            Some("lanes") => track_of(&at["track"]).zip(num(&at["fy"]).zip(num(&at["beat"]))).map(|(t, (a, b))| (format!("lanes:{}", t.0), [a, b])),
++            Some("piano") => num(&at["beat"]).zip(num(&at["key"])).map(|(b, k)| (format!("piano:{}", at["clip"]), [b, k])),
++            _ => None,
++        };
++        let triples = |v: &Value| -> Vec<[f64; 3]> {
++            v.as_array()
++                .into_iter()
++                .flatten()
++                .take(MAX_ITEMS)
++                .filter_map(|t| Some([num(&t[0])?, num(&t[1])?, num(&t[2])?]))
++                .collect()
++        };
++        (pointer, triples(&self.state["notes"]), triples(&self.state["clips"]))
++    }
++
++    /// `dt` seconds on toward their latest state; whether a mark is still on its way.
++    fn step(&mut self, dt: f64) -> bool {
++        let k = 1.0 - (-dt.clamp(0.0, 0.1) / EASE).exp();
++        let (pointer, notes, clips) = self.targets();
++        let mut moving = false;
++        match (&mut self.pointer, pointer) {
++            (Some((s, p)), Some((t, q))) if *s == t => moving |= ease(p, q, k),
++            (s, t) => *s = t,
++        }
++        moving |= ease_all(&mut self.notes, notes, k);
++        // A clip ghost's track is no number to ease: a ghost on another track goes there at once.
++        if self.clips.len() != clips.len() || self.clips.iter().zip(&clips).any(|(a, b)| a[0] != b[0]) {
++            self.clips = clips;
++        } else {
++            moving |= ease_all(&mut self.clips, clips, k);
++        }
++        moving
++    }
++}
++
++fn ease<const N: usize>(s: &mut [f64; N], t: [f64; N], k: f64) -> bool {
++    let mut moving = false;
++    for (s, t) in s.iter_mut().zip(t) {
++        *s += (t - *s) * k;
++        if (t - *s).abs() < 1.0e-3 {
++            *s = t;
++        } else {
++            moving = true;
++        }
++    }
++    moving
++}
++
++fn ease_all<const N: usize>(s: &mut Vec<[f64; N]>, t: Vec<[f64; N]>, k: f64) -> bool {
++    if s.len() != t.len() {
++        *s = t;
++        return false;
++    }
++    s.iter_mut().zip(t).fold(false, |moving, (s, t)| ease(s, t, k) | moving)
++}
++
++// ---------------------------------------------------------------- the look
++
++/// What a person shows in a view, in screen terms.
++#[derive(Default)]
++struct Marks {
++    tip: Option<Pos2>,
++    ghosts: Vec<Rect>,
++    rings: Vec<Rect>,
++    /// Where the tag goes when there is no pointer to hang it from, and the value it shows under the name.
++    tag_at: Option<Pos2>,
++    value: Option<String>,
++}
++
++/// White or near-black, whichever reads on `color`.
++fn ink(color: Color32) -> Color32 {
++    let c = egui::Rgba::from(color);
++    if 0.2126 * c.r() + 0.7152 * c.g() + 0.0722 * c.b() > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE }
++}
++
++/// The others' marks over `painter`'s area in the session's shared look: everyone's ghosts, then rings, then pointers
++/// with their name tags.
++fn paint(painter: &Painter, all: &[(Color32, String, Marks)]) {
++    let near = painter.clip_rect().expand(4.0);
++    for (color, _, marks) in all {
++        for ghost in &marks.ghosts {
++            let rect = ghost.intersect(near);
++            if rect.is_positive() {
++                painter.rect(rect, 2.0, color.gamma_multiply(GHOST), Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE)), StrokeKind::Inside);
++            }
++        }
++    }
++    for (color, _, marks) in all {
++        for ring in &marks.rings {
++            painter.rect_stroke(*ring, 4.0, Stroke::new(2.0, *color), StrokeKind::Outside);
++        }
++    }
++    for (color, name, marks) in all {
++        let tip = marks.tip.filter(|p| painter.clip_rect().contains(*p));
++        if let Some(tip) = tip {
++            let arrow = |at: Pos2| ARROW.iter().map(|&(x, y)| at + vec2(x, y)).collect::<Vec<_>>();
++            painter.add(Shape::convex_polygon(arrow(tip + vec2(0.0, 1.0)), Color32::from_black_alpha(64), Stroke::NONE));
++            painter.add(Shape::convex_polygon(arrow(tip), *color, Stroke::new(1.5, Color32::WHITE)));
++        }
++        let Some(mut at) = tip.map(|t| t + vec2(12.0, 15.0)).or(marks.tag_at.map(|t| t + vec2(4.0, -6.0))) else { continue };
++        for text in [Some(name.as_str()), marks.value.as_deref()].into_iter().flatten().filter(|t| !t.is_empty()) {
++            let galley = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(12.0), ink(*color));
++            let pad = vec2(7.0, 3.0);
++            let tag = Rect::from_min_size(pos2(at.x.round(), at.y.round()), galley.size() + 2.0 * pad);
++            painter.rect_filled(tag, 6.0, *color);
++            painter.galley(tag.min + pad, galley, ink(*color));
++            at.y = tag.bottom() + 2.0;
++        }
++    }
++}

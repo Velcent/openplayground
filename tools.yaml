@@ -334,6 +334,28 @@ groups:
         accent: "#CDE397"
         base: "#263513"
 
+      - slug: ableton-live
+        name: Suhina
+        alternative: Ableton Live
+        blurb: Launch clips, arrange and mix music with built-in instruments and effects.
+        # Shown when the app opens (shell/topbar.js), until someone ticks "Don't show this again".
+        notice:
+          title: Early preview
+          text: Suhina is pre-alpha software. Features are missing, things will break, and your work may be lost. Plug-ins and audio recording don't run in the browser.
+        # Its own projects and Live Sets (imported). Upstream publishes desktop nightlies only, so like NoteCraft it
+        # has the head channel only; patches/ableton-live.yaml adds the web build.
+        opens: [suhina, als]
+        imports: [wav, aif, aiff, flac, mp3, ogg, mid, midi]
+        repo: suhina-daw/suhina-daw
+        # What the web build compiles (Cargo.lock: dependency changes): docs, CI and the desktop apps' commits don't
+        # rebuild it. One GitHub API request per path per check.
+        paths: [crates, devices, assets, Cargo.toml, Cargo.lock]
+        patches: patches/ableton-live.yaml
+        live: crates/session/src
+        icon: icons/suhina.svg
+        accent: "#FFD97D"
+        base: "#3A2F10"
+
   - name: Other
     tools:
       - slug: figma
