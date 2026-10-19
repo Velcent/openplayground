@@ -42,13 +42,24 @@ jobs:
 
       - run: make build
 
-      # Cloudflare rebuilds and redeploys the site on every push to main, so committing a changed
-      # versions.json is what ships a new release. (Pushes made with the workflow's token don't re-run it.)
+      # Committing a changed versions.json records a new release; the deploy below ships it. (Pushes made with
+      # the workflow's token don't re-run this workflow.)
       - name: Commit version changes
+        id: commit
         run: |
           git diff --quiet versions.json && exit 0
+          echo changed=true >> "$GITHUB_OUTPUT"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           changes=$(git diff -U0 versions.json | sed -nE 's/^\+ +"([^"]+)": "([^"]+)".*/\1 \2/p' | paste -sd, - | sed 's/,/, /g')
           git commit -q -m "Update $changes" versions.json
           git pull -q --rebase && git push -q
+
+      # The site deploys from here rather than from Cloudflare's own builds (which counted build minutes on every
+      # push): after a push to main (site changes) or when versions changed, never for an idle scheduled run.
+      - name: Deploy to Cloudflare
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || steps.commit.outputs.changed == 'true')
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
