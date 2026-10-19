@@ -29,6 +29,9 @@ const GITHUB = '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="tru
 
 // A card links to the release, and carries the latest-commit build's link, label and commit date for the
 // channel switch (index.html). A tool missing one channel uses the other for both.
+// Each alternative icon's glitch starts at its own point in the loop, so the cards don't flicker in step.
+const glitchDelay = (t) => -([...t.slug].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 997, 7) % 40) / 10
+
 export const card = (t) => {
   const repo = t.repo.split('/')[1]
   const release = installed(t, 'release')
@@ -41,12 +44,12 @@ export const card = (t) => {
   return `
       <div class="tool" data-release-href="${shown.path}" data-head-href="${head.path}" style="--accent:${t.accent};--base:${t.base}">
         <img${t.alternative && altIcon ? own : ''} src="/${t.icon}" alt="" width="64" height="64">${t.alternative && altIcon ? `
-        <img class="as-alt" src="${altIcon}" alt="" width="64" height="64">` : ''}
+        <span class="as-alt glitch" style="--icon:url('${altIcon}');--glitch-delay:${glitchDelay(t)}s"><img src="${altIcon}" alt="" width="64" height="64"></span>` : ''}
         <span class="title">
           <a class="name open" href="${shown.path}"><span${own}>${t.name}</span>${t.alternative ? `<span class="as-alt">${t.alternative}</span>` : ''}</a>
           <span class="source"><a class="repo" href="https://github.com/${t.repo}" aria-label="${repo} on GitHub" title="${t.repo} on GitHub">${GITHUB}</a> <span class="version" data-release="${shown.label}" data-head="${head.label}" data-date="${head.date ?? ''}" data-ahead="${ahead}">${shown.label}</span></span>
         </span>
-        ${t.alternative ? `<span class="alt as-own">${altIcon ? `<img src="${altIcon}" alt="" width="14" height="14">` : ''}Alternative to ${t.alternative}</span>
+        ${t.alternative ? `<span class="alt as-own">${altIcon ? `<span class="glitch small" style="--icon:url('${altIcon}');--glitch-delay:${glitchDelay(t)}s"><img src="${altIcon}" alt="" width="14" height="14"></span>` : ''}Alternative to ${t.alternative}</span>
         <span class="alt as-alt"><img src="/${t.icon}" alt="" width="14" height="14">Using ${t.name}</span>` : ''}
         <span class="blurb">${t.blurb}</span>
       </div>`
