@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Playground</title>
-  <link rel="icon" href="/shell/artcraft-icon.svg" type="image/svg+xml">
+  <link rel="icon" href="/icons/playground-logo.svg" type="image/svg+xml">
   <script>
     // Before the first paint, the switches below: ?head= / ?alt= (true or false) if given, kept like a click,
     // else the kept choice. Their script reads the result back from these attributes.
@@ -68,7 +68,8 @@
     :root[data-channel="head"] body::after { opacity: 1; animation: twinkle 4s ease-in-out infinite alternate; }
     @keyframes twinkle { from { opacity: 0.3; } }
     main { max-width: 1120px; margin: 0 auto; padding: clamp(40px, 9vw, 112px) 16px 64px; }
-    .host { margin: 0; font: 500 12px var(--mono); letter-spacing: 0.04em; color: var(--muted); }
+    .host { display: flex; align-items: center; gap: 9px; margin: 0; font: 500 12px var(--mono); letter-spacing: 0.04em; color: var(--muted); }
+    .host .logo { flex: none; }
     h1 {
       position: relative; margin: 18px 0 24px;
       font-size: clamp(36px, 6.6vw, 80px); font-weight: 600;
@@ -214,7 +215,7 @@
 <body>
   <main>
     <div class="topbar">
-      <p class="host">playground.daijro.dev</p>
+      <p class="host"><img class="logo" src="/icons/playground-logo.svg" alt="" width="20" height="20">playground.daijro.dev</p>
       <a class="files-link" href="/files/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></svg>Open Files</a>
     </div>
     <h1>FOSS alternatives<br>to the apps you know.<span class="moon" aria-hidden="true"></span></h1>
@@ -234,6 +235,7 @@
       <p>Open-source apps by <a href="https://github.com/storytold">ArtCraft</a>, and SolidCraft by <a href="https://github.com/bherbruck">bherbruck</a>, LightCraft Classic by <a href="https://github.com/emmertex">emmertex</a>, MailCraft by <a href="https://github.com/MonkeySaint">MonkeySaint</a>, Honeydew by <a href="https://github.com/daijro">daijro</a> and SubCraft by <a href="https://github.com/Aalzard">Aalzard</a>.<br><strong>This website checks for new versions every 15 minutes.</strong></p>
       <p id="trademarks">This site and these projects are <u>not</u> affiliated with, endorsed by or sponsored by Adobe, Microsoft, Autodesk, Avid, Image-Line, Ableton or Figma, Inc. Photoshop, Illustrator, InDesign, Lightroom, Premiere Pro, After Effects, Acrobat and Substance Painter are trademarks of Adobe; Word, Excel, PowerPoint and Outlook of Microsoft; AutoCAD and Fusion 360 of Autodesk; Pro Tools of Avid; FL Studio Mobile of Image-Line; Ableton Live of Ableton AG; Figma of Figma, Inc. Their names appear here only to say which product each open-source app is an alternative to.</p>
       <p>This site's source: <a href="https://github.com/daijro/openplayground">daijro/openplayground</a>.</p>
+      <p>Logo designed by afif fudin from <a href="https://www.flaticon.com/">Flaticon</a>.</p>
     </footer>
   </main>
   <dialog id="unstable" aria-labelledby="unstable-title">
