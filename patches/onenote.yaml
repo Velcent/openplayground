@@ -22,6 +22,14 @@
   find: '(?![\s\S])'
   after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nweb-time = \"1\"\n"
 
+# Rule 1b/24: the web build's own profile (apps/notecraft-web/index.html names it): release with whole-program
+# optimisation, as the ArtCraft web profiles do (PhotoCraft's wasm-release): 13.4 -> 11.2 MB of wasm, 5.6 -> 4.5 MB
+# gzipped. A table of its own, so upstream's [profile.release] stays as it is.
+# If upstream adds a profile of this name, rename it here and in index.html.
+- file: Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n# Playground's web build (patches/onenote.yaml): release with whole-program optimisation.\n[profile.playground-web]\ninherits = \"release\"\nlto = \"fat\"\ncodegen-units = 1\n"
+
 # Rule 2/24: the shims, as notecraft_model::playground on wasm.
 - file: crates/model/src/lib.rs
   find: '(?![\s\S])'

@@ -1,11 +1,11 @@
 // NoteCraft (onenote): the web build starts with the sample notebooks and the Project X page open (the tree expanded
 // down to it), in every fresh browser; the joiner then adopts the owner's notebooks (same paths). Rows of the tree are
 // 27 points apart under the shell's bar; a click on a block of the page puts the caret in it; the Draw tab's pens make
-// the pointer draw on the page (its ink.svg), and Select gives it back to the text. The owner types a letter at the
+// the pointer draw on the page (its ink.svg), and Type gives it back to the text. The owner types a letter at the
 // start of Project X's first paragraph; the editor opens Ideas › Format ideas and draws a stroke on it: two files, two
 // paths of the shared document. Ctrl+Z (the session's Undo while connected) takes back only the owner's letter.
 // drag(): the owner draws, the pen held down (presence `ink`: the stroke so far); release() lets go and takes the
-// stroke back with Ctrl+Z, so nothing has changed, and picks Select again. point(): the owner clicks into the paragraph
+// stroke back with Ctrl+Z, so nothing has changed, and picks Type again. point(): the owner clicks into the paragraph
 // and rests the pointer on the page (presence: page, pointer, caret). importMedia(): the owner drops a picture on the
 // page and inserts it: the editor and the late viewer get its bytes. Every page is in the document, so opening one is
 // presence (the tree's dots), not a new document: there is no openTab().
@@ -16,9 +16,9 @@ const checkpoint = (page) => page.evaluate(() => {
 })
 const presence = (page) => page.evaluate(() => playgroundLiveAdapter.presence())
 // The first paragraph of the page shown (Project X's and Format ideas' both start under the title), tree rows, the
-// Draw tab with its Select tool and first pen, and somewhere to draw (over the page's words).
+// Draw tab with its Type tool and first pen, and somewhere to draw (over the page's words).
 const PARAGRAPH = { x: 410, y: 348 }, IDEAS = { x: 80, y: 396 }, FORMAT_IDEAS = { x: 130, y: 423 }
-const DRAW = { x: 164, y: 82 }, SELECT = { x: 181, y: 140 }, PEN = { x: 338, y: 140 }, SHEET = { x: 520, y: 470 }
+const DRAW = { x: 164, y: 82 }, TYPE = { x: 287, y: 140 }, PEN = { x: 391, y: 140 }, SHEET = { x: 520, y: 470 }
 // The first choice of the dialog a dropped file opens (centred in the window).
 const INSERT_PICTURE = { x: 503, y: 397 }
 // A letter typed where `at` is, until the shared document has it.
@@ -57,7 +57,7 @@ export default {
     await until(async () => ink(JSON.parse(await checkpoint(page))), 10000, 'the stroke in the page')
     await page.keyboard.press('Control+z')
     await until(async () => !ink(JSON.parse(await checkpoint(page))), 10000, 'the stroke taken back')
-    await page.mouse.click(SELECT.x, SELECT.y)
+    await page.mouse.click(TYPE.x, TYPE.y)
   },
   point: async (page) => {
     await page.mouse.click(PARAGRAPH.x + 60, PARAGRAPH.y)

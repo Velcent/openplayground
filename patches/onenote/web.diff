@@ -44,7 +44,7 @@ index 0000000..0b57fe8
 +filehash = true
 diff --git a/apps/notecraft-web/index.html b/apps/notecraft-web/index.html
 new file mode 100644
-index 0000000..34c6e8c
+index 0000000..a88777c
 --- /dev/null
 +++ b/apps/notecraft-web/index.html
 @@ -0,0 +1,24 @@
@@ -55,7 +55,7 @@ index 0000000..34c6e8c
 +  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
 +  <title>NoteCraft</title>
 +  <link data-trunk rel="icon" href="../../assets/brand/notecraft-64.png" />
-+  <link data-trunk rel="rust" data-bin="notecraft-web" data-wasm-opt="0" />
++  <link data-trunk rel="rust" data-bin="notecraft-web" data-wasm-opt="0" data-cargo-profile="playground-web" />
 +  <!-- The CJK face, loaded when a page needs it (src/main.rs), with its licence -->
 +  <link data-trunk rel="copy-file" href="../../assets/fonts/NotoSansCJKsc-Regular.otf" />
 +  <link data-trunk rel="copy-file" href="../../assets/fonts/OFL-NotoSansCJKsc.txt" />
