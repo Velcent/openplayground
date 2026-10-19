@@ -51,7 +51,7 @@ test('Lemon uses the supplied icons and starts under its canonical URL with the 
   assert.equal(new URL(page.url()).hash, '#editor')
   assert.equal(await page.evaluate(() => crossOriginIsolated), true)
   await page.locator('.pg-switch').waitFor()
-  assert.equal(await page.title(), 'FL Studio')
+  assert.equal(await page.title(), 'FL Studio (experimental) - Playground')
   assert.equal(await page.locator('.pg-switch img').getAttribute('src'), lemon.alternativeIcon)
   const canvas = await page.locator('#lemon-canvas').boundingBox()
   assert.equal(canvas.y, 36)

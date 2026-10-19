@@ -30,13 +30,13 @@ test('/shell/apps.json lists the installed apps with their channels and file typ
   for (const g of data.groups) assert.ok(g.apps.length > 0, `group ${g.name} is empty`)
 })
 
-test('the dashboard and the Files page use the ArtCraft icon as their favicon', async () => {
-  const icon = await fetch(`${site.url}/shell/artcraft-icon.svg`)
+test('the dashboard and the Files page use the Playground logo as their favicon', async () => {
+  const icon = await fetch(`${site.url}/icons/playground-logo.svg`)
   assert.equal(icon.status, 200)
   assert.match(icon.headers.get('content-type'), /image\/svg\+xml/)
   for (const path of ['/', '/files/']) {
     const html = await (await fetch(`${site.url}${path}`)).text()
-    assert.match(html, /<link rel="icon"[^>]*href="\/shell\/artcraft-icon\.svg"/, path)
+    assert.match(html, /<link rel="icon"[^>]*href="\/icons\/playground-logo\.svg"/, path)
   }
 })
 

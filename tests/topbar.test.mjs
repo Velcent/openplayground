@@ -61,7 +61,7 @@ test('"Alternative naming" shows each card under the name and icon of the app it
   assert.deepEqual(await page.locator('section > h2').allInnerTexts(), ['ADOBE CREATIVE CLOUD', 'MICROSOFT OFFICE', '3D', 'MUSIC', 'OTHER'])
   assert.equal(await card.locator('.name').innerText(), 'Photoshop')
   assert.equal(await card.getByText('Using PhotoCraft').isVisible(), true)
-  assert.match(await card.locator('img:visible').first().getAttribute('src'), /alternatives\/photoshop\.svg$/)
+  assert.match(await card.locator('img:visible').first().getAttribute('src'), /alternatives\/photoshop\.png$/)
   await page.reload()
   assert.equal(await page.getByRole('switch', { name: 'Alternative naming' }).isChecked(), true)
   assert.equal(await page.locator('.tool', { hasText: 'Using PhotoCraft' }).locator('.name').innerText(), 'Photoshop')
@@ -91,7 +91,7 @@ test('with "Alternative naming" on, the switcher and the tab use the alternative
   await button.waitFor()
   assert.match(await button.innerText(), /^Word/)
   assert.match(await button.locator('img').getAttribute('src'), /alternative-icon\.svg$/)
-  assert.equal(await page.title(), 'Word')
+  assert.equal(await page.title(), 'Word - Playground')
   await button.click()
   const item = page.getByRole('menuitem').filter({ has: page.getByText('Photoshop', { exact: true }) })
   assert.match(await item.innerText(), /Using PhotoCraft/)
@@ -203,7 +203,7 @@ test('an app that reports its own state is warned about only when it has unsaved
 test('the bar’s Playground link carries the ArtCraft icon', async () => {
   const page = await openPage(browser, `${site.url}${wordPath()}`)
   const home = page.getByRole('link', { name: 'Playground' })
-  assert.equal(await home.locator('img').getAttribute('src'), '/shell/artcraft-icon.svg')
+  assert.equal(await home.locator('img').getAttribute('src'), '/icons/playground-logo.svg')
 })
 
 test('the bar folds away with its arrow, comes back from the tab at the top center, and remembers', async () => {
