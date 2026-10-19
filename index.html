@@ -182,6 +182,8 @@
     .naming input:checked { background: color-mix(in srgb, var(--text) 30%, var(--line)); }
     .naming input:checked::before { background: var(--text); }
     .lede { margin: -10px 0 26px; font-size: clamp(15px, 1.6vw, 18px); color: var(--muted); }
+    /* "releases" or "commits", following the "Use latest commits" switch. */
+    :root[data-channel="head"] .on-release, :root:not([data-channel="head"]) .on-head { display: none; }
     .switches { display: flex; flex-wrap: wrap; gap: 12px 28px; margin-bottom: clamp(32px, 5vw, 56px); }
     /* Under the switches while "Alternative naming" is on: what the commercial names on the cards mean. */
     .alt-note {
@@ -225,7 +227,7 @@
       <a class="files-link" href="/files/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></svg>Open Files</a>
     </div>
     <h1>FOSS alternatives<br>to the apps you know.<span class="moon" aria-hidden="true"></span></h1>
-    <p class="lede">Patched with optimizations and live collaboration, checked for new versions every 15 minutes.</p>
+    <p class="lede">Rebuilt &amp; patched with optimizations. Checked for new <span class="on-release">releases</span><span class="on-head">commits</span> every 15 minutes.</p>
     <div class="switches">
       <label class="switch naming"><input type="checkbox" role="switch" id="naming">Alternative naming</label>
       <label class="switch"><input type="checkbox" role="switch" id="latest">Use latest commits</label>
