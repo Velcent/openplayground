@@ -376,6 +376,26 @@ groups:
         accent: "#FFD97D"
         base: "#3A2F10"
 
+      - slug: logic-pro
+        name: Pro-Wave
+        alternative: Logic Pro
+        blurb: Arrange, edit and mix music with software instruments, a piano roll and a mixer.
+        # Its own projects (a zip of project.json and the audio); WAV, AIFF and FLAC files import as audio tracks.
+        # Upstream's releases are desktop packages only (no web zip), so like MaterialCraft it has the head channel
+        # only; patches/logic-pro.yaml adds the web build.
+        opens: [prowave]
+        imports: [wav, wave, aif, aiff, aifc, flac]
+        repo: fabox-os/Pro-Wave
+        license: GPL-3.0-or-later
+        # What the web build compiles (Cargo.lock: dependency changes): docs, CI and packaging commits don't rebuild
+        # it. One GitHub API request per path per check.
+        paths: [crates, Cargo.toml, Cargo.lock]
+        patches: patches/logic-pro.yaml
+        live: crates/prowave-app/src
+        icon: icons/prowave.png
+        accent: "#4FB0F6"
+        base: "#0B2140"
+
   - name: Other
     tools:
       - slug: figma

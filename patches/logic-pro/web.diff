@@ -1,0 +1,848 @@
+diff --git a/Trunk.toml b/Trunk.toml
+new file mode 100644
+index 0000000..0b712d8
+--- /dev/null
++++ b/Trunk.toml
+@@ -0,0 +1,8 @@
++# Pro Wave in the browser, for Playground (patches/logic-pro.yaml in github.com/daijro/openplayground).
++# Build with: trunk build --release   (from the repository's root)
++[build]
++target = "index.html"
++public_url = "./"
++filehash = true
++# Not dist/: that folder holds the desktop packages.
++dist = "target/trunk-dist"
+diff --git a/crates/prowave-app/src/web.rs b/crates/prowave-app/src/web.rs
+new file mode 100644
+index 0000000..0ffe2e7
+--- /dev/null
++++ b/crates/prowave-app/src/web.rs
+@@ -0,0 +1,333 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! Pro Wave in the browser, for Playground (patches/logic-pro.yaml in github.com/daijro/openplayground): the desktop
++//! window on the page's canvas, its files in Playground's Files, and the browser's audio.
++//!
++//! `main` runs as on the desktop: the crate root takes [`eframe`] from here on the web, whose `run_native` builds the
++//! app with the desktop's own creator, then starts it on the page. Files live in memory (prowave-playground's
++//! `std::fs`): a project opened from Files comes in at its path (`browser:/Music/Song.prowave` is `/Music/Song.prowave`
++//! here), File > Open… and Save As… are Playground's dialogs ([`rfd`]), and whatever Pro Wave writes outside its own
++//! folders (a saved project) goes back to Files after the frame. "Open in Pro-Wave" opens a project, or imports an
++//! audio file as a new track, as a file dropped on the window does. The engine plays through cpal's Web Audio host on
++//! the page's one thread (index.html starts the audio at the first click or key).
++
++use crate::App;
++use ::eframe::egui;
++use prowave_playground::std::fs;
++use std::cell::{Cell, OnceCell, RefCell};
++use std::path::{Path, PathBuf};
++use wasm_bindgen::{closure::Closure, JsCast as _, JsValue};
++
++/// Pro Wave's own folders in memory, never copied to Files: extracted media, settings, sessions' media.
++const OWN: [&str; 3] = ["/tmp", "/home", "/live"];
++/// Where dropped files are kept.
++const DROPS: &str = "/Pro Wave/Dropped";
++
++/// A dialog the app asked for this frame (see [`rfd`]).
++#[derive(Clone, Copy, PartialEq)]
++enum Ask {
++    Open,
++    Save { copy: bool },
++}
++
++thread_local! {
++    static CTX: OnceCell<egui::Context> = const { OnceCell::new() };
++    static ASKED: Cell<Option<Ask>> = const { Cell::new(None) };
++    /// Files from Playground (Open, "Open in Pro-Wave"), for the next frame.
++    static OPENED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
++    /// Where Save As… put the project (and whether as a copy), for the next frame.
++    static SAVED: RefCell<Option<(PathBuf, bool)>> = const { RefCell::new(None) };
++    /// Dropped files whose bytes are in memory now, for the next frame.
++    static DROPPED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
++}
++
++pub fn repaint() {
++    CTX.with(|c| c.get().map(egui::Context::request_repaint));
++}
++
++/// The page's egui context, once the app runs.
++pub fn ctx() -> Option<egui::Context> {
++    CTX.with(|c| c.get().cloned())
++}
++
++/// The desktop's eframe, with `run_native` starting the app on the page instead.
++pub mod eframe {
++    pub use ::eframe::*;
++
++    /// The desktop window's options, which a page has no use for.
++    #[derive(Default)]
++    #[allow(dead_code)]
++    pub struct NativeOptions {
++        pub viewport: egui::ViewportBuilder,
++        pub wgpu_options: egui_wgpu::WgpuConfiguration,
++    }
++
++    /// Builds the app with `creator` now (it borrows from `main`), then runs it on the page's canvas.
++    pub fn run_native(_name: &str, _options: NativeOptions, creator: super::Creator<'_>) -> ::eframe::Result {
++        super::start(creator)
++    }
++
++    /// The window's icon, which a page takes from its own `<link rel="icon">`.
++    pub mod icon_data {
++        pub fn from_png_bytes(_png: &[u8]) -> Result<::eframe::egui::IconData, String> {
++            Ok(::eframe::egui::IconData::default())
++        }
++    }
++}
++
++/// The desktop's file dialogs: on the web they ask Playground's after the frame ([`Web::after`]) and give nothing now.
++pub mod rfd {
++    use std::path::PathBuf;
++
++    pub struct FileDialog {
++        title: String,
++    }
++
++    impl FileDialog {
++        pub fn new() -> Self {
++            Self { title: String::new() }
++        }
++        pub fn add_filter<T: ToString>(self, _name: impl Into<String>, _extensions: &[T]) -> Self {
++            self
++        }
++        pub fn set_title(mut self, title: impl Into<String>) -> Self {
++            self.title = title.into();
++            self
++        }
++        pub fn set_file_name(self, _name: impl Into<String>) -> Self {
++            self
++        }
++        pub fn pick_file(self) -> Option<PathBuf> {
++            super::ASKED.set(Some(super::Ask::Open));
++            None
++        }
++        pub fn save_file(self) -> Option<PathBuf> {
++            super::ASKED.set(Some(super::Ask::Save { copy: self.title.contains("Copy") }));
++            None
++        }
++    }
++}
++
++fn get(o: &JsValue, k: &str) -> JsValue {
++    js_sys::Reflect::get(o, &k.into()).unwrap_or(JsValue::UNDEFINED)
++}
++
++/// `playgroundFiles[method](...args)`; None when the page has none or it threw.
++fn call(method: &str, args: &[JsValue]) -> Option<JsValue> {
++    let api = Some(get(&js_sys::global(), "playgroundFiles")).filter(JsValue::is_object)?;
++    let f = get(&api, method).dyn_into::<js_sys::Function>().ok()?;
++    f.apply(&api, &args.iter().collect::<js_sys::Array>()).ok()
++}
++
++async fn wait(v: Option<JsValue>) -> Option<JsValue> {
++    let promise = v?.dyn_into::<js_sys::Promise>().ok()?;
++    wasm_bindgen_futures::JsFuture::from(promise).await.ok().filter(|v| !v.is_null() && !v.is_undefined())
++}
++
++fn is_project(path: &Path) -> bool {
++    path.extension().is_some_and(|e| e.eq_ignore_ascii_case(prowave_project::EXTENSION))
++}
++
++/// A file from Files (`{ path, name, bytes }`) into memory at its path; one from the computer goes to
++/// `/Pro Wave/Opened`.
++fn bring_in(file: &JsValue) -> Option<PathBuf> {
++    let name = get(file, "name").as_string()?;
++    let path = match get(file, "path").as_string().and_then(|p| p.strip_prefix("browser:").map(PathBuf::from)) {
++        Some(path) => path,
++        None => Path::new("/Pro Wave/Opened").join(Path::new(&name).file_name()?),
++    };
++    fs::put(&path, js_sys::Uint8Array::new(&get(file, "bytes")).to_vec());
++    Some(path)
++}
++
++fn opened(file: JsValue) {
++    if let Some(path) = bring_in(&file) {
++        OPENED.with_borrow_mut(|o| o.push(path));
++        repaint();
++    }
++}
++
++fn types() -> JsValue {
++    js_sys::Array::of1(&prowave_project::EXTENSION.into()).into()
++}
++
++/// The page's app: the window, then what it asked of the page.
++pub struct Web {
++    pub app: App,
++    unsaved: Option<bool>,
++}
++
++impl Web {
++    fn new(app: App) -> Self {
++        Self { app, unsaved: None }
++    }
++
++    /// After the window's frame: files that came in, the dialogs it asked for, what it wrote, its unsaved state.
++    fn after(&mut self, ctx: &egui::Context) {
++        // What the frame spawned (waveform overviews), now that it is drawn.
++        prowave_playground::std::thread::run_spawned();
++        for path in OPENED.take() {
++            if is_project(&path) {
++                // Through File > Open Recent's command, which asks about unsaved changes first.
++                self.app.ui.recent_pick = Some(path);
++                self.app.run_file_cmd(crate::file_commands::FileCmd::OpenRecent, ctx);
++            } else {
++                self.app.import(&path, ctx);
++            }
++        }
++        if let Some((path, copy)) = SAVED.take() {
++            if copy {
++                self.app.save_copy_to(&path);
++            } else {
++                self.app.save_to(&path);
++            }
++        }
++        match ASKED.take() {
++            Some(Ask::Open) => {
++                let options = js_sys::Object::new();
++                let _ = js_sys::Reflect::set(&options, &"types".into(), &types());
++                let asked = call("open", &[options.into()]);
++                wasm_bindgen_futures::spawn_local(async move {
++                    if let Some(file) = wait(asked).await.and_then(|p| js_sys::Array::from(&p).iter().next()) {
++                        opened(file);
++                    }
++                });
++            }
++            Some(Ask::Save { copy }) => self.save_as(copy),
++            None => {}
++        }
++        for p in fs::changes().into_iter().filter(|p| !OWN.iter().any(|own| p.starts_with(own))) {
++            let target = JsValue::from(format!("browser:{}", p.display()));
++            match fs::metadata(&p) {
++                Ok(m) if m.is_file() => {
++                    call("write", &[target, js_sys::Uint8Array::from(fs::read(&p).unwrap_or_default().as_slice()).into()]);
++                }
++                Ok(_) => {}
++                Err(_) => {
++                    call("remove", &[target]);
++                }
++            }
++        }
++        // ponytail: the project compared each frame something happened; a change counter if large projects stutter.
++        if ctx.input(|i| !i.events.is_empty()) || self.unsaved.is_none() {
++            let unsaved = crate::file_commands::content(&self.app.project) != self.app.saved;
++            if self.unsaved.replace(unsaved) != Some(unsaved) {
++                call("setUnsaved", &[unsaved.into()]);
++            }
++        }
++    }
++
++    /// Save As… / Save A Copy As…: Playground's dialog, with the project as it is now for "Download to device"; a
++    /// place in Files saves there on the next frame.
++    fn save_as(&self, copy: bool) {
++        let name = format!("{}.{}", self.app.project.name, prowave_project::EXTENSION);
++        let scratch = Path::new("/tmp/prowave-save").join(&name);
++        let bytes = crate::project_io::save_project(&self.app.project, &scratch).ok().and_then(|p| fs::read(p).ok());
++        let options = js_sys::Object::new();
++        for (k, v) in [
++            ("name", JsValue::from(name.as_str())),
++            ("types", types()),
++            ("bytes", js_sys::Uint8Array::from(bytes.unwrap_or_default().as_slice()).into()),
++        ] {
++            let _ = js_sys::Reflect::set(&options, &k.into(), &v);
++        }
++        let asked = call("saveAs", &[options.into()]);
++        wasm_bindgen_futures::spawn_local(async move {
++            let path = wait(asked).await.and_then(|a| get(&a, "path").as_string());
++            if let Some(path) = path.and_then(|p| p.strip_prefix("browser:").map(PathBuf::from)) {
++                SAVED.set(Some((path, copy)));
++                repaint();
++            }
++        });
++    }
++}
++
++/// A dropped file, in memory.
++#[derive(Debug)]
++struct InMemory(PathBuf);
++
++impl egui::DroppedFile for InMemory {
++    fn path(&self) -> &Path {
++        &self.0
++    }
++    fn bytes_async(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + '_>> {
++        let bytes = fs::read(&self.0).map_err(|e| e.to_string());
++        Box::pin(async move { bytes })
++    }
++}
++
++impl ::eframe::App for Web {
++    fn raw_input_hook(&mut self, _: &egui::Context, raw_input: &mut egui::RawInput) {
++        // A dropped file is only a name on the web: once its bytes are in memory at /Pro Wave/Dropped/<name>, a later
++        // frame drops that file instead, as the desktop window gets it.
++        raw_input.dropped_files.extend(DROPPED.take().into_iter().map(|p| std::sync::Arc::new(InMemory(p)) as _));
++        for f in std::mem::take(&mut raw_input.dropped_files).into_iter() {
++            if f.path().parent() == Some(Path::new(DROPS)) {
++                raw_input.dropped_files.push(f);
++                continue;
++            }
++            wasm_bindgen_futures::spawn_local(async move {
++                if let (Ok(bytes), Some(name)) = (f.bytes_async().await, f.path().file_name()) {
++                    let path = Path::new(DROPS).join(name);
++                    fs::put(&path, bytes);
++                    DROPPED.with_borrow_mut(|d| d.push(path));
++                    repaint();
++                }
++            });
++        }
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut ::eframe::Frame) {
++        ::eframe::App::ui(&mut self.app, ui, frame);
++        self.after(&ui.ctx().clone());
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
++    }
++}
++
++/// The page's web runner.
++pub fn runner() -> ::eframe::WebRunner {
++    thread_local! {
++        static RUNNER: OnceCell<::eframe::WebRunner> = const { OnceCell::new() };
++    }
++    RUNNER.with(|kept| kept.get_or_init(::eframe::WebRunner::new).clone())
++}
++
++/// What the page runs: the app with the page's side around it.
++fn wrap(app: App) -> Box<dyn ::eframe::App> {
++    Box::new(Web::new(app))
++}
++
++/// The desktop's app creator, as `main` hands it over (a `Box<App>`, not eframe's `dyn App`).
++pub type Creator<'a> = Box<dyn FnOnce(&::eframe::CreationContext<'_>) -> Result<Box<App>, DynError> + 'a>;
++type DynError = Box<dyn std::error::Error + Send + Sync>;
++
++/// [`eframe::run_native`] on the web: the app made now, by the desktop's creator against a scratch context whose
++/// settings (look, zoom keys) then go to the page's.
++fn start(creator: Creator<'_>) -> ::eframe::Result {
++    std::panic::set_hook(Box::new(|info| web_sys::console::error_1(&format!("Pro Wave: {info}").into())));
++    let scratch = egui::Context::default();
++    let app = *creator(&::eframe::CreationContext::_new_kittest(scratch.clone())).map_err(::eframe::Error::AppCreation)?;
++    call("onOpen", &[Closure::<dyn Fn(JsValue)>::new(opened).into_js_value()]);
++    wasm_bindgen_futures::spawn_local(async move {
++        let document = web_sys::window().and_then(|w| w.document()).expect("no document");
++        let canvas = document
++            .get_element_by_id("prowave_canvas")
++            .and_then(|c| c.dyn_into::<web_sys::HtmlCanvasElement>().ok())
++            .expect("no #prowave_canvas");
++        let creator = move |cc: &::eframe::CreationContext<'_>| {
++            cc.egui_ctx.options_mut(|o| *o = scratch.options(Clone::clone));
++            CTX.with(|c| c.set(cc.egui_ctx.clone()).ok());
++            Ok(wrap(app))
++        };
++        let started = runner().start(canvas, ::eframe::WebOptions::default(), Box::new(creator)).await;
++        if let Some(loading) = document.get_element_by_id("prowave_loading") {
++            match started {
++                Ok(()) => loading.remove(),
++                Err(e) => loading.set_text_content(Some(&format!("Pro Wave could not start: {e:?}"))),
++            }
++        }
++    });
++    Ok(())
++}
+diff --git a/crates/prowave-engine/src/disk/web.rs b/crates/prowave-engine/src/disk/web.rs
+new file mode 100644
+index 0000000..e30bbeb
+--- /dev/null
++++ b/crates/prowave-engine/src/disk/web.rs
+@@ -0,0 +1,34 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! Disk streaming in the browser (patches/logic-pro.yaml in github.com/daijro/openplayground): a page cannot start the
++//! streaming thread, so the clips are read in turns instead, each time the engine renders a block ([`pump`], from
++//! `EngineCore::process`, on the page's one thread). Same work as the thread's loop, without its waiting.
++
++use super::{handle, DiskThread, Msg, Progress, Stream};
++use std::cell::RefCell;
++use std::sync::mpsc;
++
++thread_local! {
++    /// The clips being streamed and where new ones arrive.
++    static WORK: RefCell<Option<(mpsc::Receiver<Msg>, Vec<Stream>)>> = const { RefCell::new(None) };
++}
++
++/// [`DiskThread::spawn`] on the web: the streams are read by [`pump`].
++pub(super) fn spawn() -> DiskThread {
++    let (tx, rx) = mpsc::channel();
++    WORK.set(Some((rx, Vec::new())));
++    DiskThread { tx, handle: None }
++}
++
++/// One turn of the streaming loop: new clips registered, every clip's ring topped up.
++pub fn pump() {
++    WORK.with_borrow_mut(|work| {
++        let Some((rx, streams)) = work else { return };
++        while let Ok(msg) = rx.try_recv() {
++            if !handle(msg, streams) {
++                *work = None;
++                return;
++            }
++        }
++        streams.retain_mut(|s| !matches!(s.service(), Progress::Gone));
++    });
++}
+diff --git a/crates/prowave-playground/Cargo.toml b/crates/prowave-playground/Cargo.toml
+new file mode 100644
+index 0000000..3a3fcab
+--- /dev/null
++++ b/crates/prowave-playground/Cargo.toml
+@@ -0,0 +1,14 @@
++# Playground's browser build of Pro Wave (patches/logic-pro.yaml in github.com/daijro/openplayground): std's clock,
++# files and threads as wasm32-unknown-unknown can have them. Native builds compile it empty.
++[package]
++name = "prowave-playground"
++version = "0.1.0"
++edition = "2021"
++description = "Pro Wave in the browser: the clock, files and threads std lacks on wasm32-unknown-unknown"
++license = "GPL-3.0-or-later"
++publish = false
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++web-time = "1"
++# A file here is a source symphonia decodes, as std's File is (crates/prowave-engine). Keep in step with it.
++symphonia-core = "0.5"
+diff --git a/crates/prowave-playground/src/lib.rs b/crates/prowave-playground/src/lib.rs
+new file mode 100644
+index 0000000..c4d5c0d
+--- /dev/null
++++ b/crates/prowave-playground/src/lib.rs
+@@ -0,0 +1,391 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! Pro Wave in the browser, for Playground (patches/logic-pro.yaml in github.com/daijro/openplayground).
++//!
++//! wasm32-unknown-unknown has no clock, no files, no threads and no process: `Instant::now` and `SystemTime::now`
++//! panic there, every file call fails, `thread::spawn` panics, and so do `env::temp_dir` and `process::id`. The modules
++//! that use them take `std` from here instead, through one `#[cfg(target_arch = "wasm32")] use prowave_playground::std;`
++//! line at each one's end (a local `std` shadows the standard library's name in that module; everything else in it
++//! still comes from the real std):
++//!   time     web-time's Instant and SystemTime;
++//!   fs       an in-memory file system (projects, their media, settings), each change noted for the page to mirror;
++//!   thread   `spawn` queues what it is given for the page to run after the frame, on this thread;
++//!   env      `temp_dir` is `/tmp`, and `HOME` is `/home` (settings live in memory, so every page starts afresh);
++//!   process  `id` is 1.
++#![cfg(target_arch = "wasm32")]
++
++pub mod std {
++    pub use ::std::*;
++
++    pub mod time {
++        pub use web_time::*;
++    }
++
++    pub mod process {
++        pub use ::std::process::*;
++
++        /// The page is one process (std's panics on wasm).
++        pub fn id() -> u32 {
++            1
++        }
++    }
++
++    pub mod env {
++        pub use ::std::env::*;
++        use ::std::ffi::{OsStr, OsString};
++        use ::std::path::PathBuf;
++
++        /// A folder in the in-memory files (std's panics on wasm).
++        pub fn temp_dir() -> PathBuf {
++            PathBuf::from("/tmp")
++        }
++
++        /// `HOME` is `/home`: settings go to the in-memory files. Nothing else is set.
++        pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
++            (key.as_ref() == "HOME").then(|| OsString::from("/home"))
++        }
++    }
++
++    pub mod thread {
++        pub use ::std::thread::*;
++        use ::std::cell::RefCell;
++
++        thread_local! {
++            static QUEUED: RefCell<Vec<Box<dyn FnOnce()>>> = RefCell::default();
++        }
++
++        /// Queues `f` for [`run_spawned`] (a page has one thread, and the frame should not wait for it).
++        pub fn spawn<F, T>(f: F) -> Queued
++        where
++            F: FnOnce() -> T + Send + 'static,
++            T: Send + 'static,
++        {
++            QUEUED.with_borrow_mut(|q| q.push(Box::new(move || drop(f()))));
++            Queued
++        }
++
++        /// What [`spawn`] gives back: the work waits for [`run_spawned`].
++        pub struct Queued;
++
++        /// Runs what was spawned since the last call (the page calls it after each frame).
++        pub fn run_spawned() {
++            for job in QUEUED.take() {
++                job();
++            }
++        }
++
++        /// Drops what was spawned since the last [`run_spawned`], unrun.
++        pub fn forget_spawned() {
++            QUEUED.take();
++        }
++    }
++
++    pub mod fs {
++        pub use ::std::fs::*;
++        use ::std::cell::RefCell;
++        use ::std::collections::{BTreeMap, BTreeSet};
++        use ::std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
++        use ::std::path::{Component, Path, PathBuf};
++
++        enum Entry {
++            Dir,
++            File(Vec<u8>, web_time::SystemTime),
++        }
++
++        #[derive(Default)]
++        struct Tree {
++            entries: BTreeMap<PathBuf, Entry>,
++            /// Paths written, created or removed since the last [`changes`].
++            changed: BTreeSet<PathBuf>,
++        }
++
++        thread_local! {
++            static TREE: RefCell<Tree> = RefCell::default();
++        }
++
++        fn with<T>(f: impl FnOnce(&mut Tree) -> T) -> T {
++            TREE.with(|t| f(&mut t.borrow_mut()))
++        }
++
++        /// `/a/./b/../c` -> `/a/c`: one spelling per file (relative paths start at `/`).
++        pub fn key(p: &Path) -> PathBuf {
++            let mut out = PathBuf::from("/");
++            for c in p.components() {
++                match c {
++                    Component::ParentDir => {
++                        out.pop();
++                    }
++                    Component::Normal(n) => out.push(n),
++                    _ => {}
++                }
++            }
++            out
++        }
++
++        fn missing(p: &Path) -> io::Error {
++            io::Error::new(io::ErrorKind::NotFound, format!("{} does not exist", p.display()))
++        }
++
++        impl Tree {
++            fn mark(&mut self, p: PathBuf) {
++                self.changed.insert(p);
++            }
++            fn parents(&mut self, p: &Path) {
++                for dir in p.ancestors().skip(1) {
++                    self.entries.entry(dir.to_path_buf()).or_insert(Entry::Dir);
++                }
++            }
++            fn put(&mut self, p: PathBuf, bytes: Vec<u8>) {
++                self.parents(&p);
++                self.entries.insert(p, Entry::File(bytes, web_time::SystemTime::now()));
++            }
++            /// `p` and everything below it.
++            fn below(&self, p: &Path) -> Vec<PathBuf> {
++                self.entries.range(p.to_path_buf()..).map(|(k, _)| k).take_while(|k| k.starts_with(p)).cloned().collect()
++            }
++        }
++
++        /// Stores a file without noting a change (files the page brings in from its storage or a session).
++        pub fn put(p: &Path, bytes: Vec<u8>) {
++            with(|t| t.put(key(p), bytes));
++        }
++
++        /// The paths changed since the last call: each now holds what the page's storage should hold, or is gone.
++        pub fn changes() -> Vec<PathBuf> {
++            with(|t| ::std::mem::take(&mut t.changed).into_iter().collect())
++        }
++
++        pub fn exists<P: AsRef<Path>>(p: P) -> io::Result<bool> {
++            Ok(metadata(p).is_ok())
++        }
++
++        pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(p: P, bytes: C) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                t.put(p.clone(), bytes.as_ref().to_vec());
++                t.mark(p);
++            });
++            Ok(())
++        }
++
++        pub fn read<P: AsRef<Path>>(p: P) -> io::Result<Vec<u8>> {
++            TREE.with(|t| match t.borrow().entries.get(&key(p.as_ref())) {
++                Some(Entry::File(bytes, _)) => Ok(bytes.clone()),
++                _ => Err(missing(p.as_ref())),
++            })
++        }
++
++        pub fn read_to_string<P: AsRef<Path>>(p: P) -> io::Result<String> {
++            String::from_utf8(read(p)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
++        }
++
++        pub fn create_dir_all<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                if !t.entries.contains_key(&p) {
++                    t.parents(&p);
++                    t.entries.insert(p.clone(), Entry::Dir);
++                    t.mark(p);
++                }
++            });
++            Ok(())
++        }
++
++        pub fn create_dir<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            if metadata(p.as_ref()).is_ok() {
++                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists", p.as_ref().display())));
++            }
++            create_dir_all(p)
++        }
++
++        pub fn remove_file<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| match t.entries.get(&p) {
++                Some(Entry::File(..)) => {
++                    t.entries.remove(&p);
++                    t.mark(p);
++                    Ok(())
++                }
++                _ => Err(missing(&p)),
++            })
++        }
++
++        pub fn remove_dir_all<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                let gone = t.below(&p);
++                if gone.is_empty() {
++                    return Err(missing(&p));
++                }
++                for g in gone {
++                    t.entries.remove(&g);
++                    t.mark(g);
++                }
++                Ok(())
++            })
++        }
++
++        pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
++            let (from, to) = (key(from.as_ref()), key(to.as_ref()));
++            let bytes = read(&from)?;
++            with(|t| {
++                t.entries.remove(&from);
++                t.mark(from);
++                t.put(to.clone(), bytes);
++                t.mark(to);
++            });
++            Ok(())
++        }
++
++        pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
++            let bytes = read(from)?;
++            let n = bytes.len() as u64;
++            write(to, bytes)?;
++            Ok(n)
++        }
++
++        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++        pub struct FileType(bool);
++        impl FileType {
++            pub fn is_file(&self) -> bool {
++                self.0
++            }
++            pub fn is_dir(&self) -> bool {
++                !self.0
++            }
++            pub fn is_symlink(&self) -> bool {
++                false
++            }
++        }
++
++        #[derive(Clone, Debug)]
++        pub struct Metadata(Option<(u64, web_time::SystemTime)>);
++        impl Metadata {
++            pub fn len(&self) -> u64 {
++                self.0.map_or(0, |(n, _)| n)
++            }
++            pub fn is_file(&self) -> bool {
++                self.0.is_some()
++            }
++            pub fn is_dir(&self) -> bool {
++                self.0.is_none()
++            }
++            pub fn is_symlink(&self) -> bool {
++                false
++            }
++            pub fn file_type(&self) -> FileType {
++                FileType(self.is_file())
++            }
++            pub fn modified(&self) -> io::Result<web_time::SystemTime> {
++                Ok(self.0.map_or(web_time::SystemTime::UNIX_EPOCH, |(_, t)| t))
++            }
++        }
++
++        pub fn metadata<P: AsRef<Path>>(p: P) -> io::Result<Metadata> {
++            TREE.with(|t| match t.borrow().entries.get(&key(p.as_ref())) {
++                Some(Entry::File(bytes, at)) => Ok(Metadata(Some((bytes.len() as u64, *at)))),
++                Some(Entry::Dir) => Ok(Metadata(None)),
++                None => Err(missing(p.as_ref())),
++            })
++        }
++
++        pub struct DirEntry(PathBuf);
++        impl DirEntry {
++            pub fn path(&self) -> PathBuf {
++                self.0.clone()
++            }
++            pub fn file_name(&self) -> ::std::ffi::OsString {
++                self.0.file_name().unwrap_or_default().to_os_string()
++            }
++            pub fn metadata(&self) -> io::Result<Metadata> {
++                metadata(&self.0)
++            }
++            pub fn file_type(&self) -> io::Result<FileType> {
++                Ok(metadata(&self.0)?.file_type())
++            }
++        }
++
++        pub type ReadDir = ::std::vec::IntoIter<io::Result<DirEntry>>;
++
++        pub fn read_dir<P: AsRef<Path>>(p: P) -> io::Result<ReadDir> {
++            let dir = key(p.as_ref());
++            if !metadata(&dir)?.is_dir() {
++                return Err(io::Error::other(format!("{} is not a folder", dir.display())));
++            }
++            let entries = TREE.with(|t| {
++                t.borrow().below(&dir).into_iter().filter(|k| k.parent() == Some(&dir)).map(|k| Ok(DirEntry(k))).collect::<Vec<_>>()
++            });
++            Ok(entries.into_iter())
++        }
++
++        /// A file's bytes, read whole when it opens; one opened for writing is stored back when flushed or dropped.
++        pub struct File {
++            data: Cursor<Vec<u8>>,
++            /// Where written bytes go, for a file opened to write.
++            to: Option<PathBuf>,
++            dirty: bool,
++        }
++
++        impl File {
++            pub fn open<P: AsRef<Path>>(p: P) -> io::Result<File> {
++                Ok(File { data: Cursor::new(read(p)?), to: None, dirty: false })
++            }
++            pub fn create<P: AsRef<Path>>(p: P) -> io::Result<File> {
++                write(p.as_ref(), [])?;
++                Ok(File { data: Cursor::new(Vec::new()), to: Some(key(p.as_ref())), dirty: false })
++            }
++            pub fn metadata(&self) -> io::Result<Metadata> {
++                Ok(Metadata(Some((self.data.get_ref().len() as u64, web_time::SystemTime::now()))))
++            }
++            pub fn sync_all(&self) -> io::Result<()> {
++                Ok(())
++            }
++            fn store(&mut self) {
++                if let (true, Some(to)) = (self.dirty, &self.to) {
++                    let _ = write(to, self.data.get_ref());
++                    self.dirty = false;
++                }
++            }
++        }
++
++        impl Read for File {
++            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++                self.data.read(buf)
++            }
++        }
++
++        impl Seek for File {
++            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
++                self.data.seek(pos)
++            }
++        }
++
++        impl Write for File {
++            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++                if self.to.is_none() {
++                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the file is open to read"));
++                }
++                self.dirty = true;
++                self.data.write(buf)
++            }
++            fn flush(&mut self) -> io::Result<()> {
++                self.store();
++                Ok(())
++            }
++        }
++
++        impl symphonia_core::io::MediaSource for File {
++            fn is_seekable(&self) -> bool {
++                true
++            }
++            fn byte_len(&self) -> Option<u64> {
++                Some(self.data.get_ref().len() as u64)
++            }
++        }
++
++        impl Drop for File {
++            fn drop(&mut self) {
++                self.store();
++            }
++        }
++    }
++}
+diff --git a/index.html b/index.html
+new file mode 100644
+index 0000000..d0b1173
+--- /dev/null
++++ b/index.html
+@@ -0,0 +1,32 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
++  <title>Pro Wave</title>
++  <!-- Pro Wave in the browser, for Playground (patches/logic-pro.yaml in github.com/daijro/openplayground). -->
++  <link data-trunk rel="rust" href="crates/prowave-app/Cargo.toml" data-bin="prowave" data-wasm-opt="0" />
++  <link data-trunk rel="icon" href="crates/prowave-app/assets/icon-256.png" />
++  <style>
++    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #3a3a3c; }
++    #prowave_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
++    #prowave_loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
++      color: #dcdcdc; font: 14px system-ui, sans-serif; pointer-events: none; }
++  </style>
++  <script>
++    // Browsers keep a page's audio off until the person clicks or types: the engine's AudioContext starts then.
++    {
++      const contexts = []
++      if (window.AudioContext) window.AudioContext = class extends window.AudioContext {
++        constructor(...args) { super(...args); contexts.push(this) }
++      }
++      const resume = () => contexts.forEach((c) => c.state === 'suspended' && c.resume().catch(() => {}))
++      for (const type of ['pointerdown', 'keydown', 'touchend']) addEventListener(type, resume, { capture: true })
++    }
++  </script>
++</head>
++<body>
++  <canvas id="prowave_canvas"></canvas>
++  <div id="prowave_loading">Loading Pro Wave&hellip;</div>
++</body>
++</html>
