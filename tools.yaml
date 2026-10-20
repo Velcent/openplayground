@@ -377,7 +377,7 @@ groups:
         base: "#3A2F10"
 
       - slug: logic-pro
-        name: Pro-Wave
+        name: Pro Wave
         alternative: Logic Pro
         blurb: Arrange, edit and mix music with software instruments, a piano roll and a mixer.
         # Its own projects (a zip of project.json and the audio); WAV, AIFF and FLAC files import as audio tracks.

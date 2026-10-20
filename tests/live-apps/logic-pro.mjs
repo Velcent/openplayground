@@ -1,10 +1,10 @@
-// Pro-Wave (logic-pro): every page opens its demo project (six tracks, a region on each). At 1400×900 the Tracks area's
+// Pro Wave (logic-pro): every page opens its demo project (six tracks, a region on each). At 1400×900 the Tracks area's
 // headers hold each track's M (mute) button at x 561, the rows 50 px apart from y 196 (Classic Electric Piano); the
 // lanes start at x 788, bar 1. The owner mutes the first track; the editor mutes the Drummer (the fourth). Ctrl+Z (the
 // session's Undo while connected) takes back only the owner's. point(): the owner rests the pointer on the lanes.
 // drag(): the owner holds the Analog Pad region (third row) mid-move: the editor is shown it (presence `region`);
 // release() brings it back before letting go, so nothing changes. importMedia(): the owner opens a WAV from Files in
-// Pro-Wave (an audio track); the file reaches the others as the session's media.
+// Pro Wave (an audio track); the file reaches the others as the session's media.
 import { until } from '../helpers.mjs'
 
 const checkpoint = (page) => page.evaluate(() => {
