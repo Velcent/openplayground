@@ -263,7 +263,7 @@
 # samples and Stems files added to a project are found, and a decoded file still in its place is not offered as
 # missing. If upstream changes: follow `locate`'s signature; anchor the others on the new spelling of the check.
 - file: crates/media/src/lib.rs
-  find: '\bpub\s+fn\s+locate\s*\(\s*file\s*:\s*&str\s*,\s*absolute\s*:\s*Option<&str>\s*,\s*project_dir\s*:\s*&Path\s*\)\s*->\s*Option<PathBuf>\s*\{'
+  find: '\bpub\s+fn\s+locate\s*\(\s*file\s*:\s*&str\s*,\s*absolute\s*:\s*Option<&str>\s*,\s*project_dir\s*:\s*&Path\s*[,)][^{]*\{'
   after: "\n    #[cfg(target_arch = \"wasm32\")] return suhina_playground::locate(file, absolute, project_dir);"
 - file: crates/media/src/lib.rs
   find: '\.find\(\|p\|\s*p\.is_file\(\)\)'
