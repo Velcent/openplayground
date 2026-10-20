@@ -726,6 +726,12 @@ index 0000000..f851b31
 +/// Nothing to hand over: no read has arrived for this Paste, or the clipboard has no such thing.
 +pub struct Error;
 +
++impl std::fmt::Display for Error {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("the browser's clipboard has nothing to hand over")
++    }
++}
++
 +/// A picture, as arboard gives it: unmultiplied RGBA rows.
 +pub struct ImageData<'a> {
 +    pub width: usize,
@@ -761,6 +767,11 @@ index 0000000..f851b31
 +            State::Serving(Some((_, Some((width, height, rgba))))) => Ok(ImageData { width: *width, height: *height, bytes: Cow::Owned(rgba.clone()) }),
 +            _ => Err(Error),
 +        })
++    }
++
++    /// Copying goes through egui and the browser, not here.
++    pub fn set_text(&mut self, _text: String) -> Result<(), Error> {
++        Err(Error)
 +    }
 +
 +    pub fn get_text(&mut self) -> Result<String, Error> {
