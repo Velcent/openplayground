@@ -30,6 +30,7 @@ const ICONS = {
   computer: '<rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M8 20h8M12 16v4"/>',
   browser: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M6 6.5h.01M8.5 6.5h.01"/>',
   close: '<path d="M6 6l12 12M18 6 6 18"/>',
+  code: '<path d="m8 7-5 5 5 5M16 7l5 5-5 5M13.5 4.5l-3 15"/>',
 }
 export const icon = (name) => {
   const span = h('span', { class: 'pg-icon', 'aria-hidden': 'true' })

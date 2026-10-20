@@ -111,6 +111,10 @@ body > canvas:first-of-type, body > canvas#lemon-canvas {
 .pg-app strong { font-weight: 600; }
 .pg-app small { color: var(--pg-muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pg-app .pg-icon { color: var(--pg-accent); }
+.pg-app > .pg-icon { flex: none; }
+/* The Source menu (topbar.js) hangs from the bar's right end. */
+.pg-source { inset: calc(var(--pg-bar) + 4px) 8px auto auto; }
+.pg-source-note { margin: 8px 16px 4px; color: var(--pg-muted); font-size: 12px; }
 @media (max-width: 560px) {
   .pg-version, .pg-label { display: none; }
 }

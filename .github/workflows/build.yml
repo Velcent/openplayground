@@ -200,6 +200,8 @@ jobs:
       - name: Publish, deleting this channel's older builds
         if: steps.build.outcome == 'success' || steps.rebuild.outcome == 'success' || steps.fallback.outcome == 'success'
         run: |
+          # The commit with the patches it was built from (a repair's, once committed above), for the bar's Source menu.
+          node scripts/stamp-commit.mjs out/*.zip
           gh release upload builds out/*.zip --clobber
           node scripts/build.mjs prune "$SLUG" "$CHANNEL" | xargs -r -n1 gh release delete-asset builds -y
           # Builds again (in full: a build without live editing still counts as failing): clear its failures.

@@ -32,6 +32,11 @@ Work alongside others, in every app:
 
 https://github.com/user-attachments/assets/5ac6496a-4166-4658-b998-c0fd142a35c6
 
+## Source code and licences
+
+- Every app's bar has a Source button: it links the app's code at the exact release or commit you're running, its licence, and the patches Playground built it with, at the commit that built it
+- Each app's patches are licensed under that app's own licence (see [patches/README.md](patches/README.md))
+
 ---
 
 ## Trademarks

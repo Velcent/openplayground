@@ -8,7 +8,8 @@ import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { basename, extname, join } from 'node:path'
 import { gzipSync } from 'node:zlib'
-import { CHANNELS, JUNK, alternativeIcon, builtAssets, channelAssets, github, installDir, resolveVersion, tools } from './releases.mjs'
+import { buildId } from './build.mjs'
+import { CHANNELS, COMMIT_FILE, JUNK, alternativeIcon, builtAssets, channelAssets, github, head, installDir, resolveVersion, tools } from './releases.mjs'
 
 const MAX_FILE = 25 * 1024 * 1024 // the host's per-file limit
 const prelude = readFileSync('scripts/page-prelude.js', 'utf8')
@@ -232,6 +233,11 @@ async function install(t, channel, name) {
       rmSync(tmp, { recursive: true, force: true })
     }
   }
+
+  // The Playground commit our build's patches are at, for the Source menu: build.yml records it in the build; one made
+  // before it did was made from this checkout's patches when its id is still the current one.
+  const commit = join(dir, COMMIT_FILE)
+  if (!existsSync(commit) && asset.name === `${buildId(t, tag)}.zip` && head()) writeFileSync(commit, `${head()}\n`)
 
   // The host refuses the whole deploy over one such file: leave this channel out until its build fits.
   const big = readdirSync(dir, { recursive: true }).find((f) => statSync(join(dir, f)).size > MAX_FILE)

@@ -1,4 +1,5 @@
 // tools.yaml and GitHub release lookups shared by fetch.mjs and build.mjs.
+import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { parse } from 'yaml'
 
@@ -9,6 +10,15 @@ export const headers = process.env.GITHUB_TOKEN ? { authorization: `Bearer ${pro
 export const JUNK = /^(build|deps|incremental|examples|\.fingerprint|\.cargo-.*|_headers|\.htaccess|.*\.(gz|br))$/
 // Where build.mjs publishes the patched, optimized builds, as assets of one release.
 export const BUILDS = { repo: 'daijro/openplayground', tag: 'builds' }
+// The Playground commit whose patches made one of our builds, kept in it (stamp-commit.mjs), for the bar's Source menu.
+export const COMMIT_FILE = '.playground-commit'
+export const head = () => {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+  } catch {
+    return null
+  }
+}
 
 // Retried on network errors and 5xx responses, which GitHub's API gives now and then.
 export const github = async (path) => {

@@ -1,4 +1,4 @@
-// The bar above every app: back to the dashboard, switch apps, this build's version, Files and fullscreen.
+// The bar above every app: back to the dashboard, switch apps, this build's version, Files, its source code and fullscreen.
 import { appHref, currentApp, loadApps } from './apps.js'
 import { toggleStack } from './stack.js'
 import { mountShare } from './share.js'
@@ -109,6 +109,32 @@ export async function mountTopbar() {
         ),
     ].filter(Boolean),
   )
+  bar.append(menu)
+  if (build?.source) mountSource(bar, app, build.source)
+}
+
+// Source: the app's code at the version this build is of, its licence there, and the patch files Playground built it
+// with, at the commit that built them (vite.config.js `source`); each opens on GitHub in a new tab.
+function mountSource(bar, app, src) {
+  const link = (name, title, detail, href) =>
+    h('a', { class: 'pg-app', role: 'menuitem', href, target: '_blank', rel: 'noopener', onclick: () => menu.hidePopover() }, icon(name), h('span', {}, h('strong', {}, title), h('small', {}, detail)))
+  const own = (app.own ?? app).name
+  const menu = h(
+    'div',
+    { class: 'pg-apps pg-source', id: 'pg-source', popover: 'auto', role: 'menu', 'aria-label': 'Source code' },
+    h('p', { class: 'pg-apps-group' }, `${own} source`),
+    link('code', src.repo, `at ${src.ref}`, src.url),
+    src.licenses.map((l) => link('file', `Licence: ${l.id}`, `${l.file} at ${src.ref}`, l.url)),
+    src.patches.length
+      ? [
+          h('p', { class: 'pg-apps-group' }, "Playground's patches"),
+          src.patches.map((p) => link(p.path.endsWith('/') ? 'folder' : 'file', p.path, `at ${src.commit?.slice(0, 7) ?? 'main'}`, p.url)),
+          h('p', { class: 'pg-source-note' }, `Licensed like ${own}${src.license ? `: ${src.license}` : ''}.`),
+        ]
+      : h('p', { class: 'pg-source-note' }, `This is ${own}'s own release, unpatched.`),
+  )
+  const button = h('button', { class: 'pg-bar-btn', type: 'button', popovertarget: 'pg-source', 'aria-haspopup': 'menu', 'aria-label': 'Source code', title: 'Source code' }, icon('code'), h('span', { class: 'pg-label' }, 'Source'))
+  bar.querySelector('.pg-files').after(button)
   bar.append(menu)
 }
 

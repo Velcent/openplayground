@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { existsSync, readFileSync } from 'node:fs'
 import { after, before, test } from 'node:test'
 import { launch, openPage, startSite, until } from './helpers.mjs'
 
@@ -103,6 +104,22 @@ test('the version shows this build’s label', async () => {
   const word = apps.find((a) => a.slug === 'word')
   const build = word.release ?? word.head
   assert.match(await page.locator('.pg-version').textContent(), new RegExp(build.label.replace(/[.@]/g, '\\$&')))
+})
+
+test('Source links the app’s code at this build’s version and the patches at the Playground commit that built it', async () => {
+  for (const [slug, channel, repo] of [['word', 'release', 'storytold/wordcraft'], ['onenote', 'head', 'AlienTechSoftware/notecraft']]) {
+    const { path } = apps.find((a) => a.slug === slug)[channel]
+    const { tag } = JSON.parse(readFileSync(`public${path}.release`, 'utf8'))
+    const commit = existsSync(`public${path}.playground-commit`) ? readFileSync(`public${path}.playground-commit`, 'utf8').trim() : 'main'
+    const page = await openPage(browser, `${site.url}${path}`)
+    await page.getByRole('button', { name: 'Source code' }).click()
+    const menu = page.getByRole('menu', { name: 'Source code' })
+    const code = menu.getByRole('menuitem', { name: new RegExp(`^${repo}`) })
+    assert.equal(await code.getAttribute('href'), `https://github.com/${repo}/tree/${tag.replace(/^head-/, '')}`)
+    assert.equal(await code.getAttribute('target'), '_blank')
+    assert.equal(await menu.getByRole('menuitem', { name: new RegExp(`^patches/${slug}\\.yaml`) }).getAttribute('href'), `https://github.com/daijro/openplayground/blob/${commit}/patches/${slug}.yaml`)
+    await page.context().close()
+  }
 })
 
 test('Files fans out the stack; its Open Files item opens the explorer popup, and Esc closes it', async () => {

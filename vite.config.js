@@ -2,7 +2,8 @@ import { cpSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeF
 import { extname, join } from 'node:path'
 import { defineConfig } from 'vite'
 import { parse } from 'yaml'
-import { alternativeIcon, appSlug, installDir } from './scripts/releases.mjs'
+import { diffDir } from './scripts/diffs.mjs'
+import { BUILDS, COMMIT_FILE, alternativeIcon, appSlug, installDir } from './scripts/releases.mjs'
 
 // A restored download cache can still contain apps removed from tools.yaml.
 export function pruneRetiredBuilds(root = 'public') {
@@ -16,12 +17,35 @@ export function pruneRetiredBuilds(root = 'public') {
   }
 }
 
-// What `make fetch` installed of a tool on a channel (its .release stamp), and where it's served.
+// What `make fetch` installed of a tool on a channel (its .release stamp, and our build's Playground commit), and where
+// it's served.
 const installed = (t, channel) => {
   const path = `${installDir(t, channel).slice('public'.length)}/`
+  const commit = `public${path}${COMMIT_FILE}`
   try {
-    return { path, ...JSON.parse(readFileSync(`public${path}.release`, 'utf8')) }
+    return { path, ...JSON.parse(readFileSync(`public${path}.release`, 'utf8')), commit: existsSync(commit) ? readFileSync(commit, 'utf8').trim() : null }
   } catch {}
+}
+
+// The bar's Source menu (shell/topbar.js): the app's code at the version this build is of, its licence there (tools.yaml
+// `license`), and for our builds the patch files that made it, at the Playground commit that built it (fetch.mjs).
+// ponytail: a build with no commit on record (kept from before build.yml recorded them, while its patches have changed
+// since) links them on main; it goes once that app is rebuilt.
+const source = (t, s) => {
+  if (!s.tag) return null // a hand-made stand-in for a build
+  const ref = s.tag.replace(/^head-/, '')
+  const ids = t.license?.split(' OR ') ?? []
+  const at = s.commit ?? 'main'
+  return {
+    repo: t.repo, ref, url: `https://github.com/${t.repo}/tree/${ref}`, license: t.license ?? null, commit: s.commit ?? null,
+    licenses: ids.map((id) => {
+      const file = ids.length > 1 ? `LICENSE-${id.split('-')[0].toUpperCase()}` : 'LICENSE'
+      return { id, file, url: `https://github.com/${t.repo}/blob/${ref}/${file}` }
+    }),
+    patches: !s.built ? [] : [t.patches, diffDir(t) && `${diffDir(t)}/`, t.live && 'patches/live/playground_live.rs'].filter(Boolean).map((path) => ({
+      path, url: `https://github.com/${BUILDS.repo}/${path.endsWith('/') ? 'tree' : 'blob'}/${at}/${path.replace(/\/$/, '')}`,
+    })),
+  }
 }
 
 // GitHub's mark (Octicons mark-github), linking each card to its repo.
@@ -81,7 +105,7 @@ const appsJson = () => ({
         const release = installed(t, 'release')
         const head = installed(t, 'head')
         if (!release && !head) return []
-        const channel = (s) => s && { path: s.path, label: s.label, date: s.date ?? null }
+        const channel = (s) => s && { path: s.path, label: s.label, date: s.date ?? null, source: source(t, s) }
         return [{
           slug: t.slug, name: t.name, alternative: t.alternative ?? null, blurb: t.blurb, accent: t.accent, opens: t.opens ?? [], imports: t.imports ?? [], notice: t.notice ?? null,
           icon: `${(release ?? head).path}site-icon${extname(t.icon)}`,

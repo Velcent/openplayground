@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -24,4 +25,17 @@ test("a tool's builds and failures leave out a longer slug's that start with its
     .map((name, i) => ({ name, created_at: `2026-10-1${i}T00:00:00Z` }))
   assert.deepEqual(channelAssets(assets, lightroom, 'release').map((a) => a.name), ['lightroom-v0.8.0-aaaa.zip'])
   assert.deepEqual(channelAssets(assets, lightroom, 'head').map((a) => a.name), ['lightroom-head-1234567-cccc.zip'])
+})
+
+test('a build is stamped with the Playground commit it was made from, which fetch.mjs installs with it', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'stamp-'))
+  try {
+    mkdirSync(join(dir, 'word-v1.0.0-abcd1234'))
+    writeFileSync(join(dir, 'word-v1.0.0-abcd1234', 'index.html'), '')
+    const zip = join(dir, 'word-v1.0.0-abcd1234.zip')
+    execFileSync('zip', ['-qr', zip, 'word-v1.0.0-abcd1234'], { cwd: dir })
+    execFileSync('node', ['scripts/stamp-commit.mjs', zip])
+    const stamped = execFileSync('unzip', ['-p', zip, 'word-v1.0.0-abcd1234/.playground-commit'], { encoding: 'utf8' })
+    assert.equal(stamped.trim(), execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim())
+  } finally { rmSync(dir, { recursive: true, force: true }) }
 })

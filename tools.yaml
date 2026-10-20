@@ -3,6 +3,8 @@
 # `alternative:` is its heading under the dashboard's "Alternative naming".
 #
 #   repo:   GitHub repo to download the web build from
+#   license: the app's licence (SPDX id, from its LICENSE file), which its patches here are under too (patches/README.md).
+#           The bar's Source menu links its LICENSE file, or LICENSE-MIT and LICENSE-APACHE for "MIT OR Apache-2.0".
 #   tag:    release tag to pin (optional; default: the newest non-prerelease that has a matching asset, else
 #           the newest pre-release that has one, for repos that have only pre-releases so far)
 #   branch: the branch the head channel builds (optional; default: main)
@@ -38,6 +40,7 @@ groups:
         opens: [psd, psb, psdt, pcraft, png, jpg, jpeg, webp, gif, bmp, tif, tiff, tga, ico, qoi, exr, hdr, heic, heif, afphoto]
         imports: [dng, cr2, cr3, nef, nrw, arw, pef, orf, rw2, raf, svg, svgz, pbm, pgm, ppm, pam, pfm, abr, grd, aco, ase, afdesign, afpub]
         repo: storytold/photocraft
+        license: MIT OR Apache-2.0
         icon: icons/photocraft.png
         theme: themes/photoshop.js
         patches: patches/photoshop.yaml
@@ -52,6 +55,7 @@ groups:
         opens: [vectorcraft, drawcraft, ai, ait, eps, svg, svgz, emf, wmf, afdesign]
         imports: [pdf, png, jpg, jpeg, gif, webp, tif, tiff, bmp, dxf, txt, gpl, ase]
         repo: storytold/vectorcraft
+        license: MIT OR Apache-2.0
         icon: icons/vectorcraft.png
         theme: themes/illustrator.js
         patches: patches/illustrator.yaml
@@ -66,6 +70,7 @@ groups:
         opens: [designcraft, idml]
         imports: [png, jpg, jpeg, gif, webp, tif, tiff, bmp, psd, svg, pdf, ai, txt, docx, rtf, md, xlsx, ase]
         repo: storytold/designcraft
+        license: MIT OR Apache-2.0
         icon: icons/designcraft.png
         theme: themes/indesign.js
         patches: patches/indesign.yaml
@@ -80,6 +85,7 @@ groups:
         opens: [dng, cr2, cr3, nef, nrw, arw, pef, orf, rw2, raf, rwl, raw, iiq, crw, mrw, x3f, kdc, mos, erf]
         imports: [jpg, jpeg, png, tif, tiff, webp, psd, jxl, gif, bmp, heic, avif]
         repo: storytold/lightcraft
+        license: MIT OR Apache-2.0
         icon: icons/lightcraft.png
         patches: patches/lightroom.yaml
         live: apps/lightcraft-web/src
@@ -93,6 +99,7 @@ groups:
         opens: [dng, cr2, cr3, nef, nrw, arw, pef, orf, rw2, raf, rwl, raw, iiq, crw, mrw, x3f, kdc, mos, erf]
         imports: [jpg, jpeg, png, tif, tiff, webp, psd, jxl, gif, bmp, heic, avif]
         repo: emmertex/lightcraft-classic
+        license: MIT
         icon: icons/lightcraft-classic.svg
         patches: patches/lightroom-classic.yaml
         live: apps/web/src
@@ -106,6 +113,7 @@ groups:
         opens: [fcproj, mp4, m4v, mov, mkv, webm, avi, mxf, mts, m2ts, mpg, mpeg, 3gp]
         imports: [wav, aif, aiff, mp3, m4a, aac, flac, ogg, opus, png, jpg, jpeg, gif, webp, tif, tiff, bmp, srt, vtt, scc, edl, fcpxml, otio, aaf, omf]
         repo: storytold/filmcraft
+        license: MIT OR Apache-2.0
         icon: icons/filmcraft.png
         theme: themes/premiere.js
         patches: patches/premiere.yaml
@@ -120,6 +128,7 @@ groups:
         opens: [ecproj]
         imports: [mp4, mov, m4v, mkv, webm, png, jpg, jpeg, gif, webp, tif, tiff, bmp, exr, wav, aif, aiff, mp3, flac, ogg, opus, svg, pdf, ai, eps, psd, psb, gltf, glb, obj, csv, tsv]
         repo: storytold/effectcraft
+        license: MIT OR Apache-2.0
         icon: icons/effectcraft.png
         theme: themes/after-effects.js
         patches: patches/after-effects.yaml
@@ -134,6 +143,7 @@ groups:
         opens: [pdf]
         imports: [png, jpg, jpeg, tif, tiff, gif, bmp, jp2, j2k, jpx, txt]
         repo: storytold/pdfcraft
+        license: MIT OR Apache-2.0
         patches: patches/acrobat.yaml
         live: crates/ui-egui/live
         icon: icons/pdfcraft.png
@@ -151,6 +161,7 @@ groups:
         opens: [docx, docm, dotx, dotm, odt, rtf, txt, md, html, htm]
         imports: [png, jpg, jpeg, gif, webp, bmp]
         repo: storytold/wordcraft
+        license: MIT OR Apache-2.0
         icon: icons/wordcraft.svg
         theme: themes/word.js
         patches: patches/word.yaml
@@ -165,6 +176,7 @@ groups:
         opens: [xlsx, xlsm, xltx, xltm, csv, tsv]
         imports: [txt, json, tab]
         repo: storytold/gridcraft
+        license: MIT OR Apache-2.0
         icon: icons/gridcraft.svg
         theme: themes/excel.js
         patches: patches/excel.yaml
@@ -179,6 +191,7 @@ groups:
         opens: [pptx, potx, ppsx, deckcraft]
         imports: [png, jpg, jpeg, gif, webp, bmp, tif, tiff, wav, mp3, m4a, aac, flac, ogg, opus, aif, aiff, mp4, m4v, mov, webm, txt, md]
         repo: storytold/deckcraft
+        license: MIT OR Apache-2.0
         icon: icons/deckcraft.png
         theme: themes/powerpoint.js
         patches: patches/powerpoint.yaml
@@ -196,6 +209,7 @@ groups:
         opens: [html, md]
         imports: []
         repo: AlienTechSoftware/notecraft
+        license: MIT OR Apache-2.0
         # What the web build compiles (Cargo.lock: dependency changes; the engine embeds docs/demo/DemoNotebook):
         # README, other docs and CI commits don't rebuild it.
         paths: [crates, assets, docs/demo/DemoNotebook, Cargo.toml, Cargo.lock, rust-toolchain.toml]
@@ -213,6 +227,7 @@ groups:
         opens: []
         imports: []
         repo: MonkeySaint/mailcraft
+        license: MIT OR Apache-2.0
         # Its web zip is mailcraft-<version>-web.zip; its branch is master.
         asset: '-web\.zip$'
         branch: master
@@ -230,6 +245,7 @@ groups:
         opens: []
         imports: []
         repo: storytold/cadcraft
+        license: MIT OR Apache-2.0
         patches: patches/autocad.yaml
         live: crates/doc/src
         icon: icons/cadcraft.png
@@ -244,6 +260,7 @@ groups:
         opens: [solidcraft, solvecraft, step, stp, iges, igs, stl, 3mf, obj]
         imports: []
         repo: bherbruck/solvecraft
+        license: MIT OR Apache-2.0
         # Its web zip is solidcraft-web-<version>.zip (the default pattern; the old solvecraft-<tag>-web.zip naming
         # stopped at v0.1.1); nightlies are pre-releases.
         # The web app and what it compiles (dependency changes show up in Cargo.lock; the root Cargo.toml holds
@@ -263,6 +280,7 @@ groups:
         opens: []
         imports: []
         repo: Aalzard/subcraft
+        license: MIT OR Apache-2.0
         patches: patches/substance-painter.yaml
         live: crates/ui/src
         icon: icons/subcraft.png
@@ -278,6 +296,7 @@ groups:
         opens: [mcg, mca]
         imports: []
         repo: PiJellyPin/MaterialCraft
+        license: MIT OR Apache-2.0
         # What the web build compiles: README and docs commits don't rebuild it.
         paths: [src, assets, build.rs, Cargo.toml]
         patches: patches/substance-designer.yaml
@@ -295,6 +314,7 @@ groups:
         opens: []
         imports: []
         repo: storytold/soundcraft
+        license: MIT OR Apache-2.0
         patches: patches/pro-tools.yaml
         live: crates/model/src
         branch: main
@@ -316,6 +336,7 @@ groups:
         opens: []
         imports: []
         repo: daijro/Lemon-Studio-web
+        license: GPL-3.0-or-later
         asset: '^lemon-studio-web\.zip$'
         build: false
         isolated: true
@@ -330,6 +351,7 @@ groups:
         opens: [flm, mid, midi]
         imports: [flp, zip]
         repo: daijro/honeydew
+        license: GPL-3.0-or-later
         icon: icons/honeydew.svg
         patches: patches/fl-studio-mobile.yaml
         accent: "#CDE397"
@@ -344,6 +366,7 @@ groups:
         opens: [suhina, als]
         imports: [wav, aif, aiff, flac, mp3, ogg, mid, midi]
         repo: suhina-daw/suhina-daw
+        license: GPL-3.0-or-later
         # What the web build compiles (Cargo.lock: dependency changes): docs, CI and the desktop apps' commits don't
         # rebuild it. One GitHub API request per path per check.
         paths: [crates, devices, assets, Cargo.toml, Cargo.lock]
@@ -363,6 +386,7 @@ groups:
         opens: []
         imports: []
         repo: storytold/figcraft
+        license: MIT OR Apache-2.0
         icon: icons/figcraft.png
         theme: themes/figma.js
         patches: patches/figma.yaml
@@ -383,6 +407,7 @@ groups:
         opens: [png, jpg, jpeg, sproj]
         imports: []
         repo: selfbin/selfpaint
+        license: MIT
         asset: '-web\.zip$'
         # What the web build compiles (Cargo.lock: dependency changes): README, CI and icon commits don't rebuild it.
         paths: [src, assets, Cargo.toml, Cargo.lock]
