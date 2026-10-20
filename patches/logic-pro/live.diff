@@ -1,0 +1,1119 @@
+diff --git a/crates/prowave-app/src/live.rs b/crates/prowave-app/src/live.rs
+new file mode 100644
+index 0000000..ed607d4
+--- /dev/null
++++ b/crates/prowave-app/src/live.rs
+@@ -0,0 +1,613 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! Live editing in a Playground session (patches/logic-pro.yaml in github.com/daijro/openplayground): the window is the
++//! app the session's kit (`kit`, Playground's template) runs on, and Playground's shell/live.js drives it. Nothing
++//! here runs until a session connects. Web only, and its native tests.
++//!
++//! The shared document is the project as its `.prowave` file has it (`project.json`), shaped so two people's edits
++//! merge: the kit merges objects by key and lists of objects by their `id`. Tracks and regions have no ids in the
++//! model, so they are kept here, beside it, and followed from one look to the next ([`follow`]): what is unchanged
++//! keeps its id, and between unchanged ones an item with the same name, or the only one changed in its place, keeps
++//! the one it had. A note's id is the note itself (a moved note is the old one gone and a new one added, so two people
++//! changing different notes of one region both keep theirs); notes are kept in time order, so every peer has the same
++//! bytes. Personal, never shared: the playhead and transport, the selection, the cycle, the metronome and count-in,
++//! and each track's height, folding, record and input-monitoring buttons. Audio files travel as the session's media,
++//! named by their content: a region plays `media/<hash>-<length>.<ext>`, kept in memory under `/live`.
++
++#[path = "playground_live.rs"]
++#[allow(dead_code)]
++pub mod kit;
++#[cfg(target_arch = "wasm32")]
++mod peers;
++#[cfg(target_arch = "wasm32")]
++pub use peers::{lanes, piano, strip};
++
++use crate::model::Project;
++use crate::App;
++use prowave_project::{NoteDoc, ProjectDoc, RegionDoc, TrackDoc};
++use serde_json::{Map, Value};
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::path::{Path, PathBuf};
++
++/// The document's format: peers whose formats differ do not share a document.
++#[cfg(target_arch = "wasm32")]
++pub fn format() -> String {
++    format!("prowave:{}:1", prowave_project::FORMAT_VERSION)
++}
++
++/// Where the session's media are kept: `/live/media/<asset>`, and stand-ins for those not here yet under
++/// `/live/media/missing/`.
++const ROOT: &str = "/live";
++const MISSING: &str = "missing/";
++/// The project's personal fields, and each track's.
++const PERSONAL: [&str; 7] = ["position_beats", "selected_track", "cycle", "cycle_start", "cycle_end", "metronome", "count_in"];
++const TRACK_PERSONAL: [&str; 2] = ["height", "folded"];
++
++/// The tracks as last seen: each one's id, content (personal fields neutral) and its regions' ids.
++#[derive(Default)]
++struct Seen {
++    tracks: Vec<(u64, TrackDoc, Vec<u64>)>,
++    next: u64,
++}
++
++thread_local! {
++    static SEEN: RefCell<Seen> = RefCell::default();
++    /// Asset names of files outside `/live`, by path and length.
++    // ponytail: a file rewritten in place with another of the same length keeps its old name; add its time written
++    // if that ever happens (drops and opens write new paths).
++    static ASSETS: RefCell<HashMap<(PathBuf, u64), String>> = RefCell::default();
++}
++
++// ---------------------------------------------------------------- ids
++
++/// Ids for `cur`, following `prev` (with its ids): unchanged items keep theirs (the longest run of them in order);
++/// between two unchanged ones, an item with the same `name` keeps the one it had, and so does the only one changed in
++/// its place; anything else is new and gets a `fresh` id.
++fn follow<T: PartialEq>(prev: &[(u64, &T)], cur: &[&T], name: impl Fn(&T) -> String, fresh: &mut impl FnMut() -> u64) -> Vec<u64> {
++    let (n, m) = (prev.len(), cur.len());
++    // Longest common subsequence of unchanged items.
++    let mut lcs = vec![0u32; (n + 1) * (m + 1)];
++    let at = |i: usize, j: usize| i * (m + 1) + j;
++    for i in (0..n).rev() {
++        for j in (0..m).rev() {
++            lcs[at(i, j)] = if prev[i].1 == cur[j] { lcs[at(i + 1, j + 1)] + 1 } else { lcs[at(i + 1, j)].max(lcs[at(i, j + 1)]) };
++        }
++    }
++    let mut anchors = Vec::new();
++    let (mut i, mut j) = (0, 0);
++    while i < n && j < m {
++        if prev[i].1 == cur[j] && lcs[at(i, j)] == lcs[at(i + 1, j + 1)] + 1 {
++            anchors.push((i, j));
++            (i, j) = (i + 1, j + 1);
++        } else if lcs[at(i + 1, j)] >= lcs[at(i, j + 1)] {
++            i += 1;
++        } else {
++            j += 1;
++        }
++    }
++    anchors.push((n, m));
++    let mut ids = vec![None; m];
++    let (mut p0, mut c0) = (0, 0);
++    for (pa, ca) in anchors {
++        let mut olds: Vec<usize> = (p0..pa).collect();
++        let news: Vec<usize> = (c0..ca).collect();
++        for &c in &news {
++            if let Some(k) = olds.iter().position(|&p| name(prev[p].1) == name(cur[c])) {
++                ids[c] = Some(prev[olds.remove(k)].0);
++            }
++        }
++        let left: Vec<usize> = news.iter().copied().filter(|&c| ids[c].is_none()).collect();
++        if let ([c], [p]) = (left.as_slice(), olds.as_slice()) {
++            ids[*c] = Some(prev[*p].0);
++        }
++        if pa < n {
++            ids[ca] = Some(prev[pa].0);
++        }
++        (p0, c0) = (pa + 1, ca + 1);
++    }
++    ids.into_iter().map(|id| id.unwrap_or_else(&mut *fresh)).collect()
++}
++
++fn neutral(t: &TrackDoc) -> TrackDoc {
++    TrackDoc { height: 1.0, folded: false, ..t.clone() }
++}
++
++fn note_key(n: &Value) -> (f64, u64, f64, u64) {
++    let num = |k: &str| n[k].as_f64().unwrap_or(0.0);
++    (num("start"), n["pitch"].as_u64().unwrap_or(0), num("len"), n["vel"].as_u64().unwrap_or(0))
++}
++
++/// Notes in time order (then pitch, length, velocity and id), the order every peer keeps them in.
++fn sort_notes(notes: &mut [Value]) {
++    notes.sort_by(|a, b| {
++        let (x, y) = (note_key(a), note_key(b));
++        let id = |n: &Value| n["id"].as_str().map(|s| (s.len(), s.to_owned()));
++        x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)).then(x.2.total_cmp(&y.2)).then(x.3.cmp(&y.3)).then_with(|| id(a).cmp(&id(b)))
++    });
++}
++
++/// A region's notes as the document has them, in time order: each with its id (the note itself, then which of equal
++/// notes it is).
++fn shaped_notes(notes: &[NoteDoc]) -> Value {
++    let mut sorted: Vec<&NoteDoc> = notes.iter().collect();
++    sorted.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.pitch.cmp(&b.pitch)).then(a.len.total_cmp(&b.len)).then(a.vel.cmp(&b.vel)));
++    let (mut previous, mut k) = (String::new(), 0);
++    let shaped = sorted.into_iter().map(|n| {
++        let base = format!("{}@{}+{}v{}", n.pitch, n.start, n.len, n.vel);
++        k = if base == previous { k + 1 } else { 1 };
++        let mut note = object(serde_json::to_value(n).unwrap_or_default());
++        note.insert("id".into(), Value::String(format!("{base}#{k}")));
++        previous = base;
++        Value::Object(note)
++    });
++    Value::Array(shaped.collect())
++}
++
++fn object(v: Value) -> Map<String, Value> {
++    match v {
++        Value::Object(map) => map,
++        _ => Map::new(),
++    }
++}
++
++/// `doc` as the shared document, following the ids `seen` had (and leaving the new ones there).
++fn shape(doc: &ProjectDoc, seen: &mut Seen) -> Value {
++    let Seen { tracks: prev, next } = seen;
++    let mut fresh = || kit::fresh_id(next);
++    let cur: Vec<TrackDoc> = doc.tracks.iter().map(neutral).collect();
++    let ids = follow(
++        &prev.iter().map(|(id, t, _)| (*id, t)).collect::<Vec<_>>(),
++        &cur.iter().collect::<Vec<_>>(),
++        |t| format!("{:?}/{}", t.kind, t.name),
++        &mut fresh,
++    );
++    let mut tracks = Vec::with_capacity(cur.len());
++    let mut now = Vec::with_capacity(cur.len());
++    for (t, &id) in cur.iter().zip(&ids) {
++        let before: Vec<(u64, &RegionDoc)> = prev
++            .iter()
++            .find(|(p, ..)| *p == id)
++            .map(|(_, pt, rids)| rids.iter().copied().zip(&pt.regions).collect())
++            .unwrap_or_default();
++        let rids = follow(&before, &t.regions.iter().collect::<Vec<_>>(), |r| r.name.clone(), &mut fresh);
++        let regions = t
++            .regions
++            .iter()
++            .zip(&rids)
++            .map(|(r, &rid)| {
++                let mut region = object(serde_json::to_value(r).unwrap_or_default());
++                region.insert("id".into(), rid.into());
++                region.insert("notes".into(), shaped_notes(&r.notes));
++                Value::Object(region)
++            })
++            .collect();
++        let mut track = object(serde_json::to_value(t).unwrap_or_default());
++        for k in TRACK_PERSONAL {
++            track.remove(k);
++        }
++        track.insert("id".into(), id.into());
++        track.insert("regions".into(), Value::Array(regions));
++        tracks.push(Value::Object(track));
++        now.push((id, t.clone(), rids));
++    }
++    *prev = now;
++    let mut top = object(serde_json::to_value(doc).unwrap_or_default());
++    for k in PERSONAL {
++        top.remove(k);
++    }
++    top.insert("tracks".into(), Value::Array(tracks));
++    Value::Object(top)
++}
++
++/// The track and region ids a shared document gives.
++fn ids_of(document: &Value) -> Vec<(u64, Vec<u64>)> {
++    let list = |v: &Value| v.as_array().cloned().unwrap_or_default();
++    list(&document["tracks"])
++        .iter()
++        .map(|t| (t["id"].as_u64().unwrap_or(0), list(&t["regions"]).iter().map(|r| r["id"].as_u64().unwrap_or(0)).collect()))
++        .collect()
++}
++
++/// The project file's document a shared document holds; it must read and validate as a file's does.
++pub fn project_of(document: &Value) -> Result<ProjectDoc, String> {
++    fn strip(v: &mut Value) {
++        match v {
++            Value::Object(map) => {
++                map.remove("id");
++                map.values_mut().for_each(strip);
++            }
++            Value::Array(items) => items.iter_mut().for_each(strip),
++            _ => {}
++        }
++    }
++    if !document.is_object() || !document["tracks"].is_array() {
++        return Err("Conflict: not a project".into());
++    }
++    let mut v = document.clone();
++    strip(&mut v);
++    let doc: ProjectDoc = serde_json::from_value(v).map_err(|e| format!("Conflict: {e}"))?;
++    if doc.format_version > prowave_project::FORMAT_VERSION {
++        return Err("Conflict: a newer project format".into());
++    }
++    let bad = doc.tracks.iter().flat_map(|t| &t.regions).filter_map(|r| r.audio.as_deref()).find(|a| asset_name(a).is_none());
++    match bad {
++        Some(a) => Err(format!("Conflict: {a} is not a session's media")),
++        None => Ok(doc),
++    }
++}
++
++/// The three-way merge: the kit's, then notes back in order and folder nesting as the app allows it (the merge of two
++/// valid nestings can need it); the result must read as a project.
++pub fn merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
++    let mut merged = kit::merge(base, current, edited, &[])?;
++    let mut allowed = 0;
++    for t in merged["tracks"].as_array_mut().into_iter().flatten() {
++        let indent = t["indent"].as_u64().unwrap_or(0).min(allowed);
++        if t.get("indent").is_some() {
++            t["indent"] = indent.into();
++        }
++        allowed = indent + u64::from(t["kind"] == "Folder");
++        for r in t["regions"].as_array_mut().into_iter().flatten() {
++            if let Some(notes) = r["notes"].as_array_mut() {
++                sort_notes(notes);
++            }
++        }
++    }
++    project_of(&merged)?;
++    Ok(merged)
++}
++
++// ---------------------------------------------------------------- media
++
++/// The asset a region's media path names (`media/<asset>`, or a stand-in's `media/missing/<asset>`), when it is one.
++fn asset_name(path: &str) -> Option<&str> {
++    let name = path.strip_prefix("media/")?;
++    let name = name.strip_prefix(MISSING).unwrap_or(name);
++    let (hash, rest) = name.split_once('-')?;
++    let (len, ext) = rest.split_once('.')?;
++    let ok = hash.len() == 16
++        && hash.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
++        && !len.is_empty()
++        && len.bytes().all(|b| b.is_ascii_digit())
++        && (1..=5).contains(&ext.len())
++        && ext.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
++    ok.then_some(name)
++}
++
++/// Whether `id` names an asset (and nothing else: no folders).
++fn is_asset(id: &str) -> bool {
++    asset_name(&format!("media/{id}")) == Some(id)
++}
++
++/// The asset name of `bytes` (FNV-1a over the content, its length, the file's type).
++// ponytail: a 64-bit non-cryptographic hash: an editor could forge a file under another's name, which an editor can do
++// to the document anyway; a cryptographic hash if media ever come from people who may not edit.
++fn asset_of(bytes: &[u8], ext: &str) -> String {
++    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
++    let ext: String = ext.to_ascii_lowercase().chars().filter(char::is_ascii_alphanumeric).take(5).collect();
++    format!("{hash:016x}-{}.{}", bytes.len(), if ext.is_empty() { "wav" } else { &ext })
++}
++
++/// The media files in memory (the page's), or on disk in native tests.
++mod files {
++    #[cfg(target_arch = "wasm32")]
++    pub use prowave_playground::std::fs::{metadata, put, read};
++    #[cfg(not(target_arch = "wasm32"))]
++    pub use std::fs::{metadata, read};
++    #[cfg(not(target_arch = "wasm32"))]
++    pub fn put(path: &std::path::Path, bytes: Vec<u8>) {
++        if let Some(dir) = path.parent() {
++            let _ = std::fs::create_dir_all(dir);
++        }
++        let _ = std::fs::write(path, bytes);
++    }
++}
++
++fn is_file(path: &Path) -> bool {
++    files::metadata(path).is_ok_and(|m| m.is_file())
++}
++
++/// Where the session keeps an asset.
++fn kept(asset: &str) -> PathBuf {
++    Path::new(ROOT).join("media").join(asset)
++}
++
++/// The document's media path for an audio file of the project: kept ones by their name; others by their content,
++/// copied in to where the session keeps them.
++fn media_path(source: &Path) -> String {
++    let under = |dir: &Path| source.strip_prefix(dir).ok().and_then(|p| p.to_str()).filter(|n| !n.contains('/')).map(str::to_owned);
++    if let Some(asset) = under(&Path::new(ROOT).join("media").join(MISSING)).or_else(|| under(&Path::new(ROOT).join("media"))) {
++        return format!("media/{asset}");
++    }
++    let len = files::metadata(source).map(|m| m.len()).unwrap_or(0);
++    let asset = ASSETS.with_borrow_mut(|known| {
++        known.get(&(source.to_path_buf(), len)).cloned().unwrap_or_else(|| {
++            let bytes = files::read(source).unwrap_or_default();
++            let asset = asset_of(&bytes, source.extension().and_then(|e| e.to_str()).unwrap_or(""));
++            if !is_file(&kept(&asset)) {
++                files::put(&kept(&asset), bytes);
++            }
++            known.insert((source.to_path_buf(), len), asset.clone());
++            asset
++        })
++    });
++    format!("media/{asset}")
++}
++
++/// One frame of silence, the stand-in for media not here yet.
++fn silence() -> Vec<u8> {
++    let mut wav = Vec::with_capacity(48);
++    wav.extend_from_slice(b"RIFF");
++    wav.extend_from_slice(&38u32.to_le_bytes());
++    wav.extend_from_slice(b"WAVEfmt ");
++    for v in [16u32, 0x0001_0001, 48_000, 96_000, 0x0010_0002] {
++        wav.extend_from_slice(&v.to_le_bytes());
++    }
++    wav.extend_from_slice(b"data");
++    wav.extend_from_slice(&2u32.to_le_bytes());
++    wav.extend_from_slice(&[0, 0]);
++    wav
++}
++
++/// The assets a document's regions play, once each.
++fn assets_in(doc: &ProjectDoc) -> Vec<String> {
++    let mut out: Vec<String> = doc.tracks.iter().flat_map(|t| &t.regions).filter_map(|r| asset_name(r.audio.as_deref()?)).map(str::to_owned).collect();
++    out.sort();
++    out.dedup();
++    out
++}
++
++// ---------------------------------------------------------------- the app
++
++/// The track and region ids as last seen (indexes of the project as of the last look).
++pub fn ids_now() -> Vec<(u64, Vec<u64>)> {
++    SEEN.with_borrow(|s| s.tracks.iter().map(|(id, _, r)| (*id, r.clone())).collect())
++}
++
++/// The project as the shared document.
++pub fn document_of(project: &Project) -> Value {
++    let (mut doc, media) = crate::project_io::to_doc(project);
++    let paths: HashMap<&str, String> = media.iter().map(|m| (m.zip_path.as_str(), media_path(&m.source))).collect();
++    for r in doc.tracks.iter_mut().flat_map(|t| &mut t.regions) {
++        if let Some(a) = r.audio.as_mut() {
++            *a = paths.get(a.as_str()).cloned().unwrap_or_default();
++        }
++    }
++    SEEN.with_borrow_mut(|seen| shape(&doc, seen))
++}
++
++#[cfg(target_arch = "wasm32")]
++fn context() -> egui::Context {
++    crate::web::ctx().unwrap_or_default()
++}
++#[cfg(not(target_arch = "wasm32"))]
++fn context() -> egui::Context {
++    egui::Context::default()
++}
++
++impl App {
++    /// Puts a shared document's project in place: no step of the undo history, this person's personal settings and
++    /// selection kept, the engine following. Media not here yet play silence until they arrive.
++    fn live_install(&mut self, document: &Value) -> Result<(), String> {
++        let mut doc = project_of(document)?;
++        let ids = ids_of(document);
++        for r in doc.tracks.iter_mut().flat_map(|t| &mut t.regions) {
++            let Some(asset) = r.audio.as_deref().and_then(asset_name).map(str::to_owned) else { continue };
++            if !is_file(&kept(&asset)) {
++                let stand_in = Path::new(ROOT).join("media").join(MISSING).join(&asset);
++                if !is_file(&stand_in) {
++                    files::put(&stand_in, silence());
++                }
++                r.audio = Some(format!("media/{MISSING}{asset}"));
++            }
++        }
++        let ctx = context();
++        let (mut p, _missing) = crate::project_io::from_doc(&doc, Path::new(ROOT), &ctx);
++        let old = &self.project;
++        // Waveform overviews already worked out stay (from_doc's are dropped unrun).
++        #[cfg(target_arch = "wasm32")]
++        prowave_playground::std::thread::forget_spawned();
++        let had: HashMap<PathBuf, &crate::model::AudioRegion> =
++            old.tracks.iter().flat_map(|t| &t.regions).filter_map(|r| r.audio.as_ref()).map(|a| (a.file.path.clone(), a)).collect();
++        for a in p.tracks.iter_mut().flat_map(|t| &mut t.regions).filter_map(|r| r.audio.as_mut()) {
++            match had.get(&a.file.path) {
++                Some(o) if o.file.frames == a.file.frames => *a = (*o).clone(),
++                _ => *a = crate::import::audio_region(a.file.clone(), &ctx),
++            }
++        }
++        let old_ids = ids_now();
++        let index = |id: u64| ids.iter().position(|(t, _)| *t == id);
++        for (t, (id, _)) in p.tracks.iter_mut().zip(&ids) {
++            if let Some(o) = old_ids.iter().position(|(o, _)| o == id).and_then(|i| old.tracks.get(i)) {
++                (t.height, t.folded, t.rec, t.monitor) = (o.height, o.folded, o.rec, o.monitor);
++            }
++        }
++        (p.position_beats, p.playing, p.recording) = (old.position_beats, old.playing, old.recording);
++        (p.cycle, p.cycle_start, p.cycle_end) = (old.cycle, old.cycle_start, old.cycle_end);
++        (p.metronome, p.count_in) = (old.metronome, old.count_in);
++        p.selected_track = old_ids.get(old.selected_track).and_then(|(id, _)| index(*id)).unwrap_or(old.selected_track).min(p.tracks.len().saturating_sub(1));
++        // The open region and its selected notes, by id and by value.
++        let region = |ids: &[(u64, Vec<u64>)], (t, r): (usize, usize)| ids.get(t).and_then(|(tid, rids)| Some((*tid, *rids.get(r)?)));
++        let shown = self.ui.tracks.selected.and_then(|at| Some((region(&old_ids, at)?, at)));
++        let notes = |p: &Project, (t, r): (usize, usize)| p.tracks.get(t).and_then(|t| t.regions.get(r)).map(|r| r.notes.clone()).unwrap_or_default();
++        let (old_notes, picked) = match shown {
++            Some((_, at)) => (notes(old, at), std::mem::take(&mut self.ui.piano.selected)),
++            None => (Vec::new(), Vec::new()),
++        };
++        self.ui.tracks.selected = shown.and_then(|((tid, rid), _)| {
++            let t = index(tid)?;
++            Some((t, ids[t].1.iter().position(|r| *r == rid)?))
++        });
++        if let Some(at) = self.ui.tracks.selected {
++            let new = notes(&p, at);
++            let same = |a: &crate::model::Note, b: &crate::model::Note| (a.start, a.len, a.pitch, a.vel) == (b.start, b.len, b.pitch, b.vel);
++            let mut taken = vec![false; new.len()];
++            for o in picked.iter().filter_map(|&i| old_notes.get(i)) {
++                if let Some(k) = (0..new.len()).find(|&k| !taken[k] && same(o, &new[k])) {
++                    taken[k] = true;
++                    self.ui.piano.selected.push(k);
++                }
++            }
++        }
++        p.song_rev = old.song_rev.wrapping_add(1);
++        self.project = p;
++        // The ids are the document's now, and new ones go past its numbered ones.
++        SEEN.with_borrow_mut(|seen| {
++            seen.tracks = doc
++                .tracks
++                .iter()
++                .map(neutral)
++                .zip(&ids)
++                .map(|(mut t, (id, rids))| {
++                    for r in &mut t.regions {
++                        if let Some(a) = r.audio.as_mut() {
++                            *a = a.replacen(&format!("media/{MISSING}"), "media/", 1);
++                        }
++                    }
++                    (*id, t, rids.clone())
++                })
++                .collect();
++            let top = ids.iter().flat_map(|(t, r)| std::iter::once(*t).chain(r.iter().copied())).filter(|id| *id < 1 << 52).max();
++            seen.next = seen.next.max(top.map_or(0, |id| id + 1));
++        });
++        Ok(())
++    }
++}
++
++thread_local! {
++    /// A pointer is down or text is being typed: nothing goes in or out until it ends.
++    static BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++    /// Goes up on frames where the project may have changed (input, and a while after).
++    static GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++}
++
++impl kit::Live for App {
++    fn live_document(&self) -> Value {
++        document_of(&self.project)
++    }
++
++    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
++        self.live_install(&document)
++    }
++
++    fn live_quiet(&self) -> bool {
++        !BUSY.get()
++    }
++
++    fn live_generation(&self) -> Option<u64> {
++        // The song revision goes up with what changes without input (a file opened or imported a moment later).
++        Some(GENERATION.get() ^ self.project.song_rev.rotate_left(32))
++    }
++
++    fn live_disconnected(&mut self) {
++        self.history.reset(&self.project);
++    }
++
++    fn live_assets(&self) -> Vec<(String, String, bool)> {
++        let mut out: Vec<(String, String, bool)> = self
++            .project
++            .tracks
++            .iter()
++            .flat_map(|t| &t.regions)
++            .filter_map(|r| {
++                let a = r.audio.as_ref()?;
++                let asset = media_path(&a.file.path).strip_prefix("media/")?.to_owned();
++                let name = a.file.path.file_name()?.to_string_lossy().into_owned();
++                let have = is_file(&kept(&asset));
++                Some((asset, name, have))
++            })
++            .collect();
++        out.sort();
++        out.dedup_by(|a, b| a.0 == b.0);
++        out
++    }
++
++    fn live_assets_of(document: &Value) -> Vec<String> {
++        project_of(document).map(|d| assets_in(&d)).unwrap_or_default()
++    }
++
++    fn live_read_asset(&self, id: &str) -> Option<Vec<u8>> {
++        is_asset(id).then_some(())?;
++        files::read(kept(id)).ok()
++    }
++
++    fn live_write_asset(&mut self, id: &str, _name: &str, bytes: Vec<u8>) {
++        let ext = id.rsplit('.').next().unwrap_or("");
++        if !is_asset(id) || asset_of(&bytes, ext) != id {
++            return;
++        }
++        files::put(&kept(id), bytes);
++        // The regions playing its stand-in play it now: the same document, put in again.
++        let document = document_of(&self.project);
++        let _ = self.live_install(&document);
++    }
++
++    fn live_presence(&self) -> Value {
++        #[cfg(target_arch = "wasm32")]
++        return peers::mine(self);
++        #[cfg(not(target_arch = "wasm32"))]
++        Value::Null
++    }
++
++    fn live_show_presence(&mut self, others: Vec<kit::Presence>) {
++        #[cfg(target_arch = "wasm32")]
++        peers::show(others);
++        #[cfg(not(target_arch = "wasm32"))]
++        drop(others);
++    }
++
++    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
++        merge(base, current, edited)
++    }
++
++    fn live_check(document: &Value) -> Result<(), String> {
++        project_of(document).map(drop)
++    }
++}
++
++// ---------------------------------------------------------------- the page
++
++/// The app eframe runs on the page, with the session's frame after the window's, and the adapter offered to the shell.
++#[cfg(target_arch = "wasm32")]
++pub fn wrap(web: crate::web::Web) -> Box<dyn eframe::App> {
++    let with_app = |f: &mut dyn FnMut(&mut App)| crate::web::runner().app_mut::<Shell>().map(|mut shell| f(&mut shell.web.app)).is_some();
++    if let Err(e) = kit::web::attach::<App>(&format(), with_app, crate::web::repaint) {
++        web_sys::console::warn_1(&format!("Pro Wave: no live editing: {e:?}").into());
++    }
++    Box::new(Shell { web, touched: 0 })
++}
++
++#[cfg(target_arch = "wasm32")]
++struct Shell {
++    web: crate::web::Web,
++    /// Frames left in which the project may still change after input.
++    touched: u32,
++}
++
++#[cfg(target_arch = "wasm32")]
++impl eframe::App for Shell {
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
++        eframe::App::raw_input_hook(&mut self.web, ctx, raw_input);
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        let input = ui.input(|i| !i.events.is_empty() || i.pointer.any_down() || !i.raw.dropped_files.is_empty());
++        eframe::App::ui(&mut self.web, ui, frame);
++        let ctx = ui.ctx().clone();
++        BUSY.set(ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input());
++        // Changes come from input (and land within a few frames), or with a new song revision (live_generation).
++        self.touched = if input { 3 } else { self.touched.saturating_sub(1) };
++        if self.touched > 0 {
++            GENERATION.set(GENERATION.get().wrapping_add(1));
++        }
++        kit::frame(&mut self.web.app);
++        peers::overlay(ui, &self.web.app);
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/prowave-app/src/live/peers.rs b/crates/prowave-app/src/live/peers.rs
+new file mode 100644
+index 0000000..53bbb92
+--- /dev/null
++++ b/crates/prowave-app/src/live/peers.rs
+@@ -0,0 +1,425 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! Presence in a Playground session: where each person is and the gesture under way, in the project's terms, so it
++//! shows in the same place for everyone whatever their zoom, scroll or window size.
++//!
++//! This person's state (`mine`, at most a few KiB of JSON):
++//!   `at`      the pointer: `{ "in": "lanes", "track", "fy", "beat" }` (the Tracks area: a track by id, the fraction
++//!             down its row and a beat), or `{ "in": "piano", "track", "region", "beat", "key" }` (the Piano Roll: a
++//!             region by ids, a beat of it and a key as a number), or `{ "in": "strip", "track", "ns", "fx", "fy" }`
++//!             (a track's channel strip in the Mixer or the Inspector, `ns`, and the fractions across and down it);
++//!   `region`  a region being dragged, as it is now: `[track, region, start beat, length in beats]`;
++//!   `notes`   with `track` and `region`: the notes a Piano Roll drag is moving, resizing or drawing, as they are now,
++//!             `[start, length, pitch]` each;
++//!   `fader`   while a channel strip is being worked: `{ "track", "db" }`, its volume as it is now.
++//! The views record where things are as they draw ([`lanes`], [`piano`], [`strip`]), so the pointer can be read in those terms and
++//! the others drawn back: their pointers with name tags, ghosts of what their drags are doing, in their colour, eased
++//! toward where they are.
++
++use super::kit::{self, Presence};
++use super::{ids_now, App};
++use egui::{pos2, vec2, Color32, Id, LayerId, Order, Painter, Pos2, Rangef, Rect, Shape, Stroke, StrokeKind, Ui};
++use serde_json::{json, Value};
++use std::cell::RefCell;
++
++/// The most notes a presence carries.
++const MAX_ITEMS: usize = 50;
++/// The most characters of a name tag, its ellipsis included.
++const MAX_NAME: usize = 24;
++/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
++const EASE: f64 = 0.08;
++/// The session's pointer arrow, tip first, in points.
++const ARROW: [(f32, f32); 7] = [(0.0, 0.0), (12.5, 11.0), (7.3, 11.0), (10.4, 17.3), (7.6, 18.6), (4.5, 12.2), (0.0, 16.0)];
++const GHOST: f32 = 0.28;
++const GHOST_EDGE: f32 = 0.85;
++
++/// The Tracks area as drawn this frame.
++struct Lanes {
++    rect: Rect,
++    /// Each track's row: top (from the first) and height (0 when folded away).
++    rows: Vec<(f32, f32)>,
++    scroll: (f32, f32),
++    beat_px: f32,
++}
++
++/// The Piano Roll as drawn this frame.
++struct Piano {
++    grid: Rect,
++    region: (usize, usize),
++    beat_px: f32,
++    key_h: f32,
++    scroll: (f32, f32),
++}
++
++impl Piano {
++    fn x(&self, beat: f64) -> f32 {
++        self.grid.left() + beat as f32 * self.beat_px - self.scroll.0
++    }
++    /// The top of `pitch`'s row.
++    fn top(&self, pitch: f64) -> f32 {
++        self.grid.top() + (127.0 - pitch as f32) * self.key_h - self.scroll.1
++    }
++}
++
++#[derive(Default)]
++struct Frame {
++    lanes: Option<Lanes>,
++    piano: Option<Piano>,
++    /// Channel strips of tracks: the track's index, the strip, and where it is (`mixer`, `inspector`).
++    strips: Vec<(usize, Rect, &'static str)>,
++}
++
++/// Someone else, with their marks eased toward their latest state.
++struct Peer {
++    id: String,
++    name: String,
++    color: Color32,
++    state: Value,
++    /// Their pointer's scope (`lanes:<track>`, `piano:<track>:<region>`) and place in it.
++    pointer: Option<(String, [f64; 2])>,
++    /// A region they drag: track id, region id, start and length in beats.
++    region: Option<([u64; 2], [f64; 2])>,
++    notes: Vec<[f64; 3]>,
++}
++
++thread_local! {
++    static FRAME: RefCell<Frame> = RefCell::default();
++    static MINE: RefCell<Value> = const { RefCell::new(Value::Null) };
++    static OTHERS: RefCell<Vec<Peer>> = const { RefCell::new(Vec::new()) };
++}
++
++fn on() -> bool {
++    kit::connected()
++}
++
++fn num(v: &Value) -> Option<f64> {
++    v.as_f64().filter(|n| n.is_finite() && n.abs() < 1.0e7)
++}
++
++// ---------------------------------------------------------------- the views' hooks
++
++/// The Tracks area drew its lanes in `rect`: each track's row (top from the first, height), scrolled by `scroll_x`,
++/// `scroll_y`, `beat_px` points a beat.
++pub fn lanes(rect: Rect, rows: &[(f32, f32)], scroll_x: f32, scroll_y: f32, beat_px: f32) {
++    if on() {
++        FRAME.with_borrow_mut(|f| f.lanes = Some(Lanes { rect, rows: rows.to_vec(), scroll: (scroll_x, scroll_y), beat_px }));
++    }
++}
++
++/// The Piano Roll drew region `(track, region)` (indexes) over `grid`, `beat_px` points a beat and `key_h` a key.
++pub fn piano(grid: Rect, region: (usize, usize), beat_px: f32, key_h: f32, scroll_x: f32, scroll_y: f32) {
++    if on() {
++        FRAME.with_borrow_mut(|f| f.piano = Some(Piano { grid, region, beat_px, key_h, scroll: (scroll_x, scroll_y) }));
++    }
++}
++
++/// A channel strip was drawn at `rect` (in the Mixer or the Inspector, `ns`).
++pub fn strip(rect: Rect, key: crate::mixer::StripKey, ns: &'static str) {
++    if let (true, crate::mixer::StripKey::Track(i)) = (on(), key) {
++        FRAME.with_borrow_mut(|f| f.strips.push((i, rect, ns)));
++    }
++}
++
++// ---------------------------------------------------------------- the frame's end
++
++/// After the window's frame: this person's pointer and drags read in the project's terms, the others' marks eased
++/// and drawn over the views (under menus and dialogs), and the recorded places cleared for the next frame.
++pub fn overlay(ui: &Ui, app: &App) {
++    if !on() {
++        return;
++    }
++    let frame = FRAME.with_borrow_mut(std::mem::take);
++    let ids = ids_now();
++    let pointer = ui.ctx().pointer_latest_pos();
++    let down = ui.input(|i| i.pointer.any_down());
++    let p = &app.project;
++    let bpb = p.beats_per_bar();
++    let region_ids = |(t, r): (usize, usize)| ids.get(t).and_then(|(tid, rids)| Some([*tid, *rids.get(r)?]));
++
++    // Mine.
++    let mut mine = serde_json::Map::new();
++    if let (Some(l), Some(at)) = (&frame.lanes, pointer.filter(|at| frame.lanes.as_ref().is_some_and(|l| l.rect.contains(*at)))) {
++        let y = at.y - l.rect.top() + l.scroll.1;
++        if let Some(t) = l.rows.iter().position(|&(top, h)| h > 0.0 && y >= top && y < top + h) {
++            let (top, h) = l.rows[t];
++            let beat = f64::from((at.x - l.rect.left() + l.scroll.0) / l.beat_px.max(1.0e-3));
++            if let Some((id, _)) = ids.get(t) {
++                mine.insert("at".into(), json!({ "in": "lanes", "track": id, "fy": (y - top) / h.max(1.0), "beat": beat }));
++            }
++        }
++    }
++    if let (Some(pr), Some(at)) = (&frame.piano, pointer.filter(|at| frame.piano.as_ref().is_some_and(|pr| pr.grid.contains(*at)))) {
++        if let Some([t, r]) = region_ids(pr.region) {
++            let beat = f64::from((at.x - pr.grid.left() + pr.scroll.0) / pr.beat_px.max(1.0e-3));
++            let rows_down = f64::from((at.y - pr.grid.top() + pr.scroll.1) / pr.key_h.max(1.0e-3));
++            mine.insert("at".into(), json!({ "in": "piano", "track": t, "region": r, "beat": beat, "key": 128.0 - rows_down }));
++        }
++    }
++    if let Some(&(t, rect, ns)) = pointer.and_then(|at| frame.strips.iter().find(|s| s.1.contains(at))) {
++        if let (Some(at), Some((id, _))) = (pointer, ids.get(t)) {
++            let f = (at - rect.min) / rect.size().max(vec2(1.0, 1.0));
++            mine.insert("at".into(), json!({ "in": "strip", "track": id, "ns": ns, "fx": f.x, "fy": f.y }));
++            if down {
++                mine.insert("fader".into(), json!({ "track": id, "db": p.tracks.get(t).map_or(0.0, |t| t.volume_db) }));
++            }
++        }
++    }
++    if down {
++        // A region being dragged in the Tracks area, or notes in the Piano Roll, as they are now.
++        let pressed = ui.input(|i| i.pointer.press_origin());
++        let from = |r: Option<Rect>| pressed.zip(r).is_some_and(|(at, r)| r.contains(at));
++        if let Some((t, ri)) = app.ui.tracks.selected.filter(|_| from(frame.lanes.as_ref().map(|l| l.rect))) {
++            if let (Some(ids), Some(region)) = (region_ids((t, ri)), p.tracks.get(t).and_then(|t| t.regions.get(ri))) {
++                let start = (f64::from(region.start_bar) - 1.0) * bpb;
++                mine.insert("region".into(), json!([ids[0], ids[1], start, f64::from(region.len_bars) * bpb]));
++            }
++        }
++        if let Some(pr) = frame.piano.as_ref().filter(|pr| from(Some(pr.grid))) {
++            let (t, r) = pr.region;
++            if let (Some([tid, rid]), Some(region)) = (region_ids((t, r)), p.tracks.get(t).and_then(|t| t.regions.get(r))) {
++                let notes: Vec<[f64; 3]> = app
++                    .ui
++                    .piano
++                    .selected
++                    .iter()
++                    .filter_map(|&i| region.notes.get(i))
++                    .take(MAX_ITEMS)
++                    .map(|n| [f64::from(n.start), f64::from(n.len), f64::from(n.pitch)])
++                    .collect();
++                if !notes.is_empty() {
++                    mine.insert("notes".into(), json!({ "track": tid, "region": rid, "list": notes }));
++                }
++            }
++        }
++    }
++    MINE.set(Value::Object(mine));
++
++    // The others: eased, then drawn.
++    let dt = ui.input(|i| f64::from(i.stable_dt));
++    if OTHERS.with_borrow_mut(|others| others.iter_mut().fold(false, |moving, p| p.step(dt) | moving)) {
++        ui.ctx().request_repaint();
++    }
++    let index = |id: f64| ids.iter().position(|(t, _)| *t as f64 == id);
++    let layer = ui.ctx().layer_painter(LayerId::new(Order::Middle, Id::unique("prowave-live-presence")));
++    if let Some(l) = &frame.lanes {
++        let row = |track: u64| index(track as f64).and_then(|t| l.rows.get(t)).filter(|r| r.1 > 0.0).map(|&(top, h)| Rangef::new(l.rect.top() + top - l.scroll.1, l.rect.top() + top - l.scroll.1 + h));
++        let x = |beat: f64| l.rect.left() + beat as f32 * l.beat_px - l.scroll.0;
++        let all = marks(|peer, marks| {
++            if let Some(([track, _], [start, len])) = peer.region {
++                if let Some(rows) = row(track) {
++                    marks.ghosts.push(Rect::from_x_y_ranges(Rangef::new(x(start), x(start + len)), rows.shrink(1.0)));
++                }
++            }
++            if let Some((scope, [fy, beat])) = &peer.pointer {
++                let track = scope.strip_prefix("lanes:").and_then(|t| t.parse::<u64>().ok());
++                marks.tip = track.and_then(row).map(|rows| pos2(x(*beat), rows.min + rows.span() * *fy as f32));
++            }
++        });
++        paint(&layer.with_clip_rect(l.rect), &all);
++    }
++    if let Some(pr) = &frame.piano {
++        let shown = region_ids(pr.region);
++        let all = marks(|peer, marks| {
++            let here = shown.is_some_and(|[t, r]| peer.state["notes"]["track"].as_u64() == Some(t) && peer.state["notes"]["region"].as_u64() == Some(r));
++            if here {
++                for n in &peer.notes {
++                    let left = pr.x(n[0]);
++                    let top = pr.top(n[2].round());
++                    marks.ghosts.push(Rect::from_min_max(pos2(left, top + 1.0), pos2(pr.x(n[0] + n[1].max(0.0)).max(left + 2.0), top + pr.key_h)));
++                }
++            }
++            if let (Some((scope, [beat, key])), Some([t, r])) = (&peer.pointer, shown) {
++                if *scope == format!("piano:{t}:{r}") {
++                    let k = key.floor();
++                    marks.tip = Some(pos2(pr.x(*beat), pr.top(k) + pr.key_h * (1.0 - (key - k) as f32)));
++                }
++            }
++        });
++        paint(&layer.with_clip_rect(pr.grid), &all);
++    }
++    paint_strips(&layer, &frame.strips, |id| ids.iter().position(|(t, _)| *t == id));
++}
++
++/// The others' pointers on channel strips, with the volume they are setting, over each place's strips.
++fn paint_strips(layer: &Painter, strips: &[(usize, Rect, &'static str)], index: impl Fn(u64) -> Option<usize>) {
++    for ns in ["mixer", "inspector"] {
++        let area = strips.iter().filter(|s| s.2 == ns).fold(Rect::NOTHING, |a, s| a.union(s.1));
++        if !area.is_positive() {
++            continue;
++        }
++        let all = marks(|peer, marks| {
++            let Some((scope, [fx, fy])) = &peer.pointer else { return };
++            let Some((track, place)) = scope.strip_prefix("strip:").and_then(|s| s.split_once(':')) else { return };
++            let Some(t) = track.parse::<u64>().ok().filter(|_| place == ns).and_then(&index) else { return };
++            let Some(&(_, rect, _)) = strips.iter().find(|s| s.0 == t && s.2 == ns) else { return };
++            marks.tip = Some(rect.min + vec2(rect.width() * *fx as f32, rect.height() * *fy as f32));
++            let fader = &peer.state["fader"];
++            if fader["track"].as_u64().and_then(&index) == Some(t) {
++                marks.value = num(&fader["db"]).map(|db| format!("{db:.1} dB"));
++            }
++        });
++        paint(&layer.with_clip_rect(area), &all);
++    }
++}
++
++/// Each other person's marks, as `make` places them.
++fn marks(make: impl Fn(&Peer, &mut Marks)) -> Vec<(Color32, String, Marks)> {
++    OTHERS.with_borrow(|others| {
++        others
++            .iter()
++            .map(|peer| {
++                let mut m = Marks::default();
++                make(peer, &mut m);
++                (peer.color, peer.name.clone(), m)
++            })
++            .collect()
++    })
++}
++
++/// This person's presence for the others.
++pub fn mine(_app: &App) -> Value {
++    MINE.with_borrow(Clone::clone)
++}
++
++/// The others, all of them each time any changes (empty when the session ends).
++pub fn show(list: Vec<Presence>) {
++    OTHERS.with_borrow_mut(|others| {
++        let mut next = Vec::with_capacity(list.len());
++        for p in list {
++            let mut peer = match others.iter().position(|o| o.id == p.id) {
++                Some(i) => others.swap_remove(i),
++                None => Peer { id: p.id.clone(), name: String::new(), color: Color32::GRAY, state: Value::Null, pointer: None, region: None, notes: Vec::new() },
++            };
++            peer.name = short(&p.name);
++            peer.color = Color32::from_rgb(p.color[0], p.color[1], p.color[2]);
++            peer.state = p.state;
++            // What is new shows at once; the frame's end eases the rest.
++            peer.step(0.0);
++            next.push(peer);
++        }
++        *others = next;
++    });
++    crate::web::repaint();
++}
++
++fn short(name: &str) -> String {
++    if name.chars().count() <= MAX_NAME {
++        name.to_owned()
++    } else {
++        name.chars().take(MAX_NAME - 1).chain(['…']).collect()
++    }
++}
++
++impl Peer {
++    /// Where their state puts their marks.
++    #[allow(clippy::type_complexity)]
++    fn targets(&self) -> (Option<(String, [f64; 2])>, Option<([u64; 2], [f64; 2])>, Vec<[f64; 3]>) {
++        let at = &self.state["at"];
++        let id = |v: &Value| v.as_u64();
++        let pointer = match at["in"].as_str() {
++            Some("lanes") => id(&at["track"]).zip(num(&at["fy"]).zip(num(&at["beat"]))).map(|(t, (a, b))| (format!("lanes:{t}"), [a.clamp(0.0, 1.0), b])),
++            Some("strip") => id(&at["track"])
++                .zip(at["ns"].as_str().filter(|ns| matches!(*ns, "mixer" | "inspector")))
++                .zip(num(&at["fx"]).zip(num(&at["fy"])))
++                .map(|((t, ns), (x, y))| (format!("strip:{t}:{ns}"), [x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)])),
++            Some("piano") => id(&at["track"])
++                .zip(id(&at["region"]))
++                .zip(num(&at["beat"]).zip(num(&at["key"])))
++                .map(|((t, r), (b, k))| (format!("piano:{t}:{r}"), [b, k.clamp(0.0, 128.0)])),
++            _ => None,
++        };
++        let g = &self.state["region"];
++        let region = id(&g[0]).zip(id(&g[1])).zip(num(&g[2]).zip(num(&g[3]))).map(|((t, r), (s, l))| ([t, r], [s, l]));
++        let notes = self.state["notes"]["list"]
++            .as_array()
++            .into_iter()
++            .flatten()
++            .take(MAX_ITEMS)
++            .filter_map(|t| Some([num(&t[0])?, num(&t[1])?, num(&t[2])?.clamp(0.0, 127.0)]))
++            .collect();
++        (pointer, region, notes)
++    }
++
++    /// `dt` seconds on toward their latest state; whether a mark is still on its way.
++    fn step(&mut self, dt: f64) -> bool {
++        let k = 1.0 - (-dt.clamp(0.0, 0.1) / EASE).exp();
++        let (pointer, region, notes) = self.targets();
++        let mut moving = false;
++        match (&mut self.pointer, pointer) {
++            (Some((s, p)), Some((t, q))) if *s == t => moving |= ease(p, q, k),
++            (s, t) => *s = t,
++        }
++        match (&mut self.region, region) {
++            (Some((s, p)), Some((t, q))) if *s == t => moving |= ease(p, q, k),
++            (s, t) => *s = t,
++        }
++        if self.notes.len() == notes.len() {
++            moving |= self.notes.iter_mut().zip(notes).fold(false, |m, (s, t)| ease(s, t, k) | m);
++        } else {
++            self.notes = notes;
++        }
++        moving
++    }
++}
++
++fn ease<const N: usize>(s: &mut [f64; N], t: [f64; N], k: f64) -> bool {
++    let mut moving = false;
++    for (s, t) in s.iter_mut().zip(t) {
++        *s += (t - *s) * k;
++        if (t - *s).abs() < 1.0e-3 {
++            *s = t;
++        } else {
++            moving = true;
++        }
++    }
++    moving
++}
++
++// ---------------------------------------------------------------- the look
++
++/// What a person shows in a view, in screen terms.
++#[derive(Default)]
++struct Marks {
++    tip: Option<Pos2>,
++    ghosts: Vec<Rect>,
++    /// Shown under the name: the value they are setting.
++    value: Option<String>,
++}
++
++/// White or near-black, whichever reads on `color`.
++fn ink(color: Color32) -> Color32 {
++    let c = egui::Rgba::from(color);
++    if 0.2126 * c.r() + 0.7152 * c.g() + 0.0722 * c.b() > 0.55 {
++        Color32::from_gray(0x11)
++    } else {
++        Color32::WHITE
++    }
++}
++
++/// The others' marks over `painter`'s area in the session's shared look: everyone's ghosts, then pointers with their
++/// name tags.
++fn paint(painter: &Painter, all: &[(Color32, String, Marks)]) {
++    let near = painter.clip_rect().expand(4.0);
++    for (color, _, marks) in all {
++        for ghost in &marks.ghosts {
++            let rect = ghost.intersect(near);
++            if rect.is_positive() {
++                painter.rect(rect, 2.0, color.gamma_multiply(GHOST), Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE)), StrokeKind::Inside);
++            }
++        }
++    }
++    for (color, name, marks) in all {
++        let Some(tip) = marks.tip.filter(|p| painter.clip_rect().contains(*p)) else { continue };
++        let arrow = |at: Pos2| ARROW.iter().map(|&(x, y)| at + vec2(x, y)).collect::<Vec<_>>();
++        painter.add(Shape::convex_polygon(arrow(tip + vec2(0.0, 1.0)), Color32::from_black_alpha(64), Stroke::NONE));
++        painter.add(Shape::convex_polygon(arrow(tip), *color, Stroke::new(1.5, Color32::WHITE)));
++        let mut at = tip + vec2(12.0, 15.0);
++        for text in [Some(name.as_str()), marks.value.as_deref()].into_iter().flatten().filter(|t| !t.is_empty()) {
++            let galley = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(12.0), ink(*color));
++            let pad = vec2(7.0, 3.0);
++            let tag = Rect::from_min_size(pos2(at.x.round(), at.y.round()), galley.size() + 2.0 * pad);
++            painter.rect_filled(tag, 6.0, *color);
++            painter.galley(tag.min + pad, galley, ink(*color));
++            at.y = tag.bottom() + 2.0;
++        }
++    }
++}
+diff --git a/crates/prowave-app/src/live/tests.rs b/crates/prowave-app/src/live/tests.rs
+new file mode 100644
+index 0000000..091a2d7
+--- /dev/null
++++ b/crates/prowave-app/src/live/tests.rs
+@@ -0,0 +1,63 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++use super::*;
++use kit::Live as _;
++use crate::model::{Note, Project, TrackKind};
++
++fn app() -> App {
++    let project = Project::demo();
++    App {
++        saved: crate::file_commands::content(&project),
++        history: crate::undo::History::new(&project),
++        project,
++        ui: crate::UiState::new(),
++        sync: None,
++        path: None,
++        native_menu: None,
++        bench: None,
++        shots: None,
++        frames_since_record: 0,
++    }
++}
++
++#[test]
++fn views_stay_personal_and_edits_to_different_things_both_stay() {
++    let mut a = app();
++    let base = a.live_document();
++    // Personal settings and views are not in the document.
++    a.project.position_beats = 33.0;
++    a.project.cycle = !a.project.cycle;
++    a.project.tracks[2].height = 3.0;
++    a.project.selected_track = 4;
++    assert_eq!(kit::canonical(&a.live_document()), kit::canonical(&base));
++
++    // One person moves a note of the first region and adds a track in front; the other changes another note of that
++    // region and the volume of the last track.
++    let notes = |a: &App| a.project.tracks[0].regions[0].notes.clone();
++    a.project.tracks[0].regions[0].notes[0].pitch += 1;
++    a.project.tracks.insert(0, crate::model::Track::new("Aux 1", TrackKind::Aux));
++    let mine = a.live_document();
++    a.live_adopt(base.clone()).unwrap();
++    assert_eq!(a.project.position_beats, 33.0, "adopting keeps the playhead");
++    assert_eq!(a.project.tracks[2].height, 3.0, "and the track heights");
++    let last = a.project.tracks.len() - 1;
++    a.project.tracks[last].volume_db = -20.0;
++    let louder: &mut Note = &mut a.project.tracks[0].regions[0].notes[5];
++    louder.vel = 33;
++    let theirs = a.live_document();
++
++    let merged = merge(&base, &mine, &theirs).unwrap();
++    a.live_adopt(merged.clone()).unwrap();
++    assert_eq!(a.project.tracks[0].name, "Aux 1");
++    assert_eq!(a.project.tracks.last().unwrap().volume_db, -20.0, "the volume landed on its own track");
++    let got = notes(&app());
++    let now = &a.project.tracks[1].regions[0].notes;
++    assert_eq!(now.len(), got.len());
++    assert!(now.iter().any(|n| n.vel == 33) && now.iter().any(|n| n.pitch == got[0].pitch + 1));
++    // The adopted document reads back to the same bytes: nobody proposes a fix-up.
++    assert_eq!(kit::canonical(&a.live_document()), kit::canonical(&merged));
++
++    // The same note changed by both is a conflict, not a mix of the two.
++    a.live_adopt(base.clone()).unwrap();
++    a.project.tracks[0].regions[0].notes[0].pitch += 2;
++    assert!(merge(&base, &mine, &a.live_document()).is_err());
++}
