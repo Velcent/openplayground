@@ -267,10 +267,10 @@ index 0000000..b217a51
 +//! Files: the editor asks for paths through rfd's blocking dialogs. In the browser the `rfd` and `craft_settings`
 +//! names in the editor are these shims, and files go through the page's `globalThis.playgroundFiles` (Playground's
 +//! browser storage, with "From computer…" and downloads):
-+//!   Open, Link package     the explorer opens; the picked files land in the in-memory file system
-+//!                          (crate::playground::std::fs) and the editor's own open_file / link_package runs again,
++//!   Open, Add graphs       the explorer opens; the picked files land in the in-memory file system
++//!                          (crate::playground::std::fs) and the editor's own open_file / add_graph_file runs again,
 +//!                          now getting them;
-+//!   Save As, Publish       Save As asks "keep in browser storage / download"; kept files are `browser:/…` paths that
++//!   Save As                Save As asks "keep in browser storage / download"; kept files are `browser:/…` paths that
 +//!                          Save writes back to; a file from the computer saves as a download;
 +//!   bitmaps, SVG, fonts,   pick_file answers at once with a path under Imports/ that the picked file fills a moment
 +//!   meshes                 later (the graph then evaluates again);
@@ -292,7 +292,6 @@ index 0000000..b217a51
 +    Open,
 +    Link,
 +    SaveAs,
-+    Publish,
 +}
 +
 +#[derive(Default)]
@@ -362,7 +361,7 @@ index 0000000..b217a51
 +            self.ask(Ask::Open)
 +        }
 +        pub fn pick_file(self) -> Option<PathBuf> {
-+            if self.exts.iter().any(|e| e == "mcg" || e == "mca") {
++            if self.exts.iter().any(|e| e == "sbs") {
 +                return self.ask(Ask::Link)?.into_iter().next();
 +            }
 +            with(|s| {
@@ -373,8 +372,7 @@ index 0000000..b217a51
 +            })
 +        }
 +        pub fn save_file(self) -> Option<PathBuf> {
-+            let ask = if self.exts.iter().any(|e| e == "mca") { Ask::Publish } else { Ask::SaveAs };
-+            self.ask(ask)?.into_iter().next()
++            self.ask(Ask::SaveAs)?.into_iter().next()
 +        }
 +        pub fn pick_folder(self) -> Option<PathBuf> {
 +            Some(PathBuf::from(DOWNLOADS))
@@ -533,9 +531,9 @@ index 0000000..b217a51
 +        if let Some((ask, exts, name)) = with(|s| s.request.take()) {
 +            match ask {
 +                Ask::Open | Ask::Link => later("open", vec![object(&[("types", types(&exts))])], move |v| answer(ask, arrived(&v))),
-+                Ask::SaveAs | Ask::Publish => {
++                Ask::SaveAs => {
 +                    app.goto_root();
-+                    let text = if ask == Ask::Publish { app.g.publish().unwrap_or_default() } else { app.g.to_text() };
++                    let text = materialcraft::sbs_native::save_text(&app.g).unwrap_or_default();
 +                    let name = app.file.as_ref().and_then(|f| f.file_stem()).zip(exts.first()).map(|(s, e)| format!("{}.{e}", s.to_string_lossy())).unwrap_or(name);
 +                    let args = object(&[("name", name.into()), ("types", types(&exts)), ("bytes", bytes(text.as_bytes()))]);
 +                    later("saveAs", vec![args], move |v| answer(ask, get(&v, "path").as_string().map(PathBuf::from).into_iter().collect()));
@@ -552,9 +550,8 @@ index 0000000..b217a51
 +        }
 +        match with(|s| s.answer.as_ref().map(|a| a.0)) {
 +            Some(Ask::Open) => app.open_file(),
-+            Some(Ask::Link) => app.link_package(),
++            Some(Ask::Link) => app.add_graph_file(app.pkg_active),
 +            Some(Ask::SaveAs) => app.save_as(),
-+            Some(Ask::Publish) => app.publish(),
 +            None => {}
 +        }
 +        // (an editor function that returned before its dialog leaves the answer unused)

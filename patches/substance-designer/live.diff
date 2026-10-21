@@ -32,7 +32,7 @@ index 0000000..928f755
 +
 +use super::{auto_layout_if_unplaced, App, Graph, Node, Screen};
 +use eframe::egui;
-+use materialcraft::graph::{b64_decode, b64_encode, Comment, Exposed, Link};
++use materialcraft::graph::{b64_decode, b64_encode, Comment, Exposed};
 +use playground_live::{Error, Live, Presence};
 +use serde_json::{json, Map, Value};
 +use std::collections::{HashMap, HashSet};
@@ -87,7 +87,6 @@ index 0000000..928f755
 +        "height": g.height,
 +        "seed_offset": g.seed_offset,
 +        "meta": g.meta,
-+        "links": g.links.iter().map(|l| json!([l.name, l.path, l.graph])).collect::<Vec<_>>(),
 +        "resources": g.resources.iter().map(|(k, v)| (k.clone(), Value::from(b64_encode(v)))).collect::<Map<_, _>>(),
 +        "nodes": nodes,
 +        "outputs": g.outputs,
@@ -96,7 +95,7 @@ index 0000000..928f755
 +            "id": format!("{}.{}", e.node, e.param), "label": e.label, "node": e.node, "param": e.param, "min": num(e.min), "max": num(e.max),
 +        })).collect::<Vec<_>>(),
 +        "comments": g.comments.iter().map(|c| json!({"text": c.text, "pos": pair(c.pos), "size": pair(c.size), "color": c.color})).collect::<Vec<_>>(),
-+        "subgraphs": g.subgraphs.iter().filter(|(k, _)| !g.managed.contains(*k)).map(|(k, s)| (k.clone(), graph_json(s))).collect::<Map<_, _>>(),
++        "subgraphs": g.subgraphs.iter().map(|(k, s)| (k.clone(), graph_json(s))).collect::<Map<_, _>>(),
 +    })
 +}
 +
@@ -142,9 +141,6 @@ index 0000000..928f755
 +    g.seed_offset = v["seed_offset"].as_u64().and_then(|s| u32::try_from(s).ok()).unwrap_or(0);
 +    for (k, s) in entries(&v["meta"]) {
 +        g.meta.insert(k.clone(), str_of(s)?);
-+    }
-+    for l in items(&v["links"]) {
-+        g.links.push(Link { name: str_of(&l[0])?, path: str_of(&l[1])?, graph: l[2].as_str().map(str::to_owned) });
 +    }
 +    for (k, s) in entries(&v["resources"]) {
 +        g.resources.insert(k.clone(), b64_decode(s.as_str().unwrap_or_default())?.into());
@@ -549,7 +545,8 @@ index 0000000..acb4e26
 +#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 +
 +use super::{connected, with_ctx, Live, Presence};
-+use super::super::{card_body, pdefs, slots, App, Graph, Screen, BAR, CARD, CARD_H, PK};
++use super::super::{card_body, node_slots, sd_outs, App, Graph, Screen, BAR, CARD, CARD_H};
++use materialcraft::params::{pdefs, PK};
 +use eframe::egui::{self, epaint::CubicBezierShape, vec2, Color32, FontId, LayerId, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2};
 +use serde_json::{json, Value};
 +use std::cell::RefCell;
@@ -756,15 +753,9 @@ index 0000000..acb4e26
 +impl Card {
 +    fn of(g: &Graph, id: u32) -> Option<Card> {
 +        let n = g.nodes.get(&id)?;
-+        let sub = n.strs.get("graph").filter(|_| n.kind == "subgraph").and_then(|s| g.subgraphs.get(s));
-+        // A graph node only has input sockets when that graph defines inputs.
-+        let inputs = n.kind != "subgraph" || n.strs.get("graph").and_then(|s| g.subgraphs.get(s)).is_none_or(|sg| sg.nodes.values().any(|x| x.kind == "input"));
-+        let slots: Vec<&'static str> = if inputs { slots(&n.kind).into_iter().map(|s| s.0).collect() } else { Vec::new() };
-+        let outs = sub
-+            .map(|sg| sg.output_idents())
-+            .filter(|o| o.len() >= 2)
-+            .unwrap_or_else(|| materialcraft::graph::node_outputs(&n.kind).iter().map(|s| s.to_string()).collect());
-+        Some(Card { pos: n.pos, dot: n.kind == "dot", body: card_body(slots.len(), outs.len()), slots, outs })
++        let slots: Vec<&'static str> = node_slots(n, &g.subgraphs).into_iter().map(|s| s.0).collect();
++        let outs = sd_outs(n, &g.subgraphs);
++        Some(Card { pos: n.pos, dot: n.kind == "sbs:passthrough", body: card_body(slots.len(), outs.len()), slots, outs })
 +    }
 +
 +    fn size(&self) -> Vec2 {
