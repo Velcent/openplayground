@@ -780,6 +780,20 @@ index 0000000..f851b31
 +            _ => Err(Error),
 +        })
 +    }
++
++    /// The builder arboard's rich flavours come from.
++    pub fn get(&mut self) -> Get {
++        Get
++    }
++}
++
++pub struct Get;
++
++impl Get {
++    /// The browser's rich flavour is not read: the Paste falls back to the words.
++    pub fn html(self) -> Result<String, Error> {
++        Err(Error)
++    }
 +}
 +
 +/// The Paste: `None` when the browser's clipboard has arrived (read it now); otherwise what to say meanwhile, having
