@@ -785,6 +785,19 @@ index 0000000..f851b31
 +    pub fn get(&mut self) -> Get {
 +        Get
 +    }
++
++    /// The builder arboard's rich writes come from (copying goes through egui and the browser, not here).
++    pub fn set(&mut self) -> Set {
++        Set
++    }
++}
++
++pub struct Set;
++
++impl Set {
++    pub fn html(self, _html: String, _alt_text: Option<String>) -> Result<(), Error> {
++        Err(Error)
++    }
 +}
 +
 +pub struct Get;
