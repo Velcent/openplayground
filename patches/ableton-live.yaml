@@ -45,9 +45,6 @@
 - file: crates/als/Cargo.toml
   find: '(?![\s\S])'
   after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nsuhina-playground = { path = \"../playground\" }\n"
-- file: crates/device-bundle/Cargo.toml
-  find: '(?![\s\S])'
-  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nsuhina-playground = { path = \"../playground\" }\n"
 - file: crates/device-sdk/Cargo.toml
   find: '(?![\s\S])'
   after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nsuhina-playground = { path = \"../playground\" }\n"
@@ -92,9 +89,6 @@
 # writer stay out: they hand std's File to crates that take that one, and never run here). If upstream starts using
 # these in another module, give it the same line; a missing one panics at the first clock or file call.
 - file: crates/als/src/lib.rs
-  find: '(?![\s\S])'
-  after: "\n// Playground's browser build: the clock, files and threads (patches/ableton-live.yaml).\n#[cfg(target_arch = \"wasm32\")] use suhina_playground::std;\n"
-- file: crates/device-bundle/src/lib.rs
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: the clock, files and threads (patches/ableton-live.yaml).\n#[cfg(target_arch = \"wasm32\")] use suhina_playground::std;\n"
 - file: crates/device-sdk/src/lib.rs
@@ -362,8 +356,8 @@
   after: "\n    #[cfg(target_arch = \"wasm32\")] crate::app::live::pan(painter, column.track, knob_rect);"
 - live: true
   file: crates/ui/src/detail/detail_view.rs
-  find: 'if\s+response\.as_ref\(\)\.is_some_and\(\|response\|\s*response\.changed\(\)\s*\|\|\s*response\.drag_stopped\(\)\)\s*\{'
-  before: "#[cfg(target_arch = \"wasm32\")] crate::app::live::param(painter, track, &device.at.value(), &parameter.id, slider_rect, value, parameter.min, parameter.max, response.as_ref().is_some_and(|r| r.dragged()));\n            "
+  find: 'if\s+let\s+Some\(response\)\s*=\s*response\.filter\(\|r\|\s*r\.changed\(\)\s*\|\|\s*r\.drag_stopped\(\)\)\s*\{'
+  before: "#[cfg(target_arch = \"wasm32\")] crate::app::live::param(painter, track, &at.value(), &parameter.id, slider_rect, value, parameter.min, parameter.max, response.as_ref().is_some_and(|r| r.dragged()));\n    "
 - live: true
   file: apps/suhina-web/src/main.rs
   find: '(?![\s\S])'
