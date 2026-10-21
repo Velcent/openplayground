@@ -29,7 +29,7 @@
   "fusion-360": "v0.18.2+2f4e7ef6",
   "fusion-360@head": "head-55587f4+2f4e7ef6",
   "substance-painter@head": "head-71e49fd+db9a8bc5",
-  "substance-designer@head": "head-c90ec55+a5768007",
+  "substance-designer@head": "head-d3a4217+a5768007",
   "pro-tools": "v0.10.0+7e088015",
   "pro-tools@head": "head-e894076+7e088015",
   "fl-studio": "v0.0.1-web.9",
@@ -38,7 +38,7 @@
   "ableton-live@head": "head-dddc6ed+7c796e60",
   "logic-pro@head": "head-7030233+613fcb91",
   "figma": "v0.8.0+bfef1be6",
-  "figma@head": "head-96a82ed+bfef1be6",
+  "figma@head": "head-bb532a5+bfef1be6",
   "mspaint": "v0.1.0+34cee1de",
   "mspaint@head": "head-f128ca0+34cee1de",
   "artcraft-store": "dff1898"
