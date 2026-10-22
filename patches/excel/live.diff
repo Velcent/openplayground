@@ -217,7 +217,7 @@ index 0000000..a1f83df
 +            let r = sel.current();
 +            json!({"move": RangeRef::new(to, to.offset_clamped(i64::from(r.height()) - 1, i64::from(r.width()) - 1)).a1()})
 +        }
-+        Drag::Fill { target: Some(t) } => json!({"fill": t.a1()}),
++        Drag::Fill { target: Some(t), .. } => json!({"fill": t.a1()}),
 +        Drag::ResizeCol { col, .. } => json!({"col": col, "width": round(sh.col_width(col).into())}),
 +        Drag::ResizeRow { row, .. } => json!({"row": row, "height": round(sh.row_height(row).into())}),
 +        Drag::MoveCols { before: Some(before), .. } => json!({"before": before}),

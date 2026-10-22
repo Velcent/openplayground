@@ -137,14 +137,16 @@
 #   build, so AutoSave could never fire there.
 # How: the wasm arm returns Date.now() through WEB_NOW_MS, a fn pointer the bridge (rule 7) sets.
 # Verify: turn AutoSave on for a browser-storage workbook, edit a cell, wait ~3 s: the stored file updates.
-# If upstream changes: if now_ms gets a real wasm clock, delete this.
+#   Newer head's now_ms already reads Date.now on wasm (core::date::unix_now_ms); there the hook is only a
+#   preferred override, kept so the bridge compiles on both channels.
+# If upstream changes: once every channel has a real wasm clock, delete this and the bridge's WEB_NOW_MS line.
 - file: crates/ui-egui/src/lib.rs
-  find: '(pub fn now_ms\(\) -> f64 \{[\s\S]*?#\[cfg\(target_arch = "wasm32"\)\]\s*\{\s*)0\.0'
+  find: '(pub fn now_ms\(\) -> f64 \{\s*)(?:((?:(?!\n\}\n)[\s\S])*?#\[cfg\(target_arch = "wasm32"\)\]\s*\{\s*)(0\.0)|(gridcraft_engine::core::date::unix_now_ms\(\)\.unwrap_or\(0\.0\)))'
   replace: |-
     /// playground (patches/excel.yaml): the browser clock (`Date.now`), set by the web crate's bridge.
     pub static WEB_NOW_MS: std::sync::OnceLock<fn() -> f64> = std::sync::OnceLock::new();
 
-    $1WEB_NOW_MS.get().map_or(0.0, |now| now())
+    $1$2WEB_NOW_MS.get().map_or($3$4, |now| now())
 
 # Rule 6/7: switch it on at startup.
 # What it's for: the control channel Save As answers come back on, and the bridge (rule 7) installed.
