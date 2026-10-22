@@ -111,5 +111,5 @@
 # "Closed here" and a click opens it again. If upstream moves Recent, anchor on the start page's next section.
 - live: true
   file: crates/ui-egui/src/home.rs
-  find: '^\s*section\(\s*ui\s*,[^;\n]*[Rr]ecent[^;\n]*;'
+  find: '^[ \t]*(?:FileView::)?section\(\s*ui\s*,[^\n]*[Rr]ecent'
   before: "#[cfg(target_arch = \"wasm32\")] if let Some(list) = crate::LIVE_HOME.get() { list(app, ui); }\n"
