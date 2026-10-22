@@ -1076,7 +1076,7 @@ index 0000000..f58c9ea
 +    let text = view.selection_quads(info).filter(|_| pressed && gesture.is_none());
 +    let page = match gesture {
 +        Some(Gesture::Draw { page, .. } | Gesture::Move { page, .. } | Gesture::Resize { page, .. }) => *page,
-+        None => (text.as_ref().map(|(page, _)| *page))
++        _ => (text.as_ref().map(|(page, _)| *page))
 +            .or_else(|| hover.and_then(|p| view.visible_page_rects().into_iter().find(|(_, r)| r.contains(p)).map(|(page, _)| page)))
 +            .unwrap_or(view.current),
 +    };
@@ -1144,7 +1144,7 @@ index 0000000..f58c9ea
 +                }
 +            }
 +        }
-+        None => {}
++        _ => {}
 +    }
 +    if let Some((_, quads)) = &text {
 +        let bbox = |q: &[f64; 8]| {
