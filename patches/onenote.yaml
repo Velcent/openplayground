@@ -91,6 +91,11 @@
 - file: crates/ui-egui/src/app.rs
   find: 'rfd::FileDialog::new\(\)[^;]*?\.pick_folder\(\)'
   replace: '({ #[cfg(not(target_arch = "wasm32"))] { $& } #[cfg(target_arch = "wasm32")] { None::<std::path::PathBuf> } })'
+# The import dialogs (import_notebook_folder, import_file) build a dialog value first; on wasm a local `rfd` module
+# with a FileDialog that picks nothing shadows the crate's name, so those calls compile and do nothing.
+- file: crates/ui-egui/src/app.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: rfd has no dialogs on wasm (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")]\nmod rfd {\n    pub struct FileDialog;\n    impl FileDialog {\n        pub fn new() -> Self { FileDialog }\n        pub fn set_title(self, _: impl Into<String>) -> Self { self }\n        pub fn set_directory(self, _: impl AsRef<std::path::Path>) -> Self { self }\n        pub fn pick_folder(self) -> Option<std::path::PathBuf> { None }\n        pub fn pick_file(self) -> Option<std::path::PathBuf> { None }\n    }\n}\n"
 
 # Rule 17/28: upstream pins its toolchain (rust-toolchain.toml, profile minimal), which rustup installs without the
 # wasm target: CI then fails with "can't find crate for `core`". The pin also asks for the target here.
