@@ -25,7 +25,11 @@
 # upstream's); uuid (accesskit, human-panic) takes the browser's random numbers.
 - file: crates/prowave-app/Cargo.toml
   find: '(?![\s\S])'
-  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nprowave-playground = { path = \"../prowave-playground\" }\nuuid = { version = \"1\", features = [\"js\"] }\nwasm-bindgen = \"0.2\"\nwasm-bindgen-futures = \"0.4\"\njs-sys = \"0.3\"\nweb-sys = { version = \"0.3\", features = [\"Window\", \"Document\", \"Element\", \"HtmlCanvasElement\", \"console\"] }\n"
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nprowave-playground = { path = \"../prowave-playground\" }\nuuid = { version = \"1\", features = [\"js\"] }\nwasm-bindgen = \"0.2\"\nwasm-bindgen-futures = \"0.4\"\njs-sys = \"0.3\"\ngetrandom = { version = \"0.3\", features = [\"wasm_js\"] }\nring = { version = \"0.17\", features = [\"wasm32_unknown_unknown_js\"] }\nrustls-pki-types = { version = \"1\", features = [\"web\"] }\nweb-sys = { version = \"0.3\", features = [\"Window\", \"Document\", \"Element\", \"HtmlCanvasElement\", \"console\"] }\n"
+# getrandom 0.3 (ahash, ring) has no wasm backend unless the `wasm_js` feature (above) and this cfg are both on.
+- file: .cargo/config.toml
+  find: '(?![\s\S])'
+  after: "\n[target.wasm32-unknown-unknown]\nrustflags = [\"--cfg\", \"getrandom_backend=\\\"wasm_js\\\"\"]\n"
 - file: crates/prowave-engine/Cargo.toml
   find: '(?![\s\S])'
   after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nprowave-playground = { path = \"../prowave-playground\" }\ncpal = { version = \"*\", features = [\"wasm-bindgen\"] }\n"
@@ -79,7 +83,7 @@
 # follow.
 - file: crates/prowave-app/src/main.rs
   find: '(?![\s\S])'
-  after: "\n// Playground's browser build (patches/logic-pro.yaml).\n#[cfg(target_arch = \"wasm32\")] mod web;\n#[cfg(target_arch = \"wasm32\")] use web::eframe;\n"
+  after: "\n// Playground's browser build (patches/logic-pro.yaml).\n#[cfg(target_arch = \"wasm32\")] mod web;\n#[cfg(target_arch = \"wasm32\")] use web::{eframe, rfd};\n"
 - file: crates/prowave-app/src/main.rs
   find: '\bfn\s+init_logging\s*\(\s*\)\s*\{'
   after: "\n    #[cfg(target_arch = \"wasm32\")] return;"

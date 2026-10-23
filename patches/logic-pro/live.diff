@@ -757,7 +757,6 @@ index 0000000..53bbb92
 +    let pointer = ui.ctx().pointer_latest_pos();
 +    let down = ui.input(|i| i.pointer.any_down());
 +    let p = &app.project;
-+    let bpb = p.beats_per_bar();
 +    let region_ids = |(t, r): (usize, usize)| ids.get(t).and_then(|(tid, rids)| Some([*tid, *rids.get(r)?]));
 +
 +    // Mine.
@@ -794,8 +793,7 @@ index 0000000..53bbb92
 +        let from = |r: Option<Rect>| pressed.zip(r).is_some_and(|(at, r)| r.contains(at));
 +        if let Some((t, ri)) = app.ui.tracks.selected.filter(|_| from(frame.lanes.as_ref().map(|l| l.rect))) {
 +            if let (Some(ids), Some(region)) = (region_ids((t, ri)), p.tracks.get(t).and_then(|t| t.regions.get(ri))) {
-+                let start = (f64::from(region.start_bar) - 1.0) * bpb;
-+                mine.insert("region".into(), json!([ids[0], ids[1], start, f64::from(region.len_bars) * bpb]));
++                mine.insert("region".into(), json!([ids[0], ids[1], p.region_start_beats(region), p.region_len_beats(region)]));
 +            }
 +        }
 +        if let Some(pr) = frame.piano.as_ref().filter(|pr| from(Some(pr.grid))) {
