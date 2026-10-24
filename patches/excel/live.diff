@@ -112,6 +112,10 @@ index 0000000..a1f83df
 +#[path = "playground_live.rs"]
 +pub mod playground_live;
 +
++// DocState::new for a made-here workbook, which differs by channel (livedoc.diff, livedoc.head.diff).
++#[path = "live_doc.rs"]
++mod live_doc;
++
 +use std::cell::{Cell as Flag, RefCell};
 +use std::sync::Arc;
 +
@@ -734,7 +738,7 @@ index 0000000..a1f83df
 +            let found = SHARED.with_borrow(|sh| sh.docs.iter().find(|d| d.id == id).map(|d| ((*d.wb).clone(), d.title.clone())));
 +            let Some((wb, title)) = found else { return false };
 +            let active = s.active_index();
-+            let i = s.add_document(DocState::new(wb, None, title));
++            let i = s.add_document(live_doc::new_doc(wb, title));
 +            let uid = s.documents()[i].uid;
 +            SHARED.with_borrow_mut(|sh| sh.docs.iter_mut().filter(|d| d.id == id).for_each(|d| d.uid = Some(uid)));
 +            s.set_active(active);
@@ -939,7 +943,7 @@ index 0000000..a1f83df
 +                }),
 +                (None, Some((_, last))) => Some(Doc { id, uid: None, wb: wb.map_or(last, Arc::new), title }),
 +                (None, None) => {
-+                    let i = s.add_document(DocState::new(wb.unwrap_or_default(), None, title.clone()));
++                    let i = s.add_document(live_doc::new_doc(wb.unwrap_or_default(), title.clone()));
 +                    s.set_active(active);
 +                    let d = &s.documents()[i];
 +                    Some(Doc { id, uid: Some(d.uid), wb: d.wb.clone(), title })

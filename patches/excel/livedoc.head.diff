@@ -1,0 +1,10 @@
+diff --git a/crates/ui-egui/src/live_doc.rs b/crates/ui-egui/src/live_doc.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/ui-egui/src/live_doc.rs
+@@ -0,0 +1,5 @@
++use gridcraft_engine::DocState;
++
++pub fn new_doc(wb: gridcraft_engine::model::Workbook, title: String) -> DocState {
++    DocState::new(wb, None, title, gridcraft_engine::Trust::Local)
++}
