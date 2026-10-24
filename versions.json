@@ -7,7 +7,7 @@
   "indesign@head": "head-5449bc4+98b07899",
   "lightroom": "v0.13.0+049ffc3b",
   "lightroom@head": "head-4ae3089+049ffc3b",
-  "lightroom-classic": "v26.43.5+b58bf3d3",
+  "lightroom-classic": "v26.43.6+b58bf3d3",
   "lightroom-classic@head": "head-8c0de9c+b58bf3d3",
   "premiere": "v0.12.0+100671b2",
   "premiere@head": "head-fa550ce+100671b2",
@@ -38,7 +38,7 @@
   "ableton-live@head": "head-3067d90+6ff1fb75",
   "logic-pro@head": "head-bd4a4aa+5a740ce6",
   "figma": "v0.10.0+bfef1be6",
-  "figma@head": "head-e3e39bb+bfef1be6",
+  "figma@head": "head-70227e3+bfef1be6",
   "mspaint": "v0.1.0+34cee1de",
   "mspaint@head": "head-f128ca0+34cee1de",
   "artcraft-store": "dff1898"
