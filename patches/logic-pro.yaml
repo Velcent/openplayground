@@ -20,7 +20,7 @@
 #                                  in it still comes from the real std).
 # Native builds see none of this: every rule adds wasm-only lines.
 
-# Rules 1-3/18: the wasm-only dependencies, each in a table under a target spelling nobody else uses (`all(...)`), so
+# Rules 1-4/28: the wasm-only dependencies, each in a table under a target spelling nobody else uses (`all(...)`), so
 # it never meets one of upstream's. cpal's `wasm-bindgen` feature is its Web Audio host (the version follows
 # upstream's); uuid (accesskit, human-panic) takes the browser's random numbers.
 - file: crates/prowave-app/Cargo.toml
@@ -37,10 +37,12 @@
   find: '(?![\s\S])'
   after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nprowave-playground = { path = \"../prowave-playground\" }\n"
 
-# Rules 4-11/18: the modules that use the clock, files, threads, the temp folder or the process id take `std` from
+# Rules 5-20/28: the modules that use the clock, files, threads, the temp folder or the process id take `std` from
 # crates/prowave-playground on wasm (see the top). Found with: every non-test module that names Instant, SystemTime,
-# fs::, File::, thread::spawn, env:: or process::id. If upstream starts using these in another module, give it the
-# same line; a missing one panics at the first clock, file or thread call.
+# fs::, File::, thread::spawn, env:: or process::id, except prowave-engine's mapped.rs (memory maps, which upstream
+# already leaves out on wasm) and updater.rs (off on the web, rule 25). If upstream starts using these in another
+# module, give it the same line; a missing one panics at the first clock, file or thread call (Pro Wave then never gets
+# past "Loading Pro Wave…").
 - file: crates/prowave-engine/src/disk.rs
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: the files, and the streaming done in turns (patches/logic-pro.yaml).\n#[cfg(target_arch = \"wasm32\")] use prowave_playground::std;\n#[cfg(target_arch = \"wasm32\")] mod web;\n#[cfg(target_arch = \"wasm32\")] pub(crate) use web::pump;\n"
@@ -65,8 +67,32 @@
 - file: crates/prowave-app/src/ui_scale.rs
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: settings in memory (patches/logic-pro.yaml).\n#[cfg(target_arch = \"wasm32\")] use prowave_playground::std;\n"
+- file: crates/prowave-engine/src/flex.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/logic-pro.yaml).\n#[cfg(target_arch = \"wasm32\")] use prowave_playground::std;\n"
+- file: crates/prowave-app/src/main.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (MIDI time code), the files and the temp folder (patches/logic-pro.yaml).\n#[cfg(target_arch = \"wasm32\")] use prowave_playground::std;\n"
+- file: crates/prowave-app/src/midi_in.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/logic-pro.yaml).\n#[cfg(target_arch = \"wasm32\")] use prowave_playground::std;\n"
+- file: crates/prowave-app/src/midi_out.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/logic-pro.yaml).\n#[cfg(target_arch = \"wasm32\")] use prowave_playground::std;\n"
+- file: crates/prowave-app/src/mtc_in.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/logic-pro.yaml).\n#[cfg(target_arch = \"wasm32\")] use prowave_playground::std;\n"
+- file: crates/prowave-app/src/scripter.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/logic-pro.yaml).\n#[cfg(target_arch = \"wasm32\")] use prowave_playground::std;\n"
+- file: crates/prowave-app/src/flex_edit.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files, the temp folder and the process id (patches/logic-pro.yaml).\n#[cfg(target_arch = \"wasm32\")] use prowave_playground::std;\n"
+- file: crates/prowave-app/src/midi_file.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/logic-pro.yaml).\n#[cfg(target_arch = \"wasm32\")] use prowave_playground::std;\n"
 
-# Rules 12-13/18: disk streaming on the web (crates/prowave-engine/src/disk/web.rs): no thread is started, and the
+# Rules 21-22/28: disk streaming on the web (crates/prowave-engine/src/disk/web.rs): no thread is started, and the
 # engine reads the clips in turns before each block it renders. If upstream renames `DiskThread::spawn` or
 # `EngineCore::process`, follow.
 - file: crates/prowave-engine/src/disk.rs
@@ -76,8 +102,9 @@
   find: '\bpub\s+fn\s+process\s*\(\s*&mut\s+self\s*,\s*out\s*:\s*&mut\s*\[f32\]\s*\)\s*\{'
   after: "\n        #[cfg(target_arch = \"wasm32\")] crate::disk::pump();"
 
-# Rules 14-18/18: the app. main runs as on the desktop with `eframe` from web.rs (its `run_native` starts the page);
-# the log goes nowhere on the web (its timestamps would read the clock std lacks); the desktop's graphics choice
+# Rules 23-28/28: the app. main runs as on the desktop with `eframe` from web.rs (its `run_native` starts the page);
+# the log goes nowhere on the web (its timestamps would read the clock std lacks); no automatic update check (Playground
+# serves new builds; the check would read the clock and start a thread at startup); the desktop's graphics choice
 # (which probes OpenGL) is the page's default; File > Open… and Save As… use Playground's dialogs; and the window
 # has no buttons of its own (minimize, maximize, close) in a browser tab. If upstream renames what these anchor on,
 # follow.
@@ -87,6 +114,9 @@
 - file: crates/prowave-app/src/main.rs
   find: '\bfn\s+init_logging\s*\(\s*\)\s*\{'
   after: "\n    #[cfg(target_arch = \"wasm32\")] return;"
+- file: crates/prowave-app/src/updater.rs
+  find: '\bpub\s+fn\s+auto_enabled\s*\(\s*\)\s*->\s*bool\s*\{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")] return false;"
 - file: crates/prowave-app/src/graphics.rs
   find: '\bpub\s+fn\s+config\s*\(\s*\)\s*->\s*WgpuConfiguration\s*\{'
   after: "\n    #[cfg(target_arch = \"wasm32\")] return WgpuConfiguration::default();"
