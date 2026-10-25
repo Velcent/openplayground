@@ -881,6 +881,17 @@ index 0000000..66fc0d7
 +    use picasso_core::{MediaItem, Rational};
 +    use std::sync::Arc;
 +
++    /// The browser decides how a `<video>` is decoded: the switch is kept only to answer the desktop's API.
++    static HARDWARE_DECODING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
++
++    pub fn set_hardware_decoding(enabled: bool) {
++        HARDWARE_DECODING.store(enabled, std::sync::atomic::Ordering::Relaxed);
++    }
++
++    pub fn hardware_decoding() -> bool {
++        HARDWARE_DECODING.load(std::sync::atomic::Ordering::Relaxed)
++    }
++
 +    pub struct VideoDecoder {
 +        source: JsValue,
 +        ctx: web_sys::CanvasRenderingContext2d,
