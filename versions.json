@@ -6,7 +6,7 @@
   "indesign": "v0.12.0+98b07899",
   "indesign@head": "head-dcce40f+98b07899",
   "lightroom": "v0.13.0+049ffc3b",
-  "lightroom@head": "head-31ec62c+049ffc3b",
+  "lightroom@head": "head-03c88c1+049ffc3b",
   "lightroom-classic": "v26.43.7+96dfb08a",
   "lightroom-classic@head": "head-b6e13ed+96dfb08a",
   "premiere": "v0.12.0+100671b2",
@@ -31,7 +31,7 @@
   "substance-painter@head": "head-71e49fd+db9a8bc5",
   "substance-designer@head": "head-8611344+7a755e84",
   "pro-tools": "v0.12.1+7e088015",
-  "pro-tools@head": "head-353ea14+7e088015",
+  "pro-tools@head": "head-01b3985+7e088015",
   "fl-studio": "v0.0.1-web.10",
   "fl-studio-mobile": "v0.3.3+394aa42a",
   "fl-studio-mobile@head": "head-9797e7b+394aa42a",
@@ -41,6 +41,6 @@
   "figma@head": "head-22c15e3+bfef1be6",
   "mspaint": "v0.1.0+34cee1de",
   "mspaint@head": "head-f128ca0+34cee1de",
-  "paint-net": "v0.1.3",
+  "paint-net": "v0.1.4",
   "artcraft-store": "dff1898"
 }
