@@ -273,8 +273,11 @@ export class PeerSession extends EventTarget {
   }
   async raw(peer, data, channel = peer.channel) {
     if (channel?.readyState !== 'open') throw new Error('Peer disconnected')
-    const deadline = Date.now() + 15000
+    // Stalled: no byte has left for a minute. Time counts from the last progress, not from the start: a relayed link
+    // drains a large message in bursts, with pauses of half a minute between them.
+    let deadline = Date.now() + 60000, left = channel.bufferedAmount
     while (channel.bufferedAmount > 262144) {
+      if (channel.bufferedAmount < left) { left = channel.bufferedAmount; deadline = Date.now() + 60000 }
       if (channel.readyState !== 'open' || Date.now() > deadline) throw new Error('Transfer stalled; reconnect to resume')
       await sleep(10)
     }
