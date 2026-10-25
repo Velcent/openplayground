@@ -65,7 +65,10 @@ const canvas = document.createElement('canvas')
 canvas.className = 'shader-bg'
 canvas.setAttribute('aria-hidden', 'true')
 document.body.prepend(canvas)
-const gl = canvas.getContext('webgl', { antialias: false })
+// No context (and so the plain background) when WebGL would run on the CPU: with hardware acceleration off, or after
+// the browser gave up on the GPU, the shader drawn in software takes the browser's GPU process, which also draws the
+// browser itself, and the whole browser stalls.
+const gl = canvas.getContext('webgl', { antialias: false, failIfMajorPerformanceCaveat: true })
 
 if (gl) {
   const shader = (type, src) => {
