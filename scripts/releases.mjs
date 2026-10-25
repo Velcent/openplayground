@@ -40,14 +40,14 @@ export const alternativeIcon = (t) => ['svg', 'png'].map((ext) => `icons/alterna
 // The version of a tool on a channel, as { release, asset }, or null when the channel has none (a repo
 // without web releases has no release channel).
 //   release: the newest upstream release (or its pinned `tag:`) with a web build, and that build's asset;
-//   head: the newest commit on its `branch:` (default main), or the newest that changed one of its `paths:`,
-//         with `ref` (the commit), `label` (<branch>@<commit>) and `date`, and no asset: only build.mjs
-//         can make its build.
+//   head: the newest commit on its `branch:` (default main), or the newest that changed one of its `paths:`, or
+//         its pinned `commit:`, with `ref` (the commit), `label` (<branch>@<commit>) and `date`, and no asset:
+//         only build.mjs can make its build.
 export const resolveVersion = async (t, channel) => {
   if (channel === 'head') {
     if (t.build === false) return null
     const branch = t.branch ?? 'main'
-    const newest = await Promise.all(
+    const newest = t.commit ? await github(`repos/${t.repo}/commits/${t.commit}`) : await Promise.all(
       (t.paths ?? ['']).map((p) => github(`repos/${t.repo}/commits?sha=${branch}&per_page=1${p ? `&path=${encodeURIComponent(p)}` : ''}`)),
     ).then((lists) => lists.flat().sort((a, b) => b.commit.committer.date.localeCompare(a.commit.committer.date))[0])
     if (!newest) return null

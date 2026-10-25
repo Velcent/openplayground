@@ -9,6 +9,7 @@
 #           the newest pre-release that has one, for repos that have only pre-releases so far)
 #   branch: the branch the head channel builds (optional; default: main)
 #   paths:  only commits changing these paths count as new head versions (optional; default: any)
+#   commit: pins the head channel to this commit (optional; for an upstream whose newer commits dropped its web version)
 #   asset:  regex matching the release asset name (optional; default: "-web-.*\.zip$")
 #   alternative: the commercial app it's an open-source alternative to, shown as "Alternative to …" and
 #           under the dashboard's "Alternative naming". Its icon there is icons/alternatives/<slug>.png: the product's
@@ -281,6 +282,9 @@ groups:
         imports: []
         repo: Aalzard/subcraft
         license: MIT OR Apache-2.0
+        # Pinned: upstream removed its browser version right after this commit (4c3aacf, "Remove the browser version …
+        # (ADR-0038)"), so newer commits have no web build. patches/substance-painter.yaml fits this commit.
+        commit: 71e49fde7e4e1dba188a6589c9e5a139d1e3d9d5
         patches: patches/substance-painter.yaml
         live: crates/ui/src
         icon: icons/subcraft.png

@@ -1,4 +1,15 @@
 # SubCraft: its diffs (patches/substance-painter/) and the live adapter (tools.yaml live:) apply, then these rules.
+#   Its head channel is pinned (tools.yaml `commit:`): upstream removed the browser version right after.
+
+# The compositor's texture cache times its work with std's clock, which panics on wasm32-unknown-unknown ("time not
+# implemented on this platform", the app never starts): on the web it takes web-time's (a workspace dependency the
+# other crates use already). Native builds keep std's.
+- file: crates/compositor/src/cache.rs
+  find: '^use\s+std::time::\{Duration,\s*Instant\};'
+  replace: "#[cfg(not(target_arch = \"wasm32\"))]\nuse std::time::{Duration, Instant};\n#[cfg(target_arch = \"wasm32\")]\nuse web_time::{Duration, Instant};"
+- file: crates/compositor/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nweb-time.workspace = true\n"
 
 # Live editing in Playground sessions (patches/substance-painter/live.diff + patches/live/playground_live.rs)
 # What it's for: people in a Playground session paint one project together (layer trees, painted tiles, images and the
