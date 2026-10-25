@@ -1,22 +1,29 @@
-# SoundCraft: its diffs (patches/pro-tools/) and the live adapter (tools.yaml live:) apply, then these rules.
+# SoundCraft: its diffs (patches/pro-tools/) and the playground-live crate (tools.yaml live_kit) apply, then these rules.
 
-# Live editing in Playground sessions (patches/pro-tools/live.diff + patches/live/playground_live.rs)
+# Live editing in Playground sessions (patches/pro-tools/live.diff + the playground-live crate, tools.yaml `live_kit`)
 # The adapter lives in new files: crates/ui-egui/src/edit_window/live.rs (the shared document, merge, media, presence,
 # Undo and the session-switch guard) and apps/soundcraft-web/src/web/live.rs (the kept runner and the shell that ends
 # each frame with the session's frame hook and the others drawn over the Mix window, plug-in windows and the MIDI Editor's velocity lane). These rules only declare them and call in; most append at the end of a file or
 # follow a function's signature. Verify: node scripts/build.mjs check pro-tools head|release, then the e2e
-# (tests/live-apps/pro-tools.mjs). If upstream renames a function named below, anchor on its new signature.
+# (tests/live-apps/pro-tools.mjs) and `cargo test -p soundcraft-ui-egui --lib live::`. If upstream renames a function
+# named below, anchor on its new signature.
 #
-# The template in the model crate, everywhere (native builds never call it; ui-egui's native tests use it), and its
-# wasm dependencies under a target spelling nobody else uses.
+# The playground-live crate (patches/live/kit: the session and the presence look the others are drawn with)
+# re-exported from the model crate under its old module name, everywhere (native builds never call it; ui-egui's native
+# tests use it), so every crate reaches it there; the crate as a dependency of the model crate, and of ui-egui with its
+# look (`egui`).
 - live: true
   file: crates/model/src/lib.rs
   find: '(?![\s\S])'
-  after: "\n// Live editing in a Playground session (patches/live/playground_live.rs).\npub mod playground_live;\n"
+  after: "\n// Live editing in a Playground session (the playground-live crate, patches/live/kit).\npub use ::playground_live;\n"
 - live: true
   file: crates/model/Cargo.toml
-  find: '(?![\s\S])'
-  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\njs-sys = \"0.3\"\nwasm-bindgen = \"0.2\"\n"
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\" }\n"
+- live: true
+  file: crates/ui-egui/Cargo.toml
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 # Session::alloc, the one id allocator: while connected, an id nobody else adding something at once picks.
 - live: true
   file: crates/model/src/session.rs

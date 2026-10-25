@@ -1,23 +1,25 @@
 diff --git a/apps/deckcraft-web/src/live.rs b/apps/deckcraft-web/src/live.rs
 new file mode 100644
-index 0000000..9b96448
+index 0000000..4254b6a
 --- /dev/null
 +++ b/apps/deckcraft-web/src/live.rs
-@@ -0,0 +1,1117 @@
-+//! Playground live editing (`playground_live`): the shared document is the session's presentations, `{documents: [{id,
-+//! name, ...presentation}]}`: the one active when the session started (or that a joiner's active window takes) and each
-+//! one opened, created or imported since by anyone, which opens behind the others' own. Each is its model as JSON
-+//! (written as the native save writes it, non-finite numbers as 0) with its media's bytes and without the id counter, the
-+//! drawing guides or this person's views (selection, current slide, zoom, panes). Closing one is personal: the session
-+//! goes on with it, and File › Home lists the session's presentations to go to or open again. Native undo history stays
-+//! local; while connected, Undo and Redo of the session's presentations go to the session.
+@@ -0,0 +1,1039 @@
++//! Playground live editing (the playground-live crate, patches/live/kit): the shared document is the session's
++//! presentations, `{documents: [{id, name, ...presentation}]}`: the one active when the session started (or that a
++//! joiner's active window takes) and each one opened, created or imported since by anyone, which opens behind the others'
++//! own. Each is its model as JSON (written as the native save writes it, non-finite numbers as 0) with its media's bytes
++//! and without the id counter, the drawing guides or this person's views (selection, current slide, zoom, panes). Closing
++//! one is personal: the session goes on with it, and File › Home lists the session's presentations to go to or open
++//! again. Native undo history stays local; while connected, Undo and Redo of the session's presentations go to the
++//! session.
 +//!
 +//! Presence: the presentation and slide each person shows, their pointer on it (slide points), their selected shapes and
 +//! what they are doing before it reaches the document (shapes moved, resized or rotated, a shape or text box being drawn,
 +//! ink or a freeform path), drawn over the others' slides in their color and eased toward where they are; each slide's
-+//! thumbnail (the Slides pane, the Slide Sorter) shows a badge with the initial of each other person on it. Typing needs
-+//! nothing of its own: each keystroke edits the document (between keystrokes the app is quiet), so it reaches the others
-+//! at once.
++//! thumbnail (the Slides pane, the Slide Sorter) shows a badge with the initial of each other person on it. Pointers, name
++//! tags, ghosts, outlines, colors and the easing are the kit's ([`kit`]); lines, rubber bands, strokes and the badges are
++//! DeckCraft's own, in the kit's colors. Typing needs nothing of its own: each keystroke edits the document (between
++//! keystrokes the app is quiet), so it reaches the others at once.
 +//!
 +//! Upstream calls in through hooks (rules in patches/powerpoint.yaml): `deckcraft_engine::LIVE_UNDO` at the top of
 +//! `Session::execute`, `deckcraft_model::LIVE_ALLOC` at the top of `Presentation::alloc_id`, `deckcraft_ui_egui::LIVE_PAINT`
@@ -27,9 +29,6 @@ index 0000000..9b96448
 +// The frame hook and drawing run in the browser only.
 +#![cfg_attr(test, allow(dead_code))]
 +
-+#[path = "playground_live.rs"]
-+#[allow(dead_code)]
-+pub mod playground_live;
 +mod finite;
 +
 +use deckcraft_engine::cmd::{base64_decode, base64_encode, xfrm_of};
@@ -43,11 +42,12 @@ index 0000000..9b96448
 +use egui::epaint::PathShape;
 +use egui::{Align2, Color32, Painter, Pos2, Rect, RichText, Sense, Shape, Stroke, pos2, vec2};
 +use finite::Finite;
-+use playground_live::{Live, Presence};
++use playground_live::{Live, Presence, presence as kit};
 +use serde::Deserialize as _;
 +use serde_json::{Value, json};
++use std::borrow::{Borrow, BorrowMut};
 +use std::cell::{Cell, RefCell};
-+use std::collections::BTreeMap;
++use std::collections::{BTreeMap, HashMap};
 +use std::sync::Arc;
 +
 +pub const FORMAT: &str = concat!("powerpoint:2:", env!("CARGO_PKG_VERSION"));
@@ -58,12 +58,6 @@ index 0000000..9b96448
 +const MAX_STROKE: usize = 200;
 +/// The shell sends no presence over 4 KiB.
 +const MAX_PRESENCE: usize = 4000;
-+/// Names in tags are cut to this many characters.
-+const MAX_NAME: usize = 24;
-+/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
-+const EASE: f64 = 0.08;
-+/// A pointer's arrow, tip first: egui fills a closed path as a fan from its first point, which this shape allows.
-+const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [12.5, 11.0], [7.3, 11.0], [10.4, 17.3], [7.6, 18.6], [4.5, 12.2], [0.0, 16.0]];
 +/// A thumbnail's badges: their side, their gap, their inset from the image's top right, how many show (the last one
 +/// "+N" when more are on the slide) and how long one takes to fade in (seconds).
 +const BADGE: f32 = 16.0;
@@ -75,15 +69,28 @@ index 0000000..9b96448
 +thread_local! {
 +    /// The session's presentations as this page knows them.
 +    static SHARED: RefCell<Shared> = RefCell::new(Shared::default());
-+    /// A pointer is down or a text field (the notes, a ribbon box) has the keyboard.
-+    static UI_BUSY: Cell<bool> = const { Cell::new(false) };
 +    static CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
 +    /// This person's pointer over the canvas, in slide points, as of the last frame.
 +    static POINTER: Cell<Option<[f64; 2]>> = const { Cell::new(None) };
-+    /// The others in the session, as they last showed themselves.
-+    static OTHERS: RefCell<Vec<Peer>> = const { RefCell::new(Vec::new()) };
-+    /// When the others' marks were last drawn (egui's clock): easing goes by the time that passed, however slow frames are.
-+    static DRAWN: Cell<f64> = const { Cell::new(0.0) };
++    /// When each other person's badge first showed on the slide they are on (egui's clock), by person: (doc, slide, time).
++    static ARRIVED: RefCell<HashMap<String, (u64, u64, f64)>> = RefCell::default();
++}
++
++/// The app as the session sees it: [`Live`] is the playground-live crate's and SlideApp the UI crate's, so the trait
++/// goes on this, around what holds the app (the web shell; the app itself in tests), which it reaches through.
++pub struct Peer<T>(pub T);
++
++impl<T: Borrow<SlideApp>> std::ops::Deref for Peer<T> {
++    type Target = SlideApp;
++    fn deref(&self) -> &SlideApp {
++        self.0.borrow()
++    }
++}
++
++impl<T: BorrowMut<SlideApp>> std::ops::DerefMut for Peer<T> {
++    fn deref_mut(&mut self) -> &mut SlideApp {
++        self.0.borrow_mut()
++    }
 +}
 +
 +/// The session's presentations on this page: the one active when it started (or that it joined into), and every one
@@ -118,12 +125,14 @@ index 0000000..9b96448
 +    let _ = deckcraft_ui_egui::LIVE_THUMB.set(badges);
 +}
 +
-+/// The end of a frame. `kept`: the slide rect from before the frame, put back when the canvas was not drawn (the
-+/// caller cleared it so a drawn canvas shows).
-+pub fn frame(app: &mut SlideApp, ui: &egui::Ui, kept: Option<Rect>) {
-+    let ctx = ui.ctx();
-+    UI_BUSY.set(ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input());
++/// The end of a frame, after the canvas drew the others (name tags in DeckCraft's bold): the presence look's frame
++/// ended (so moving marks keep easing), then the session's frame hook. `kept`: the slide rect from before the frame, put
++/// back when the canvas was not drawn (the caller cleared it so a drawn canvas shows).
++pub fn frame<T: BorrowMut<SlideApp>>(peer: &mut Peer<T>, ui: &egui::Ui, kept: Option<Rect>) {
++    let (ctx, app) = (ui.ctx(), &mut **peer);
 +    CTX.with_borrow_mut(|c| _ = c.get_or_insert_with(|| ctx.clone()));
++    kit::set_font(theme::bold(12.0));
++    kit::end_frame(ctx);
 +    let canvas = app.canvas_rect.zip(app.slide_rect).map(|(canvas, slide)| (canvas, slide.min, app.canvas_scale));
 +    if app.slide_rect.is_none() {
 +        app.slide_rect = kept;
@@ -134,7 +143,7 @@ index 0000000..9b96448
 +        let at = |v: f32, o: f32| round(f64::from((v - o) / scale));
 +        Some([at(p.x, origin.x), at(p.y, origin.y)])
 +    }));
-+    playground_live::frame(app);
++    playground_live::frame(peer);
 +}
 +
 +pub fn repaint() {
@@ -415,74 +424,6 @@ index 0000000..9b96448
 +    (kept.len() >= 2).then(|| (kept.iter().flatten().map(|v| round(*v)).collect(), round(width)))
 +}
 +
-+/// Another person as they last showed themselves, with their moving marks where this canvas last drew them (slide
-+/// points), eased toward where they are: the pointer, the moved shapes' ghosts, the rubber band, and the stroke ([its
-+/// length, how far its shown end is behind its newest point]; a length of infinity: not seen yet, shown whole at once),
-+/// and when their badge first showed on their slide's thumbnail (egui's clock; NaN: not yet).
-+struct Peer {
-+    who: Presence,
-+    pointer: Option<[f64; 2]>,
-+    ghosts: Vec<Ghost>,
-+    band: Option<([f64; 4], u8)>,
-+    ink: [f64; 2],
-+    arrived: f64,
-+}
-+
-+/// A moved shape's ghost: (id, [x, y, w, h, rot], flags).
-+type Ghost = (u32, [f64; 5], u8);
-+
-+impl Peer {
-+    /// One frame on toward this person's latest state (`k`: the share of the way, `z`: screen points a slide point,
-+    /// `far`: the jump in screen points that goes at once). Whether a mark is still on its way.
-+    fn step(&mut self, k: f64, z: f64, far: f64) -> bool {
-+        let state = &self.who.state;
-+        let mut moving = false;
-+        match (&mut self.pointer, pointer_at(&state["pointer"])) {
-+            (Some(s), Some(t)) => moving |= ease(s, &t, k, z, far),
-+            (s, t) => *s = t,
-+        }
-+        let mut ghosts = ghosts_at(&state["drag"]);
-+        for (id, t, _) in &mut ghosts {
-+            if let Some((_, s, _)) = self.ghosts.iter().find(|g| g.0 == *id) {
-+                // A rotation goes the short way round.
-+                t[4] = s[4] + (t[4] - s[4] + 540.0).rem_euclid(360.0) - 180.0;
-+                let mut at = *s;
-+                moving |= ease(&mut at, t, k, z, far);
-+                *t = at;
-+            }
-+        }
-+        self.ghosts = ghosts;
-+        match (&mut self.band, band_at(&state["create"])) {
-+            (Some((s, f)), Some((t, g))) if *f == g => moving |= ease(s, &t, k, z, far),
-+            (s, t) => *s = t,
-+        }
-+        let stroke = stroke_at(&state["stroke"]);
-+        if stroke.is_empty() {
-+            self.ink = [0.0; 2];
-+        } else {
-+            let [seen, behind] = &mut self.ink;
-+            let length = length(&stroke);
-+            *behind = (*behind + length - *seen).max(0.0);
-+            *seen = length;
-+            moving |= ease(std::slice::from_mut(behind), &[0.0], k, z, far);
-+        }
-+        moving
-+    }
-+}
-+
-+/// `s` moved `k` of the way to `t` (slide points, `z` screen points each), all of it after a jump of more than `far`
-+/// screen points or once under half a point remains. Whether it is still on its way.
-+fn ease(s: &mut [f64], t: &[f64], k: f64, z: f64, far: f64) -> bool {
-+    let off = |s: &[f64]| s.iter().zip(t).map(|(s, t)| (t - s).abs() * z).fold(0.0, f64::max);
-+    let k = if off(s) > far { 1.0 } else { k };
-+    s.iter_mut().zip(t).for_each(|(s, t)| *s += (t - *s) * k);
-+    let moving = off(s) >= 0.5;
-+    if !moving {
-+        s.copy_from_slice(t);
-+    }
-+    moving
-+}
-+
 +/// A number from another person's presence, if it is one worth drawing.
 +fn number(v: &Value) -> Option<f64> {
 +    v.as_f64().filter(|v| v.abs() < 1e6)
@@ -491,6 +432,9 @@ index 0000000..9b96448
 +fn pointer_at(v: &Value) -> Option<[f64; 2]> {
 +    Some([number(&v[0])?, number(&v[1])?])
 +}
++
++/// A moved shape's ghost: (id, [x, y, w, h, rot], flags).
++type Ghost = (u32, [f64; 5], u8);
 +
 +/// The ghosts of a move (see [`ghosts`]); what does not resolve is left out.
 +fn ghosts_at(v: &Value) -> Vec<Ghost> {
@@ -541,21 +485,28 @@ index 0000000..9b96448
 +    (paths == 1 && n >= 3 && convex).then_some(points)
 +}
 +
++/// Person `who`'s ghost of shape `id` eased toward `to` (`[x, y, w, h, rot]`, `z` screen points a slide point, `far`
++/// the jump that goes at once); it turns the short way round.
++fn eased_ghost(ctx: &egui::Context, who: &str, id: u32, to: [f64; 5], z: f64, far: f64) -> Option<[f64; 5]> {
++    let [x, y, w, h] = kit::ease(ctx, who, &format!("ghost {id}"), [to[0], to[1], to[2], to[3]], [z; 4], [far; 4])?;
++    let rot = kit::ease_angle(ctx, who, &format!("ghost {id} turn"), to[4], z, far)?;
++    Some([x, y, w, h, rot])
++}
++
 +/// A shape moved, resized or rotated, where it is going: its own outline when this page has it and it is convex, else
-+/// its box, filled faintly with an edge; a line as a band along it.
++/// its box, the kit's ghost; a line as a band along it, in the ghost's colors.
 +fn paint_ghost(p: &Painter, xf: Xf, st: &DocState, &(id, at, f): &Ghost, color: Color32) {
 +    let x = xfrm([at[0], at[1], at[2], at[3]], at[4], f);
 +    let a = x.affine();
-+    let edge = Stroke::new(1.5, color.gamma_multiply(0.85));
 +    if f & 4 != 0 {
 +        let ends = [xf.to_screen(a * Point::new(0.0, 0.0)), xf.to_screen(a * Point::new(x.w, x.h))];
 +        p.line_segment(ends, Stroke::new(6.0, color.gamma_multiply(0.28)));
-+        p.line_segment(ends, edge);
++        p.line_segment(ends, Stroke::new(1.5, color.gamma_multiply(0.85)));
 +        return;
 +    }
 +    let corners = || vec![Point::new(0.0, 0.0), Point::new(x.w, 0.0), Point::new(x.w, x.h), Point::new(0.0, x.h)];
 +    let local = st.shape(ShapeId(id)).and_then(|sh| convex_outline(sh, x.w, x.h)).unwrap_or_else(corners);
-+    p.add(PathShape::convex_polygon(local.into_iter().map(|q| xf.to_screen(a * q)).collect(), color.gamma_multiply(0.28), edge));
++    kit::ghost_shape(p, &local.into_iter().map(|q| xf.to_screen(a * q)).collect::<Vec<_>>(), color);
 +}
 +
 +/// A rubber band: its box (or line) dashed.
@@ -588,41 +539,20 @@ index 0000000..9b96448
 +    p.add(PathShape::line(line, Stroke::new(width, color.gamma_multiply(0.7))));
 +}
 +
-+/// A person's selected shapes outlined in `color`: the box DeckCraft outlines its own selection with, or the line.
++/// A person's selected shapes outlined in `color`: the box DeckCraft outlines its own selection with (the kit's
++/// outline), or the line, as wide.
 +fn paint_selection(p: &Painter, xf: Xf, st: &DocState, state: &Value, color: Color32) {
-+    let stroke = Stroke::new(2.0, color);
 +    let ids = state["selection"].as_array().into_iter().flatten().take(MAX_SHOWN);
 +    for sh in ids.filter_map(|id| st.shape(ShapeId(u32::try_from(id.as_u64()?).ok()?))) {
 +        let x = xfrm_of(&st.doc, &st.selection, sh);
 +        let a = x.affine();
 +        let corner = |cx: f64, cy: f64| xf.to_screen(a * Point::new(cx, cy));
 +        if sh.is_line() {
-+            p.line_segment([corner(0.0, 0.0), corner(x.w, x.h)], stroke);
++            p.line_segment([corner(0.0, 0.0), corner(x.w, x.h)], Stroke::new(2.0, color));
 +        } else {
-+            p.add(Shape::closed_line(vec![corner(0.0, 0.0), corner(x.w, 0.0), corner(x.w, x.h), corner(0.0, x.h)], stroke));
++            kit::outline_shape(p, &[corner(0.0, 0.0), corner(x.w, 0.0), corner(x.w, x.h), corner(0.0, x.h)], color);
 +        }
 +    }
-+}
-+
-+/// A pointer: the arrow, its tip at `tip`, in `color` with a white edge and a soft shadow.
-+fn paint_arrow(p: &Painter, tip: Pos2, color: Color32) {
-+    let points: Vec<Pos2> = ARROW.iter().map(|&[x, y]| tip + vec2(x, y)).collect();
-+    let shadow = points.iter().map(|q| *q + vec2(0.0, 1.0)).collect();
-+    p.add(PathShape::convex_polygon(shadow, Color32::from_black_alpha(64), Stroke::NONE));
-+    p.add(PathShape::convex_polygon(points, color, Stroke::new(1.5, Color32::WHITE)));
-+}
-+
-+/// A name tag in `color`, its top left at `at`. Dark text on light colors.
-+fn paint_tag(p: &Painter, at: Pos2, name: &str, color: Color32) {
-+    if name.is_empty() {
-+        return;
-+    }
-+    let name: String = if name.chars().count() > MAX_NAME { name.chars().take(MAX_NAME - 1).chain(['…']).collect() } else { name.into() };
-+    let ink = ink(color);
-+    let text = p.layout_no_wrap(name, theme::bold(12.0), ink);
-+    let r = Rect::from_min_size(at, text.size() + vec2(14.0, 6.0));
-+    p.rect_filled(r, 6.0, color);
-+    p.galley(r.min + vec2(7.0, 3.0), text, ink);
 +}
 +
 +/// Text on `color`: dark on light colors, else white.
@@ -632,60 +562,55 @@ index 0000000..9b96448
 +    if luminance > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE }
 +}
 +
-+fn color(o: &Peer) -> Color32 {
-+    let [r, g, b] = o.who.color;
-+    Color32::from_rgb(r, g, b)
-+}
-+
 +/// The canvas's overlays call it first: the others on this person's presentation and slide, in their colors, under this
 +/// person's own overlays: what they are moving or drawing, then their selections, then their pointers with their names.
-+/// Marks ease toward where they were last shown, repainting until they get there.
++/// Marks ease toward where they were last shown ([`kit::end_frame`], after the frame, repaints until they get there).
 +fn paint(app: &SlideApp, p: &Painter, xf: Xf) {
-+    OTHERS.with_borrow_mut(|others| {
-+        let (Some(doc), Some(st)) = (active_id(&app.session).filter(|_| !others.is_empty()), app.session.active()) else { return };
-+        let Some(slide) = st.doc.slides.get(st.selection.slide).filter(|_| st.selection.target == Target::Slides) else { return };
-+        let on = |s: &Value| s["doc"].as_u64() == Some(doc) && s["slide"].as_u64() == Some(u64::from(slide.id.0));
-+        let mut here: Vec<&mut Peer> = others.iter_mut().filter(|o| on(&o.who.state)).collect();
-+        let now = p.ctx().input(|i| i.time);
-+        let dt = (now - DRAWN.replace(now)).clamp(0.0, 0.1);
-+        let (k, z) = (1.0 - (-dt / EASE).exp(), f64::from(xf.scale));
-+        let far = 0.25 * f64::from(p.clip_rect().width().max(p.clip_rect().height()));
-+        let mut moving = false;
-+        for o in &mut here {
-+            moving |= o.step(k, z, far);
-+        }
-+        if moving {
-+            p.ctx().request_repaint();
-+        }
-+        for o in &here {
-+            for g in &o.ghosts {
-+                paint_ghost(p, xf, st, g, color(o));
-+            }
-+            if let Some(band) = o.band {
-+                paint_band(p, xf, band, color(o));
-+            }
-+            let width = number(&o.who.state["width"]).unwrap_or(0.0);
-+            paint_stroke(p, xf, &stroke_at(&o.who.state["stroke"]), width, o.ink[1], color(o));
-+        }
-+        for o in &here {
-+            paint_selection(p, xf, st, &o.who.state, color(o));
-+        }
-+        for o in &here {
-+            if let Some(at) = o.pointer {
-+                let tip = xf.to_screen(Point::new(at[0], at[1]));
-+                paint_arrow(p, tip, color(o));
-+                paint_tag(p, tip + vec2(12.0, 15.0), &o.who.name, color(o));
++    let others = kit::others();
++    let (Some(doc), Some(st)) = (active_id(&app.session).filter(|_| !others.is_empty()), app.session.active()) else { return };
++    let Some(slide) = st.doc.slides.get(st.selection.slide).filter(|_| st.selection.target == Target::Slides) else { return };
++    let on = |s: &Value| s["doc"].as_u64() == Some(doc) && s["slide"].as_u64() == Some(u64::from(slide.id.0));
++    let here: Vec<&Presence> = others.iter().filter(|o| on(&o.state)).collect();
++    let (ctx, z) = (p.ctx(), f64::from(xf.scale));
++    let far = 0.25 * f64::from(p.clip_rect().width().max(p.clip_rect().height()));
++    for o in &here {
++        let (state, color) = (&o.state, kit::color(o));
++        for (id, to, f) in ghosts_at(&state["drag"]) {
++            if let Some(at) = eased_ghost(ctx, &o.id, id, to, z, far) {
++                paint_ghost(p, xf, st, &(id, at, f), color);
 +            }
 +        }
-+    });
++        // A band whose flags change (a line, a flip) is another one, shown at once.
++        if let Some((to, f)) = band_at(&state["create"])
++            && let Some(at) = kit::ease(ctx, &o.id, &format!("create {f}"), to, [z; 4], [far; 4])
++        {
++            paint_band(p, xf, (at, f), color);
++        }
++        // The stroke shown up to a length that eases toward its whole, so its end follows the pen: a stroke started
++        // while they are seen grows from its start, one under way when first seen shows whole.
++        let stroke = stroke_at(&state["stroke"]);
++        let whole = length(&stroke);
++        let reach = if stroke.is_empty() { 0.0 } else { far };
++        if let Some([shown]) = kit::ease(ctx, &o.id, "ink", [whole], [z], [reach]) {
++            paint_stroke(p, xf, &stroke, number(&state["width"]).unwrap_or(0.0), (whole - shown).max(0.0), color);
++        }
++    }
++    for o in &here {
++        paint_selection(p, xf, st, &o.state, kit::color(o));
++    }
++    for o in &here {
++        if let Some(at) = pointer_at(&o.state["pointer"]).and_then(|to| kit::ease(ctx, &o.id, "pointer", to, [z; 2], [far; 2])) {
++            kit::cursor(p, xf.to_screen(Point::new(at[0], at[1])), kit::color(o), &o.name);
++        }
++    }
 +}
 +
 +/// Who of the others is on each slide of presentation `doc`: slide id → their places in `others`, in session order.
-+fn on_slides(others: &[Peer], doc: u64) -> BTreeMap<u64, Vec<usize>> {
++fn on_slides(others: &[Presence], doc: u64) -> BTreeMap<u64, Vec<usize>> {
 +    let mut on: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
 +    for (k, o) in others.iter().enumerate() {
-+        if o.who.state["doc"].as_u64() == Some(doc)
-+            && let Some(slide) = o.who.state["slide"].as_u64()
++        if o.state["doc"].as_u64() == Some(doc)
++            && let Some(slide) = o.state["slide"].as_u64()
 +        {
 +            on.entry(slide).or_default().push(k);
 +        }
@@ -699,36 +624,33 @@ index 0000000..9b96448
 +fn badges(app: &SlideApp, ui: &egui::Ui, img: Rect, i: usize) {
 +    let (Some(doc), Some(st)) = (active_id(&app.session), app.session.active()) else { return };
 +    let Some(slide) = st.doc.slides.get(i).map(|s| u64::from(s.id.0)) else { return };
++    let others = kit::others();
++    let Some(on) = on_slides(&others, doc).remove(&slide) else { return };
 +    let now = ui.input(|inp| inp.time);
-+    OTHERS.with_borrow_mut(|others| {
-+        let Some(on) = on_slides(others, doc).remove(&slide) else { return };
-+        let shown = if on.len() > MAX_BADGES { MAX_BADGES - 1 } else { on.len() };
-+        let mut right = img.right() - BADGE_INSET;
-+        let mut badge = |n: usize, label: String, fill: Color32, alpha: f32, tip: String| {
-+            let r = Rect::from_min_size(pos2(right - BADGE, img.top() + BADGE_INSET), vec2(BADGE, BADGE));
-+            right -= BADGE + BADGE_GAP;
-+            let p = ui.painter();
-+            p.rect_filled(r, 0.0, fill.gamma_multiply(alpha));
-+            p.text(r.center(), Align2::CENTER_CENTER, label, theme::bold(10.5), ink(fill).gamma_multiply(alpha));
-+            ui.interact(r, ui.id().with(("live-badge", i, n)), Sense::hover()).on_hover_text(tip);
-+        };
-+        for (n, &k) in on[..shown].iter().enumerate() {
-+            let o = &mut others[k];
-+            if o.arrived.is_nan() {
-+                o.arrived = now;
-+            }
-+            let alpha = ((now - o.arrived) / BADGE_FADE).clamp(0.0, 1.0) as f32;
-+            if alpha < 1.0 {
-+                ui.ctx().request_repaint();
-+            }
-+            let initial = o.who.name.chars().next().map_or_else(|| "?".into(), |c| c.to_uppercase().collect());
-+            badge(n, initial, color(o), alpha, o.who.name.clone());
++    let shown = if on.len() > MAX_BADGES { MAX_BADGES - 1 } else { on.len() };
++    let mut right = img.right() - BADGE_INSET;
++    let mut badge = |n: usize, label: String, fill: Color32, alpha: f32, tip: String| {
++        let r = Rect::from_min_size(pos2(right - BADGE, img.top() + BADGE_INSET), vec2(BADGE, BADGE));
++        right -= BADGE + BADGE_GAP;
++        let p = ui.painter();
++        p.rect_filled(r, 0.0, fill.gamma_multiply(alpha));
++        p.text(r.center(), Align2::CENTER_CENTER, label, theme::bold(10.5), ink(fill).gamma_multiply(alpha));
++        ui.interact(r, ui.id().with(("live-badge", i, n)), Sense::hover()).on_hover_text(tip);
++    };
++    for (n, &k) in on[..shown].iter().enumerate() {
++        let o = &others[k];
++        let arrived = ARRIVED.with_borrow_mut(|a| a.entry(o.id.clone()).or_insert((doc, slide, now)).2);
++        let alpha = ((now - arrived) / BADGE_FADE).clamp(0.0, 1.0) as f32;
++        if alpha < 1.0 {
++            kit::keep_moving();
 +        }
-+        if on.len() > shown {
-+            let names: Vec<&str> = on[shown..].iter().map(|&k| others[k].who.name.as_str()).collect();
-+            badge(shown, format!("+{}", names.len()), Color32::from_gray(0x55), 1.0, names.join("\n"));
-+        }
-+    });
++        let initial = o.name.chars().next().map_or_else(|| "?".into(), |c| c.to_uppercase().collect());
++        badge(n, initial, kit::color(o), alpha, o.name.clone());
++    }
++    if on.len() > shown {
++        let names: Vec<&str> = on[shown..].iter().map(|&k| others[k].name.as_str()).collect();
++        badge(shown, format!("+{}", names.len()), Color32::from_gray(0x55), 1.0, names.join("\n"));
++    }
 +}
 +
 +/// File › Home in a session: the session's presentations, a row each with dots in the colors of the others on it; a
@@ -742,7 +664,7 @@ index 0000000..9b96448
 +    if rows.is_empty() {
 +        return false;
 +    }
-+    let (t, here) = (Tokens::get(ui.ctx()), active_id(&app.session));
++    let (t, here, others) = (Tokens::get(ui.ctx()), active_id(&app.session), kit::others());
 +    ui.label(RichText::new("In this session").font(theme::bold(16.0)).color(t.text));
 +    ui.add_space(6.0);
 +    let width = ui.available_width().min(720.0);
@@ -762,15 +684,14 @@ index 0000000..9b96448
 +        icons::paint(p, Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(22.0, 22.0)), Icon::Slide, t.text, false);
 +        p.text(pos2(rect.left() + 44.0, rect.center().y - 8.0), Align2::LEFT_CENTER, &title, theme::font(13.0), t.text);
 +        p.text(pos2(rect.left() + 44.0, rect.center().y + 9.0), Align2::LEFT_CENTER, note, theme::font(11.0), t.text_dim);
-+        let names = OTHERS.with_borrow(|others| {
-+            let on = others.iter().filter(|o| o.who.state["doc"].as_u64() == Some(id));
-+            on.enumerate()
-+                .map(|(k, o)| {
-+                    p.circle(pos2(rect.right() - 16.0 - 16.0 * k as f32, rect.center().y), 5.0, color(o), Stroke::new(1.5, Color32::WHITE));
-+                    o.who.name.clone()
-+                })
-+                .collect::<Vec<_>>()
-+        });
++        let on = others.iter().filter(|o| o.state["doc"].as_u64() == Some(id));
++        let names: Vec<String> = on
++            .enumerate()
++            .map(|(k, o)| {
++                p.circle(pos2(rect.right() - 16.0 - 16.0 * k as f32, rect.center().y), 5.0, kit::color(o), Stroke::new(1.5, Color32::WHITE));
++                o.name.clone()
++            })
++            .collect();
 +        let resp = if names.is_empty() { resp } else { resp.on_hover_text(names.join(", ")) };
 +        if resp.clicked() {
 +            chosen = Some((id, uid));
@@ -793,7 +714,7 @@ index 0000000..9b96448
 +    true
 +}
 +
-+impl Live for SlideApp {
++impl<T: BorrowMut<SlideApp>> Live for Peer<T> {
 +    /// `{ documents: [{ id, name, ...presentation }] }`: every presentation of the session, open here or not.
 +    fn live_document(&self) -> Value {
 +        sync(&self.session);
@@ -852,7 +773,7 @@ index 0000000..9b96448
 +    }
 +
 +    fn live_quiet(&self) -> bool {
-+        !UI_BUSY.get()
++        kit::quiet()
 +            && !self.session.tool.dragging()
 +            && !self.session.tool.drawing_freeform()
 +            && self.session.documents().iter().all(|d| d.interaction.is_none() && d.composition.is_none())
@@ -926,19 +847,13 @@ index 0000000..9b96448
 +        v
 +    }
 +
-+    /// Who is still on the same presentation and slide keeps their marks where they were drawn, to ease on from there.
++    /// Who is still on the same presentation and slide keeps their badge's arrival, so it fades in only where they arrive.
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        OTHERS.with_borrow_mut(|old| {
-+            *old = (others.into_iter())
-+                .map(|who| {
-+                    let place = |s: &Value| (s["doc"].clone(), s["slide"].clone());
-+                    let same = |o: &&Peer| o.who.id == who.id && place(&o.who.state) == place(&who.state);
-+                    let kept = old.iter().find(same).map(|o| (o.pointer, o.ghosts.clone(), o.band, o.ink, o.arrived));
-+                    let (pointer, ghosts, band, ink, arrived) = kept.unwrap_or((None, Vec::new(), None, [f64::INFINITY, 0.0], f64::NAN));
-+                    Peer { who, pointer, ghosts, band, ink, arrived }
-+                })
-+                .collect();
-+        });
++        let stayed = |id: &String, (doc, slide): (u64, u64)| {
++            others.iter().any(|o| o.id == *id && o.state["doc"].as_u64() == Some(doc) && o.state["slide"].as_u64() == Some(slide))
++        };
++        ARRIVED.with_borrow_mut(|a| a.retain(|id, &mut (doc, slide, _)| stayed(id, (doc, slide))));
++        kit::show(others);
 +    }
 +}
 +
@@ -947,12 +862,12 @@ index 0000000..9b96448
 +    use super::*;
 +    use deckcraft_engine::model::chart::ChartPart;
 +    use deckcraft_engine::model::{DrawGuide, ShapeKind};
-+    use deckcraft_engine::{EngineError, Interaction, Mods, PointerEvent, PointerKind};
++    use deckcraft_engine::{EngineError, Mods, PointerEvent, PointerKind};
 +    use deckcraft_ui_egui::Services;
 +    use playground_live::canonical;
 +
-+    fn sample() -> Result<SlideApp, String> {
-+        let mut app = SlideApp::new(Session::new(), Services::default());
++    fn sample() -> Result<Peer<SlideApp>, String> {
++        let mut app = Peer(SlideApp::new(Session::new(), Services::default()));
 +        deckcraft_engine::sample::open_sample(&mut app.session).map_err(|e| e.to_string())?;
 +        Ok(app)
 +    }
@@ -977,10 +892,12 @@ index 0000000..9b96448
 +        let mut a = sample()?;
 +        // A chart with package parts from a file, which the JSON leaves out.
 +        let chart = a.session.execute("insert.chart", &json!({})).map_err(e)?["id"].as_u64().unwrap_or_default();
++        // From JSON, so fields newer upstream adds take their defaults.
++        let part: ChartPart = serde_json::from_value(json!({"name": "ppt/embeddings/Workbook.xlsx", "contentType": "xlsx", "bytes": [1, 2]})).map_err(|e| e.to_string())?;
 +        a.session.edit(|d, _| {
 +            let shape = find_shape_mut(&mut Arc::make_mut(&mut d.slides[0]).shapes, ShapeId(chart as u32));
 +            if let Some(ShapeKind::Chart(c)) = shape.map(|s| &mut s.kind) {
-+                c.kept.parts.push(ChartPart { name: "ppt/embeddings/Workbook.xlsx".into(), content_type: "xlsx".into(), bytes: vec![1, 2] });
++                c.kept.parts.push(part);
 +            }
 +            Ok(())
 +        })
@@ -1006,6 +923,9 @@ index 0000000..9b96448
 +        a.session.pointer(at(PointerKind::Down, 30.0, 505.0)).map_err(e)?;
 +        a.session.pointer(at(PointerKind::Drag, 50.0, 465.0)).map_err(e)?;
 +        assert_eq!(ghosts_at(&a.live_presence()["drag"]), [(ids[2], [20.0, 430.0, 960.0, 70.0, 0.0], 0)]);
++        // The engine's own record of a gesture under way, held again below.
++        let gesture = a.session.doc().map_err(e)?.interaction.clone();
++        assert!(gesture.is_some());
 +        a.session.pointer(at(PointerKind::Drag, 30.0, 505.0)).map_err(e)?;
 +        a.session.pointer(at(PointerKind::Up, 30.0, 505.0)).map_err(e)?;
 +        assert!(a.live_presence().get("drag").is_none(), "no ghost at rest");
@@ -1040,7 +960,7 @@ index 0000000..9b96448
 +        let to = done.clone();
 +        playground_live::queue(Some(start.clone()), edited.clone(), Box::new(move |r| to.set(r.is_ok())));
 +        let st = a.session.doc_mut().map_err(e)?;
-+        st.interaction = Some(Interaction { label: "Move".into(), doc: st.doc.clone(), selection: st.selection.clone() });
++        st.interaction = gesture;
 +        playground_live::frame(&mut a);
 +        assert!(!done.get(), "a gesture under way holds remote changes");
 +        a.session.doc_mut().map_err(e)?.interaction = None;
@@ -1050,7 +970,8 @@ index 0000000..9b96448
 +        let st = a.session.doc().map_err(e)?;
 +        assert_eq!((st.history.undo.len(), &st.selection, st.doc.guides.len()), (undo_steps, &selection, 1));
 +        assert!(Arc::ptr_eq(&st.doc.slides[1], &second), "an unchanged slide keeps its Arc");
-+        assert_eq!((kept(&a), kept(&b)), (Some(1), Some(0)), "parts stay where they were");
++        // (Newer upstream shares the parts too: then b has them as well.)
++        assert_eq!(kept(&a), Some(1), "the chart's parts stay");
 +
 +        // Undo goes to the session; new objects get unused ids unique to this peer.
 +        assert_eq!(a.session.execute("edit.undo", &json!({})).map_err(e)?, Value::Null);
@@ -1060,21 +981,22 @@ index 0000000..9b96448
 +
 +        // Only the session's presentations, each id once, are recorded or installed.
 +        for bad in [json!(null), json!([1]), json!({"slides": 5}), json!({"documents": [{"id": 1, "name": "x", "slides": 5}]})] {
-+            assert!(SlideApp::live_check(&bad).is_err() && a.live_adopt(bad).is_err());
++            assert!(Peer::<SlideApp>::live_check(&bad).is_err() && a.live_adopt(bad).is_err());
 +        }
 +        let one = parse(&edited)?["documents"][0].clone();
-+        assert!(SlideApp::live_check(&json!({"documents": [one.clone(), one]})).is_err());
-+        assert!(SlideApp::live_check(&parse(&edited)?).is_ok());
++        assert!(Peer::<SlideApp>::live_check(&json!({"documents": [one.clone(), one]})).is_err());
++        assert!(Peer::<SlideApp>::live_check(&parse(&edited)?).is_ok());
 +        playground_live::disconnect();
 +        Ok(())
 +    }
 +
 +    #[test]
 +    fn the_slide_strip_badges_the_others_on_each_slide_of_this_presentation() {
-+        let mut a = SlideApp::new(Session::new(), Services::default());
++        let mut a = Peer(SlideApp::new(Session::new(), Services::default()));
 +        let who = |name: &str, doc: u64, slide: u32| Presence { id: name.into(), name: name.into(), color: [1, 2, 3], state: json!({"doc": doc, "slide": slide}) };
 +        a.live_show_presence(vec![who("A", 7, 2), who("B", 7, 3), who("C", 8, 2)]);
-+        let model = OTHERS.with_borrow(|o| on_slides(o, 7).into_iter().map(|(s, on)| (s, on.iter().map(|&k| o[k].who.name.clone()).collect())).collect::<Vec<(u64, Vec<String>)>>());
++        let o = kit::others();
++        let model: Vec<(u64, Vec<String>)> = on_slides(&o, 7).into_iter().map(|(s, on)| (s, on.iter().map(|&k| o[k].name.clone()).collect())).collect();
 +        assert_eq!(model, [(2, vec!["A".to_string()]), (3, vec!["B".to_string()])]);
 +        a.live_show_presence(Vec::new());
 +    }
@@ -1292,15 +1214,16 @@ index 0000000..440fdfc
 +fields!(SerializeStructVariant);
 diff --git a/apps/deckcraft-web/src/web/live.rs b/apps/deckcraft-web/src/web/live.rs
 new file mode 100644
-index 0000000..eff5d58
+index 0000000..da982d0
 --- /dev/null
 +++ b/apps/deckcraft-web/src/web/live.rs
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,79 @@
 +//! Live editing in a Playground session: the page's runner, kept so the session can reach the app, and the shell around
-+//! [`WebShell`] that ends each frame with the session's frame hook (`crate::live`).
++//! [`WebShell`] that ends each frame with the session's frame hook (`crate::live`): the adapter's [`Peer`], which the
++//! session reaches the app through.
 +
 +use super::WebShell;
-+use crate::live::{self as adapter, playground_live};
++use crate::live::{self as adapter, Peer};
 +use deckcraft_ui_egui::SlideApp;
 +use std::cell::OnceCell;
 +
@@ -1317,18 +1240,28 @@ index 0000000..eff5d58
 +/// The app eframe runs: `shell`, offered to the page for live editing.
 +pub(super) fn wrap(shell: WebShell) -> Box<dyn eframe::App> {
 +    adapter::install();
-+    let with_app = |with: &mut dyn FnMut(&mut SlideApp)| {
-+        RUNNER.with(|runner| runner.get().and_then(|r| r.app_mut::<Live>().map(|mut live| with(&mut live.0.app))).is_some())
++    let with_app = |with: &mut dyn FnMut(&mut Peer<WebShell>)| {
++        RUNNER.with(|runner| runner.get().and_then(|r| r.app_mut::<Peer<WebShell>>().map(|mut peer| with(&mut peer))).is_some())
 +    };
-+    if let Err(e) = playground_live::web::attach::<SlideApp>(adapter::FORMAT, with_app, adapter::repaint) {
++    if let Err(e) = playground_live::web::attach::<Peer<WebShell>>(adapter::FORMAT, with_app, adapter::repaint) {
 +        log::error!("live editing unavailable: {e:?}");
 +    }
-+    Box::new(Live(shell))
++    Box::new(Peer(shell))
 +}
 +
-+struct Live(WebShell);
++impl std::borrow::Borrow<SlideApp> for WebShell {
++    fn borrow(&self) -> &SlideApp {
++        &self.app
++    }
++}
 +
-+impl eframe::App for Live {
++impl std::borrow::BorrowMut<SlideApp> for WebShell {
++    fn borrow_mut(&mut self) -> &mut SlideApp {
++        &mut self.app
++    }
++}
++
++impl eframe::App for Peer<WebShell> {
 +    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
 +        self.0.logic(ctx, frame);
 +    }
@@ -1337,7 +1270,7 @@ index 0000000..eff5d58
 +        // Cleared so the slide rect shows whether the canvas was drawn this frame (put back otherwise).
 +        let kept = self.0.app.slide_rect.take();
 +        self.0.ui(ui, frame);
-+        adapter::frame(&mut self.0.app, ui, kept);
++        adapter::frame(self, ui, kept);
 +    }
 +
 +    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {

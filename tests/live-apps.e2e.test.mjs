@@ -4,9 +4,9 @@ import { after, before, test } from 'node:test'
 import { sessionSite } from './session-helpers.mjs'
 import { until } from './helpers.mjs'
 
-// Live editing in real app builds that use patches/live/playground_live.rs (JSON documents). LIVE_PUBLIC is a public
-// directory holding each patched build at its URL path with the shell injected (tests/live-apps/README.md). Each
-// tests/live-apps/<slug>.mjs exports { path, viewport?, ready?(page), editA(page), editB(page), undo(page), ignore? }:
+// Live editing in real app builds that use the playground-live crate (patches/live/kit; JSON documents). LIVE_PUBLIC
+// is a public directory holding each patched build at its URL path with the shell injected (tests/live-apps/README.md).
+// Each tests/live-apps/<slug>.mjs exports { path, viewport?, ready?(page), editA(page), editB(page), undo(page), ignore? }:
 // two edits to different objects, then Undo of the owner's; `ignore` lists path prefixes of allocator counters. An app
 // that keeps media outside the document also exports importMedia(page), which adds one in the owner's browser; one
 // that shows the others' pointers and selections exports point(page), which moves or selects in the owner's; drag(page)
@@ -76,7 +76,7 @@ for (const slug of specs) {
     await follow(a)
     await b.evaluate(async (invite) => { window.session = await PeerSession.join(invite, { name: 'Bob' }) }, invite.editor)
     await follow(b)
-    await until(async () => await status(a) === 'live' && await status(b) === 'live', 30000, 'live editing')
+    await until(async () => await status(a) === 'live' && await status(b) === 'live', app.liveTimeout ?? 30000, 'live editing')
     const start = JSON.parse(await same([a, b], 'the joiner to adopt the owner\'s document'))
 
     if (app.point || app.drag) {

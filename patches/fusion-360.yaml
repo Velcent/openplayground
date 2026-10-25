@@ -54,26 +54,34 @@
   find: 'if design && intent == Intent::Open \{'
   replace: 'if design {'
 
-# Live editing in Playground sessions (patches/fusion-360/live.diff + patches/live/playground_live.rs)
-# The adapter lives in apps/solidcraft-web/src/live.rs (it declares the template): the session's designs and their
-# merge, adoption, ids, Undo's hand-off, presence and the gestures under way (drawn over the viewport at the end of
-# each frame, with dots on the tabs), the start page's "In this session" list, and the app the web runner starts, which
-# ends each frame with the session's hook. A second new file, crates/ui-egui/src/documents_live.rs, gives it the open
-# designs and a tab opened behind the others. The rules below only declare them and call in, each one line at the end
-# of a file, after a function's signature, before a statement or around a call in the web entry. Native builds behave
-# as before: the hooks compile on wasm only (the modules also for the web crate's native tests).
+# Live editing in Playground sessions (patches/fusion-360/live.diff + the playground-live crate, tools.yaml `live_kit`)
+# The adapter lives in apps/solidcraft-web/src/live.rs, on its App around the web entry's Shell (the playground-live
+# crate's Live trait can't go on SolveApp here): the session's designs and their merge, adoption, ids, Undo's hand-off,
+# presence and the gestures under way (drawn over the viewport at the end of each frame, with dots on the tabs:
+# pointers, tags, outlines and easing the kit's, feature ghosts, sketch drags and rubber bands SolidCraft's own), the
+# start page's "In this session" list, and the app the web runner starts (that App), which ends each frame with the
+# session's hook. A second new file, crates/ui-egui/src/documents_live.rs, gives it the open designs and a tab opened
+# behind the others. The rules below only declare them and call in, each one line at the end of a file, after a
+# function's signature, before a statement or around a call in the web entry. Native builds behave as before: the hooks
+# compile on wasm only (the modules also for the web crate's native tests).
 # Verify all: node scripts/build.mjs check fusion-360 head|release, LIVE=0 the same, then the e2e
 # (tests/live-apps/fusion-360.mjs) and `cargo test -p solidcraft-web live::`. If upstream renames a function or type
 # named below, anchor on its new name.
 #
-# The web crate's live module, for the browser and its native tests.
+# The web crate's live module, for the browser and its native tests, and its dependency there: the playground-live
+# crate (patches/live/kit: the session and the presence look, `egui`).
 - live: true
   file: apps/*-web/src/main.rs
   find: '(?![\s\S])'
-  after: "\n// Live editing in a Playground session.\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
-# The web entry keeps its runner for the session, and the app it starts is the Shell wrapped by live::wrap (which
-# delegates every eframe::App method, then runs the session's frame hook, and gives the runner `as_any_mut`). If
-# upstream renames Shell or its `app` field (the SolveApp), follow it here.
+  after: "\n// Live editing in a Playground session (the playground-live crate, patches/live/kit).\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
+- live: true
+  file: apps/*-web/Cargo.toml
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
+# The web entry keeps its runner for the session, and the app it starts is the Shell wrapped by live::wrap in live::App
+# (which delegates every eframe::App method, then runs the session's frame hook, gives the runner `as_any_mut`, and
+# reaches the SolveApp through the two accessors given here). If upstream renames Shell or its `app` field (the
+# SolveApp), follow it here.
 - live: true
   file: apps/*-web/src/main.rs
   find: 'eframe::WebRunner::new\(\)'
@@ -81,7 +89,7 @@
 - live: true
   file: apps/*-web/src/main.rs
   find: 'Ok\(Box::new\((?=\s*Shell\s*\{)'
-  replace: 'Ok(crate::live::wrap(|shell: &mut Shell| &mut shell.app, '
+  replace: 'Ok(crate::live::wrap(|shell: &Shell| &shell.app, |shell: &mut Shell| &mut shell.app, '
 # serde_json for the web crate's native tests (it has it on wasm), under a target spelling nobody else uses.
 - live: true
   file: apps/*-web/Cargo.toml

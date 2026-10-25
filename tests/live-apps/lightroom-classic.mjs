@@ -37,15 +37,21 @@ export default {
     await until(() => page.evaluate(() => !!playgroundLiveAdapter.presence()?.pointer), 10000, 'the pointer on the photo')
   },
   // Holds a drag of Develop's Exposure slider by its thumb (a fresh profile opens in Develop and shows it there at
-  // 1280×800). Shift makes it a fine drag, which moves the value by the pointer's sideways travel only (widgets.rs
-  // `slider`): straight down, the value stays where it is. Presence `adjust` names the slider while it is held; let go,
-  // the interaction ends with nothing changed (Escape would be Back, which leaves the loupe mid-drag).
+  // 1280×800: at (1100, 610) in older builds, at (1168, 602) since upstream's Chromaforge layout; the first that
+  // presence says is held). Shift makes it a fine drag, which moves the value by the pointer's sideways travel only
+  // (widgets.rs `slider`): straight down, the value stays where it is. Presence `adjust` names the slider while it is
+  // held; let go, the interaction ends with nothing changed (Escape would be Back, which leaves the loupe mid-drag).
   drag: async (page) => {
-    await page.mouse.move(1100, 610)
-    await page.keyboard.down('Shift')
-    await page.mouse.down()
-    for (let i = 1; i <= 6; i++) { await page.mouse.move(1100, 610 + 4 * i); await page.waitForTimeout(50) }
-    await page.waitForTimeout(300)
+    for (const [x, y] of [[1100, 610], [1168, 602]]) {
+      await page.mouse.move(x, y)
+      await page.keyboard.down('Shift')
+      await page.mouse.down()
+      for (let i = 1; i <= 6; i++) { await page.mouse.move(x, y + 4 * i); await page.waitForTimeout(50) }
+      await page.waitForTimeout(300)
+      if (await page.evaluate(() => !!playgroundLiveAdapter.presence()?.adjust)) return
+      await page.mouse.up()
+      await page.keyboard.up('Shift')
+    }
   },
   release: async (page) => {
     await page.mouse.up()

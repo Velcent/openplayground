@@ -11,9 +11,9 @@ import { until } from '../helpers.mjs'
 // starts a new design (Ctrl+N) and adds a Box to it, so the session shares it: the editor gets it as a tab behind.
 const VIEWPORT = [700, 450]
 // The top face of the Box a new design gets at its origin, in the default view.
-const BOX_TOP = [830, 368]
+const BOX_TOP = [726, 336]
 // Extrude's distance arrow on that face, in the default view (canvas.rs drag_arrow publishes it as "arrow").
-const ARROW = [830, 330]
+const ARROW = [726, 286]
 const pause = (page) => page.waitForTimeout(400)
 
 async function command(page, query) {
@@ -35,11 +35,15 @@ async function command(page, query) {
 export default {
   path: '/solidcraft/',
   viewport: { width: 1280, height: 800 },
-  // Home's New Design (ui-egui home.rs), once the first frames are drawn, and a Box in it.
+  // Home's New Design (ui-egui home.rs) until Home closes (a click before the first frames are drawn is lost; the
+  // control channel's ui.inspect says), and a Box in it.
   ready: async (page) => {
     await page.waitForTimeout(1500)
-    await page.mouse.click(120, 176)
-    await page.waitForTimeout(800)
+    await until(async () => {
+      await page.mouse.click(442, 264)
+      await page.waitForTimeout(800)
+      return page.evaluate(async () => (await solidcraft.request('ui.inspect')).home === false)
+    }, 30000, 'Home\'s New Design to open a design')
     await command(page, 'Box')
   },
   // A face of the Box selected, the pointer resting on it.

@@ -1,5 +1,5 @@
-# SubCraft: its diffs (patches/substance-painter/) and the live adapter (tools.yaml live:) apply, then these rules.
-#   Its head channel is pinned (tools.yaml `commit:`): upstream removed the browser version right after.
+# SubCraft: its diffs (patches/substance-painter/) and the playground-live crate (tools.yaml `live_kit`) apply, then
+#   these rules. Its head channel is pinned (tools.yaml `commit:`): upstream removed the browser version right after.
 
 # The compositor's texture cache times its work with std's clock, which panics on wasm32-unknown-unknown ("time not
 # implemented on this platform", the app never starts): on the web it takes web-time's (a workspace dependency the
@@ -11,16 +11,19 @@
   find: '(?![\s\S])'
   after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nweb-time.workspace = true\n"
 
-# Live editing in Playground sessions (patches/substance-painter/live.diff + patches/live/playground_live.rs)
+# Live editing in Playground sessions (patches/substance-painter/live.diff + the playground-live crate, tools.yaml
+#   `live_kit`)
 # What it's for: people in a Playground session paint one project together (layer trees, painted tiles, images and the
 #   mesh) and see where the others point on the model and which layer they work on, in each person's color.
 # How: the adapter lives in new files: crates/ui/src/app/live.rs (the binary checkpoint's adapter, Undo, the session
-#   guards, presence, the kept runner and the app that ends each frame with the session's frame hook; it declares the
-#   template, copied next to lib.rs), crates/ui/src/app/live/checkpoint.rs (the canonical checkpoint and its merge),
-#   crates/ui/src/app/live/peers.rs (the others drawn: pointers, strokes and pen paths under way, Layers panel marks)
-#   and crates/app/src/session/live.rs (Session::live_adopt: a document from elsewhere, no undo step of its own).
-#   These rules only declare them and call in, each one line at the end of a file or right after a function's
-#   signature (the Undo/Redo buttons' line is the exception).
+#   guards, presence, the kept runner and the app that ends each frame with the session's frame hook),
+#   crates/ui/src/app/live/checkpoint.rs (the canonical checkpoint and its merge), crates/ui/src/app/live/peers.rs (the
+#   others drawn: pointers, name tags, colours, easing, the selected layer's outline and the into-a-folder ghost the
+#   kit's; strokes and pen paths under way and drop lines SubCraft's own) and crates/app/src/session/live.rs
+#   (Session::live_adopt: a document from elsewhere, no undo step of its own). The playground-live crate
+#   (patches/live/kit) gives the JSON merge, the canonical form, Presence and the presence look; its JSON adapter isn't
+#   used, the checkpoint being binary. These rules only declare them and call in, each one line at the end of a file or
+#   right after a function's signature (the Undo/Redo buttons' line is the exception).
 # Verify: node scripts/build.mjs check substance-painter head (and LIVE=0), then the e2e (LIVE_GPU=1,
 #   tests/live-apps/substance-painter.mjs) and `cargo test -p subcraft-ui --lib app::live`.
 # If upstream changes: if a function named below is renamed, anchor on its new signature; if SubcraftApp, UiState or
@@ -31,11 +34,12 @@
   file: crates/app/src/session.rs
   find: '(?![\s\S])'
   after: "\n// Live editing in a Playground session (subcraft-ui's app::live).\nmod live;\n"
-# The checkpoint's dependencies, for the web and for native tests, under target spellings nobody else uses.
+# The checkpoint's dependencies, and the playground-live crate (patches/live/kit, with its presence look: `egui`), for
+# the web and for native tests, under target spellings nobody else uses.
 - live: true
   file: crates/ui/Cargo.toml
   find: '(?![\s\S])'
-  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nsubcraft-project.workspace = true\nuuid.workspace = true\nflate2 = \"1\"\n\n[target.'cfg(all(not(target_arch = \"wasm32\")))'.dev-dependencies]\nsubcraft-project.workspace = true\nuuid.workspace = true\nflate2 = \"1\"\n"
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nsubcraft-project.workspace = true\nuuid.workspace = true\nflate2 = \"1\"\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n\n[target.'cfg(all(not(target_arch = \"wasm32\")))'.dev-dependencies]\nsubcraft-project.workspace = true\nuuid.workspace = true\nflate2 = \"1\"\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 # The app's adapter module, a child of app.rs so it reaches SubcraftApp's fields (web, and its native tests).
 - live: true
   file: crates/ui/src/app.rs

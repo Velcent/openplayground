@@ -320,20 +320,22 @@
     $&
             playground::report_unsaved(self.app.session.documents().iter().any(|d| d.is_dirty()));
 
-# Live editing in Playground sessions (patches/excel/live.diff + patches/live/playground_live.rs)
+# Live editing in Playground sessions (patches/excel/live.diff + the playground-live crate, tools.yaml `live_kit`)
 # What it's for: people in a Playground session edit the session's workbooks together (the one open when it started and
 #   every one opened since, which reaches the others behind their own) and see each other's workbook, sheet, selection,
 #   pointer and gestures under way (drafts, moves, fills, edges, objects, ink), in each person's color.
-# How: the adapter lives in new files: crates/ui-egui/src/live.rs (the shared document, merge, adopt, Undo, presence;
-#   it declares the template, copied next to it) and apps/gridcraft-web/src/web/live.rs (the kept runner and the shell
-#   that ends each frame with the session's frame hook). These rules only declare them and call in, each one line at
-#   the end of a file or right after a function's signature.
-# Verify: node scripts/build.mjs check excel head|release, then the e2e (tests/live-apps/excel.mjs).
+# How: the adapter lives in new files: crates/ui-egui/src/live.rs (the shared document, merge, adopt, Undo, presence:
+#   pointers, tags, colors, easing and ghosts the kit's, selections, drafts, strokes and edge lines GridCraft's own) and
+#   apps/gridcraft-web/src/web/live.rs (the kept runner and the shell that ends each frame with the session's frame
+#   hook). The playground-live crate (patches/live/kit) is the session and the presence look. These rules only declare
+#   them and call in, each one line at the end of a file or right after a function's signature.
+# Verify: node scripts/build.mjs check excel head|release, then the e2e (tests/live-apps/excel.mjs) and
+#   `cargo test -p gridcraft-ui-egui --lib live::`.
 # If upstream changes: if a function named below is renamed, anchor on its new signature; if WebShell or its `app`
 #   field is renamed, follow it in web/live.rs.
 #
-# The frontend's module (web, and its native tests), and the template's wasm dependencies under a target spelling
-# nobody else uses.
+# The frontend's module (web, and its native tests), and the playground-live crate (patches/live/kit: the session and
+# the presence look, `egui`) for the same two, under target spellings nobody else uses.
 - live: true
   file: crates/ui-egui/src/lib.rs
   find: '(?![\s\S])'
@@ -341,7 +343,7 @@
 - live: true
   file: crates/ui-egui/Cargo.toml
   find: '(?![\s\S])'
-  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\njs-sys = \"0.3\"\nwasm-bindgen = \"0.2\"\n"
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n\n[target.'cfg(all(not(target_arch = \"wasm32\")))'.dev-dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 # SheetApp::run, which every command goes through: Undo and Redo in the shared workbook go to the session.
 - live: true
   file: crates/ui-egui/src/lib.rs

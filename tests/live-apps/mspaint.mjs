@@ -24,6 +24,7 @@ const stroke = async (page, x, y) => {
 
 export default {
   path: '/selfpaint/',
+  url: '/selfpaint/index.html',
   viewport: { width: 1280, height: 800 },
   ready: async (page) => {
     // The Early preview notice (tools.yaml notice) covers the app until it is dismissed.

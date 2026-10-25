@@ -85,10 +85,10 @@ index 0000000..67aa2cc
 +}
 diff --git a/crates/ui-egui/src/edit_window/live.rs b/crates/ui-egui/src/edit_window/live.rs
 new file mode 100644
-index 0000000..aa2e055
+index 0000000..3ef6251
 --- /dev/null
 +++ b/crates/ui-egui/src/edit_window/live.rs
-@@ -0,0 +1,1243 @@
+@@ -0,0 +1,1123 @@
 +//! Live editing in a Playground session (web only). The shared document is the session without anyone's views: no
 +//! Edit-window state (`edit`: selection, playhead, zoom, tools, modes, view flags), and per track no height, lane view,
 +//! folder state, pin, record arm or input monitor. Audio reaches everyone as session files, one per source id (the
@@ -103,25 +103,26 @@ index 0000000..aa2e055
 +//! Mix window's strips and over plug-in windows: the pointer. A value being set (a fader, pan, trim, send, plug-in
 +//! parameter, clip gain or velocity) is tagged under the person's name; a fader, pan knob or send level also shows as a
 +//! ghost on this person's own, its value beside it. Tags go where they show whole.
++//! The look is the playground-live crate's ([`presence`]: pointers, tags, ghosts, outlines, playheads, easing); rubber
++//! bands, strokes, fades, control ghosts and where the tags go are SoundCraft's own, in its colors.
 +//! A child of the Edit window's module, for its drag preview and lane geometry.
 +
 +use super::{clip_name_height, clip_preview_fades, drag_plan, fade_curve_points, midi_clip_span, ops, plugin_range, rect, sample_at, x_of};
 +use crate::widgets::{db_text, fader_slot, pan_text};
 +use crate::{Gesture, MainWindow, SoundApp};
-+use egui::emath::GuiRounding as _;
-+use egui::{Color32, Context, Galley, Id, LayerId, Order, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
++use egui::{Color32, Context, Id, LayerId, Order, Painter, Pos2, Rect, Shape, Stroke, Ui, Vec2, pos2, vec2};
 +use serde::Deserialize as _;
 +use serde_json::{Value, json};
 +use soundcraft_audio_io::{BitDepth, EncodeOptions, FileFormat, SampleFormat};
-+use soundcraft_model::playground_live::{self, Live, Presence};
++use soundcraft_model::playground_live::{self, Live, Presence, presence};
 +use soundcraft_model::{AutoParam, ClipContent, ClipId, EditState, Fade, Session, Source, SourceAudio, SourceId, Track, TrackId, fader_db_to_pos};
 +use std::cell::{Cell, RefCell};
 +use std::collections::{BTreeMap, HashMap};
 +use std::sync::Arc;
 +
 +thread_local! {
-+    /// The others in the session, as the shell last gave them, with their marks as drawn last.
-+    static OTHERS: RefCell<Vec<Other>> = const { RefCell::new(Vec::new()) };
++    /// The control each other person set last, by their id: `[command, params]`, its value's tag and when last seen.
++    static HELD: RefCell<HashMap<String, (Value, String, f64)>> = RefCell::default();
 +    /// The Mix window's strips as the latest pass drew them (that pass's number first).
 +    static STRIPS: RefCell<(u64, Vec<Strip>)> = const { RefCell::new((0, Vec::new())) };
 +    /// The MIDI Editor's piano roll as last drawn.
@@ -133,66 +134,17 @@ index 0000000..aa2e055
 +/// Selected or dragged things a presence carries, at most; the points of a stroke.
 +const MAX_ITEMS: usize = 50;
 +const MAX_STROKE: usize = 120;
-+/// The most characters of a tag (name or value), its ellipsis included.
-+const MAX_TAG: usize = 24;
-+/// How long the others' marks take to go most (1 - 1/e) of the way to their latest place, in seconds.
-+const EASE: f64 = 0.08;
-+/// A ghost's fill and edge, and a stroke under way: the person's colour at these opacities.
++/// The kit's ghost fill and edge (the person's colour at these opacities), for the ghosts drawn here that aren't boxes (a
++/// fade, a pan knob, a stalk's dot); a stroke under way.
 +const GHOST: f32 = 0.28;
 +const GHOST_EDGE: f32 = 0.85;
 +const STROKE: f32 = 0.7;
-+/// A tag's padding.
-+const PAD: Vec2 = vec2(7.0, 3.0);
 +/// How long a control's ghost stays after they let go (seconds): until the change itself has most likely arrived.
 +const LINGER: f64 = 0.6;
 +
-+/// Another person, with their marks as drawn last by kind (see [`ease`]): the pass and where; and the control they set
-+/// last (`[command, params]`, its value's tag and when it was last seen).
-+struct Other {
-+    p: Presence,
-+    marks: HashMap<&'static str, (u64, Vec<[f64; 3]>)>,
-+    held: Option<(Value, String, f64)>,
-+}
-+
-+impl Other {
-+    fn color(&self) -> Color32 {
-+        Color32::from_rgb(self.p.color[0], self.p.color[1], self.p.color[2])
-+    }
-+
-+    /// The value they are setting, when there is one.
-+    fn value(&self) -> Option<&str> {
-+        self.p.state["value"].as_str().filter(|v| v.len() <= 64)
-+    }
-+
-+    /// `to` (marks of one kind), eased from where they were drawn the pass before: `px` points a unit of each part, a
-+    /// jump wider than `far` points on any part goes at once, as marks first seen, not drawn the pass before (another
-+    /// view or scope) or of another number do. Sets `moving` while any is still on its way.
-+    fn ease(&mut self, key: &'static str, to: Vec<[f64; 3]>, ctx: &Context, px: [f64; 3], far: [f64; 3], moving: &mut bool) -> Vec<[f64; 3]> {
-+        let pass = ctx.cumulative_pass_nr();
-+        let k = 1.0 - (-f64::from(ctx.input(|i| i.stable_dt).clamp(0.0, 0.1)) / EASE).exp();
-+        let (last, at) = self.marks.entry(key).or_default();
-+        if *last + 1 < pass || at.len() != to.len() {
-+            *at = to;
-+        } else {
-+            for (s, t) in at.iter_mut().zip(to) {
-+                let off = |s: &[f64; 3], i: usize| ((t[i] - s[i]) * px[i]).abs();
-+                if (0..3).any(|i| !(off(s, i) <= far[i])) {
-+                    *s = t;
-+                    continue;
-+                }
-+                for i in 0..3 {
-+                    s[i] += (t[i] - s[i]) * k;
-+                }
-+                if (0..3).all(|i| off(s, i) < 0.5) {
-+                    *s = t;
-+                } else {
-+                    *moving = true;
-+                }
-+            }
-+        }
-+        *last = pass;
-+        at.clone()
-+    }
++/// The value `p` is setting, when there is one.
++fn value(p: &Presence) -> Option<&str> {
++    p.state["value"].as_str().filter(|v| v.len() <= 64)
 +}
 +
 +/// A Mix-window strip as drawn: its track, its rect, the area it shows in, its layer and its Ui's id (its widgets' ids
@@ -270,45 +222,6 @@ index 0000000..aa2e055
 +    (f64::from(f) * 1000.0).round() / 1000.0
 +}
 +
-+/// A ghost: the colour at [`GHOST`] over `r`, with an edge at [`GHOST_EDGE`].
-+fn ghost(painter: &Painter, r: Rect, radius: f32, color: Color32) {
-+    painter.rect(r, radius, color.gamma_multiply(GHOST), Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE)), StrokeKind::Inside);
-+}
-+
-+/// A selection outline: 2 points of the colour around `r`.
-+fn outline(painter: &Painter, r: Rect, radius: f32, color: Color32) {
-+    painter.rect_stroke(r, radius, Stroke::new(2.0, color), StrokeKind::Inside);
-+}
-+
-+/// A rubber band: `r`'s outline dashed in the colour.
-+fn band(painter: &Painter, r: Rect, color: Color32) {
-+    let corners = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
-+    painter.extend(Shape::dashed_line(&corners, Stroke::new(1.5, color), 4.0, 3.0));
-+}
-+
-+/// The text on a tag in `color`: white, or near black on a light colour.
-+fn ink(color: Color32) -> Color32 {
-+    let l = egui::Rgba::from(color);
-+    if 0.2126 * l.r() + 0.7152 * l.g() + 0.0722 * l.b() > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE }
-+}
-+
-+/// `text` laid out for a tag in `color`, cut to [`MAX_TAG`] characters.
-+fn label(painter: &Painter, text: &str, color: Color32) -> Arc<Galley> {
-+    let text: String = match text.chars().count() > MAX_TAG {
-+        true => text.chars().take(MAX_TAG - 1).chain(['…']).collect(),
-+        false => text.to_owned(),
-+    };
-+    painter.layout_no_wrap(text, crate::theme::bold(12.0), ink(color))
-+}
-+
-+/// A tag of `galley` from `at` (its top left), filled with `color`; its rect.
-+fn tag(painter: &Painter, at: Pos2, galley: Arc<Galley>, color: Color32) -> Rect {
-+    let r = Rect::from_min_size(at.round_to_pixels(painter.pixels_per_point()), galley.size() + 2.0 * PAD);
-+    painter.rect_filled(r, 6.0, color);
-+    painter.galley(r.min + PAD, galley, ink(color));
-+    r
-+}
-+
 +/// The first of `spots` (top left corners) where a box of `size` shows whole in `area` without covering `avoid`, else
 +/// the first where it shows whole, else the first moved as far inside as it goes.
 +fn place(area: Rect, size: Vec2, spots: &[Pos2], avoid: Option<Rect>) -> Pos2 {
@@ -321,33 +234,27 @@ index 0000000..aa2e055
 +
 +/// A tag of `text` beside `anchor` (right of it, else left), vertically centred on it; its rect.
 +fn tag_beside(painter: &Painter, anchor: Rect, text: &str, color: Color32) -> Option<Rect> {
-+    let galley = label(painter, text, color);
-+    let size = galley.size() + 2.0 * PAD;
++    let size = presence::label_size(painter, text);
 +    let y = anchor.center().y - size.y / 2.0;
 +    let at = place(painter.clip_rect(), size, &[pos2(anchor.max.x + 6.0, y), pos2(anchor.min.x - 6.0 - size.x, y)], None);
-+    (!text.is_empty()).then(|| tag(painter, at, galley, color))
++    (!text.is_empty()).then(|| presence::label(painter, at, color, text))
 +}
 +
-+/// A pointer at `tip` with a tag of `name` and, under it, one of a `value` being set (the look every Playground app
-+/// shares). The tags go below and right of the tip, else (when they would not show whole in the painter's area, or
-+/// would cover `avoid`) above it, left of it or both, else as far inside as they go.
++/// A pointer at `tip` (the kit's arrow) with its name tag and, under it, a tag of a `value` being set. The tags go below
++/// and right of the tip, else (when they would not show whole in the painter's area, or would cover `avoid`) above it,
++/// left of it or both, else as far inside as they go.
 +fn cursor(painter: &Painter, tip: Pos2, color: Color32, name: &str, value: Option<&str>, avoid: Option<Rect>) {
-+    const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
-+    // Star-shaped around the tip (its first point), which is what a filled path's triangle fan needs.
-+    let arrow = |d: Vec2| ARROW.iter().map(|&[x, y]| tip + d + vec2(x, y)).collect::<Vec<_>>();
-+    painter.add(Shape::convex_polygon(arrow(vec2(0.0, 1.0)), Color32::from_black_alpha(64), Stroke::NONE));
-+    painter.add(Shape::convex_polygon(arrow(Vec2::ZERO), color, Stroke::new(1.5, Color32::WHITE)));
-+    let tags: Vec<_> = [Some(name), value].into_iter().flatten().filter(|t| !t.is_empty()).map(|t| label(painter, t, color)).collect();
-+    let width = tags.iter().map(|g| g.size().x + 2.0 * PAD.x).fold(0.0, f32::max);
-+    let size = vec2(width, tags.iter().map(|g| g.size().y + 2.0 * PAD.y + 2.0).sum::<f32>() - 2.0);
++    presence::cursor(painter, tip, color, "");
++    let value = value.unwrap_or_default();
++    let (name_size, value_size) = (presence::tag_size(painter, name), presence::label_size(painter, value));
++    let gap = if name_size.y > 0.0 && value_size.y > 0.0 { 2.0 } else { 0.0 };
++    let size = vec2(name_size.x.max(value_size.x), name_size.y + gap + value_size.y);
 +    let (right, left, below, above) = (tip.x + 12.0, tip.x - 4.0 - size.x, tip.y + 15.0, tip.y - 4.0 - size.y);
 +    let at = place(painter.clip_rect(), size, &[pos2(right, below), pos2(right, above), pos2(left, below), pos2(left, above)], avoid);
-+    let mut y = at.y;
-+    for galley in tags {
-+        // Left of the tip, they line up at their right ends.
-+        let x = if at.x < tip.x { at.x + width - galley.size().x - 2.0 * PAD.x } else { at.x };
-+        y = tag(painter, pos2(x, y), galley, color).max.y + 2.0;
-+    }
++    // Left of the tip, they line up at their right ends.
++    let x = |s: Vec2| if at.x < tip.x { at.x + size.x - s.x } else { at.x };
++    let name_tag = presence::tag(painter, pos2(x(name_size), at.y), color, name);
++    presence::label(painter, pos2(x(value_size), name_tag.max.y + gap), color, value);
 +}
 +
 +/// Copies what each person keeps of a track for themselves.
@@ -465,120 +372,110 @@ index 0000000..aa2e055
 +    let spp = s.edit.zoom.samples_per_px.max(0.01);
 +    let px = [1.0 / spp, rows.first().map_or(50.0, |r| f64::from(r.1.height())), 1.0 / spp];
 +    let far = [f64::from(tl.width()) / 4.0, f64::from(tl.height()) / 4.0, f64::from(tl.width()) / 4.0];
-+    let mut moving = false;
-+    OTHERS.with_borrow_mut(|others| {
-+        for o in others.iter_mut() {
-+            let (st, color) = (&o.p.state, o.color());
-+            let span = |g: &Value| Some([time(&g[1])?, row_of(&g[0])?, time(&g[2])?]);
-+            let ghosts: Vec<_> = items(&st["ghosts"]).filter_map(span).collect();
-+            let rubber: Vec<_> = span(&st["band"]).into_iter().collect();
-+            let playhead: Vec<_> = time(&st["playhead"]).map(|t| [t, 0.0, 0.0]).into_iter().collect();
-+            // A Pencil stroke on an automation lane: its points as values on this person's lane for that track.
-+            let stroke = &st["stroke"];
-+            let stroke = (s.track(TrackId(stroke["track"].as_u64().unwrap_or_default())))
-+                .zip(stroke["view"].as_str().and_then(AutoParam::parse))
-+                .zip(row_of(&stroke["track"]).and_then(lane))
-+                .map(|((t, p), lane)| {
-+                    let (lo, hi) = value_range(t, &p);
-+                    let y = move |v: f64| lane.max.y - 4.0 - ((v as f32 - lo) / (hi - lo).max(1e-6)).clamp(0.0, 1.0) * (lane.height() - 8.0);
-+                    let points: Vec<[f64; 2]> = (stroke["points"].as_array().into_iter().flatten().take(MAX_STROKE))
-+                        .filter_map(|p| Some([time(&p[0])?, p[1].as_f64().filter(|v| v.is_finite())?]))
-+                        .collect();
-+                    (points, y, (hi - lo).max(1e-6), lane)
-+                });
-+            let fade = &st["fade"];
-+            let fade =
-+                s.find_clip(ClipId(fade["clip"].as_u64().unwrap_or_default())).zip(Fade::deserialize(&fade["fade"]).ok()).zip(fade["in"].as_bool());
-+            let ghosts = o.ease("edit.ghosts", ghosts, ctx, px, far, &mut moving);
-+            let rubber = o.ease("edit.band", rubber, ctx, px, far, &mut moving);
-+            let playhead = o.ease("edit.playhead", playhead, ctx, px, far, &mut moving);
-+            for [t, ..] in playhead {
-+                let at = painter.round_to_pixel_center(x(t));
-+                painter.line_segment([pos2(at, tl.min.y), pos2(at, tl.max.y)], Stroke::new(1.5, color));
++    let others = presence::others();
++    for o in &others {
++        let (st, color) = (&o.state, presence::color(o));
++        let span = |g: &Value| Some([time(&g[1])?, row_of(&g[0])?, time(&g[2])?]);
++        let ghosts: Vec<_> = items(&st["ghosts"]).filter_map(span).collect();
++        let rubber: Vec<_> = span(&st["band"]).into_iter().collect();
++        // A Pencil stroke on an automation lane: its points as values on this person's lane for that track.
++        let stroke = &st["stroke"];
++        let stroke = (s.track(TrackId(stroke["track"].as_u64().unwrap_or_default())))
++            .zip(stroke["view"].as_str().and_then(AutoParam::parse))
++            .zip(row_of(&stroke["track"]).and_then(lane))
++            .map(|((t, p), lane)| {
++                let (lo, hi) = value_range(t, &p);
++                let y = move |v: f64| lane.max.y - 4.0 - ((v as f32 - lo) / (hi - lo).max(1e-6)).clamp(0.0, 1.0) * (lane.height() - 8.0);
++                let points: Vec<[f64; 2]> = (stroke["points"].as_array().into_iter().flatten().take(MAX_STROKE))
++                    .filter_map(|p| Some([time(&p[0])?, p[1].as_f64().filter(|v| v.is_finite())?]))
++                    .collect();
++                (points, y, (hi - lo).max(1e-6), lane)
++            });
++        let fade = &st["fade"];
++        let fade =
++            s.find_clip(ClipId(fade["clip"].as_u64().unwrap_or_default())).zip(Fade::deserialize(&fade["fade"]).ok()).zip(fade["in"].as_bool());
++        // The playhead while it shows on the timeline.
++        if let Some([t]) = time(&st["playhead"]).and_then(|t| presence::ease(ctx, &o.id, "edit.playhead", [t], [px[0]], [far[0]]))
++            && (tl.min.x..=tl.max.x).contains(&x(t))
++        {
++            presence::playhead(&painter, x(t), [tl.min.y, tl.max.y], tl.max.x, color, &o.name);
++        }
++        for &[a, v, b] in presence::ease_list(ctx, &o.id, "edit.ghosts", ghosts.as_flattened(), &px, &far).unwrap_or_default().as_chunks().0 {
++            if let Some(r) = body(a, v, b) {
++                presence::ghost(&painter, r, color);
 +            }
-+            for [a, v, b] in ghosts {
-+                if let Some(r) = body(a, v, b) {
-+                    ghost(&painter, r, 2.0, color);
++        }
++        for &[a, v, b] in presence::ease_list(ctx, &o.id, "edit.band", rubber.as_flattened(), &px, &far).unwrap_or_default().as_chunks().0 {
++            if let Some(r) = body(a, v, b) {
++                presence::dashed(&painter, &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()], true, color);
++            }
++        }
++        // A fade being drawn or bent: the area under its curve, as the clip draws its fades.
++        if let Some((((track, c), fade), fade_in)) = fade
++            && fade.len > 0
++            && fade.len <= c.length
++            && fade.curvature.is_finite()
++            && let Some(l) = row_of(&json!(track.0)).and_then(lane)
++        {
++            let r = Rect::from_min_max(pos2(x(c.start as f64), l.min.y + 1.0), pos2(x(c.end() as f64), l.max.y - 1.0));
++            let body = Rect::from_min_max(pos2(r.min.x, r.min.y + clip_name_height(s, l)), r.max);
++            let (a, b) = match fade_in {
++                true => (r.min.x, x((c.start + fade.len) as f64)),
++                false => (x((c.end() - fade.len) as f64), r.max.x),
++            };
++            let curve = fade_curve_points(fade, fade_in, a, b, body, ctx.pixels_per_point());
++            let mut mesh = egui::Mesh::default();
++            for (i, p) in curve.iter().enumerate() {
++                mesh.colored_vertex(*p, color.gamma_multiply(GHOST));
++                mesh.colored_vertex(pos2(p.x, body.max.y), color.gamma_multiply(GHOST));
++                if let Some(k) = (2 * i as u32).checked_sub(2) {
++                    mesh.add_triangle(k, k + 1, k + 2);
++                    mesh.add_triangle(k + 1, k + 2, k + 3);
 +                }
 +            }
-+            for [a, v, b] in rubber {
-+                if let Some(r) = body(a, v, b) {
-+                    band(&painter, r, color);
++            painter.with_clip_rect(r.intersect(tl)).add(mesh);
++            painter.with_clip_rect(r.intersect(tl)).add(Shape::line(curve, Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE))));
++        }
++        if let Some((mut points, y, span, lane)) = stroke {
++            // The newest point eases; the others are where the stroke has them.
++            let k = [px[0], f64::from(lane.height() / span)];
++            if let Some(tip) = points.pop().and_then(|tip| presence::ease(ctx, &o.id, "edit.stroke", tip, k, [far[0], far[1]])) {
++                points.push(tip);
++            }
++            let line: Vec<Pos2> = points.iter().map(|&[t, v]| pos2(x(t), y(v))).collect();
++            if let Some(&tip) = line.last() {
++                painter.circle_filled(tip, 2.0, color.gamma_multiply(STROKE));
++            }
++            painter.with_clip_rect(lane.intersect(tl)).add(Shape::line(line, Stroke::new(2.0, color.gamma_multiply(STROKE))));
++        }
++    }
++    for o in &others {
++        let (st, color) = (&o.state["selection"], presence::color(o));
++        let selecting = o.state["selecting"] == true;
++        let ids = |v: &Value| items(v).filter_map(Value::as_u64).collect::<Vec<_>>();
++        if let (Some(a), Some(b)) = (time(&st["range"][0]), time(&st["range"][1])) {
++            for v in ids(&st["tracks"]).into_iter().filter_map(|t| row_of(&json!(t))) {
++                // A time range (at least 2 points wide: an insertion point); filled while it is being dragged.
++                if let Some(l) = lane(v).filter(|_| x(b) >= tl.min.x && x(a) <= tl.max.x) {
++                    let r = Rect::from_min_max(pos2(x(a), l.min.y + 1.0), pos2(x(b).max(x(a) + 2.0), l.max.y - 1.0));
++                    if selecting { presence::ghost(&painter, r, color) } else { presence::outline(&painter, r, color) }
 +                }
 +            }
-+            // A fade being drawn or bent: the area under its curve, as the clip draws its fades.
-+            if let Some((((track, c), fade), fade_in)) = fade
-+                && fade.len > 0
-+                && fade.len <= c.length
-+                && fade.curvature.is_finite()
-+                && let Some(l) = row_of(&json!(track.0)).and_then(lane)
++        }
++        for clip in ids(&st["clips"]) {
++            if let Some((track, c)) = s.find_clip(ClipId(clip))
++                && let Some(r) = row_of(&json!(track.0)).and_then(|v| body(c.start as f64, v, c.end() as f64))
 +            {
-+                let r = Rect::from_min_max(pos2(x(c.start as f64), l.min.y + 1.0), pos2(x(c.end() as f64), l.max.y - 1.0));
-+                let body = Rect::from_min_max(pos2(r.min.x, r.min.y + clip_name_height(s, l)), r.max);
-+                let (a, b) = match fade_in {
-+                    true => (r.min.x, x((c.start + fade.len) as f64)),
-+                    false => (x((c.end() - fade.len) as f64), r.max.x),
-+                };
-+                let curve = fade_curve_points(fade, fade_in, a, b, body, ctx.pixels_per_point());
-+                let mut mesh = egui::Mesh::default();
-+                for (i, p) in curve.iter().enumerate() {
-+                    mesh.colored_vertex(*p, color.gamma_multiply(GHOST));
-+                    mesh.colored_vertex(pos2(p.x, body.max.y), color.gamma_multiply(GHOST));
-+                    if let Some(k) = (2 * i as u32).checked_sub(2) {
-+                        mesh.add_triangle(k, k + 1, k + 2);
-+                        mesh.add_triangle(k + 1, k + 2, k + 3);
-+                    }
-+                }
-+                painter.with_clip_rect(r.intersect(tl)).add(mesh);
-+                painter.with_clip_rect(r.intersect(tl)).add(Shape::line(curve, Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE))));
-+            }
-+            if let Some((mut points, y, span, lane)) = stroke {
-+                // The newest point eases; the others are where the stroke has them.
-+                if let Some(tip) = points.pop() {
-+                    let tip =
-+                        o.ease("edit.stroke", vec![[tip[0], tip[1], 0.0]], ctx, [px[0], f64::from(lane.height() / span), 0.0], far, &mut moving);
-+                    points.extend(tip.iter().map(|&[t, v, _]| [t, v]));
-+                }
-+                let line: Vec<Pos2> = points.iter().map(|&[t, v]| pos2(x(t), y(v))).collect();
-+                if let Some(&tip) = line.last() {
-+                    painter.circle_filled(tip, 2.0, color.gamma_multiply(STROKE));
-+                }
-+                painter.with_clip_rect(lane.intersect(tl)).add(Shape::line(line, Stroke::new(2.0, color.gamma_multiply(STROKE))));
++                presence::outline(&painter, r, color);
 +            }
 +        }
-+        for o in others.iter() {
-+            let (st, color) = (&o.p.state["selection"], o.color());
-+            let selecting = o.p.state["selecting"] == true;
-+            let ids = |v: &Value| items(v).filter_map(Value::as_u64).collect::<Vec<_>>();
-+            if let (Some(a), Some(b)) = (time(&st["range"][0]), time(&st["range"][1])) {
-+                for v in ids(&st["tracks"]).into_iter().filter_map(|t| row_of(&json!(t))) {
-+                    // A time range (at least 2 points wide: an insertion point); filled while it is being dragged.
-+                    if let Some(l) = lane(v).filter(|_| x(b) >= tl.min.x && x(a) <= tl.max.x) {
-+                        let r = Rect::from_min_max(pos2(x(a), l.min.y + 1.0), pos2(x(b).max(x(a) + 2.0), l.max.y - 1.0));
-+                        if selecting { ghost(&painter, r, 2.0, color) } else { outline(&painter, r, 2.0, color) }
-+                    }
-+                }
-+            }
-+            for clip in ids(&st["clips"]) {
-+                if let Some((track, c)) = s.find_clip(ClipId(clip))
-+                    && let Some(r) = row_of(&json!(track.0)).and_then(|v| body(c.start as f64, v, c.end() as f64))
-+                {
-+                    outline(&painter, r, 2.0, color);
-+                }
-+            }
++    }
++    for o in &others {
++        if let Some([at, v, _]) = pointer_target(app, &o.state["pointer"]).and_then(|t| presence::ease(ctx, &o.id, "edit.pointer", t, px, far))
++            && let Some(tip) = edit_pos(app, at, v)
++        {
++            cursor(&painter, tip, presence::color(o), &o.name, value(o), clip_name(app, &painter, at, v));
 +        }
-+        for o in others.iter_mut() {
-+            let to: Vec<_> = pointer_target(app, &o.p.state["pointer"]).into_iter().collect();
-+            let tip = o.ease("edit.pointer", to, ctx, px, far, &mut moving);
-+            if let Some(&[at, v, _]) = tip.first()
-+                && let Some(tip) = edit_pos(app, at, v)
-+            {
-+                cursor(&painter, tip, o.color(), &o.p.name, o.value(), clip_name(app, &painter, at, v));
-+            }
-+        }
-+    });
-+    if moving {
-+        ctx.request_repaint();
 +    }
 +}
 +
@@ -604,35 +501,27 @@ index 0000000..aa2e055
 +    };
 +    let px = [f64::from(r.kx), f64::from(-r.ky), f64::from(r.kx)];
 +    let far = [f64::from(roll.width()) / 4.0, f64::from(roll.height()) / 4.0, f64::from(roll.width()) / 4.0];
-+    let mut moving = false;
-+    OTHERS.with_borrow_mut(|others| {
-+        let mut here: Vec<_> = others.iter_mut().filter(|o| o.p.state["midi"]["clip"].as_u64() == Some(clip.0)).collect();
-+        for o in &mut here {
-+            let ghosts: Vec<_> = items(&o.p.state["midi"]["ghosts"]).filter_map(note).collect();
-+            let color = o.color();
-+            for g in o.ease("midi.ghosts", ghosts, ctx, px, far, &mut moving) {
-+                ghost(&painter, r.note(g), 2.0, color);
-+            }
++    let others = presence::others();
++    let here: Vec<_> = others.iter().filter(|o| o.state["midi"]["clip"].as_u64() == Some(clip.0)).collect();
++    for o in &here {
++        let ghosts: Vec<_> = items(&o.state["midi"]["ghosts"]).filter_map(note).collect();
++        for &g in presence::ease_list(ctx, &o.id, "midi.ghosts", ghosts.as_flattened(), &px, &far).unwrap_or_default().as_chunks().0 {
++            presence::ghost(&painter, r.note(g), presence::color(o));
 +        }
-+        for o in &here {
-+            for n in items(&o.p.state["midi"]["notes"]).filter_map(note) {
-+                outline(&painter, r.note(n), 2.0, o.color());
-+            }
++    }
++    for o in &here {
++        for n in items(&o.state["midi"]["notes"]).filter_map(note) {
++            presence::outline(&painter, r.note(n), presence::color(o));
 +        }
-+        for o in &mut here {
-+            let p = &o.p.state["pointer"];
-+            let to: Vec<_> = (p["clip"].as_u64() == Some(clip.0))
-+                .then(|| Some([time(&p["tick"])?, p["pitch"].as_f64().filter(|p| (-1.0..=129.0).contains(p))?, 0.0]))
-+                .flatten()
-+                .into_iter()
-+                .collect();
-+            if let Some(&[tick, pitch, _]) = o.ease("midi.pointer", to, ctx, px, far, &mut moving).first() {
-+                cursor(&painter, r.at([tick, pitch]), o.color(), &o.p.name, o.value(), None);
-+            }
++    }
++    for o in &here {
++        let p = &o.state["pointer"];
++        let to = (p["clip"].as_u64() == Some(clip.0))
++            .then(|| Some([time(&p["tick"])?, p["pitch"].as_f64().filter(|p| (-1.0..=129.0).contains(p))?]))
++            .flatten();
++        if let Some([tick, pitch]) = to.and_then(|t| presence::ease(ctx, &o.id, "midi.pointer", t, [px[0], px[1]], [far[0], far[1]])) {
++            cursor(&painter, r.at([tick, pitch]), presence::color(o), &o.name, value(o), None);
 +        }
-+    });
-+    if moving {
-+        ctx.request_repaint();
 +    }
 +}
 +
@@ -683,7 +572,7 @@ index 0000000..aa2e055
 +            pos2(slot.center().x, slot.max.y - slot.height() * pos),
 +            vec2((w.width() * 0.4).clamp(16.0, 18.0), w.height() - slot.height()),
 +        );
-+        ghost(painter, cap, 3.0, color);
++        presence::ghost(painter, cap, color);
 +        Some(cap)
 +    } else if which < 100.0 {
 +        // `w` is the knob's readout; the knob (widgets::pan_knob) is centred 25 points above it, 8 narrower.
@@ -697,81 +586,83 @@ index 0000000..aa2e055
 +        // `w` is the level icon's hit area (mix_window::send_slot): 3 points either side of the icon, 1 above and below.
 +        let well = w.shrink2(vec2(3.0, 1.0)).shrink(1.0);
 +        let mark = Rect::from_center_size(pos2(well.center().x, well.max.y - well.height() * pos), vec2(well.width() + 6.0, 4.0));
-+        (w.width() < 16.0).then(|| ghost(painter, mark, 1.0, color)).map(|()| well.union(mark))
++        (w.width() < 16.0).then(|| presence::ghost(painter, mark, color)).map(|()| well.union(mark))
 +    }
 +}
 +
 +/// The end of a frame (the web app's shell calls it): the others' pointers over the Mix window's strips and over the
 +/// plug-in windows open here too, drawn over them, with ghosts of the faders, pan knobs and send levels they set; their
-+/// pointers and the stalks they drag over the MIDI Editor's velocity lane; and where the gesture under way starts in the
-+/// command journal.
++/// pointers and the stalks they drag over the MIDI Editor's velocity lane; where the gesture under way starts in the
++/// command journal; then the kit's end of frame ([`presence::end_frame`]), after every view drew the others.
 +pub fn end_frame(app: &SoundApp, ctx: &Context) {
++    presence::set_font(crate::theme::bold(12.0));
 +    if !ctx.input(|i| i.pointer.any_down()) {
 +        PRESSED_AT.set(app.engine.journal.len());
 +    }
 +    let strips = STRIPS.with_borrow(|(pass, strips)| if fresh(ctx, *pass) { strips.clone() } else { Vec::new() });
 +    let roll = ROLL.get().filter(|r| fresh(ctx, r.pass) && r.kx > 0.0);
 +    let now = ctx.input(|i| i.time);
-+    let mut moving = false;
-+    OTHERS.with_borrow_mut(|others| {
-+        for o in others.iter_mut() {
-+            let p = o.p.state["pointer"].clone();
++    HELD.with_borrow_mut(|held| {
++        for o in &presence::others() {
++            let (p, color) = (&o.state["pointer"], presence::color(o));
 +            let (x, y) = (fraction(&p["x"]), fraction(&p["y"]));
 +            // A fader, pan knob or send level they set (and for a moment after they let go: until the change arrives), as
 +            // a ghost on this person's strip for it, its value beside it.
-+            if o.p.state["control"].is_array() {
-+                o.held = Some((o.p.state["control"].clone(), o.value().unwrap_or_default().to_owned(), now));
++            if o.state["control"].is_array() {
++                held.insert(o.id.clone(), (o.state["control"].clone(), value(o).unwrap_or_default().to_owned(), now));
 +            }
-+            o.held = o.held.take().filter(|h| now - h.2 < LINGER);
 +            let mut value_tag = None;
-+            if let Some((c, value, seen)) = o.held.clone()
-+                && let Some((s, (which, w, pos))) = strips.iter().find_map(|s| Some((s, control(ctx, s, &c)?)))
-+                && let Some(&[_, _, pos]) = (o
-+                    .ease("mix.control", vec![[s.track as f64, which, pos]], ctx, [1.0, 1.0, 100.0], [0.0, 0.0, f64::INFINITY], &mut moving)
-+                    .first())
++            if let Some((c, text, seen)) = held.get(&o.id).filter(|h| now - h.2 < LINGER)
++                && let Some((s, (which, w, pos))) = strips.iter().find_map(|s| Some((s, control(ctx, s, c)?)))
++                && let Some([_, _, pos]) =
++                    presence::ease(ctx, &o.id, "mix.control", [s.track as f64, which, pos], [1.0, 1.0, 100.0], [0.0, 0.0, f64::INFINITY])
 +            {
 +                let painter = ctx.layer_painter(s.layer).with_clip_rect(s.clip);
-+                value_tag = control_ghost(&painter, which, w, pos, o.color()).and_then(|g| tag_beside(&painter, g, &value, o.color()));
-+                moving |= seen < now;
++                value_tag = control_ghost(&painter, which, w, pos, color).and_then(|g| tag_beside(&painter, g, text, color));
++                if *seen < now {
++                    presence::keep_moving();
++                }
 +            }
-+            let value = o.value().filter(|_| value_tag.is_none()).map(str::to_owned);
++            let shown = value(o).filter(|_| value_tag.is_none());
 +            // Over a strip: its place among this person's strips, plus how far across and down it.
 +            let on = p["strip"].as_u64().and_then(|t| strips.iter().position(|s| s.track == t));
-+            let to: Vec<_> = on.zip(x).zip(y).map(|((i, x), y)| [i as f64 + x, y, 0.0]).into_iter().collect();
-+            if let Some(&first) = strips.first() {
-+                let px = [f64::from(first.rect.width()), f64::from(first.clip.height()), 0.0];
-+                let far = [f64::from(first.clip.width()) / 4.0, f64::from(first.clip.height()) / 4.0, 0.0];
-+                if let Some(&[v, y, _]) = o.ease("mix.pointer", to, ctx, px, far, &mut moving).first() {
-+                    let i = (v.max(0.0) as usize).min(strips.len() - 1);
-+                    let s = strips[i];
-+                    let tip = pos2(s.rect.min.x + (v - i as f64) as f32 * s.rect.width(), s.rect.min.y + y as f32 * s.rect.height());
-+                    cursor(&ctx.layer_painter(s.layer).with_clip_rect(s.clip), tip, o.color(), &o.p.name, value.as_deref(), value_tag);
-+                }
++            if let Some(&first) = strips.first()
++                && let Some([v, y]) = on.zip(x).zip(y).and_then(|((i, x), y)| {
++                    let px = [f64::from(first.rect.width()), f64::from(first.clip.height())];
++                    let far = [f64::from(first.clip.width()) / 4.0, f64::from(first.clip.height()) / 4.0];
++                    presence::ease(ctx, &o.id, "mix.pointer", [i as f64 + x, y], px, far)
++                })
++            {
++                let i = (v.max(0.0) as usize).min(strips.len() - 1);
++                let s = strips[i];
++                let tip = pos2(s.rect.min.x + (v - i as f64) as f32 * s.rect.width(), s.rect.min.y + y as f32 * s.rect.height());
++                cursor(&ctx.layer_painter(s.layer).with_clip_rect(s.clip), tip, color, &o.name, shown, value_tag);
 +            }
 +            // Over the MIDI Editor's velocity lane when they edit its clip too: the stalks they drag, and their pointer.
 +            if let Some(r) = roll
 +                && let Some(vel) = r.vel
-+                && o.p.state["midi"]["clip"].as_u64() == Some(r.clip)
++                && o.state["midi"]["clip"].as_u64() == Some(r.clip)
 +            {
-+                let (painter, color) = (ctx.layer_painter(r.layer).with_clip_rect(r.area), o.color());
-+                let px = [f64::from(r.kx), f64::from((vel.height() - 4.0) / 127.0), 0.0];
-+                let far = [f64::from(r.rect.width()) / 4.0, f64::INFINITY, 0.0];
-+                let stalks: Vec<_> = (items(&o.p.state["midi"]["vel"]))
-+                    .filter_map(|s| Some([time(&s[0])?, s[1].as_u64().filter(|v| *v <= 127)? as f64, 0.0]))
-+                    .collect();
-+                for [tick, v, _] in o.ease("midi.vel", stalks, ctx, px, far, &mut moving) {
++                let painter = ctx.layer_painter(r.layer).with_clip_rect(r.area);
++                let px = [f64::from(r.kx), f64::from((vel.height() - 4.0) / 127.0)];
++                let far = [f64::from(r.rect.width()) / 4.0, f64::INFINITY];
++                let stalks: Vec<_> =
++                    items(&o.state["midi"]["vel"]).filter_map(|s| Some([time(&s[0])?, s[1].as_u64().filter(|v| *v <= 127)? as f64])).collect();
++                for &[tick, v] in presence::ease_list(ctx, &o.id, "midi.vel", stalks.as_flattened(), &px, &far).unwrap_or_default().as_chunks().0 {
 +                    // As the editor draws a stalk: 3 points wide from the lane's foot, a dot on top.
 +                    let top = r.vel_pos(vel, [tick, v]) + vec2(1.0, 0.0);
-+                    ghost(&painter.with_clip_rect(vel), Rect::from_min_max(top - vec2(2.0, 0.0), pos2(top.x + 2.0, vel.max.y - 2.0)), 2.0, color);
++                    presence::ghost(
++                        &painter.with_clip_rect(vel),
++                        Rect::from_min_max(top - vec2(2.0, 0.0), pos2(top.x + 2.0, vel.max.y - 2.0)),
++                        color,
++                    );
 +                    painter.with_clip_rect(vel).circle(top, 3.5, color.gamma_multiply(GHOST), Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE)));
 +                }
-+                let to: Vec<_> = (p["clip"].as_u64() == Some(r.clip))
-+                    .then(|| Some([time(&p["tick"])?, p["vel"].as_f64().filter(|v| (-10.0..=140.0).contains(v))?, 0.0]))
-+                    .flatten()
-+                    .into_iter()
-+                    .collect();
-+                if let Some(&[tick, v, _]) = o.ease("midi.vel.pointer", to, ctx, px, [far[0], f64::from(vel.height()), 0.0], &mut moving).first() {
-+                    cursor(&painter, r.vel_pos(vel, [tick, v]), color, &o.p.name, o.value(), None);
++                let to = (p["clip"].as_u64() == Some(r.clip))
++                    .then(|| Some([time(&p["tick"])?, p["vel"].as_f64().filter(|v| (-10.0..=140.0).contains(v))?]))
++                    .flatten();
++                if let Some([tick, v]) = to.and_then(|t| presence::ease(ctx, &o.id, "midi.vel.pointer", t, px, [far[0], f64::from(vel.height())])) {
++                    cursor(&painter, r.vel_pos(vel, [tick, v]), color, &o.name, value(o), None);
 +                }
 +            }
 +            // Over a plug-in window this person has open too: how far across and down it.
@@ -780,19 +671,17 @@ index 0000000..aa2e055
 +                .filter(|w| app.ui.plugin_windows.contains(w))
 +                .map(|(t, slot)| Id::new(("plugin", t.0, slot)))
 +                .and_then(|id| Some((id, ctx.memory(|m| m.area_rect(id))?)));
-+            let to: Vec<_> = window.zip(x).zip(y).map(|((_, x), y)| [x, y, 0.0]).into_iter().collect();
 +            if let Some((id, r)) = window {
-+                let px = [f64::from(r.width()), f64::from(r.height()), 0.0];
-+                if let Some(&[x, y, _]) = o.ease("plugin.pointer", to, ctx, px, px.map(|p| p / 4.0), &mut moving).first() {
++                let px = [f64::from(r.width()), f64::from(r.height())];
++                if let Some([x, y]) = x.zip(y).and_then(|(x, y)| presence::ease(ctx, &o.id, "plugin.pointer", [x, y], px, px.map(|p| p / 4.0))) {
 +                    let tip = r.min + vec2(x as f32 * r.width(), y as f32 * r.height());
-+                    cursor(&ctx.layer_painter(LayerId::new(Order::Middle, id)).with_clip_rect(r), tip, o.color(), &o.p.name, value.as_deref(), None);
++                    cursor(&ctx.layer_painter(LayerId::new(Order::Middle, id)).with_clip_rect(r), tip, color, &o.name, shown, None);
 +                }
 +            }
 +        }
++        held.retain(|_, h| now - h.2 < LINGER);
 +    });
-+    if moving {
-+        ctx.request_repaint();
-+    }
++    presence::end_frame(ctx);
 +}
 +
 +/// Where `p` is, in the session's terms: over a plug-in window (`{plugin: [track, slot], x, y}`), a Mix-window strip
@@ -1037,8 +926,7 @@ index 0000000..aa2e055
 +    }
 +
 +    fn live_quiet(&self) -> bool {
-+        let input = self.docking_context.as_ref().is_some_and(|ctx| ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input());
-+        !input
++        presence::quiet()
 +            && self.gesture.is_none()
 +            && self.dialogs.open.is_none()
 +            && self.bounce.is_none()
@@ -1094,15 +982,7 @@ index 0000000..aa2e055
 +    }
 +
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        OTHERS.with_borrow_mut(|was| {
-+            let now = (others.into_iter())
-+                .map(|p| match was.iter().position(|o| o.p.id == p.id) {
-+                    Some(i) => Other { p, ..was.swap_remove(i) },
-+                    None => Other { p, marks: HashMap::new(), held: None },
-+                })
-+                .collect();
-+            *was = now;
-+        });
++        presence::show(others);
 +    }
 +
 +    fn live_assets(&self) -> Vec<(String, String, bool)> {

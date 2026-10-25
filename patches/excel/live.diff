@@ -93,10 +93,10 @@ index 0000000..98bdd39
 +}
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..a1f83df
+index 0000000..e3f4174
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,1181 @@
+@@ -0,0 +1,1114 @@
 +//! Live editing in a Playground session (web only): the shared document is the session's workbooks as JSON, keyed by a
 +//! session id: the one active when the session started (or that a joiner's active window takes) and each one opened,
 +//! created or imported since by anyone, which opens behind the others' own. Closing one is personal: the session goes on
@@ -107,10 +107,12 @@ index 0000000..a1f83df
 +//! file data GridCraft does not model stay local. Presence: the workbook and sheet each person is on, their pointer,
 +//! their selection and what they are doing before it reaches the workbook (a draft being typed, a range moved or filled,
 +//! a row or column edge, an object moved or resized, an ink stroke), drawn over the others' grids in their color.
++//!
++//! The session and the presence look (pointers, name tags, colors, easing, ghosts) are the playground-live crate's
++//! (patches/live/kit); selections, drafts, strokes and edge lines are GridCraft's own, drawn here in the kit's colors.
 +
-+// The adapter template (patches/live/playground_live.rs), copied next to this file.
-+#[path = "playground_live.rs"]
-+pub mod playground_live;
++// The playground-live crate, under the module name web/live.rs and the tests reach it by.
++pub use ::playground_live;
 +
 +// DocState::new for a made-here workbook, which differs by channel (livedoc.diff, livedoc.head.diff).
 +#[path = "live_doc.rs"]
@@ -124,7 +126,7 @@ index 0000000..a1f83df
 +use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2, pos2, vec2};
 +use gridcraft_engine::core::{CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value as CellValue};
 +use gridcraft_engine::model::{
-+    Anchor, Cell, CellStore, Formula, PatternType, Shape, ShapeKind, Sheet, Style, StyleId, StyleTable, Workbook,
++    Anchor, Cell, CellStore, Formula, PatternType, Sheet, Style, StyleId, StyleTable, Workbook,
 +};
 +use gridcraft_engine::{DocState, Mode, Selection, Session};
 +use serde::{Deserialize, Serialize};
@@ -132,7 +134,7 @@ index 0000000..a1f83df
 +
 +use crate::grid::{Drag, Geo, outline_bands};
 +use crate::{SheetApp, theme};
-+use playground_live::{Live, Presence};
++use playground_live::{Live, Presence, presence};
 +
 +/// Sheet fields that are this person's view.
 +const VIEW: [&str; 7] = ["zoom", "view", "view_active", "view_top_left", "show_gridlines", "show_headings", "show_formulas"];
@@ -142,17 +144,15 @@ index 0000000..a1f83df
 +thread_local! {
 +    /// The session's workbooks as this page knows them.
 +    static SHARED: RefCell<Shared> = RefCell::new(Shared::default());
-+    /// A pointer is down or a text field has the keyboard (as of the last frame).
-+    static GESTURE: Flag<bool> = const { Flag::new(false) };
 +    /// Where the pointer is on screen (as of the last frame).
 +    static POINTER: Flag<Option<Pos2>> = const { Flag::new(None) };
-+    /// The others in the session, as they last showed themselves.
-+    static OTHERS: RefCell<Vec<Peer>> = const { RefCell::new(Vec::new()) };
 +}
 +
-+/// The end of each frame (web): [`playground_live::frame`], told whether a pointer or the keyboard is busy.
++/// The end of each frame (web), after the grid drew: the presence look's (name tags in GridCraft's bold), then
++/// [`playground_live::frame`].
 +pub fn frame(app: &mut SheetApp, ctx: &egui::Context) {
-+    GESTURE.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
++    presence::set_font(theme::ui_bold(12.0));
++    presence::end_frame(ctx);
 +    POINTER.set(ctx.input(|i| i.pointer.hover_pos()));
 +    playground_live::frame(app);
 +}
@@ -203,12 +203,9 @@ index 0000000..a1f83df
 +const MAX_TEXT: usize = 300;
 +/// The shell sends no presence over 4 KiB.
 +const MAX_PRESENCE: usize = 4000;
-+/// Names in tags are cut to this many characters.
-+const MAX_NAME: usize = 24;
-+/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
-+const EASE: f64 = 0.08;
-+/// A pointer's arrow, tip first: egui fills a closed path as a fan from its first point, which this shape allows.
-+const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [12.5, 11.0], [7.3, 11.0], [10.4, 17.3], [7.6, 18.6], [4.5, 12.2], [0.0, 16.0]];
++/// The kit's pointer arrow, tip first, for right-to-left sheets (its cursor doesn't mirror): egui fills a closed path as
++/// a fan from its first point, which this shape allows.
++const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
 +
 +/// The gesture under way in this person's grid, where it has its items so far, for the others' ghosts: the range a
 +/// border drag moves (`move`: where it goes) or the fill handle fills (`fill`), a column's or a row's edge (`col` and
@@ -226,7 +223,7 @@ index 0000000..a1f83df
 +        Drag::ResizeRow { row, .. } => json!({"row": row, "height": round(sh.row_height(row).into())}),
 +        Drag::MoveCols { before: Some(before), .. } => json!({"before": before}),
 +        Drag::Object { kind, id, .. } => {
-+            let (a, _) = object(sh, Some(kind), id)?;
++            let a = object(sh, Some(kind), id)?;
 +            let (x, y) = (sh.col_left(a.cell.col) + f64::from(a.dx), sh.row_top(a.cell.row) + f64::from(a.dy));
 +            json!({"object": [kind, id], "rect": [round(x), round(y), round(a.width.into()), round(a.height.into())]})
 +        }
@@ -258,80 +255,32 @@ index 0000000..a1f83df
 +    (kept.len() >= 2).then(|| kept.iter().flatten().map(|v| v.round() as i64).collect())
 +}
 +
-+/// A floating object on `sh` by its kind (any when `None`) and id: its anchor and corner radius (sheet points).
-+fn object(sh: &Sheet, kind: Option<&str>, id: u32) -> Option<(Anchor, f32)> {
++/// A floating object on `sh` by its kind (any when `None`) and id: its anchor.
++fn object(sh: &Sheet, kind: Option<&str>, id: u32) -> Option<Anchor> {
 +    let is = |k: &str| kind.is_none_or(|kind| kind == k);
-+    let radius = |s: &Shape| if s.kind == ShapeKind::RoundedRectangle { 10.0 } else { 0.0 };
-+    (sh.shapes.iter().find(|s| is("shape") && s.id == id).map(|s| (s.anchor, radius(s))))
-+        .or_else(|| sh.charts.iter().find(|c| is("chart") && c.id == id).map(|c| (c.anchor, 0.0)))
-+        .or_else(|| sh.images.iter().find(|c| is("image") && c.id == id).map(|c| (c.anchor, 0.0)))
-+        .or_else(|| sh.slicers.iter().find(|c| is("slicer") && c.id == id).map(|c| (c.anchor, 0.0)))
++    (sh.shapes.iter().find(|s| is("shape") && s.id == id).map(|s| s.anchor))
++        .or_else(|| sh.charts.iter().find(|c| is("chart") && c.id == id).map(|c| c.anchor))
++        .or_else(|| sh.images.iter().find(|c| is("image") && c.id == id).map(|c| c.anchor))
++        .or_else(|| sh.slicers.iter().find(|c| is("slicer") && c.id == id).map(|c| c.anchor))
 +}
 +
-+/// Another person as they last showed themselves, with their moving marks where this grid last drew them (sheet
-+/// points), eased toward where they are: the pointer, the ghost of a drag, and the stroke ([its length, how far its shown
-+/// end is behind its newest point]; a length of infinity: not seen yet, shown whole at once).
-+struct Peer {
-+    who: Presence,
-+    pointer: Option<[f64; 2]>,
-+    ghost: Option<Ghost>,
-+    ink: [f64; 2],
-+}
-+
-+/// The ghost of a drag in sheet points: an area ([left, top, right, bottom] of cells or an object, with its corner radius)
-+/// or the line a column's (x) or a row's (y) edge goes to.
++/// The ghost of a drag in sheet points: an area ([left, top, right, bottom] of cells or an object) or the line a column's
++/// (x) or a row's (y) edge goes to.
 +#[derive(Clone, Copy, Debug, PartialEq)]
 +enum Ghost {
-+    Area([f64; 4], f32),
++    Area([f64; 4]),
 +    Col(f64),
 +    Row(f64),
 +}
 +
-+impl Peer {
-+    /// One frame on toward this person's latest state on `sh` laid out by `geo` (`k`: the share of the way, `far`: the
-+    /// jump in screen points that goes at once). Whether a mark is still on its way.
-+    fn step(&mut self, sh: &Sheet, geo: &Geo, k: f64, far: f64) -> bool {
-+        let state = &self.who.state;
-+        let (z, mut moving) = (f64::from(geo.z), false);
-+        let head = [geo.header_w, geo.header_h].map(|size| f64::from(size / geo.z));
-+        // Between a heading strip and the cells it goes at once: sheet points do not run on across that edge.
-+        let side = |at: &[f64; 2]| at.map(|v| v < 0.0);
-+        match (&mut self.pointer, pointer_at(sh, &state["pointer"], &state["drag"], head)) {
-+            (Some(s), Some(t)) if side(s) == side(&t) => moving |= ease(s, &t, k, z, far),
-+            (s, t) => *s = t,
-+        }
-+        match (&mut self.ghost, ghost(sh, &state["drag"])) {
-+            (Some(Ghost::Area(s, r)), Some(Ghost::Area(t, q))) if *r == q => moving |= ease(s, &t, k, z, far),
-+            (Some(Ghost::Col(s)), Some(Ghost::Col(t))) | (Some(Ghost::Row(s)), Some(Ghost::Row(t))) => {
-+                moving |= ease(std::slice::from_mut(s), &[t], k, z, far);
-+            }
-+            (s, t) => *s = t,
-+        }
-+        let stroke = stroke_at(&state["stroke"]);
-+        if stroke.is_empty() {
-+            self.ink = [0.0; 2];
-+        } else {
-+            let [seen, behind] = &mut self.ink;
-+            let length = length(&stroke);
-+            *behind = (*behind + length - *seen).max(0.0);
-+            *seen = length;
-+            moving |= ease(std::slice::from_mut(behind), &[0.0], k, z, far);
-+        }
-+        moving
++/// Person `o`'s drag on `sh` (see [`ghost`]), eased toward where it is ([`presence::ease`]; `z`: screen points per sheet
++/// point, `far`: the jump in screen points that goes at once). Another kind of ghost shows at once.
++fn eased_ghost(ctx: &egui::Context, o: &Presence, sh: &Sheet, z: f64, far: f64) -> Option<Ghost> {
++    match ghost(sh, &o.state["drag"])? {
++        Ghost::Area(t) => presence::ease(ctx, &o.id, "area", t, [z; 4], [far; 4]).map(Ghost::Area),
++        Ghost::Col(t) => presence::ease(ctx, &o.id, "col", [t], [z], [far]).map(|[x]| Ghost::Col(x)),
++        Ghost::Row(t) => presence::ease(ctx, &o.id, "row", [t], [z], [far]).map(|[y]| Ghost::Row(y)),
 +    }
-+}
-+
-+/// `s` moved `k` of the way to `t` (sheet points, `z` screen points each), all of it after a jump of more than `far`
-+/// screen points or once under half a point remains. Whether it is still on its way.
-+fn ease(s: &mut [f64], t: &[f64], k: f64, z: f64, far: f64) -> bool {
-+    let off = |s: &[f64]| s.iter().zip(t).map(|(s, t)| (t - s).abs() * z).fold(0.0, f64::max);
-+    let k = if off(s) > far { 1.0 } else { k };
-+    s.iter_mut().zip(t).for_each(|(s, t)| *s += (t - *s) * k);
-+    let moving = off(s) >= 0.5;
-+    if !moving {
-+        s.copy_from_slice(t);
-+    }
-+    moving
 +}
 +
 +fn cell(v: &Value) -> Option<CellRef> {
@@ -376,7 +325,7 @@ index 0000000..a1f83df
 +    let index = |k: &str, max: u32| d[k].as_u64().filter(|&i| i < u64::from(max)).map(|i| i as u32);
 +    if let Some(r) = range("move").or_else(|| range("fill")) {
 +        let (right, bottom) = (sh.col_left(r.end.col) + f64::from(sh.col_width(r.end.col)), sh.row_top(r.end.row) + f64::from(sh.row_height(r.end.row)));
-+        return Some(Ghost::Area([sh.col_left(r.start.col), sh.row_top(r.start.row), right, bottom], 0.0));
++        return Some(Ghost::Area([sh.col_left(r.start.col), sh.row_top(r.start.row), right, bottom]));
 +    }
 +    if let (Some(c), Some(w)) = (index("col", MAX_COLS), number(&d["width"], 1e4)) {
 +        return Some(Ghost::Col(sh.col_left(c) + w));
@@ -388,9 +337,9 @@ index 0000000..a1f83df
 +        return Some(Ghost::Col(sh.col_left(before)));
 +    }
 +    let id = u32::try_from(d["object"][1].as_u64()?).ok()?;
-+    let (_, radius) = object(sh, Some(d["object"][0].as_str()?), id)?;
++    object(sh, Some(d["object"][0].as_str()?), id)?;
 +    let [x, y, w, h] = [0, 1, 2, 3].map(|i| number(&d["rect"][i], 1e9));
-+    Some(Ghost::Area([x?, y?, x? + w?, y? + h?], radius))
++    Some(Ghost::Area([x?, y?, x? + w?, y? + h?]))
 +}
 +
 +/// A stroke's points (sheet points) from its flat list; none unless every number is a sheet point.
@@ -411,25 +360,24 @@ index 0000000..a1f83df
 +    pos2(along(at[0], geo.cells.left(), geo.x(sh, c), sh.col_left(c)), along(at[1], geo.cells.top(), geo.y(sh, r), sh.row_top(r)))
 +}
 +
-+/// The ghost of a drag in `color`: the area translucent with its edge, or the edge's line across the grid.
++/// The ghost of a drag in `color`: the area the kit's way, or the edge's line across the grid.
 +fn paint_ghost(p: &Painter, geo: &Geo, sh: &Sheet, ghost: Ghost, color: Color32) {
 +    let edge = color.gamma_multiply(0.85);
 +    let cells = geo.cells;
 +    match ghost {
-+        Ghost::Area(a, radius) => {
++        Ghost::Area(a) => {
 +            let rect = Rect::from_min_max(screen(geo, sh, &a[..2]), screen(geo, sh, &a[2..]));
 +            let last = |v: f64, start: f64| (v - 0.01).max(start);
 +            let covered = RangeRef::new(
 +                CellRef::new(sh.row_at(a[1]), sh.col_at(a[0])),
 +                CellRef::new(sh.row_at(last(a[3], a[1])), sh.col_at(last(a[2], a[0]))),
 +            );
-+            let radius = radius * geo.z;
 +            for pane in geo.range_panes(covered) {
 +                let clip = pane.intersect(p.clip_rect());
 +                // Cut to what shows (a whole column is millions of points tall), keeping its edges out of sight.
-+                let shown = rect.intersect(clip.expand(radius + 4.0));
++                let shown = rect.intersect(clip.expand(4.0));
 +                if shown.is_positive() {
-+                    p.with_clip_rect(clip).rect(shown, radius, color.gamma_multiply(0.28), Stroke::new(1.5, edge), StrokeKind::Inside);
++                    presence::ghost(&p.with_clip_rect(clip), shown, color);
 +                }
 +            }
 +        }
@@ -444,10 +392,10 @@ index 0000000..a1f83df
 +    }
 +}
 +
-+/// A stroke being drawn, up to `behind` sheet points short of its newest point: translucent, as wide as the pen.
-+fn paint_stroke(p: &Painter, geo: &Geo, sh: &Sheet, stroke: &[[f64; 2]], behind: f64, color: Color32) {
++/// A stroke being drawn, its first `shown` sheet points: translucent, as wide as the pen.
++fn paint_stroke(p: &Painter, geo: &Geo, sh: &Sheet, stroke: &[[f64; 2]], shown: f64, color: Color32) {
 +    let Some(&first) = stroke.first() else { return };
-+    let mut left = length(stroke) - behind;
++    let mut left = shown;
 +    let mut line = vec![screen(geo, sh, &first)];
 +    for w in stroke.windows(2) {
 +        let d = (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
@@ -523,38 +471,24 @@ index 0000000..a1f83df
 +            }
 +        }
 +    }
-+    if let Some((a, radius)) = state["object"].as_u64().and_then(|id| object(sh, None, u32::try_from(id).ok()?)) {
-+        let r = crate::chartview::anchor_rect(geo, sh, &a);
-+        p.rect_stroke(r, radius * geo.z, Stroke::new(2.0, color), StrokeKind::Outside);
++    if let Some(a) = state["object"].as_u64().and_then(|id| object(sh, None, u32::try_from(id).ok()?)) {
++        // Just outside it.
++        presence::outline(p, crate::chartview::anchor_rect(geo, sh, &a).expand(2.0), color);
 +    }
 +}
 +
-+/// A pointer on `p`, which paints on screen: the arrow, its tip at `tip` (logical, mirrored on a right-to-left sheet), in
-+/// `color` with a white edge and a soft shadow.
-+fn paint_arrow(p: &Painter, geo: &Geo, tip: Pos2, color: Color32) {
-+    let mut points: Vec<Pos2> = ARROW.iter().map(|&[x, y]| geo.mirror_pos(tip + vec2(x, y))).collect();
-+    // Mirrored, the outline runs the other way round: the same way again, tip first.
-+    if geo.rtl {
-+        points[1..].reverse();
-+    }
-+    let shadow = points.iter().map(|q| *q + vec2(0.0, 1.0)).collect();
-+    p.add(PathShape::convex_polygon(shadow, Color32::from_black_alpha(64), Stroke::NONE));
++/// A pointer on `p`, which paints on screen, on a right-to-left sheet: the kit's arrow mirrored, its tip at `tip`
++/// (logical), in `color` with a white edge and a soft shadow.
++fn paint_mirrored_arrow(p: &Painter, geo: &Geo, tip: Pos2, color: Color32) {
++    let points: Vec<Pos2> = ARROW.iter().map(|&[x, y]| geo.mirror_pos(tip + vec2(x, y))).collect();
++    let shadow = Color32::from_black_alpha(64);
++    p.add(PathShape::convex_polygon(points.iter().map(|q| *q + vec2(0.0, 1.0)).collect(), shadow, Stroke::new(1.5, shadow)));
 +    p.add(PathShape::convex_polygon(points, color, Stroke::new(1.5, Color32::WHITE)));
 +}
 +
-+/// A name tag in `color` where `place` puts a tag of the size it is given. Dark text on light colors.
++/// The kit's name tag in `color` where `place` puts a tag of the size it is given.
 +fn paint_tag(p: &Painter, name: &str, color: Color32, place: impl FnOnce(Vec2) -> Rect) {
-+    if name.is_empty() {
-+        return;
-+    }
-+    let name: String = if name.chars().count() > MAX_NAME { name.chars().take(MAX_NAME - 1).chain(['…']).collect() } else { name.into() };
-+    let lin = egui::ecolor::linear_f32_from_gamma_u8;
-+    let luminance = 0.2126 * lin(color.r()) + 0.7152 * lin(color.g()) + 0.0722 * lin(color.b());
-+    let ink = if luminance > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE };
-+    let text = p.layout_no_wrap(name, theme::ui_bold(12.0), ink);
-+    let r = place(text.size() + vec2(14.0, 6.0));
-+    p.rect_filled(r, 6.0, color);
-+    p.galley(r.min + vec2(7.0, 3.0), text, ink);
++    presence::tag(p, place(presence::tag_size(p, name)).min, color, name);
 +}
 +
 +/// Where a name of `size` goes without a pointer to go by: in the row of `at` (the active cell, or the draft over it),
@@ -573,58 +507,64 @@ index 0000000..a1f83df
 +/// The others on this person's workbook and sheet, in their colors: first what they are dragging, then their
 +/// selections and drafts, then their pointers with their names, over the cells and the headings (a name by the active
 +/// cell or draft for whoever's pointer is off the grid). The grid's overlays call it first: `p` paints over the cells of
-+/// `sh`, the active sheet, laid out by `geo`, left to right. Marks ease toward where they were last shown, repainting
-+/// until they get there.
++/// `sh`, the active sheet, laid out by `geo`, left to right. Marks ease toward where they were last shown
++/// ([`presence::ease`], which repaints until they get there).
 +pub(crate) fn draw_presence(app: &SheetApp, p: &Painter, geo: &Geo, sh: &Sheet) {
-+    OTHERS.with_borrow_mut(|others| {
-+        let (Some(doc), Some(d)) = (active_id(&app.session).filter(|_| !others.is_empty()), app.session.active()) else { return };
-+        let here = |s: &Value| s["doc"].as_u64() == Some(doc) && s["sheet"].as_str() == Some(sh.name.as_str());
-+        let mut here: Vec<&mut Peer> = others.iter_mut().filter(|o| here(&o.who.state)).collect();
-+        let dt = p.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
-+        let k = 1.0 - (-f64::from(dt) / EASE).exp();
-+        let far = 0.25 * f64::from(geo.cells.width().max(geo.cells.height()));
-+        let mut moving = false;
-+        for o in &mut here {
-+            moving |= o.step(sh, geo, k, far);
++    let others = presence::others();
++    let (Some(doc), Some(d)) = (active_id(&app.session).filter(|_| !others.is_empty()), app.session.active()) else { return };
++    let here = |s: &Value| s["doc"].as_u64() == Some(doc) && s["sheet"].as_str() == Some(sh.name.as_str());
++    let here: Vec<&Presence> = others.iter().filter(|o| here(&o.state)).collect();
++    let (ctx, z) = (p.ctx(), f64::from(geo.z));
++    let far = 0.25 * f64::from(geo.cells.width().max(geo.cells.height()));
++    for o in &here {
++        if let Some(ghost) = eased_ghost(ctx, o, sh, z, far) {
++            paint_ghost(p, geo, sh, ghost, presence::color(o));
 +        }
-+        if moving {
-+            p.ctx().request_repaint();
++        // How much of the stroke shows: its length, eased toward its newest point; held at none between strokes so the
++        // next one is drawn out from its start (one under way when its person is first seen shows whole).
++        let stroke = stroke_at(&o.state["stroke"]);
++        let far = if stroke.is_empty() { 0.0 } else { far };
++        if let Some([shown]) = presence::ease(ctx, &o.id, "stroke", [length(&stroke)], [z], [far]) {
++            paint_stroke(p, geo, sh, &stroke, shown, presence::color(o));
 +        }
-+        let color = |o: &Peer| Color32::from_rgb(o.who.color[0], o.who.color[1], o.who.color[2]);
-+        for o in &here {
-+            if let Some(ghost) = o.ghost {
-+                paint_ghost(p, geo, sh, ghost, color(o));
++    }
++    let drafts: Vec<Option<Rect>> = here.iter().map(|o| {
++        paint_selection(p, geo, sh, &o.state, presence::color(o));
++        paint_typing(p, geo, &d.wb, sh, &o.state["typing"], presence::color(o))
++    }).collect();
++    // Pointers on a layer of their own just above the grid's, so they show over the headings too (menus, popups and
++    // dialogs stay above), painted on screen.
++    let layer = egui::LayerId::new(p.layer_id().order, egui::Id::new("live_presence"));
++    ctx.set_sublayer(p.layer_id(), layer);
++    let top = Painter::new(ctx.clone(), layer, geo.rect);
++    let heads = Rect::from_min_max(pos2(geo.head_left(), geo.head_top()), geo.cells.max);
++    let head = [geo.header_w, geo.header_h].map(|size| f64::from(size / geo.z));
++    // A pointer shows where it lands as what it is (a cell scrolled away is not over the headings), unless frozen
++    // panes cover it.
++    let shown = |at: [f64; 2]| {
++        let tip = screen(geo, sh, &at);
++        let agrees = (at[0] < 0.0) == (tip.x < geo.cells.left()) && (at[1] < 0.0) == (tip.y < geo.cells.top());
++        let frozen = geo.hidden_under_frozen(sh, CellRef::new(sh.row_at(at[1].max(0.0)), sh.col_at(at[0].max(0.0))));
++        (heads.contains(tip) && agrees && !frozen).then_some(tip)
++    };
++    for (o, draft) in here.iter().zip(drafts) {
++        let color = presence::color(o);
++        // Between a heading strip and the cells it goes at once (a mark of its own): sheet points do not run on across
++        // that edge.
++        let pointer = pointer_at(sh, &o.state["pointer"], &o.state["drag"], head)
++            .and_then(|t| presence::ease(ctx, &o.id, &format!("pointer {:?}", t.map(|v| v < 0.0)), t, [z; 2], [far; 2]));
++        if let Some(tip) = pointer.and_then(shown) {
++            if geo.rtl {
++                paint_mirrored_arrow(&top, geo, tip, color);
++                paint_tag(&top, &o.name, color, |size| geo.mirror_rect(Rect::from_min_size(tip + vec2(12.0, 15.0), size)));
++            } else {
++                presence::cursor(&top, tip, color, &o.name);
 +            }
-+            paint_stroke(p, geo, sh, &stroke_at(&o.who.state["stroke"]), o.ink[1], color(o));
++        } else if let Some(active) = cell(&o.state["active"]).filter(|&c| !geo.hidden_under_frozen(sh, c)) {
++            let at = draft.unwrap_or_else(|| geo.range_rect(sh, sh.merge_at(active).unwrap_or(RangeRef::cell(active))));
++            paint_tag(p, &o.name, color, |size| parked(geo, sh, at, size));
 +        }
-+        let drafts: Vec<Option<Rect>> = here.iter().map(|o| {
-+            paint_selection(p, geo, sh, &o.who.state, color(o));
-+            paint_typing(p, geo, &d.wb, sh, &o.who.state["typing"], color(o))
-+        }).collect();
-+        // Pointers on a layer of their own just above the grid's, so they show over the headings too (menus, popups and
-+        // dialogs stay above), painted on screen.
-+        let layer = egui::LayerId::new(p.layer_id().order, egui::Id::new("live_presence"));
-+        p.ctx().set_sublayer(p.layer_id(), layer);
-+        let top = Painter::new(p.ctx().clone(), layer, geo.rect);
-+        let heads = Rect::from_min_max(pos2(geo.head_left(), geo.head_top()), geo.cells.max);
-+        // A pointer shows where it lands as what it is (a cell scrolled away is not over the headings), unless frozen
-+        // panes cover it.
-+        let shown = |at: [f64; 2]| {
-+            let tip = screen(geo, sh, &at);
-+            let agrees = (at[0] < 0.0) == (tip.x < geo.cells.left()) && (at[1] < 0.0) == (tip.y < geo.cells.top());
-+            let frozen = geo.hidden_under_frozen(sh, CellRef::new(sh.row_at(at[1].max(0.0)), sh.col_at(at[0].max(0.0))));
-+            (heads.contains(tip) && agrees && !frozen).then_some(tip)
-+        };
-+        for (o, draft) in here.iter().zip(drafts) {
-+            if let Some(tip) = o.pointer.and_then(shown) {
-+                paint_arrow(&top, geo, tip, color(o));
-+                paint_tag(&top, &o.who.name, color(o), |size| geo.mirror_rect(Rect::from_min_size(tip + vec2(12.0, 15.0), size)));
-+            } else if let Some(active) = cell(&o.who.state["active"]).filter(|&c| !geo.hidden_under_frozen(sh, c)) {
-+                let at = draft.unwrap_or_else(|| geo.range_rect(sh, sh.merge_at(active).unwrap_or(RangeRef::cell(active))));
-+                paint_tag(p, &o.who.name, color(o), |size| parked(geo, sh, at, size));
-+            }
-+        }
-+    });
++    }
 +}
 +
 +/// The session's workbooks on this page: the one active when it started (or that it joined into), and every one opened,
@@ -713,16 +653,15 @@ index 0000000..a1f83df
 +        };
 +        p.text(pos2(rect.left() + 42.0, rect.center().y - 8.0), egui::Align2::LEFT_CENTER, &title, theme::ui_font(13.5), t.text);
 +        p.text(pos2(rect.left() + 42.0, rect.center().y + 9.0), egui::Align2::LEFT_CENTER, note, theme::ui_font(11.5), t.text_dim);
-+        let names = OTHERS.with_borrow(|others| {
-+            let on = others.iter().filter(|o| o.who.state["doc"].as_u64() == Some(id));
-+            on.enumerate()
-+                .map(|(k, o)| {
-+                    let at = pos2(rect.right() - 16.0 - 16.0 * k as f32, rect.center().y);
-+                    p.circle(at, 5.0, Color32::from_rgb(o.who.color[0], o.who.color[1], o.who.color[2]), Stroke::new(1.5, Color32::WHITE));
-+                    o.who.name.clone()
-+                })
-+                .collect::<Vec<_>>()
-+        });
++        let on = presence::others().into_iter().filter(|o| o.state["doc"].as_u64() == Some(id));
++        let names = on
++            .enumerate()
++            .map(|(k, o)| {
++                let at = pos2(rect.right() - 16.0 - 16.0 * k as f32, rect.center().y);
++                p.circle(at, 5.0, presence::color(&o), Stroke::new(1.5, Color32::WHITE));
++                o.name
++            })
++            .collect::<Vec<_>>();
 +        let resp = if names.is_empty() { resp } else { resp.on_hover_text(names.join(", ")) };
 +        if resp.clicked() {
 +            chosen = Some((id, uid));
@@ -969,7 +908,7 @@ index 0000000..a1f83df
 +
 +    fn live_quiet(&self) -> bool {
 +        let g = &self.grid;
-+        !GESTURE.get()
++        presence::quiet()
 +            && self.editor.is_none()
 +            && self.text_box_editor.is_none()
 +            && self.session.mode == Mode::Ready
@@ -1027,18 +966,8 @@ index 0000000..a1f83df
 +        state
 +    }
 +
-+    /// Who is still on the same workbook and sheet keeps their marks where they were drawn, to ease on from there.
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        OTHERS.with_borrow_mut(|old| {
-+            *old = (others.into_iter())
-+                .map(|who| {
-+                    let place = |s: &Value| (s["doc"].clone(), s["sheet"].clone());
-+                    let same = |o: &&Peer| o.who.id == who.id && place(&o.who.state) == place(&who.state);
-+                    let (pointer, ghost, ink) = old.iter().find(same).map_or((None, None, [f64::INFINITY, 0.0]), |o| (o.pointer, o.ghost, o.ink));
-+                    Peer { who, pointer, ghost, ink }
-+                })
-+                .collect();
-+        });
++        presence::show(others);
 +    }
 +
 +    fn live_disconnected(&mut self) {
@@ -1224,8 +1153,8 @@ index 0000000..a1f83df
 +        POINTER.set(None);
 +        assert!(a.live_presence().get("pointer").is_none(), "no pointer off the grid");
 +        // A fill under way: the others see its ghost over the range it fills so far.
-+        a.grid.drag = Drag::Fill { target: RangeRef::parse("D4:D9") };
-+        let Some(Ghost::Area(at, _)) = ghost(sh, &a.live_presence()["drag"]) else { panic!("no ghost for a fill") };
++        a.grid.drag = Drag::Fill { target: RangeRef::parse("D4:D9"), menu: false };
++        let Some(Ghost::Area(at)) = ghost(sh, &a.live_presence()["drag"]) else { panic!("no ghost for a fill") };
 +        let (geo, d4) = (a.grid.geo.as_ref().unwrap(), RangeRef::parse("D4:D9").unwrap());
 +        let ghost = Rect::from_min_max(screen(geo, sh, &at[..2]), screen(geo, sh, &at[2..]));
 +        assert!((ghost.min - geo.range_rect(sh, d4).min).length() + (ghost.max - geo.range_rect(sh, d4).max).length() < 0.01);

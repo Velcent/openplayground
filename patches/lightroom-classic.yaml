@@ -111,21 +111,27 @@
   find: 'pub const TAB_LOCK: &str = "lightcraft-library";'
   replace: 'pub const TAB_LOCK: &str = "lightcraft-classic-library";'
 
-# Live editing in Playground sessions (patches/lightroom-classic/live.diff + patches/live/playground_live.rs)
+# Live editing in Playground sessions (patches/lightroom-classic/live.diff + the playground-live crate, `live_kit`)
 # What it's for: two or more people edit one library together in a Playground session: the shared document is the
 #   catalog (develop settings, History, Versions, ratings, flags, labels, metadata, collections and saved creations,
 #   stacks, keywords, saved locations) and imported originals travel as session files; views and this browser's own
 #   records stay local, and while connected Undo and Redo go to the session.
 # How: live.diff only adds files: apps/web/src/live.rs (the adapter, media and command hooks), apps/web/src/live_web.rs
-#   (the host side, a child of web.rs) and a `live` module in the catalog, engine and ui-egui crates. The rules below
-#   declare those modules and add one-line calls into them; native builds never set the hooks, so nothing changes there.
+#   (the host side, a child of web.rs) and a `live` module in the catalog, engine and ui-egui crates. The
+#   playground-live crate (patches/live/kit) gives the session, the JSON merge and the presence look (pointers, tags,
+#   outlines, ghosts, colors, easing). The rules below add the crate, declare those modules and add one-line calls into
+#   them; native builds never set the hooks, so nothing changes there.
 # Verify: open /lightroom-classic/ twice (two browser profiles), start a session in one and join from the other: a
 #   rating or an imported photo shows in both, each keeps its own photo on screen, and Ctrl+Z undoes only its author's
-#   step (tests/live-apps/lightroom-classic.mjs).
+#   step (tests/live-apps/lightroom-classic.mjs); and `cargo test -p lcc-web --lib live::`.
 # If upstream changes: re-anchor the rule that no longer matches on the same function's signature (or the file's end
 #   for module declarations); a compile error inside an inserted line means a field or parameter it names was renamed.
 
-# The adapter module (native tests compile it too).
+# The adapter module (native tests compile it too), and the playground-live crate with its presence look (`egui`).
+- live: true
+  file: apps/web/Cargo.toml
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 - live: true
   file: apps/web/src/lib.rs
   find: '(?![\s\S])'

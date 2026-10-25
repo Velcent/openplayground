@@ -21,14 +21,14 @@
 # threads), the browser panel's folder index and the sample map (never started). Native builds see none of this:
 # every rule adds wasm-only lines, or a wasm-only early return.
 
-# Rule 1/76: the web build's own profile (apps/suhina-web/index.html names it): release with whole-program
+# Rule 1/77: the web build's own profile (apps/suhina-web/index.html names it): release with whole-program
 # optimisation, as NoteCraft's and the ArtCraft web profiles have. A table of its own, so upstream's [profile.release]
 # stays as it is. If upstream adds a profile of this name, rename it here and in index.html.
 - file: Cargo.toml
   find: '(?![\s\S])'
   after: "\n# Playground's web build (patches/ableton-live.yaml): release with whole-program optimisation.\n[profile.playground-web]\ninherits = \"release\"\nlto = \"fat\"\ncodegen-units = 1\n"
 
-# Rules 2-3/76: the plug-in hosts' sockets. `interprocess` has no wasm side: on wasm crates/plugins takes the
+# Rules 2-3/77: the plug-in hosts' sockets. `interprocess` has no wasm side: on wasm crates/plugins takes the
 # never-connecting stand-in crates/playground has under that name (starting a plug-in host fails with a message, and
 # the project plays without it). The first rule moves the crate's line into a native-only table at the end; if
 # upstream drops or renames the dependency, drop both rules.
@@ -39,7 +39,7 @@
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: no plug-in hosts there (patches/ableton-live.yaml).\n#[cfg(target_arch = \"wasm32\")] use suhina_playground::interprocess;\n"
 
-# Rules 4-17/76: crates/playground as a wasm-only dependency of each crate whose modules take its std (crates/plugins
+# Rules 4-17/77: crates/playground as a wasm-only dependency of each crate whose modules take its std (crates/plugins
 # has it from the rules above), under a target spelling nobody else uses (`all(...)`), so it never meets a table of
 # upstream's. A crate upstream adds that needs the clock or files gets one more such rule.
 - file: crates/als/Cargo.toml
@@ -82,7 +82,7 @@
   find: '(?![\s\S])'
   after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nsuhina-playground = { path = \"../../crates/playground\" }\n"
 
-# Rules 18-69/76: the modules that use the clock, files or threads (Instant::now, SystemTime::now, std::fs,
+# Rules 18-70/77: the modules that use the clock, files or threads (Instant::now, SystemTime::now, std::fs,
 # thread::scope / sleep, process::id) take `std` from crates/playground on wasm through ONE `use` line at their end
 # (see the top). Found with: every non-test module of the crates the web build compiles that names Instant,
 # SystemTime, fs::, File::, OpenOptions or thread::scope/sleep (crates/ipc's mmap'd regions and the recording thread's
@@ -116,6 +116,9 @@
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: the clock, files and threads (patches/ableton-live.yaml).\n#[cfg(target_arch = \"wasm32\")] use suhina_playground::std;\n"
 - file: crates/engine/src/plugin.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock, files and threads (patches/ableton-live.yaml).\n#[cfg(target_arch = \"wasm32\")] use suhina_playground::std;\n"
+- file: crates/engine/src/swap.rs
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: the clock, files and threads (patches/ableton-live.yaml).\n#[cfg(target_arch = \"wasm32\")] use suhina_playground::std;\n"
 - file: crates/ipc/src/doorbell.rs
@@ -242,7 +245,7 @@
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: the clock, files and threads (patches/ableton-live.yaml).\n#[cfg(target_arch = \"wasm32\")] use suhina_playground::std;\n"
 
-# Rules 70-71/76: backups name their times through chrono, which takes std's SystemTime: those two functions get it
+# Rules 71-72/77: backups name their times through chrono, which takes std's SystemTime: those two functions get it
 # from the page's (no backups are written in the browser, but backup.rs's clock must be the page's: every Session
 # makes a backup state at once). If upstream renames them, follow.
 - file: crates/session/src/backup.rs
@@ -252,7 +255,7 @@
   find: '\bfn\s+clock_time\s*\(\s*written\s*:\s*SystemTime\s*\)\s*->\s*String\s*\{'
   after: "\n    #[cfg(target_arch = \"wasm32\")] let written = suhina_playground::std_time(written);"
 
-# Rules 72-76/76: files in memory where a call asks the real file system (Path::is_file, canonicalize): the project's
+# Rules 73-77/77: files in memory where a call asks the real file system (Path::is_file, canonicalize): the project's
 # audio is found (`locate`, inside the project's folder, no links, answered by crates/playground) and decoded,
 # samples and Stems files added to a project are found, and a decoded file still in its place is not offered as
 # missing. If upstream changes: follow `locate`'s signature; anchor the others on the new spelling of the check.
@@ -272,7 +275,7 @@
   find: '!loaded\s*\|\|\s*!missing\.last_path\.is_file\(\)'
   replace: '!loaded || !std::fs::metadata(&missing.last_path).is_ok_and(|m| m.is_file())'
 
-# Live editing in Playground sessions (patches/ableton-live/live.diff + patches/live/playground_live.rs)
+# Live editing in Playground sessions (patches/ableton-live/live.diff + the playground-live crate, tools.yaml live_kit)
 # What it's for: people in a Playground session work on the same project at once: clips and their notes, audio clip
 #   settings, scenes, tracks, the arrangement, the mixer (volume, pan, sends), devices and their parameters and the
 #   tempo reach the others as they are made; two people's edits to different clips, or different notes of one clip,
@@ -284,20 +287,26 @@
 #   are not part of the project).
 # How: the adapter lives in new files: crates/session/src/live.rs (the shared document: the project file's JSON, with
 #   ids for lists that have none, a note's being the note itself; the merge; putting a document back into the session;
-#   media; it declares the template, copied next to it), crates/ui/src/app/live.rs (the window as the template's app:
-#   which project is shared, quiet frames, media) with live/peers.rs (presence), and apps/suhina-web/src/live.rs (the
-#   kept runner, the app wrapped with the session's frame). These rules only declare them and call in, one line each.
+#   media; it re-exports the playground-live crate, patches/live/kit, as `kit`), crates/ui/src/app/live.rs (the window
+#   as the kit's app: which project is shared, quiet frames, media) with live/peers.rs (presence, drawn with the kit's
+#   look), and apps/suhina-web/src/live.rs (the kept runner, the app wrapped with the session's frame). These rules
+#   only declare them and call in, one line each.
 # Verify: node scripts/build.mjs check ableton-live head (and LIVE=0), the e2e (tests/live-apps/ableton-live.mjs) and
 #   `cargo test -p suhina-session --lib live`.
 # If upstream changes: when a line named below changes, anchor on its new spelling; if Session or App rename the fields
 #   live.rs uses (project, changes, open_step, param_gesture, audio, audio_changed, audio_folder, undo, redo; projects,
 #   shown, view.drag), follow them there.
 #
-
+# The playground-live crate (the session, and the presence look the others are drawn with) as a dependency of the
+# session crate, whose `live` re-exports it, and of crates/ui with its look (`egui`).
 - live: true
   file: crates/session/Cargo.toml
-  find: '(?![\s\S])'
-  after: "\n[target.'cfg(any(target_arch = \"wasm32\"))'.dependencies]\nwasm-bindgen = \"0.2\"\njs-sys = \"0.3\"\nserde_json = { version = \"1\", features = [\"float_roundtrip\"] }\n"
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\" }\n"
+- live: true
+  file: crates/ui/Cargo.toml
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 - live: true
   file: crates/session/src/lib.rs
   find: '(?![\s\S])'

@@ -1,12 +1,12 @@
 diff --git a/crates/prowave-app/src/live.rs b/crates/prowave-app/src/live.rs
 new file mode 100644
-index 0000000..ed607d4
+index 0000000..f3b1778
 --- /dev/null
 +++ b/crates/prowave-app/src/live.rs
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,606 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +//! Live editing in a Playground session (patches/logic-pro.yaml in github.com/daijro/openplayground): the window is the
-+//! app the session's kit (`kit`, Playground's template) runs on, and Playground's shell/live.js drives it. Nothing
++//! app the session's kit (`kit`, the playground-live crate) runs on, and Playground's shell/live.js drives it. Nothing
 +//! here runs until a session connects. Web only, and its native tests.
 +//!
 +//! The shared document is the project as its `.prowave` file has it (`project.json`), shaped so two people's edits
@@ -19,9 +19,7 @@ index 0000000..ed607d4
 +//! and each track's height, folding, record and input-monitoring buttons. Audio files travel as the session's media,
 +//! named by their content: a region plays `media/<hash>-<length>.<ext>`, kept in memory under `/live`.
 +
-+#[path = "playground_live.rs"]
-+#[allow(dead_code)]
-+pub mod kit;
++pub use ::playground_live as kit;
 +#[cfg(target_arch = "wasm32")]
 +mod peers;
 +#[cfg(target_arch = "wasm32")]
@@ -481,8 +479,6 @@ index 0000000..ed607d4
 +}
 +
 +thread_local! {
-+    /// A pointer is down or text is being typed: nothing goes in or out until it ends.
-+    static BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 +    /// Goes up on frames where the project may have changed (input, and a while after).
 +    static GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 +}
@@ -497,7 +493,7 @@ index 0000000..ed607d4
 +    }
 +
 +    fn live_quiet(&self) -> bool {
-+        !BUSY.get()
++        kit::presence::quiet()
 +    }
 +
 +    fn live_generation(&self) -> Option<u64> {
@@ -556,10 +552,7 @@ index 0000000..ed607d4
 +    }
 +
 +    fn live_show_presence(&mut self, others: Vec<kit::Presence>) {
-+        #[cfg(target_arch = "wasm32")]
-+        peers::show(others);
-+        #[cfg(not(target_arch = "wasm32"))]
-+        drop(others);
++        kit::presence::show(others);
 +    }
 +
 +    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
@@ -599,15 +592,15 @@ index 0000000..ed607d4
 +    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
 +        let input = ui.input(|i| !i.events.is_empty() || i.pointer.any_down() || !i.raw.dropped_files.is_empty());
 +        eframe::App::ui(&mut self.web, ui, frame);
-+        let ctx = ui.ctx().clone();
-+        BUSY.set(ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input());
 +        // Changes come from input (and land within a few frames), or with a new song revision (live_generation).
 +        self.touched = if input { 3 } else { self.touched.saturating_sub(1) };
 +        if self.touched > 0 {
 +            GENERATION.set(GENERATION.get().wrapping_add(1));
 +        }
-+        kit::frame(&mut self.web.app);
++        // The others drawn, then the kit's end of frame (what live_quiet reads), then the session's.
 +        peers::overlay(ui, &self.web.app);
++        kit::presence::end_frame(ui.ctx());
++        kit::frame(&mut self.web.app);
 +    }
 +
 +    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -619,10 +612,10 @@ index 0000000..ed607d4
 +mod tests;
 diff --git a/crates/prowave-app/src/live/peers.rs b/crates/prowave-app/src/live/peers.rs
 new file mode 100644
-index 0000000..53bbb92
+index 0000000..f0e84cf
 --- /dev/null
 +++ b/crates/prowave-app/src/live/peers.rs
-@@ -0,0 +1,425 @@
+@@ -0,0 +1,333 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +//! Presence in a Playground session: where each person is and the gesture under way, in the project's terms, so it
 +//! shows in the same place for everyone whatever their zoom, scroll or window size.
@@ -637,25 +630,19 @@ index 0000000..53bbb92
 +//!             `[start, length, pitch]` each;
 +//!   `fader`   while a channel strip is being worked: `{ "track", "db" }`, its volume as it is now.
 +//! The views record where things are as they draw ([`lanes`], [`piano`], [`strip`]), so the pointer can be read in those terms and
-+//! the others drawn back: their pointers with name tags, ghosts of what their drags are doing, in their colour, eased
-+//! toward where they are.
++//! the others drawn back in the playground-live crate's look ([`presence`]): their pointers with name tags, ghosts of
++//! what their drags are doing, in their colour, eased toward where they are.
 +
-+use super::kit::{self, Presence};
++use super::kit::{self, presence, Presence};
 +use super::{ids_now, App};
-+use egui::{pos2, vec2, Color32, Id, LayerId, Order, Painter, Pos2, Rangef, Rect, Shape, Stroke, StrokeKind, Ui};
++use egui::{pos2, vec2, Color32, Context, Id, LayerId, Order, Painter, Pos2, Rangef, Rect, Ui};
 +use serde_json::{json, Value};
 +use std::cell::RefCell;
 +
 +/// The most notes a presence carries.
 +const MAX_ITEMS: usize = 50;
-+/// The most characters of a name tag, its ellipsis included.
-+const MAX_NAME: usize = 24;
-+/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
-+const EASE: f64 = 0.08;
-+/// The session's pointer arrow, tip first, in points.
-+const ARROW: [(f32, f32); 7] = [(0.0, 0.0), (12.5, 11.0), (7.3, 11.0), (10.4, 17.3), (7.6, 18.6), (4.5, 12.2), (0.0, 16.0)];
-+const GHOST: f32 = 0.28;
-+const GHOST_EDGE: f32 = 0.85;
++/// The others' marks glide however far they go ([`presence::ease`]'s `far`).
++const GLIDE: f64 = f64::INFINITY;
 +
 +/// The Tracks area as drawn this frame.
 +struct Lanes {
@@ -693,23 +680,19 @@ index 0000000..53bbb92
 +    strips: Vec<(usize, Rect, &'static str)>,
 +}
 +
-+/// Someone else, with their marks eased toward their latest state.
-+struct Peer {
-+    id: String,
-+    name: String,
-+    color: Color32,
-+    state: Value,
-+    /// Their pointer's scope (`lanes:<track>`, `piano:<track>:<region>`) and place in it.
++/// Where a person's state puts their marks.
++struct Targets {
++    /// The pointer's scope (`lanes:<track>`, `piano:<track>:<region>`, `strip:<track>:<ns>`) and place in it.
 +    pointer: Option<(String, [f64; 2])>,
 +    /// A region they drag: track id, region id, start and length in beats.
 +    region: Option<([u64; 2], [f64; 2])>,
++    /// Notes they drag: start, length and pitch each.
 +    notes: Vec<[f64; 3]>,
 +}
 +
 +thread_local! {
 +    static FRAME: RefCell<Frame> = RefCell::default();
 +    static MINE: RefCell<Value> = const { RefCell::new(Value::Null) };
-+    static OTHERS: RefCell<Vec<Peer>> = const { RefCell::new(Vec::new()) };
 +}
 +
 +fn on() -> bool {
@@ -816,66 +799,74 @@ index 0000000..53bbb92
 +    }
 +    MINE.set(Value::Object(mine));
 +
-+    // The others: eased, then drawn.
-+    let dt = ui.input(|i| f64::from(i.stable_dt));
-+    if OTHERS.with_borrow_mut(|others| others.iter_mut().fold(false, |moving, p| p.step(dt) | moving)) {
-+        ui.ctx().request_repaint();
-+    }
-+    let index = |id: f64| ids.iter().position(|(t, _)| *t as f64 == id);
-+    let layer = ui.ctx().layer_painter(LayerId::new(Order::Middle, Id::unique("prowave-live-presence")));
++    // The others, eased and drawn.
++    let ctx = ui.ctx();
++    let index = |id: u64| ids.iter().position(|(t, _)| *t == id);
++    let layer = ctx.layer_painter(LayerId::new(Order::Middle, Id::unique("prowave-live-presence")));
 +    if let Some(l) = &frame.lanes {
-+        let row = |track: u64| index(track as f64).and_then(|t| l.rows.get(t)).filter(|r| r.1 > 0.0).map(|&(top, h)| Rangef::new(l.rect.top() + top - l.scroll.1, l.rect.top() + top - l.scroll.1 + h));
++        let row = |track: u64| index(track).and_then(|t| l.rows.get(t)).filter(|r| r.1 > 0.0).map(|&(top, h)| Rangef::new(l.rect.top() + top - l.scroll.1, l.rect.top() + top - l.scroll.1 + h));
 +        let x = |beat: f64| l.rect.left() + beat as f32 * l.beat_px - l.scroll.0;
-+        let all = marks(|peer, marks| {
-+            if let Some(([track, _], [start, len])) = peer.region {
-+                if let Some(rows) = row(track) {
++        let beat_px = f64::from(l.beat_px);
++        let all = marks(|p, to, marks| {
++            if let Some(([track, region], at)) = to.region {
++                let key = format!("region:{track}:{region}");
++                if let (Some(rows), Some([start, len])) = (row(track), presence::ease(ctx, &p.id, &key, at, [beat_px; 2], [GLIDE; 2])) {
 +                    marks.ghosts.push(Rect::from_x_y_ranges(Rangef::new(x(start), x(start + len)), rows.shrink(1.0)));
 +                }
 +            }
-+            if let Some((scope, [fy, beat])) = &peer.pointer {
++            if let Some((scope, at)) = &to.pointer {
 +                let track = scope.strip_prefix("lanes:").and_then(|t| t.parse::<u64>().ok());
-+                marks.tip = track.and_then(row).map(|rows| pos2(x(*beat), rows.min + rows.span() * *fy as f32));
++                if let Some(rows) = track.and_then(row) {
++                    let px = [f64::from(rows.span()), beat_px];
++                    marks.tip = presence::ease(ctx, &p.id, scope, *at, px, [GLIDE; 2]).map(|[fy, beat]| pos2(x(beat), rows.min + rows.span() * fy as f32));
++                }
 +            }
 +        });
 +        paint(&layer.with_clip_rect(l.rect), &all);
 +    }
 +    if let Some(pr) = &frame.piano {
 +        let shown = region_ids(pr.region);
-+        let all = marks(|peer, marks| {
-+            let here = shown.is_some_and(|[t, r]| peer.state["notes"]["track"].as_u64() == Some(t) && peer.state["notes"]["region"].as_u64() == Some(r));
++        let (beat_px, key_h) = (f64::from(pr.beat_px), f64::from(pr.key_h));
++        let all = marks(|p, to, marks| {
++            let here = shown.is_some_and(|[t, r]| p.state["notes"]["track"].as_u64() == Some(t) && p.state["notes"]["region"].as_u64() == Some(r));
 +            if here {
-+                for n in &peer.notes {
++                let px = [beat_px, beat_px, key_h];
++                for n in presence::ease_list(ctx, &p.id, "notes", to.notes.as_flattened(), &px, &[GLIDE]).unwrap_or_default().as_chunks::<3>().0 {
 +                    let left = pr.x(n[0]);
 +                    let top = pr.top(n[2].round());
 +                    marks.ghosts.push(Rect::from_min_max(pos2(left, top + 1.0), pos2(pr.x(n[0] + n[1].max(0.0)).max(left + 2.0), top + pr.key_h)));
 +                }
 +            }
-+            if let (Some((scope, [beat, key])), Some([t, r])) = (&peer.pointer, shown) {
++            if let (Some((scope, at)), Some([t, r])) = (&to.pointer, shown) {
 +                if *scope == format!("piano:{t}:{r}") {
-+                    let k = key.floor();
-+                    marks.tip = Some(pos2(pr.x(*beat), pr.top(k) + pr.key_h * (1.0 - (key - k) as f32)));
++                    if let Some([beat, key]) = presence::ease(ctx, &p.id, scope, *at, [beat_px, key_h], [GLIDE; 2]) {
++                        let k = key.floor();
++                        marks.tip = Some(pos2(pr.x(beat), pr.top(k) + pr.key_h * (1.0 - (key - k) as f32)));
++                    }
 +                }
 +            }
 +        });
 +        paint(&layer.with_clip_rect(pr.grid), &all);
 +    }
-+    paint_strips(&layer, &frame.strips, |id| ids.iter().position(|(t, _)| *t == id));
++    paint_strips(ctx, &layer, &frame.strips, index);
 +}
 +
 +/// The others' pointers on channel strips, with the volume they are setting, over each place's strips.
-+fn paint_strips(layer: &Painter, strips: &[(usize, Rect, &'static str)], index: impl Fn(u64) -> Option<usize>) {
++fn paint_strips(ctx: &Context, layer: &Painter, strips: &[(usize, Rect, &'static str)], index: impl Fn(u64) -> Option<usize>) {
 +    for ns in ["mixer", "inspector"] {
 +        let area = strips.iter().filter(|s| s.2 == ns).fold(Rect::NOTHING, |a, s| a.union(s.1));
 +        if !area.is_positive() {
 +            continue;
 +        }
-+        let all = marks(|peer, marks| {
-+            let Some((scope, [fx, fy])) = &peer.pointer else { return };
++        let all = marks(|p, to, marks| {
++            let Some((scope, at)) = &to.pointer else { return };
 +            let Some((track, place)) = scope.strip_prefix("strip:").and_then(|s| s.split_once(':')) else { return };
 +            let Some(t) = track.parse::<u64>().ok().filter(|_| place == ns).and_then(&index) else { return };
 +            let Some(&(_, rect, _)) = strips.iter().find(|s| s.0 == t && s.2 == ns) else { return };
-+            marks.tip = Some(rect.min + vec2(rect.width() * *fx as f32, rect.height() * *fy as f32));
-+            let fader = &peer.state["fader"];
++            let px = [f64::from(rect.width()), f64::from(rect.height())];
++            let Some([fx, fy]) = presence::ease(ctx, &p.id, scope, *at, px, [GLIDE; 2]) else { return };
++            marks.tip = Some(rect.min + vec2(rect.width() * fx as f32, rect.height() * fy as f32));
++            let fader = &p.state["fader"];
 +            if fader["track"].as_u64().and_then(&index) == Some(t) {
 +                marks.value = num(&fader["db"]).map(|db| format!("{db:.1} dB"));
 +            }
@@ -884,18 +875,17 @@ index 0000000..53bbb92
 +    }
 +}
 +
-+/// Each other person's marks, as `make` places them.
-+fn marks(make: impl Fn(&Peer, &mut Marks)) -> Vec<(Color32, String, Marks)> {
-+    OTHERS.with_borrow(|others| {
-+        others
-+            .iter()
-+            .map(|peer| {
-+                let mut m = Marks::default();
-+                make(peer, &mut m);
-+                (peer.color, peer.name.clone(), m)
-+            })
-+            .collect()
-+    })
++/// Each other person's marks, as `make` places them from where their state puts them.
++fn marks(make: impl Fn(&Presence, &Targets, &mut Marks)) -> Vec<(Color32, String, Marks)> {
++    let others = presence::others();
++    others
++        .iter()
++        .map(|p| {
++            let mut m = Marks::default();
++            make(p, &targets(&p.state), &mut m);
++            (presence::color(p), p.name.clone(), m)
++        })
++        .collect()
 +}
 +
 +/// This person's presence for the others.
@@ -903,98 +893,32 @@ index 0000000..53bbb92
 +    MINE.with_borrow(Clone::clone)
 +}
 +
-+/// The others, all of them each time any changes (empty when the session ends).
-+pub fn show(list: Vec<Presence>) {
-+    OTHERS.with_borrow_mut(|others| {
-+        let mut next = Vec::with_capacity(list.len());
-+        for p in list {
-+            let mut peer = match others.iter().position(|o| o.id == p.id) {
-+                Some(i) => others.swap_remove(i),
-+                None => Peer { id: p.id.clone(), name: String::new(), color: Color32::GRAY, state: Value::Null, pointer: None, region: None, notes: Vec::new() },
-+            };
-+            peer.name = short(&p.name);
-+            peer.color = Color32::from_rgb(p.color[0], p.color[1], p.color[2]);
-+            peer.state = p.state;
-+            // What is new shows at once; the frame's end eases the rest.
-+            peer.step(0.0);
-+            next.push(peer);
-+        }
-+        *others = next;
-+    });
-+    crate::web::repaint();
-+}
-+
-+fn short(name: &str) -> String {
-+    if name.chars().count() <= MAX_NAME {
-+        name.to_owned()
-+    } else {
-+        name.chars().take(MAX_NAME - 1).chain(['…']).collect()
-+    }
-+}
-+
-+impl Peer {
-+    /// Where their state puts their marks.
-+    #[allow(clippy::type_complexity)]
-+    fn targets(&self) -> (Option<(String, [f64; 2])>, Option<([u64; 2], [f64; 2])>, Vec<[f64; 3]>) {
-+        let at = &self.state["at"];
-+        let id = |v: &Value| v.as_u64();
-+        let pointer = match at["in"].as_str() {
-+            Some("lanes") => id(&at["track"]).zip(num(&at["fy"]).zip(num(&at["beat"]))).map(|(t, (a, b))| (format!("lanes:{t}"), [a.clamp(0.0, 1.0), b])),
-+            Some("strip") => id(&at["track"])
-+                .zip(at["ns"].as_str().filter(|ns| matches!(*ns, "mixer" | "inspector")))
-+                .zip(num(&at["fx"]).zip(num(&at["fy"])))
-+                .map(|((t, ns), (x, y))| (format!("strip:{t}:{ns}"), [x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)])),
-+            Some("piano") => id(&at["track"])
-+                .zip(id(&at["region"]))
-+                .zip(num(&at["beat"]).zip(num(&at["key"])))
-+                .map(|((t, r), (b, k))| (format!("piano:{t}:{r}"), [b, k.clamp(0.0, 128.0)])),
-+            _ => None,
-+        };
-+        let g = &self.state["region"];
-+        let region = id(&g[0]).zip(id(&g[1])).zip(num(&g[2]).zip(num(&g[3]))).map(|((t, r), (s, l))| ([t, r], [s, l]));
-+        let notes = self.state["notes"]["list"]
-+            .as_array()
-+            .into_iter()
-+            .flatten()
-+            .take(MAX_ITEMS)
-+            .filter_map(|t| Some([num(&t[0])?, num(&t[1])?, num(&t[2])?.clamp(0.0, 127.0)]))
-+            .collect();
-+        (pointer, region, notes)
-+    }
-+
-+    /// `dt` seconds on toward their latest state; whether a mark is still on its way.
-+    fn step(&mut self, dt: f64) -> bool {
-+        let k = 1.0 - (-dt.clamp(0.0, 0.1) / EASE).exp();
-+        let (pointer, region, notes) = self.targets();
-+        let mut moving = false;
-+        match (&mut self.pointer, pointer) {
-+            (Some((s, p)), Some((t, q))) if *s == t => moving |= ease(p, q, k),
-+            (s, t) => *s = t,
-+        }
-+        match (&mut self.region, region) {
-+            (Some((s, p)), Some((t, q))) if *s == t => moving |= ease(p, q, k),
-+            (s, t) => *s = t,
-+        }
-+        if self.notes.len() == notes.len() {
-+            moving |= self.notes.iter_mut().zip(notes).fold(false, |m, (s, t)| ease(s, t, k) | m);
-+        } else {
-+            self.notes = notes;
-+        }
-+        moving
-+    }
-+}
-+
-+fn ease<const N: usize>(s: &mut [f64; N], t: [f64; N], k: f64) -> bool {
-+    let mut moving = false;
-+    for (s, t) in s.iter_mut().zip(t) {
-+        *s += (t - *s) * k;
-+        if (t - *s).abs() < 1.0e-3 {
-+            *s = t;
-+        } else {
-+            moving = true;
-+        }
-+    }
-+    moving
++/// Where `state` (a person's presence) puts their marks; what isn't a sane number is left out.
++fn targets(state: &Value) -> Targets {
++    let at = &state["at"];
++    let id = |v: &Value| v.as_u64();
++    let pointer = match at["in"].as_str() {
++        Some("lanes") => id(&at["track"]).zip(num(&at["fy"]).zip(num(&at["beat"]))).map(|(t, (a, b))| (format!("lanes:{t}"), [a.clamp(0.0, 1.0), b])),
++        Some("strip") => id(&at["track"])
++            .zip(at["ns"].as_str().filter(|ns| matches!(*ns, "mixer" | "inspector")))
++            .zip(num(&at["fx"]).zip(num(&at["fy"])))
++            .map(|((t, ns), (x, y))| (format!("strip:{t}:{ns}"), [x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)])),
++        Some("piano") => id(&at["track"])
++            .zip(id(&at["region"]))
++            .zip(num(&at["beat"]).zip(num(&at["key"])))
++            .map(|((t, r), (b, k))| (format!("piano:{t}:{r}"), [b, k.clamp(0.0, 128.0)])),
++        _ => None,
++    };
++    let g = &state["region"];
++    let region = id(&g[0]).zip(id(&g[1])).zip(num(&g[2]).zip(num(&g[3]))).map(|((t, r), (s, l))| ([t, r], [s, l]));
++    let notes = state["notes"]["list"]
++        .as_array()
++        .into_iter()
++        .flatten()
++        .take(MAX_ITEMS)
++        .filter_map(|t| Some([num(&t[0])?, num(&t[1])?, num(&t[2])?.clamp(0.0, 127.0)]))
++        .collect();
++    Targets { pointer, region, notes }
 +}
 +
 +// ---------------------------------------------------------------- the look
@@ -1008,50 +932,29 @@ index 0000000..53bbb92
 +    value: Option<String>,
 +}
 +
-+/// White or near-black, whichever reads on `color`.
-+fn ink(color: Color32) -> Color32 {
-+    let c = egui::Rgba::from(color);
-+    if 0.2126 * c.r() + 0.7152 * c.g() + 0.0722 * c.b() > 0.55 {
-+        Color32::from_gray(0x11)
-+    } else {
-+        Color32::WHITE
-+    }
-+}
-+
-+/// The others' marks over `painter`'s area in the session's shared look: everyone's ghosts, then pointers with their
-+/// name tags.
++/// The others' marks over `painter`'s area in the kit's look: everyone's ghosts, then pointers with their name tags
++/// (and under the name, the value being set).
 +fn paint(painter: &Painter, all: &[(Color32, String, Marks)]) {
 +    let near = painter.clip_rect().expand(4.0);
 +    for (color, _, marks) in all {
 +        for ghost in &marks.ghosts {
 +            let rect = ghost.intersect(near);
 +            if rect.is_positive() {
-+                painter.rect(rect, 2.0, color.gamma_multiply(GHOST), Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE)), StrokeKind::Inside);
++                presence::ghost(painter, rect, *color);
 +            }
 +        }
 +    }
 +    for (color, name, marks) in all {
 +        let Some(tip) = marks.tip.filter(|p| painter.clip_rect().contains(*p)) else { continue };
-+        let arrow = |at: Pos2| ARROW.iter().map(|&(x, y)| at + vec2(x, y)).collect::<Vec<_>>();
-+        painter.add(Shape::convex_polygon(arrow(tip + vec2(0.0, 1.0)), Color32::from_black_alpha(64), Stroke::NONE));
-+        painter.add(Shape::convex_polygon(arrow(tip), *color, Stroke::new(1.5, Color32::WHITE)));
-+        let mut at = tip + vec2(12.0, 15.0);
-+        for text in [Some(name.as_str()), marks.value.as_deref()].into_iter().flatten().filter(|t| !t.is_empty()) {
-+            let galley = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(12.0), ink(*color));
-+            let pad = vec2(7.0, 3.0);
-+            let tag = Rect::from_min_size(pos2(at.x.round(), at.y.round()), galley.size() + 2.0 * pad);
-+            painter.rect_filled(tag, 6.0, *color);
-+            painter.galley(tag.min + pad, galley, ink(*color));
-+            at.y = tag.bottom() + 2.0;
-+        }
++        presence::cursor_with(painter, tip, *color, name, marks.value.as_deref().unwrap_or_default());
 +    }
 +}
 diff --git a/crates/prowave-app/src/live/tests.rs b/crates/prowave-app/src/live/tests.rs
 new file mode 100644
-index 0000000..091a2d7
+index 0000000..c2b4f8f
 --- /dev/null
 +++ b/crates/prowave-app/src/live/tests.rs
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,68 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +use super::*;
 +use kit::Live as _;
@@ -1070,6 +973,11 @@ index 0000000..091a2d7
 +        bench: None,
 +        shots: None,
 +        frames_since_record: 0,
++        midi: None,
++        midi_out: None,
++        mtc_in: None,
++        chase: Default::default(),
++        updater: crate::updater::Updater::new(),
 +    }
 +}
 +

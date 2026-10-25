@@ -6,32 +6,47 @@
     let dark = web_sys::window().and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten()).is_some_and(|m| m.matches());
     session.prefs.theme = if dark { "dark" } else { "light" }.into();
 
-# Live editing in Playground sessions (patches/figma/live.diff + patches/live/playground_live.rs)
+# Live editing in Playground sessions (patches/figma/live.diff + the playground-live crate, tools.yaml `live_kit`)
 # What it's for: people in a Playground session edit the design files open in it together (each one a tab, renaming
 #   shared, closing personal), typing as it is typed, and see each other's pointer, selected layers and gestures in
 #   progress (moves, resizes, shapes being drawn, pencil and pen strokes) on the page they look at, in each person's
 #   color, with dots on the tabs for who is on each file.
 # How: the adapter lives in new files: crates/engine/src/live_playground.rs (the shared files, each the collaboration
-#   core's snapshot, merge, adopt, Undo, presence with the gesture in progress; it declares the template, copied next to
-#   it), crates/ui-egui/src/live/playground.rs (this person's pointer, the others' marks over the canvas in the shared
-#   look, tab dots, Home's "In this session") and apps/figcraft-web/src/web/playground.rs (the kept runner and the app
-#   that ends each frame with the session's frame hook). These rules only declare them and call in, each one line at
-#   the end of a file, right after a function's signature, or before a stable line of the canvas, tab strip and Home.
+#   core's snapshot, merge, adopt, Undo, presence with the gesture in progress), crates/ui-egui/src/live/playground.rs
+#   (this person's pointer, the others' marks over the canvas: pointers, name tags, outlines and easing the kit's,
+#   ghosts in a layer's shape, dashed bands and strokes FigCraft's own; tab dots, Home's "In this session") and
+#   apps/figcraft-web/src/web/playground.rs (the kept runner and the app that ends each frame with the presence look's
+#   and the session's frame hooks). The playground-live crate (patches/live/kit) is the session and the presence look.
+#   These rules only declare them and call in, each one line at the end of a file, under [dependencies], right after a
+#   function's signature, or before a stable line of the canvas, tab strip and Home.
 # Verify: node scripts/build.mjs check figma head|release (and LIVE=0), then the e2e (tests/live-apps/figma.mjs) and
 #   `cargo test -p figcraft-engine --lib live_playground`.
 # If upstream changes: if a function named below is renamed, anchor on its new signature; if WebShell or its `fig`
 #   field is renamed, follow it in web/playground.rs; if a line anchored on moves, anchor on its new place (same role).
 #
-# The engine's adapter module (web, and its native tests), and the template's wasm dependencies under a target
-# spelling nobody else uses.
+# The engine's adapter module (web, and its native tests); its dependencies: the playground-live crate, and js-sys
+# (random file ids in the browser) under a target spelling nobody else uses; the playground-live crate with the
+# presence look (`egui`) for the crates that draw the others and end each frame.
 - live: true
   file: crates/engine/src/lib.rs
   find: '(?![\s\S])'
   after: "\n// Live editing in a Playground session (web only).\n#[cfg(any(target_arch = \"wasm32\", test))]\npub mod live_playground;\n"
 - live: true
   file: crates/engine/Cargo.toml
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\" }\n"
+- live: true
+  file: crates/engine/Cargo.toml
   find: '(?![\s\S])'
-  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\njs-sys = \"0.3\"\nwasm-bindgen = \"0.2\"\n"
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\njs-sys = \"0.3\"\n"
+- live: true
+  file: crates/ui-egui/Cargo.toml
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
+- live: true
+  file: apps/figcraft-web/Cargo.toml
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 # Session::undo and Session::redo: in the shared document they go to the session.
 - live: true
   file: crates/engine/src/lib.rs

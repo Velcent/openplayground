@@ -127,7 +127,7 @@
   find: '\bpub\s+const\s+CUSTOM\s*:\s*bool\s*=\s*([^;]+);'
   replace: 'pub const CUSTOM: bool = $1 && !cfg!(target_arch = "wasm32");'
 
-# Live editing in Playground sessions (patches/logic-pro/live.diff + patches/live/playground_live.rs)
+# Live editing in Playground sessions (patches/logic-pro/live.diff + the playground-live crate, tools.yaml `live_kit`)
 # What it's for: people in a Playground session work on the same project at once: tracks (adding, removing, stacking,
 #   names, instruments and patches, mute and solo, volume, pan, sends, inspector values), regions (adding, moving,
 #   repeating, resizing, removing, their inspector values) and notes, the tempo, signature, key and master volume reach
@@ -139,8 +139,9 @@
 #   playing and the playhead, the cycle, metronome and count-in, the selection, each track's height and folding.
 # How: the adapter lives in new files: crates/prowave-app/src/live.rs (the shared document: the project file's JSON,
 #   with ids for tracks and regions followed beside the model, a note's being the note itself; the merge; putting a
-#   document back in; media; the window wrapped with the session's frame; it declares the template, copied next to it)
-#   and live/peers.rs (presence). These rules only declare it and call in, one line each.
+#   document back in; media; the window wrapped with the session's frame; the session is the playground-live crate,
+#   patches/live/kit, as `kit`) and live/peers.rs (presence, drawn in the crate's look). These rules only add the crate
+#   (with its egui look; wasm, and the native tests), declare the module and call in, one line each.
 # Verify: node scripts/build.mjs check logic-pro head (and LIVE=0), the e2e (tests/live-apps/logic-pro.mjs) and
 #   `cargo test -p prowave-app live`.
 # If upstream changes: when a line named below changes, anchor on its new spelling; if App, UiState or History rename
@@ -148,7 +149,7 @@
 - live: true
   file: crates/prowave-app/Cargo.toml
   find: '(?![\s\S])'
-  after: "\n[target.'cfg(any(target_arch = \"wasm32\"))'.dependencies]\nserde_json = { version = \"1\", features = [\"float_roundtrip\"] }\n\n[target.'cfg(not(target_arch = \"wasm32\"))'.dev-dependencies]\nserde_json = { version = \"1\", features = [\"float_roundtrip\"] }\n"
+  after: "\n[target.'cfg(any(target_arch = \"wasm32\"))'.dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n\n[target.'cfg(not(target_arch = \"wasm32\"))'.dev-dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 - live: true
   file: crates/prowave-app/src/main.rs
   find: '(?![\s\S])'

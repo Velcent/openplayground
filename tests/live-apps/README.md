@@ -1,6 +1,6 @@
 # Live-editing acceptance specs
 
-One `<slug>.mjs` per app with the generic adapter (`patches/live/playground_live.rs`), used by
+One `<slug>.mjs` per app with live editing (most on the playground-live crate, `patches/live/kit`), used by
 `tests/live-apps.e2e.test.mjs`:
 
 ```js
@@ -12,6 +12,8 @@ export default {
   editB: async (page) => {},           // the editor's edit, to a different object
   undo: async (page) => {},            // the owner's Undo (its usual shortcut or button)
   ignore: ['/next_id'],                // optional: allocator counters, which Undo leaves raised
+  liveTimeout: 180000,                 // optional: ms to wait for both pages to go live (default 30000), for a large
+                                       // first document over a slow (relayed) connection
   importMedia: async (page) => {},     // optional: the owner adds a photo/clip/sample kept outside the document; the
                                        // editor and the late viewer must end up with the same bytes (adapter assets())
   drag: async (page) => {},            // optional: the owner holds a gesture mid-way (no mouse up); the editor must be

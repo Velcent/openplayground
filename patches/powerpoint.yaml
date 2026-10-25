@@ -304,25 +304,33 @@
             $&
             playground::report_unsaved(self.app.session.documents().iter().any(|d| d.is_dirty()));
 
-# Live editing in Playground sessions (patches/powerpoint/live.diff + patches/live/playground_live.rs)
+# Live editing in Playground sessions (patches/powerpoint/live.diff + the playground-live crate, tools.yaml `live_kit`)
 # What it's for: people in a Playground session edit the session's presentations together (the one open when it started
 #   and every one opened since, which reaches the others behind their own) and see each other's presentation, slide,
 #   pointer, selection and gestures under way (moves, resizes and rotations as ghosts, shapes and text boxes being drawn,
 #   ink and freeform paths), in each person's color, and who is on which slide (badges on the slide thumbnails).
 # The adapter lives in new files: apps/deckcraft-web/src/live.rs (the shared document, merge, Undo, the id allocator,
-# presence and its drawing, the thumbnails' badges, File › Home's session list; the template is its child module,
-# live/finite.rs writes non-finite numbers as 0) and apps/deckcraft-web/src/web/live.rs (the kept runner, and the shell
-# that ends each frame with the session's frame hook). These rules only declare them and call in, one line each at the
-# end of a file, after a function's signature or before a call, the same on both channels. Verify: node
-# scripts/build.mjs check powerpoint head|release, then the e2e (tests/live-apps/powerpoint.mjs). If upstream renames a
-# function named below, anchor on its new signature; if it renames WebShell or its `app` field, follow it in web/live.rs.
+# presence and its drawing, the thumbnails' badges, File › Home's session list, on its Peer around the app, as the
+# playground-live crate's Live trait can't go on SlideApp here; pointers, name tags, ghosts, outlines and easing are the
+# crate's, lines, rubber bands, strokes and badges DeckCraft's own; live/finite.rs writes non-finite numbers as 0) and
+# apps/deckcraft-web/src/web/live.rs (the kept runner, and the shell that ends each frame with the session's frame hook).
+# These rules only declare them and call in, one line each at the end of a file, under [dependencies], after a
+# function's signature or before a call, the same on both channels. Verify: node scripts/build.mjs check powerpoint
+# head|release, `cargo test -p deckcraft-web live::`, then the e2e (tests/live-apps/powerpoint.mjs). If upstream renames
+# a function named below, anchor on its new signature; if it renames WebShell or its `app` field, follow it in
+# web/live.rs.
 #
-# The adapter's module (web, and native tests), and serde for it on every target (its tests run natively) under a target
+# The adapter's module (web, and native tests); its dependency there, the playground-live crate (patches/live/kit: the
+# session and the presence look, `egui`); and serde for it on every target (its tests run natively) under a target
 # spelling nobody else uses.
 - live: true
   file: apps/deckcraft-web/src/main.rs
   find: '(?![\s\S])'
-  after: "\n// Live editing in a Playground session (patches/live/playground_live.rs).\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
+  after: "\n// Live editing in a Playground session (the playground-live crate, patches/live/kit).\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
+- live: true
+  file: apps/deckcraft-web/Cargo.toml
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 - live: true
   file: apps/deckcraft-web/Cargo.toml
   find: '(?![\s\S])'

@@ -19,6 +19,8 @@ const PAD = [1000, 291]
 
 export default {
   path: '/pro-wave/',
+  // The dev server serves an app folder's index.html only for builds in its own public/.
+  url: '/pro-wave/index.html',
   viewport: { width: 1400, height: 900 },
   ready: async (page) => {
     await until(async () => !(await checkpoint(page)).startsWith('error'), 60000, 'the demo project')

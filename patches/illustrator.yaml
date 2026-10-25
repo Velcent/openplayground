@@ -322,22 +322,24 @@
                 }
             }
 
-# Live editing in Playground sessions (patches/illustrator/live.diff + patches/live/playground_live.rs)
+# Live editing in Playground sessions (patches/illustrator/live.diff + the playground-live crate, tools.yaml `live_kit`)
 # What it's for: people in a Playground session edit one document together, and see each other's pointer, selected
 #   objects and gestures in progress (moves, strokes, shapes being drawn), in each person's color.
 # How: the adapter lives in new files: crates/ui-egui/live/playground.rs (the shared document, merge checks, adopt,
-#   Undo, presence; it declares the template, copied next to it; outside src/, whose strings i18n's tests read),
-#   crates/ui-egui/live/presence.rs (this person's gesture in progress, and the others' marks drawn over the canvas),
-#   crates/doc/src/playground_ids.rs (ids nobody else in the session picks) and apps/vectorcraft-web/src/web/
-#   playground.rs (the shell around WebShell that ends each frame with the session's frame hook). These rules only
-#   declare them and call in, each at the end of a file or right after a signature, except the canvas's one call.
+#   Undo, presence; outside src/, whose strings i18n's tests read), crates/ui-egui/live/presence.rs (this person's
+#   gesture in progress, and the others' marks drawn over the canvas: pointers, colors and easing the kit's, object
+#   shapes VectorCraft's own), crates/doc/src/playground_ids.rs (ids nobody else in the session picks) and
+#   apps/vectorcraft-web/src/web/playground.rs (the shell around WebShell that ends each frame with the session's
+#   frame hook). These rules only declare them and call in, each at the end of a file or right after a signature,
+#   except the canvas's one call.
 # Verify: node scripts/build.mjs check illustrator head|release (and LIVE=0), then the e2e
 #   (tests/live-apps/illustrator.mjs) and `cargo test -p vectorcraft-ui-egui --lib playground::`.
 # If upstream changes: if a function named below is renamed, anchor on its new signature; if WebShell or its `app` or
 #   `host.runner` fields are renamed, follow them in web/playground.rs.
 #
-# The frontend's module (web, and its native tests), and the template's wasm dependencies under a target spelling
-# nobody else uses.
+# The frontend's module (web, and its native tests), and its dependencies: the playground-live crate (patches/live/kit:
+# the session and the presence look, `egui`) for the same two, and the browser's js-sys and wasm-bindgen (session
+# document ids, attach's error), under a target spelling nobody else uses.
 - live: true
   file: crates/ui-egui/src/lib.rs
   find: '(?![\s\S])'
@@ -345,7 +347,7 @@
 - live: true
   file: crates/ui-egui/Cargo.toml
   find: '(?![\s\S])'
-  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\njs-sys = \"0.3\"\nwasm-bindgen = \"0.2\"\n"
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\njs-sys = \"0.3\"\nwasm-bindgen = \"0.2\"\n\n[target.'cfg(not(target_arch = \"wasm32\"))'.dev-dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 # VectorcraftApp::run, which every command goes through: Undo and Redo in the shared document go to the session.
 - live: true
   file: crates/ui-egui/src/lib.rs

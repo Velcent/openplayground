@@ -1,15 +1,17 @@
 diff --git a/apps/figcraft-web/src/web/playground.rs b/apps/figcraft-web/src/web/playground.rs
 new file mode 100644
-index 0000000..8b1acdc
+index 0000000..b9964c4
 --- /dev/null
 +++ b/apps/figcraft-web/src/web/playground.rs
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,88 @@
 +//! Live editing in a Playground session (`figcraft_engine::live_playground`): the page's runner, kept for the session
-+//! to reach the app, and the app eframe runs: [`WebShell`], then the session's end-of-frame hook.
++//! to reach the app, and the app eframe runs: [`WebShell`], then the presence look's and the session's end-of-frame
++//! hooks.
 +
 +use super::WebShell;
 +use figcraft_engine::Session;
-+use figcraft_engine::live_playground::{self as live, playground_live};
++use figcraft_engine::live_playground as live;
++use playground_live::presence;
 +use std::cell::OnceCell;
 +
 +thread_local! {
@@ -56,10 +58,10 @@ index 0000000..8b1acdc
 +        CONTEXT.with(|kept| {
 +            kept.get_or_init(|| ctx.clone());
 +        });
++        presence::end_frame(ctx);
 +        let session = &mut self.0.fig.session;
 +        let revision = session.ds().map(|d| d.revision).ok();
-+        let typing = ctx.memory(|m| m.focused()).is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
-+        live::frame(session, typing || ctx.input(|i| i.pointer.any_down()));
++        live::frame(session, !presence::quiet());
 +        if session.ds().map(|d| d.revision).ok() != revision {
 +            ctx.request_repaint();
 +        }
@@ -92,11 +94,12 @@ index 0000000..8b1acdc
 +}
 diff --git a/crates/engine/src/live_playground.rs b/crates/engine/src/live_playground.rs
 new file mode 100644
-index 0000000..1506d91
+index 0000000..8ed51e6
 --- /dev/null
 +++ b/crates/engine/src/live_playground.rs
-@@ -0,0 +1,900 @@
-+//! Playground live editing (the web build; [`playground_live`] is the adapter the Playground shell drives).
+@@ -0,0 +1,897 @@
++//! Playground live editing (the web build; [`playground_live`], the playground-live crate in patches/live/kit, is the
++//! adapter the Playground shell drives).
 +//!
 +//! The shared document is the set of design files open in the session, `{ "documents": [{ "id", "name", "changes" }] }`:
 +//! each one as the collaboration core's snapshot of the file ([`Replica::snapshot`]: layers with their properties,
@@ -133,10 +136,6 @@ index 0000000..1506d91
 +use crate::tools::Gesture;
 +use crate::{DocState, EngineError, Result as EngineResult, Session};
 +use playground_live::{Error, Live, Presence};
-+
-+/// The Playground adapter (patches/live/playground_live.rs, copied next to this file).
-+#[path = "playground_live.rs"]
-+pub mod playground_live;
 +
 +/// Most selected ids, layers moved and outlines a presence carries.
 +const MAX_ITEMS: usize = 50;
@@ -795,7 +794,7 @@ index 0000000..1506d91
 +
 +#[cfg(test)]
 +mod tests {
-+    use super::playground_live::{activity, canonical, connect, disconnect, frame, queue};
++    use playground_live::{activity, canonical, connect, disconnect, frame, queue};
 +    use super::*;
 +    use figcraft_geom::Affine;
 +    use std::rc::Rc;
@@ -998,73 +997,26 @@ index 0000000..1506d91
 +}
 diff --git a/crates/ui-egui/src/live/playground.rs b/crates/ui-egui/src/live/playground.rs
 new file mode 100644
-index 0000000..a3a8bcc
+index 0000000..c7eaae6
 --- /dev/null
 +++ b/crates/ui-egui/src/live/playground.rs
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,202 @@
 +//! Live editing in a Playground session (`figcraft_engine::live_playground`): this person's pointer over the canvas
 +//! for the others, and the others on the page in front, in their colors: the layers they move, resize or turn (ghosts
 +//! in the layers' own shape), the shapes and selection boxes they drag out (dashed), what they draw with the Pencil or
 +//! the Pen, then their selections, then their pointers with their names, under this person's own selection and tool
-+//! overlays; each easing toward its latest state. The tabs show dots for the others on each file, and Home lists the
-+//! session's files closed here.
++//! overlays; each easing toward its latest state. Pointers, name tags, outlines and easing are the playground-live
++//! crate's presence look; ghosts in a layer's shape, dashed bands and strokes FigCraft's own, in its colors. The tabs
++//! show dots for the others on each file, and Home lists the session's files closed here.
 +
-+use std::cell::RefCell;
-+use std::collections::HashMap;
-+
-+use egui::{Color32, CornerRadius, Mesh, Painter, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2, pos2, vec2};
++use egui::{Color32, Mesh, Painter, Pos2, Rect, Sense, Shape, Stroke, Ui, pos2, vec2};
 +use figcraft_doc::{Document, NodeKind};
 +use figcraft_engine::live_playground::{self as live, Ghost, rings};
 +use figcraft_geom::{Affine, BezPath, Point};
++use playground_live::presence;
 +
 +use crate::FigApp;
 +use crate::theme::{ACCENT, Tokens, semibold};
-+
-+/// How long the others' marks take to go most (1 - 1/e) of the way to their latest state, in seconds.
-+const EASE: f64 = 0.08;
-+
-+thread_local! {
-+    /// The others' marks as last drawn, by person: they ease on from there.
-+    static SHOWN: RefCell<HashMap<String, Shown>> = RefCell::new(HashMap::new());
-+}
-+
-+/// A person's moving marks as last drawn, in page coordinates.
-+#[derive(Default)]
-+struct Shown {
-+    pointer: Option<[f64; 2]>,
-+    /// The layers moved: their page transform and size, by key.
-+    ghosts: Vec<(String, [f64; 8])>,
-+    /// The box the bands are drawn into (their own box, as last received).
-+    frame: Option<[f64; 4]>,
-+    /// The newest point of the strokes.
-+    head: Option<[f64; 2]>,
-+}
-+
-+/// `s` `k` of the way on toward `t`, all of it after a jump of more than `far` pixels or once under half a pixel
-+/// remains (`px`: pixels a unit of each part). Whether it is still on its way.
-+fn ease<const N: usize>(s: &mut [f64; N], t: [f64; N], k: f64, px: [f64; N], far: f64) -> bool {
-+    let off = |s: &[f64; N]| s.iter().zip(t).zip(px).map(|((s, t), px)| ((t - s) * px).abs()).fold(0.0, f64::max);
-+    if off(s) > far {
-+        *s = t;
-+    }
-+    s.iter_mut().zip(t).for_each(|(s, t)| *s += (t - *s) * k);
-+    let moving = off(s) >= 0.5;
-+    if !moving {
-+        *s = t;
-+    }
-+    moving
-+}
-+
-+/// [`ease`] for a mark that may come and go: it shows at once where it first does.
-+fn step<const N: usize>(s: &mut Option<[f64; N]>, t: Option<[f64; N]>, k: f64, px: [f64; N], far: f64) -> bool {
-+    match (s.as_mut(), t) {
-+        (Some(s), Some(t)) => ease(s, t, k, px, far),
-+        _ => {
-+            *s = t;
-+            false
-+        }
-+    }
-+}
 +
 +/// The box around `lines`, as `[x0, y0, x1, y1]`.
 +fn bounds(lines: &[Vec<Point>]) -> Option<[f64; 4]> {
@@ -1082,11 +1034,6 @@ index 0000000..a3a8bcc
 +
 +fn rgb([r, g, b]: [u8; 3]) -> Color32 {
 +    Color32::from_rgb(r, g, b)
-+}
-+
-+/// `color` at `alpha` (0–1).
-+fn alpha(color: Color32, alpha: f32) -> Color32 {
-+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), (alpha * 255.0).round() as u8)
 +}
 +
 +/// A layer being moved (`v`: its page transform and size so far) in its own shape when it is one here, else its box.
@@ -1118,81 +1065,67 @@ index 0000000..a3a8bcc
 +    live::point(at.map(|p| (p.x, p.y)));
 +    let others = live::others(&app.session);
 +    let Ok(ds) = app.session.ds() else { return };
-+    SHOWN.with_borrow_mut(|shown| {
-+        // Someone back on this page shows at once where they are.
-+        shown.retain(|id, _| others.iter().any(|o| o.id == *id));
-+        if others.is_empty() {
-+            return;
-+        }
-+        let dt = f64::from(ctx.input(|i| i.stable_dt).clamp(0.0, 0.1));
-+        let k = if app.reduce_motion() { 1.0 } else { 1.0 - (-dt / EASE).exp() };
-+        let far = f64::from(app.canvas.rect.width().min(app.canvas.rect.height())) / 4.0;
-+        let px = ds.view.zoom.max(1e-9);
-+        let screen = |p: &Point| app.to_screen(p.x, p.y);
-+        let mut moving = false;
-+        for o in &others {
-+            let (s, color) = (shown.entry(o.id.clone()).or_default(), rgb(o.color));
-+            // Layers moved, resized or turned: in their own shape where they are so far.
-+            let mut ghosts = Vec::new();
-+            for g in &o.ghosts {
-+                let t = [g.m[0], g.m[1], g.m[2], g.m[3], g.m[4], g.m[5], g.w, g.h];
-+                let mut v = s.ghosts.iter().find(|(key, _)| *key == g.key).map_or(t, |(_, v)| *v);
-+                let size = g.w.max(g.h).max(1.0) * px;
-+                moving |= ease(&mut v, t, k, [size, size, size, size, px, px, px, px], far);
++    if others.is_empty() {
++        return;
++    }
++    presence::set_font(semibold(12.0));
++    // A jump of more than a quarter of the canvas goes at once, as every move does with reduced motion.
++    let far = if app.reduce_motion() { 0.0 } else { f64::from(app.canvas.rect.width().min(app.canvas.rect.height())) / 4.0 };
++    let px = ds.view.zoom.max(1e-9);
++    let screen = |p: &Point| app.to_screen(p.x, p.y);
++    for o in &others {
++        let color = rgb(o.color);
++        // Layers moved, resized or turned: in their own shape where they are so far.
++        for g in &o.ghosts {
++            let t = [g.m[0], g.m[1], g.m[2], g.m[3], g.m[4], g.m[5], g.w, g.h];
++            let size = g.w.max(g.h).max(1.0) * px;
++            if let Some(v) = presence::ease(ctx, &o.id, &format!("ghost {}", g.key), t, [size, size, size, size, px, px, px, px], [far; 8]) {
 +                ghost(painter, rings(&outline(&ds.doc, g, v), px).iter().map(|r| r.iter().map(screen).collect()).collect(), color);
-+                ghosts.push((g.key.clone(), v));
-+            }
-+            s.ghosts = ghosts;
-+            // Shapes being drawn and selection boxes: dashed, drawn into their box as it eases.
-+            let target = bounds(&o.bands);
-+            moving |= step(&mut s.frame, target, k, [px; 4], far);
-+            if let Some((from, to)) = target.zip(s.frame) {
-+                let at = fit(from, to);
-+                for band in &o.bands {
-+                    let band: Vec<Pos2> = band.iter().map(|p| screen(&(at * *p))).collect();
-+                    painter.extend(Shape::dashed_line(&band, Stroke::new(1.5, color), 4.0, 3.0));
-+                }
-+            }
-+            // Strokes: their newest point eases.
-+            let mut strokes = o.strokes.clone();
-+            let head = strokes.last().and_then(|l| l.last()).map(|p| [p.x, p.y]);
-+            moving |= step(&mut s.head, head, k, [px; 2], far);
-+            if let (Some(last), Some([x, y])) = (strokes.last_mut().and_then(|l| l.last_mut()), s.head) {
-+                *last = Point::new(x, y);
-+            }
-+            for l in &strokes {
-+                stroke(painter, l.iter().map(screen).collect(), (o.width * px).clamp(2.0, 400.0) as f32, color);
-+            }
-+            // Where a layer dragged in auto layout would go.
-+            if let Some([a, b]) = o.line {
-+                painter.line_segment([screen(&a), screen(&b)], Stroke::new(2.0, color));
 +            }
 +        }
-+        // Selected layers, outlined as the canvas outlines this person's own.
-+        for o in &others {
-+            for q in o.selection.iter().filter_map(|id| crate::canvas::node_quad(app, &ds.doc, *id)) {
-+                painter.add(Shape::closed_line(q.to_vec(), Stroke::new(2.0, rgb(o.color))));
++        // Shapes being drawn and selection boxes: dashed, drawn into their box as it eases.
++        let target = bounds(&o.bands);
++        if let Some((from, to)) = target.zip(target.and_then(|t| presence::ease(ctx, &o.id, "frame", t, [px; 4], [far; 4]))) {
++            let at = fit(from, to);
++            for band in &o.bands {
++                let band: Vec<Pos2> = band.iter().map(|p| screen(&(at * *p))).collect();
++                painter.extend(Shape::dashed_line(&band, Stroke::new(1.5, color), 4.0, 3.0));
 +            }
 +        }
-+        // Pointers, with their names.
-+        for o in &others {
-+            let s = shown.entry(o.id.clone()).or_default();
-+            moving |= step(&mut s.pointer, o.pointer.map(|(x, y)| [x, y]), k, [px; 2], far);
-+            if let Some([x, y]) = s.pointer {
-+                pointer(painter, app.to_screen(x, y), rgb(o.color), &o.name);
-+            }
++        // Strokes: their newest point eases.
++        let mut strokes = o.strokes.clone();
++        let head = strokes.last().and_then(|l| l.last()).and_then(|p| presence::ease(ctx, &o.id, "head", [p.x, p.y], [px; 2], [far; 2]));
++        if let (Some(last), Some([x, y])) = (strokes.last_mut().and_then(|l| l.last_mut()), head) {
++            *last = Point::new(x, y);
 +        }
-+        if moving {
-+            ctx.request_repaint();
++        for l in &strokes {
++            stroke(painter, l.iter().map(screen).collect(), (o.width * px).clamp(2.0, 400.0) as f32, color);
 +        }
-+    });
++        // Where a layer dragged in auto layout would go.
++        if let Some([a, b]) = o.line {
++            painter.line_segment([screen(&a), screen(&b)], Stroke::new(2.0, color));
++        }
++    }
++    // Selected layers, outlined as the canvas outlines this person's own.
++    for o in &others {
++        for q in o.selection.iter().filter_map(|id| crate::canvas::node_quad(app, &ds.doc, *id)) {
++            presence::outline_shape(painter, &q, rgb(o.color));
++        }
++    }
++    // Pointers, with their names.
++    for o in &others {
++        if let Some([x, y]) = o.pointer.and_then(|(x, y)| presence::ease(ctx, &o.id, "pointer", [x, y], [px; 2], [far; 2])) {
++            presence::cursor(painter, app.to_screen(x, y), rgb(o.color), &o.name);
++        }
++    }
 +}
 +
-+/// Outlines being moved or changed (screen points): the closed ones filled with `color` at 28%, all edged at 85%.
++/// Outlines being moved or changed (screen points), as `presence::ghost` draws boxes: the closed ones filled with
++/// `color` at 28%, all edged at 85% (a layer's own shape can be concave, or have holes).
 +fn ghost(painter: &Painter, rings: Vec<Vec<Pos2>>, color: Color32) {
 +    let closed = |r: &&Vec<Pos2>| r.len() > 3 && r.first() == r.last();
-+    fill(painter, rings.iter().filter(closed), alpha(color, 0.28));
-+    let edge = Stroke::new(1.5, alpha(color, 0.85));
++    fill(painter, rings.iter().filter(closed), color.gamma_multiply(0.28));
++    let edge = Stroke::new(1.5, color.gamma_multiply(0.85));
 +    for r in rings.into_iter().filter(|r| r.len() >= 2) {
 +        match closed(&&r) {
 +            true => painter.add(Shape::closed_line(r[..r.len() - 1].to_vec(), edge)),
@@ -1229,7 +1162,7 @@ index 0000000..a3a8bcc
 +
 +/// A stroke being drawn (screen points): `color` at 70%, `width` wide, with round ends.
 +fn stroke(painter: &Painter, line: Vec<Pos2>, width: f32, color: Color32) {
-+    let color = alpha(color, 0.7);
++    let color = color.gamma_multiply(0.7);
 +    let ends = [(line[0], line[1]), (line[line.len() - 1], line[line.len() - 2])];
 +    painter.add(Shape::line(line, Stroke::new(width, color)));
 +    for (end, next) in ends {
@@ -1239,41 +1172,6 @@ index 0000000..a3a8bcc
 +            painter.add(Shape::convex_polygon(half.map(|a| end + (d.rot90() * a.cos() + d * a.sin()) * width / 2.0).collect(), color, Stroke::NONE));
 +        }
 +    }
-+}
-+
-+/// The pointer arrow, tip at (0, 0), in points; and the triangles that fill it.
-+const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
-+const ARROW_FILL: [[u32; 3]; 5] = [[0, 1, 2], [0, 2, 5], [0, 5, 6], [2, 3, 4], [2, 4, 5]];
-+/// The most characters of a name tag, its ellipsis included.
-+const MAX_NAME: usize = 24;
-+
-+/// Another person's pointer at `tip`: an arrow in their color with a white edge and a soft shadow, and a tag with
-+/// their name.
-+fn pointer(painter: &Painter, tip: Pos2, color: Color32, name: &str) {
-+    let at = |offset: Vec2| ARROW.map(|[x, y]| tip + offset + vec2(x, y)).to_vec();
-+    let filled = |points: Vec<Pos2>, color: Color32| {
-+        let mut mesh = Mesh::default();
-+        points.into_iter().for_each(|p| mesh.colored_vertex(p, color));
-+        ARROW_FILL.into_iter().for_each(|[a, b, c]| mesh.add_triangle(a, b, c));
-+        mesh
-+    };
-+    painter.add(filled(at(vec2(0.0, 1.0)), Color32::from_black_alpha(64)));
-+    painter.add(filled(at(Vec2::ZERO), color));
-+    painter.add(Shape::closed_line(at(Vec2::ZERO), Stroke::new(1.5, Color32::WHITE)));
-+    let name: String = match name.chars().nth(MAX_NAME) {
-+        Some(_) => name.chars().take(MAX_NAME - 1).chain(['…']).collect(),
-+        None => name.into(),
-+    };
-+    if name.is_empty() {
-+        return;
-+    }
-+    // Relative luminance: dark ink on light colors.
-+    let c = egui::Rgba::from(color);
-+    let ink = if 0.2126 * c.r() + 0.7152 * c.g() + 0.0722 * c.b() > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE };
-+    let text = painter.layout_no_wrap(name, semibold(12.0), ink);
-+    let tag = Rect::from_min_size(tip + vec2(12.0, 15.0), text.size() + vec2(14.0, 6.0));
-+    painter.rect_filled(tag, CornerRadius::same(6), color);
-+    painter.galley(tag.min + vec2(7.0, 3.0), text, ink);
 +}
 +
 +/// Dots at the bottom of a tab (`r`, of open file `uid`) in the colors of the others on its file.

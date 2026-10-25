@@ -80,11 +80,11 @@ index 0000000..6fac43b
 +}
 diff --git a/crates/ui-egui/live/live.rs b/crates/ui-egui/live/live.rs
 new file mode 100644
-index 0000000..f58c9ea
+index 0000000..bb134c5
 --- /dev/null
 +++ b/crates/ui-egui/live/live.rs
-@@ -0,0 +1,1916 @@
-+//! Playground live editing (web only; the template [`playground_live`], copied next to this file, drives it). The
+@@ -0,0 +1,1774 @@
++//! Playground live editing (web only; the playground-live crate, patches/live/kit, drives it and draws the others). The
 +//! shared document is the set of PDFs open in the session, `{"documents": [{"id", "name", ...that PDF}]}` by id: the
 +//! one shown when the session started and every PDF opened, created or dropped here or by the others since, which
 +//! reaches the others as a tab behind theirs. Closing a tab is this person's own: the PDF stays in the session, up to
@@ -104,21 +104,20 @@ index 0000000..f58c9ea
 +//! numbers of selected comments]}` and the gesture under way: `draw` (a comment being drawn: its tool, points and
 +//! width), `ghost` (a comment being moved or resized: its number and rectangle), `text` (a text selection being
 +//! dragged, as rectangles), `typing` (text being typed into a comment, a form field or a text box: where, and its
-+//! end). Drawn on the pages shown in the session's look, eased ([`paint`]); dots on the tabs ([`tab_dots`]) and Home's
-+//! "In this session" ([`session_list`]) show who is on which PDF. The web entry runs the app wrapped ([`wrap`]), so
-+//! each frame ends with the session's [`frame`]; the engine's `live_playground` installs graphs without undo steps.
++//! end). Drawn on the pages shown in the session's look by [`paint`] ([`presence`]: pointers, tags, ghosts, outlines,
++//! dashed bands, easing; a drawing's strokes are PdfCraft's own, in the person's colour); dots on the tabs
++//! ([`tab_dots`]) and Home's "In this session" ([`session_list`]) show who is on which PDF. The web entry runs the app
++//! wrapped ([`wrap`]), so each frame ends with the session's [`frame`]; the engine's `live_playground` installs graphs
++//! without undo steps.
 +
 +#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-+
-+#[path = "playground_live.rs"]
-+mod playground_live;
 +
 +use crate::{DocView, PdfCraftApp};
 +use base64::Engine as _;
 +use egui::{Color32, Pos2, Rect, Shape, Stroke, pos2, vec2};
 +use pdfcraft_cos::{Dict, Document, Lexer, Name, ObjRef, Object, SaveOptions, Stream, parse_indirect, serialize, write_incremental};
 +use pdfcraft_engine::DocId;
-+use playground_live::{Error, Live, Presence};
++use playground_live::{Error, Live, Presence, presence};
 +use serde_json::{Map, Value, json};
 +use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 +use std::rc::Rc;
@@ -153,13 +152,6 @@ index 0000000..f58c9ea
 +    paused: bool,
 +}
 +
-+/// Another person, and their moving marks as last drawn here.
-+struct Peer {
-+    who: Presence,
-+    /// `pointer`, `ghost` and `tip` (the newest point drawn), eased toward their presence, in their page's user space.
-+    shown: Value,
-+}
-+
 +#[derive(Default)]
 +struct State {
 +    /// The session's PDFs, by id.
@@ -180,8 +172,6 @@ index 0000000..f58c9ea
 +    in_frame: bool,
 +    notice: Option<String>,
 +    ctx: Option<egui::Context>,
-+    /// The others in the session, as the shell last showed them.
-+    others: Vec<Peer>,
 +    ids: Option<Rc<Ids>>,
 +}
 +
@@ -677,8 +667,13 @@ index 0000000..f58c9ea
 +    app.active_ids().is_some_and(|(_, id)| shared(id)) && playground_live::undo(!undo)
 +}
 +
-+/// The end of each frame.
++/// The end of each frame, after the others were drawn: the presence look's (name tags in PdfCraft's semibold), then
++/// the session's.
 +pub(crate) fn frame(app: &mut PdfCraftApp) {
++    if let Some(ctx) = &app.ctx {
++        presence::set_font(crate::theme::semibold(12.0));
++        presence::end_frame(ctx);
++    }
 +    STATE.with_borrow_mut(|s| (s.ctx.clone_from(&app.ctx), s.in_frame = true));
 +    let tabs = STATE.with_borrow(|s| s.docs.iter().filter(|d| !d.paused).filter_map(|d| d.tab).collect());
 +    pdfcraft_engine::live_playground::share(if playground_live::connected() { tabs } else { Vec::new() });
@@ -899,7 +894,6 @@ index 0000000..f58c9ea
 +    }
 +
 +    fn live_quiet(&self) -> bool {
-+        let input = self.ctx.as_ref().is_some_and(|ctx| ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
 +        let gesture = self.views.iter().any(|v| {
 +            v.comments.gesture.is_some()
 +                || v.comments.composer.is_some()
@@ -915,7 +909,7 @@ index 0000000..f58c9ea
 +                || v.marquee.is_some()
 +                || v.camera.is_some()
 +        });
-+        !input && !gesture && !self.modal_open() && !self.palette_open
++        presence::quiet() && !gesture && !self.modal_open() && !self.palette_open
 +    }
 +
 +    fn live_generation(&self) -> Option<u64> {
@@ -965,18 +959,9 @@ index 0000000..f58c9ea
 +        presence(self).unwrap_or(Value::Null)
 +    }
 +
-+    /// Who is still on the same PDF and page keeps their marks where they were drawn, to ease on from there.
++    /// Their marks ease by PDF and page ([`paint`]): who goes to another one shows there at once.
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        STATE.with_borrow_mut(|s| {
-+            let mut old = std::mem::take(&mut s.others);
-+            let place = |v: &Value| (v["doc"].clone(), v["page"].clone());
-+            s.others = (others.into_iter())
-+                .map(|who| {
-+                    let same = old.iter_mut().find(|o| o.who.id == who.id && place(&o.who.state) == place(&who.state));
-+                    Peer { shown: same.map(|o| o.shown.take()).unwrap_or_default(), who }
-+                })
-+                .collect();
-+        });
++        presence::show(others);
 +    }
 +}
 +
@@ -1234,23 +1219,12 @@ index 0000000..f58c9ea
 +    Some((e.page, rect(view.edit_lines.get(&e.page)?.1.get(e.block)?.rect), &e.text))
 +}
 +
-+/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
-+const EASE: f32 = 0.08;
 +/// Coordinates beyond this are not drawn (remote data).
 +const FAR_OUT: f64 = 1e6;
-+/// A ghost's fill and edge, a live stroke, in the person's colour at these opacities.
++/// Selected text's fill and a live stroke, in the person's colour at these opacities (the kit's ghost fill, and
++/// PdfCraft's own stroke).
 +const GHOST: f32 = 0.28;
-+const GHOST_EDGE: f32 = 0.85;
 +const LIVE_STROKE: f32 = 0.7;
-+
-+fn sane(v: &Value) -> bool {
-+    match v {
-+        Value::Number(n) => n.as_f64().is_some_and(|x| x.abs() < FAR_OUT),
-+        Value::Array(items) => items.iter().all(sane),
-+        Value::Object(m) => m.values().all(sane),
-+        _ => true,
-+    }
-+}
 +
 +/// `N` numbers in range, or none.
 +fn numbers<const N: usize>(v: &Value) -> Option<[f64; N]> {
@@ -1262,248 +1236,132 @@ index 0000000..f58c9ea
 +    Some(out)
 +}
 +
-+/// The moving part of a person's `state` (remote data: out-of-range values dropped), as [`Peer::shown`] holds it.
-+fn marks(state: &Value) -> Value {
-+    let tip = state["draw"]["points"].as_array().and_then(|p| p.last());
-+    let picks = [("pointer", state.get("pointer")), ("ghost", state["ghost"].get("rect")), ("tip", tip)];
-+    Value::Object(picks.into_iter().filter_map(|(key, v)| Some((key.to_owned(), v.filter(|v| sane(v))?.clone()))).collect())
++/// A person's mark `key` eased toward `target` (user space of their page; `zoom` points a unit, a jump past `far`
++/// points goes at once), by PDF and page: someone gone to another page shows there at once.
++fn eased<const N: usize>(ctx: &egui::Context, o: &Presence, key: &str, target: [f64; N], zoom: f64, far: f64) -> Option<[f64; N]> {
++    presence::ease(ctx, &o.id, &format!("{key} {} {}", o.state["doc"], o.state["page"]), target, [zoom; N], [far; N])
 +}
 +
-+/// `shown` moved `k` of the way to `to`, key by key and number by number; a new key, another shape or a jump of more
-+/// than `far` goes there at once. Whether a number is still more than `near` away.
-+fn ease(shown: &mut Value, to: Value, k: f64, near: f64, far: f64) -> bool {
-+    let Value::Object(to) = to else { return false };
-+    let Value::Object(s) = shown else {
-+        *shown = Value::Object(to);
-+        return false;
-+    };
-+    s.retain(|key, _| to.contains_key(key));
-+    let mut moving = false;
-+    for (key, t) in to {
-+        match s.get_mut(&key) {
-+            Some(v) if gap(v, &t).is_some_and(|g| g <= far) => {
-+                lerp(v, &t, k);
-+                if gap(v, &t).is_some_and(|g| g > near) {
-+                    moving = true;
-+                } else {
-+                    *v = t;
-+                }
-+            }
-+            _ => {
-+                s.insert(key, t);
-+            }
-+        }
-+    }
-+    moving
++/// The oval in `r`, as 64 points.
++fn ring(r: Rect) -> Vec<Pos2> {
++    (0..64)
++        .map(|i| std::f32::consts::TAU * i as f32 / 64.0)
++        .map(|t| r.center() + vec2(t.cos() * r.width() / 2.0, t.sin() * r.height() / 2.0))
++        .collect()
 +}
 +
-+/// The largest difference between numbers in the same place of `a` and `b`; `None` when they differ otherwise.
-+fn gap(a: &Value, b: &Value) -> Option<f64> {
-+    match (a, b) {
-+        (Value::Number(x), Value::Number(y)) => Some((x.as_f64()? - y.as_f64()?).abs()),
-+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => x.iter().zip(y).try_fold(0.0, |g: f64, (x, y)| Some(g.max(gap(x, y)?))),
-+        _ => (a == b).then_some(0.0),
-+    }
-+}
-+
-+/// `a`'s numbers moved `k` of the way to `b`'s.
-+fn lerp(a: &mut Value, b: &Value, k: f64) {
-+    match (a, b) {
-+        (Value::Number(x), Value::Number(y)) => {
-+            if let (Some(p), Some(q)) = (x.as_f64(), y.as_f64())
-+                && let Some(n) = serde_json::Number::from_f64(p + (q - p) * k)
-+            {
-+                *x = n;
-+            }
-+        }
-+        (Value::Array(x), Value::Array(y)) => x.iter_mut().zip(y).for_each(|(x, y)| lerp(x, y, k)),
-+        _ => {}
-+    }
-+}
-+
-+fn color_of(who: &Presence) -> Color32 {
-+    Color32::from_rgb(who.color[0], who.color[1], who.color[2])
-+}
-+
-+/// A rubber band: 1.5 px dashed (4 on, 3 off).
-+fn band(painter: &egui::Painter, points: &[Pos2], color: Color32) {
-+    painter.extend(Shape::dashed_line(points, Stroke::new(1.5, color), 4.0, 3.0));
-+}
-+
-+/// Draws the others on the PDF `view` shows, on its pages, in the session's look (after the pages; the find bar and
-+/// every popup come after): their drawings under way, moved comments' ghosts and selected text, then their selected
-+/// comments outlined, then what they type, then their pointers with their names, each in their colour and eased toward
-+/// their latest presence.
++/// Draws the others on the PDF `view` shows, on its pages, in the session's look ([`presence`]; after the pages, the
++/// find bar and every popup come after): their drawings under way, moved comments' ghosts and selected text, then
++/// their selected comments outlined, then what they type, then their pointers with their names, each in their colour
++/// and eased toward their latest presence.
 +pub(crate) fn paint(view: &DocView, area: Rect, ui: &egui::Ui) {
 +    if !playground_live::connected() {
 +        return;
 +    }
 +    let ctx = ui.ctx();
-+    let k = f64::from(1.0 - (-ctx.input(|i| i.stable_dt).clamp(0.0, 0.1) / EASE).exp());
-+    let moving = STATE.with_borrow_mut(|s| {
-+        let Some(doc) = s.docs.iter().find(|d| d.tab == Some(view.id) && !d.paused).map(|d| d.id) else { return false };
-+        let Some(ids) = s.ids.clone().filter(|i| i.doc == view.id) else { return false };
-+        let painter = ui.painter().with_clip_rect(area);
-+        let mut moving = false;
-+        // Who is here, on which page, and where that page is drawn.
-+        let mut here = Vec::new();
-+        for (n, o) in s.others.iter_mut().enumerate().filter(|(_, o)| o.who.state["doc"].as_u64() == Some(doc)) {
-+            let Some((page, xf)) = ids.page(&o.who.state["page"]).and_then(|p| Some((p, view.page_xform(p)?))) else { continue };
-+            let zoom = f64::from(xf.rect.width() / xf.pw.max(1.0)).max(1e-3);
-+            moving |= ease(&mut o.shown, marks(&o.who.state), k, 0.5 / zoom, f64::from(area.height()) / 4.0 / zoom);
-+            here.push((n, page, xf));
-+        }
-+        let here: Vec<(&Peer, usize, crate::canvas::PageXform)> = here.into_iter().map(|(n, page, xf)| (&s.others[n], page, xf)).collect();
-+        let at = |page: usize, xf: &crate::canvas::PageXform, [x, y]: [f64; 2]| -> Option<Pos2> {
-+            let v = ids.pages.get(page)?.1.user_to_view(x as f32, y as f32);
-+            Some(xf.norm_to_screen(v[0] / xf.pw, v[1] / xf.ph))
-+        };
-+        let screen_rect = |page: usize, xf: &crate::canvas::PageXform, r: [f64; 4]| Some(Rect::from_two_pos(at(page, xf, [r[0], r[1]])?, at(page, xf, [r[2], r[3]])?));
-+        for &(o, page, ref xf) in &here {
-+            let (state, color) = (&o.who.state, color_of(&o.who));
-+            let zoom = xf.rect.width() / xf.pw.max(1.0);
-+            if let Some(draw) = state["draw"].as_object() {
-+                let points = draw["points"].as_array().into_iter().flatten().take(MAX_POINTS);
-+                let mut pts: Vec<Pos2> = points.filter_map(|p| at(page, xf, numbers::<2>(p)?)).collect();
-+                if let (Some(last), Some(tip)) = (pts.last_mut(), numbers::<2>(&o.shown["tip"]).and_then(|t| at(page, xf, t))) {
-+                    *last = tip;
-+                }
-+                let width = draw["width"].as_f64().filter(|w| (0.0..1000.0).contains(w)).unwrap_or(1.0) as f32;
-+                match (draw["tool"].as_str().unwrap_or_default(), pts.as_slice()) {
-+                    ("ink" | "eraser", _) => {
-+                        painter.add(Shape::line(pts, Stroke::new((width * zoom).max(2.0), color.gamma_multiply(LIVE_STROKE))));
-+                    }
-+                    ("rect", &[a, b]) => {
-+                        let r = Rect::from_two_pos(a, b);
-+                        band(&painter, &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()], color);
-+                    }
-+                    ("oval", &[a, b]) => {
-+                        let r = Rect::from_two_pos(a, b);
-+                        let ring: Vec<Pos2> = (0..=64)
-+                            .map(|i| std::f32::consts::TAU * i as f32 / 64.0)
-+                            .map(|t| r.center() + vec2(t.cos() * r.width() / 2.0, t.sin() * r.height() / 2.0))
-+                            .collect();
-+                        band(&painter, &ring, color);
-+                    }
-+                    ("line" | "arrow" | "callout", &[a, b]) => {
-+                        band(&painter, &[a, b], color);
-+                        if draw["tool"] == "arrow" && a.distance(b) > 1.0 {
-+                            let (d, s) = ((a - b).normalized(), (6.0 + 3.0 * width) * zoom);
-+                            let turn = |v: egui::Vec2, t: f32| vec2(v.x * t.cos() - v.y * t.sin(), v.x * t.sin() + v.y * t.cos());
-+                            band(&painter, &[b + turn(d, 0.52) * s, b, b + turn(d, -0.52) * s], color);
-+                        }
-+                        if draw["tool"] == "callout" {
-+                            let r = Rect::from_min_size(b, vec2(160.0, 40.0) * zoom);
-+                            band(&painter, &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()], color);
-+                        }
-+                    }
-+                    ("polygon" | "polyline" | "cloud", _) => band(&painter, &pts, color),
-+                    _ => {}
-+                }
-+            }
-+            let ghost = ids.annots.get(&state["ghost"]["id"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0));
-+            if let (Some(a), Some(r)) = (ghost, numbers::<4>(&o.shown["ghost"]).and_then(|r| screen_rect(page, xf, r))) {
-+                let (fill, edge) = (color.gamma_multiply(GHOST), Stroke::new(1.5, color.gamma_multiply(GHOST_EDGE)));
-+                if a.oval {
-+                    painter.add(Shape::ellipse_filled(r.center(), r.size() / 2.0, fill));
-+                    painter.add(Shape::ellipse_stroke(r.center(), r.size() / 2.0, edge));
-+                } else {
-+                    painter.rect(r, 0.0, fill, edge, egui::StrokeKind::Middle);
-+                }
-+            }
-+            for r in state["text"].as_array().into_iter().flatten().take(MAX_ITEMS).filter_map(|r| screen_rect(page, xf, numbers::<4>(r)?)) {
-+                painter.rect_filled(r, 1.0, color.gamma_multiply(GHOST));
-+            }
-+        }
-+        // Their selected comments, on whichever shown page they are, where they were (a moved one's ghost is above).
-+        for o in s.others.iter().filter(|o| o.who.state["doc"].as_u64() == Some(doc)) {
-+            let numbers = o.who.state["selection"].as_array().into_iter().flatten().take(MAX_ITEMS).filter_map(Value::as_u64);
-+            for a in numbers.filter_map(|n| ids.annots.get(&u32::try_from(n).ok()?)) {
-+                let Some(xf) = view.page_xform(a.page) else { continue };
-+                let boxes = if a.boxes.is_empty() { std::slice::from_ref(&a.rect) } else { &a.boxes[..] };
-+                for r in boxes.iter().filter_map(|r| screen_rect(a.page, &xf, r.map(f64::from))) {
-+                    painter.rect_stroke(r.expand(2.0), 0.0, Stroke::new(2.0, color_of(&o.who)), egui::StrokeKind::Middle);
-+                }
-+            }
-+        }
-+        // What they type, in a tag above where it goes.
-+        for o in s.others.iter().filter(|o| o.who.state["doc"].as_u64() == Some(doc)) {
-+            let t = &o.who.state["typing"];
-+            let (Some(page), Some(r), Some(text)) = (ids.page(&t["page"]), numbers::<4>(&t["rect"]), t["text"].as_str()) else { continue };
-+            let Some(r) = view.page_xform(page).and_then(|xf| screen_rect(page, &xf, r)) else { continue };
-+            let n = text.chars().count();
-+            let end: String = text.chars().skip(n.saturating_sub(40)).map(|c| if c.is_control() { ' ' } else { c }).collect();
-+            let shown = if n > 40 { format!("…{end}") } else { end };
-+            let size = tag_text(&painter, &shown, Color32::WHITE).size() + 2.0 * TAG_PAD;
-+            tag(&painter, r.left_top() - vec2(0.0, size.y + 4.0), &shown, color_of(&o.who));
-+        }
-+        for &(o, page, ref xf) in &here {
-+            let tip = numbers::<2>(&o.shown["pointer"]).and_then(|p| at(page, xf, p));
-+            if let Some(tip) = tip.filter(|t| area.expand(20.0).contains(*t)) {
-+                cursor(&painter, tip, color_of(&o.who), &o.who.name);
-+            }
-+        }
-+        moving
-+    });
-+    if moving {
-+        ctx.request_repaint();
-+    }
-+}
-+
-+/// The session's pointer arrow, tip first, in points.
-+const ARROW: [(f32, f32); 7] = [(0.0, 0.0), (0.0, 16.0), (4.5, 12.2), (7.6, 18.6), (10.4, 17.3), (7.3, 11.0), (12.5, 11.0)];
-+/// The most characters of a name tag, its ellipsis included.
-+const MAX_NAME: usize = 24;
-+/// Inside a tag, in points.
-+const TAG_PAD: egui::Vec2 = vec2(7.0, 3.0);
-+
-+/// Another person's pointer at `tip`: an arrow in their colour with a white edge and a soft shadow, and a tag with
-+/// their name.
-+fn cursor(painter: &egui::Painter, tip: Pos2, color: Color32, name: &str) {
-+    let arrow = |at: Pos2| ARROW.iter().map(|&(x, y)| at + vec2(x, y)).collect::<Vec<_>>();
-+    // Filled as a fan from the tip (the arrow is not convex, which egui's polygon fill needs), edged after.
-+    let fan = |pts: &[Pos2], fill: Color32| {
-+        let mut mesh = egui::Mesh::default();
-+        pts.iter().for_each(|q| mesh.colored_vertex(*q, fill));
-+        (1..pts.len() as u32 - 1).for_each(|i| mesh.add_triangle(0, i, i + 1));
-+        mesh
++    let shown = STATE.with_borrow(|s| Some((s.docs.iter().find(|d| d.tab == Some(view.id) && !d.paused)?.id, s.ids.clone().filter(|i| i.doc == view.id)?)));
++    let Some((doc, ids)) = shown else { return };
++    let others: Vec<Presence> = presence::others().into_iter().filter(|o| o.state["doc"].as_u64() == Some(doc)).collect();
++    let painter = ui.painter().with_clip_rect(area);
++    let far = area.height() / 4.0;
++    // Who is here, on which page, where that page is drawn and at what zoom.
++    let here: Vec<(&Presence, usize, crate::canvas::PageXform, f32)> = (others.iter())
++        .filter_map(|o| {
++            let page = ids.page(&o.state["page"])?;
++            let xf = view.page_xform(page)?;
++            let zoom = (xf.rect.width() / xf.pw.max(1.0)).max(1e-3);
++            Some((o, page, xf, zoom))
++        })
++        .collect();
++    let at = |page: usize, xf: &crate::canvas::PageXform, [x, y]: [f64; 2]| -> Option<Pos2> {
++        let v = ids.pages.get(page)?.1.user_to_view(x as f32, y as f32);
++        Some(xf.norm_to_screen(v[0] / xf.pw, v[1] / xf.ph))
 +    };
-+    painter.add(fan(&arrow(tip + vec2(0.0, 1.0)), Color32::from_black_alpha(64)));
-+    painter.add(fan(&arrow(tip), color));
-+    painter.add(Shape::closed_line(arrow(tip), Stroke::new(1.5, Color32::WHITE)));
-+    let name: String = match name.chars().nth(MAX_NAME) {
-+        Some(_) => name.chars().take(MAX_NAME - 1).chain(['…']).collect(),
-+        None => name.to_owned(),
-+    };
-+    if !name.is_empty() {
-+        tag(painter, tip + vec2(12.0, 15.0), &name, color);
++    let screen_rect = |page: usize, xf: &crate::canvas::PageXform, r: [f64; 4]| Some(Rect::from_two_pos(at(page, xf, [r[0], r[1]])?, at(page, xf, [r[2], r[3]])?));
++    for &(o, page, ref xf, zoom) in &here {
++        let (state, color) = (&o.state, presence::color(o));
++        if let Some(draw) = state["draw"].as_object() {
++            let points = draw["points"].as_array().into_iter().flatten().take(MAX_POINTS);
++            let mut pts: Vec<Pos2> = points.filter_map(|p| at(page, xf, numbers::<2>(p)?)).collect();
++            // The newest point eases.
++            let tip = draw["points"].as_array().and_then(|p| p.last()).and_then(numbers::<2>).and_then(|t| eased(ctx, o, "tip", t, zoom.into(), far.into()));
++            if let (Some(last), Some(tip)) = (pts.last_mut(), tip.and_then(|t| at(page, xf, t))) {
++                *last = tip;
++            }
++            let width = draw["width"].as_f64().filter(|w| (0.0..1000.0).contains(w)).unwrap_or(1.0) as f32;
++            match (draw["tool"].as_str().unwrap_or_default(), pts.as_slice()) {
++                ("ink" | "eraser", _) => {
++                    painter.add(Shape::line(pts, Stroke::new((width * zoom).max(2.0), color.gamma_multiply(LIVE_STROKE))));
++                }
++                ("rect", &[a, b]) => {
++                    let r = Rect::from_two_pos(a, b);
++                    presence::dashed(&painter, &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()], true, color);
++                }
++                ("oval", &[a, b]) => {
++                    presence::dashed(&painter, &ring(Rect::from_two_pos(a, b)), true, color);
++                }
++                ("line" | "arrow" | "callout", &[a, b]) => {
++                    presence::dashed(&painter, &[a, b], false, color);
++                    if draw["tool"] == "arrow" && a.distance(b) > 1.0 {
++                        let (d, s) = ((a - b).normalized(), (6.0 + 3.0 * width) * zoom);
++                        let turn = |v: egui::Vec2, t: f32| vec2(v.x * t.cos() - v.y * t.sin(), v.x * t.sin() + v.y * t.cos());
++                        presence::dashed(&painter, &[b + turn(d, 0.52) * s, b, b + turn(d, -0.52) * s], false, color);
++                    }
++                    if draw["tool"] == "callout" {
++                        let r = Rect::from_min_size(b, vec2(160.0, 40.0) * zoom);
++                        presence::dashed(&painter, &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()], true, color);
++                    }
++                }
++                ("polygon" | "polyline" | "cloud", _) => presence::dashed(&painter, &pts, false, color),
++                _ => {}
++            }
++        }
++        let ghost = ids.annots.get(&state["ghost"]["id"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0));
++        let rect = numbers::<4>(&state["ghost"]["rect"]).and_then(|r| eased(ctx, o, "ghost", r, zoom.into(), far.into()));
++        if let (Some(a), Some(r)) = (ghost, rect.and_then(|r| screen_rect(page, xf, r))) {
++            match a.oval {
++                true => presence::ghost_shape(&painter, &ring(r), color),
++                false => presence::ghost(&painter, r, color),
++            }
++        }
++        for r in state["text"].as_array().into_iter().flatten().take(MAX_ITEMS).filter_map(|r| screen_rect(page, xf, numbers::<4>(r)?)) {
++            painter.rect_filled(r, 1.0, color.gamma_multiply(GHOST));
++        }
 +    }
-+}
-+
-+/// White, or near-black on a colour whose relative luminance passes 0.55.
-+fn ink(color: Color32) -> Color32 {
-+    let c = egui::Rgba::from(color);
-+    if 0.2126 * c.r() + 0.7152 * c.g() + 0.0722 * c.b() > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE }
-+}
-+
-+/// A tag's text: 12 points semibold.
-+fn tag_text(painter: &egui::Painter, text: &str, color: Color32) -> Arc<egui::Galley> {
-+    painter.layout_no_wrap(text.to_owned(), crate::theme::semibold(12.0), ink(color))
-+}
-+
-+/// A name or typing tag in `color`, its top left at `at` (on whole pixels, so the text stays crisp).
-+fn tag(painter: &egui::Painter, at: Pos2, text: &str, color: Color32) {
-+    let galley = tag_text(painter, text, color);
-+    let ppp = painter.pixels_per_point();
-+    let at = pos2((at.x * ppp).round() / ppp, (at.y * ppp).round() / ppp);
-+    let r = Rect::from_min_size(at, galley.size() + 2.0 * TAG_PAD);
-+    painter.rect_filled(r, 6.0, color);
-+    painter.galley(r.min + TAG_PAD, galley, ink(color));
++    // Their selected comments, on whichever shown page they are, where they were (a moved one's ghost is above).
++    for o in &others {
++        let numbers = o.state["selection"].as_array().into_iter().flatten().take(MAX_ITEMS).filter_map(Value::as_u64);
++        for a in numbers.filter_map(|n| ids.annots.get(&u32::try_from(n).ok()?)) {
++            let Some(xf) = view.page_xform(a.page) else { continue };
++            let boxes = if a.boxes.is_empty() { std::slice::from_ref(&a.rect) } else { &a.boxes[..] };
++            for r in boxes.iter().filter_map(|r| screen_rect(a.page, &xf, r.map(f64::from))) {
++                // 2 px, from 1 to 3 px outside the comment.
++                presence::outline(&painter, r.expand(3.0), presence::color(o));
++            }
++        }
++    }
++    // What they type, in a tag above where it goes.
++    for o in &others {
++        let t = &o.state["typing"];
++        let (Some(page), Some(r), Some(text)) = (ids.page(&t["page"]), numbers::<4>(&t["rect"]), t["text"].as_str()) else { continue };
++        let Some(r) = view.page_xform(page).and_then(|xf| screen_rect(page, &xf, r)) else { continue };
++        let n = text.chars().count();
++        let end: String = text.chars().skip(n.saturating_sub(40)).map(|c| if c.is_control() { ' ' } else { c }).collect();
++        let shown = if n > 40 { format!("…{end}") } else { end };
++        let size = presence::label_size(&painter, &shown);
++        presence::label(&painter, r.left_top() - vec2(0.0, size.y + 4.0), presence::color(o), &shown);
++    }
++    for &(o, page, ref xf, zoom) in &here {
++        let pointer = numbers::<2>(&o.state["pointer"]).and_then(|p| eased(ctx, o, "pointer", p, zoom.into(), far.into()));
++        if let Some(tip) = pointer.and_then(|p| at(page, xf, p)).filter(|t| area.expand(20.0).contains(*t)) {
++            presence::cursor(&painter, tip, presence::color(o), &o.name);
++        }
++    }
 +}
 +
 +/// The others in a PDF of the session: their colours, at most four.
 +fn on(doc: u64) -> Vec<Color32> {
-+    STATE.with_borrow(|s| s.others.iter().filter(|o| o.who.state["doc"].as_u64() == Some(doc)).take(4).map(|o| color_of(&o.who)).collect())
++    presence::others().iter().filter(|o| o.state["doc"].as_u64() == Some(doc)).take(4).map(presence::color).collect()
 +}
 +
 +/// Dots in the colours of the others on the PDF in tab `i` (drawn at `tab`, right after the tab strip draws it), in
@@ -1635,7 +1493,7 @@ index 0000000..f58c9ea
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
-+    use super::playground_live::{activity, canonical, checkpoint, connect, disconnect, queue};
++    use playground_live::{activity, canonical, checkpoint, connect, disconnect, queue};
 +    use pdfcraft_engine::{Edit, NewAnnotation, NoteIcon, Session, Shape, Style};
 +
 +    thread_local! {

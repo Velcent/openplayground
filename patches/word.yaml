@@ -352,24 +352,32 @@
             playground::report_unsaved(self.app.session.dirty);
 
 
-# Live editing in Playground sessions (patches/word/live.diff + patches/live/playground_live.rs)
+# Live editing in Playground sessions (patches/word/live.diff + the playground-live crate, tools.yaml `live_kit`)
 # What it's for: people in a Playground session edit the open document together and see each other's pointer, selection
 #   and caret, and gestures under way before they reach the document (a picture's, shape's or text box's frame moved,
 #   resized or turned, a table border dragged, ink being drawn), in each person's color.
-# The adapter lives in new files: apps/wordcraft-web/src/live.rs (the shared document, adopt, Undo and presence; the
-# template is its child module, live/text_merge.rs merges text character by character, live/presence.rs shares and
-# draws the others) and apps/wordcraft-web/src/web/live.rs (the kept runner, and the shell that ends each frame with the
-# session's frame hook, which draws the others over the pages); crates/ui-egui/src/{objects,ink,table_resize}/live.rs
-# read the canvas's drags. These rules only declare them and call in, one line each at the end of a file or after a
-# function's signature, the same on both channels. Verify: node scripts/build.mjs check word head|release, then the
-# e2e (tests/live-apps/word.mjs). If upstream renames a function named below, anchor on its new signature; if it renames
-# WebShell or its `app` field, follow it in web/live.rs; if it renames a drag's fields, follow them in its live.rs.
+# The adapter lives in new files: apps/wordcraft-web/src/live.rs (the shared document, adopt, Undo and presence, on its
+# Peer around the app, as the playground-live crate's Live trait can't go on WordApp here; live/text_merge.rs merges
+# text character by character, live/presence.rs shares and draws the others: pointers, name tags, ghosts, outlines and
+# easing the kit's, text shading, carets, border lines and strokes WordCraft's own) and
+# apps/wordcraft-web/src/web/live.rs (the kept runner, and the shell that ends each frame with the session's frame
+# hook, which draws the others over the pages); crates/ui-egui/src/{objects,ink,table_resize}/live.rs read the canvas's
+# drags. These rules only declare them and call in, one line each at the end of a file or after a function's signature,
+# the same on both channels. Verify: node scripts/build.mjs check word head|release, then the e2e
+# (tests/live-apps/word.mjs) and `cargo test -p wordcraft-web live::`. If upstream renames a function named below,
+# anchor on its new signature; if it renames WebShell or its `app` field, follow it in web/live.rs; if it renames a
+# drag's fields, follow them in its live.rs.
 #
-# The adapter's module (web, and native tests).
+# The adapter's module (web, and native tests), and its dependency there: the playground-live crate (patches/live/kit:
+# the session and the presence look, `egui`).
 - live: true
   file: apps/wordcraft-web/src/main.rs
   find: '(?![\s\S])'
-  after: "\n// Live editing in a Playground session (patches/live/playground_live.rs).\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
+  after: "\n// Live editing in a Playground session (the playground-live crate, patches/live/kit).\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
+- live: true
+  file: apps/wordcraft-web/Cargo.toml
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 # The two hooks upstream calls through, set by live.rs: the session takes Undo and Redo of the shared document, and
 # the QAT keeps them enabled while it does.
 - live: true

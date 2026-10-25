@@ -1,22 +1,22 @@
 // Checks that each live-editing tool's diffs (and patch rules) still apply to what build.mjs would build now, on
-// both channels: the same refs as `build.mjs facts`, the live template copied in first, then applyDiffs and the rules.
+// both channels: the same refs as `build.mjs facts`, the live crate copied in first, then applyDiffs and the rules.
 // No compile. Sources are cached under $LIVE_CHECK_DIR (default ~/.cache/live-check). Also names the existing
 // upstream files the diffs edit: each such hunk breaks as soon as upstream edits its context, so they should be none
 // (new files only, upstream edits as yaml rules anchored on stable lines).
 //   node scripts/check-live.mjs [slug...]
 import { execFileSync } from 'node:child_process'
-import { cpSync, existsSync, globSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, globSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { parse } from 'yaml'
-import { applyDiffs } from './diffs.mjs'
+import { applyDiffs, installLive } from './diffs.mjs'
 import { CHANNELS, resolveVersion, tools } from './releases.mjs'
 
 const root = process.env.LIVE_CHECK_DIR ?? join(homedir(), '.cache', 'live-check')
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
 const wanted = process.argv.slice(2)
 let failed = 0
-for (const t of tools.filter((t) => (t.live || t.slug === 'fl-studio-mobile') && (!wanted.length || wanted.includes(t.slug)))) {
+for (const t of tools.filter((t) => (t.live_kit || t.slug === 'fl-studio-mobile') && (!wanted.length || wanted.includes(t.slug)))) {
   for (const channel of CHANNELS) {
     const version = await resolveVersion(t, channel)
     if (!version) { console.log(`${t.slug} ${channel}: no version`); continue }
@@ -28,7 +28,7 @@ for (const t of tools.filter((t) => (t.live || t.slug === 'fl-studio-mobile') &&
     git(src, 'fetch', '--quiet', '--depth', '1', `https://github.com/${t.repo}.git`, version.release.ref ?? `refs/tags/${ref}`)
     git(src, 'checkout', '--quiet', 'FETCH_HEAD')
     try {
-      if (t.live) cpSync(new URL('../patches/live/playground_live.rs', import.meta.url), join(src, t.live, 'playground_live.rs'))
+      installLive(src, t)
       const merged = applyDiffs(src, t, channel)
       let bad = 0
       for (const rule of (t.patches && existsSync(t.patches) && parse(readFileSync(t.patches, 'utf8'))) || []) {

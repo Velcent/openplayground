@@ -1,9 +1,9 @@
 diff --git a/src/app/live.rs b/src/app/live.rs
 new file mode 100644
-index 0000000..0da745f
+index 0000000..84905a7
 --- /dev/null
 +++ b/src/app/live.rs
-@@ -0,0 +1,525 @@
+@@ -0,0 +1,526 @@
 +// SPDX-License-Identifier: MIT
 +//! Live editing in a Playground session (patches/mspaint.yaml in github.com/daijro/openplayground). Playground's
 +//! `shell/live.js` drives it through the adapter [`web::attach`] offers; nothing here runs until a session connects.
@@ -14,11 +14,9 @@ index 0000000..0da745f
 +//! pixel ([`merge`]): both strokes stay, and where both painted the same pixel the later one is on top. A remote change
 +//! goes into the picture at the end of a frame with no stroke under way ([`frame`]) and is no step of the app's own
 +//! history; while connected, Undo and Redo go to the session, which takes back only this person's edits. Each person's
-+//! pointer and the stroke, shape or text they are making go to the others (`peers`).
++//! pointer and the stroke, shape or text they are making go to the others (`peers`). Presence lists and the look of the
++//! others' pointers are the playground-live crate's (patches/live/kit).
 +
-+#[path = "playground_live.rs"]
-+#[allow(dead_code)]
-+mod template;
 +mod peers;
 +#[cfg(test)]
 +mod tests;
@@ -29,6 +27,7 @@ index 0000000..0da745f
 +use super::{DragState, SelfPaintApp};
 +use crate::document::Document;
 +use image::RgbaImage;
++use playground_live::presence;
 +use std::cell::{Cell, RefCell};
 +use std::collections::VecDeque;
 +
@@ -394,7 +393,7 @@ index 0000000..0da745f
 +    if let Some(app) = app {
 +        app.history.clear();
 +    }
-+    peers::show(Vec::new());
++    presence::show(Vec::new());
 +}
 +
 +/// The adapter object the shell drives (`shell/live.js`): `format`, `checkpoint()` (throws `busy` mid-stroke),
@@ -424,7 +423,8 @@ index 0000000..0da745f
 +        runner().app_mut::<Shell>().map(|mut shell| f(&mut shell.0.0))
 +    }
 +
-+    /// The app eframe runs: the page's app, then the session's frame; and the adapter offered to the shell.
++    /// The app eframe runs: the page's app, the presence look's end of frame (repaints while a mark eases), then the
++    /// session's frame; and the adapter offered to the shell.
 +    pub fn wrap(web: Web) -> Box<dyn eframe::App> {
 +        if let Err(e) = attach() {
 +            web_sys::console::warn_1(&format!("SelfPaint: no live editing: {e:?}").into());
@@ -437,6 +437,7 @@ index 0000000..0da745f
 +    impl eframe::App for Shell {
 +        fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
 +            eframe::App::ui(&mut self.0, ui, frame);
++            super::presence::end_frame(ui.ctx());
 +            if super::frame(&mut self.0.0) {
 +                ui.ctx().request_repaint();
 +            }
@@ -515,7 +516,7 @@ index 0000000..0da745f
 +        set("presence", Closure::<dyn Fn() -> _>::new(presence).into_js_value())?;
 +        let show_presence = |others: JsValue| -> Result<(), JsValue> {
 +            let text: String = js_sys::JSON::stringify(&others)?.into();
-+            super::peers::show(super::template::Presence::list(&serde_json::from_str(&text).unwrap_or_default()));
++            super::presence::show(playground_live::Presence::list(&serde_json::from_str(&text).unwrap_or_default()));
 +            crate::app::web::repaint();
 +            Ok(())
 +        };
@@ -531,42 +532,39 @@ index 0000000..0da745f
 +}
 diff --git a/src/app/live/peers.rs b/src/app/live/peers.rs
 new file mode 100644
-index 0000000..34f306a
+index 0000000..f592128
 --- /dev/null
 +++ b/src/app/live/peers.rs
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,201 @@
 +// SPDX-License-Identifier: MIT
 +//! Presence in a live session. Each person shares their pointer over the picture (in picture pixels, so it lands on
 +//! the same spot at anyone's zoom and scroll) and what they are making: the stroke being drawn (its newest points and
 +//! brush size), the shape being dragged out, the text being typed. Here, for the others, over the picture: their
 +//! stroke in their colour, their shape's outline dashed, their text, then their pointer with their name. Pointers ease
 +//! toward their latest place. A finished stroke stays until the picture with it arrives (at most a second).
-+//! Everything in a state comes from another person: what doesn't read as numbers in range is skipped.
++//! Everything in a state comes from another person: what doesn't read as numbers in range is skipped. Pointers, name
++//! tags and the easing are the playground-live crate's presence look; strokes, dashed outlines and text are drawn here,
++//! in the person's colour.
 +// The painting is web only (its hook is); native tests use the state.
 +#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 +
 +use super::super::{DragState, SelfPaintApp};
-+use super::connected;
-+use super::template::Presence;
-+use egui::{Color32, FontId, Pos2, Rect, Shape, Stroke, Vec2, vec2};
++use super::{connected, presence};
++use egui::{Color32, FontId, Pos2, Rect, Shape, Stroke, vec2};
 +use serde_json::{Value, json};
 +use std::cell::{Cell, RefCell};
 +use std::collections::HashMap;
 +
-+/// How long the others' pointers take to go most (1 - 1/e) of the way to where they last were, in seconds.
-+const EASE: f32 = 0.08;
 +/// The newest points of a stroke shared (presence stays under 4 KiB).
 +const MAX_POINTS: usize = 150;
 +const MAX_TEXT: usize = 300;
 +/// How long a finished stroke stays while its picture is on the way, in seconds.
 +const LINGER: f64 = 1.0;
 +
-+/// How someone shows here.
++/// Someone's stroke as shown here: its points and brush size, when it last changed, and once it is finished, until
++/// when it stays.
 +#[derive(Default)]
 +struct Mark {
-+    /// Their pointer as last drawn.
-+    pointer: Option<[f32; 2]>,
-+    /// Their stroke (points, brush size), when it last changed, and once it is finished, until when it stays.
 +    stroke: Option<(Vec<[f32; 2]>, f32)>,
 +    changed: f64,
 +    until: Option<f64>,
@@ -576,7 +574,6 @@ index 0000000..34f306a
 +    /// This person's pointer over the picture and the stroke they are drawing, as of the last frame.
 +    static POINTER: Cell<Option<[f32; 2]>> = const { Cell::new(None) };
 +    static STROKE: RefCell<Vec<[f32; 2]>> = const { RefCell::new(Vec::new()) };
-+    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
 +    static SHOWN: RefCell<HashMap<String, Mark>> = RefCell::default();
 +    /// A remote change went into the picture since the last frame, and when one last did.
 +    static LANDED: Cell<bool> = const { Cell::new(false) };
@@ -613,10 +610,6 @@ index 0000000..34f306a
 +    s
 +}
 +
-+pub(in super::super) fn show(others: Vec<Presence>) {
-+    OTHERS.set(others);
-+}
-+
 +/// A remote change went into the picture: finished strokes have arrived.
 +pub(super) fn landed() {
 +    LANDED.set(true);
@@ -637,68 +630,10 @@ index 0000000..34f306a
 +    (!points.is_empty()).then_some((points, size(&v["size"])?))
 +}
 +
-+fn rgb(c: [u8; 3]) -> Color32 {
-+    Color32::from_rgb(c[0], c[1], c[2])
-+}
-+
 +/// `c` at 70% over white, opaque (overlapping dabs of a translucent colour would show darker spots).
 +fn tint(c: Color32) -> Color32 {
 +    let mix = |v: u8| (255.0 - 0.7 * (255.0 - f32::from(v))).round() as u8;
 +    Color32::from_rgb(mix(c.r()), mix(c.g()), mix(c.b()))
-+}
-+
-+/// Relative luminance (sRGB) of `c`.
-+fn luminance(c: Color32) -> f32 {
-+    let lin = |v: u8| {
-+        let v = f32::from(v) / 255.0;
-+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-+    };
-+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
-+}
-+
-+fn shorten(text: &str, n: usize) -> String {
-+    match text.chars().nth(n) {
-+        Some(_) => text.chars().take(n - 1).chain(['…']).collect(),
-+        None => text.to_owned(),
-+    }
-+}
-+
-+const TAG_PAD: Vec2 = vec2(7.0, 3.0);
-+
-+/// A name tag filled with `color`, its top left at `at` (on a pixel).
-+fn tag(painter: &egui::Painter, at: Pos2, name: &str, color: Color32) {
-+    let ink = if luminance(color) > 0.55 { Color32::from_rgb(0x11, 0x11, 0x11) } else { Color32::WHITE };
-+    let galley = painter.layout_no_wrap(shorten(name, 24), FontId::proportional(12.0), ink);
-+    let ppp = painter.pixels_per_point();
-+    let at = (at.to_vec2() * ppp).round().to_pos2() / ppp;
-+    painter.rect_filled(Rect::from_min_size(at, galley.size() + 2.0 * TAG_PAD), 6.0, color);
-+    painter.galley(at + TAG_PAD, galley, color);
-+}
-+
-+/// The pointer arrow, tip at (0, 0), in points.
-+const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
-+
-+/// `points` filled as a fan from the first (the arrow is star-shaped around its tip).
-+fn fan(points: &[Pos2], fill: Color32) -> Shape {
-+    let mut mesh = egui::Mesh::default();
-+    for p in points {
-+        mesh.colored_vertex(*p, fill);
-+    }
-+    for i in 1..points.len() as u32 - 1 {
-+        mesh.add_triangle(0, i, i + 1);
-+    }
-+    Shape::mesh(mesh)
-+}
-+
-+/// A person's pointer: the arrow in their colour with a white outline and a soft shadow, and their name tag.
-+fn pointer(painter: &egui::Painter, tip: Pos2, color: Color32, name: &str) {
-+    let ppp = painter.pixels_per_point();
-+    let tip = (tip.to_vec2() * ppp).round().to_pos2() / ppp;
-+    let arrow = |off: Vec2| ARROW.map(|[x, y]| tip + off + vec2(x, y));
-+    painter.add(fan(&arrow(vec2(0.0, 1.0)), Color32::from_black_alpha(64)));
-+    painter.add(fan(&arrow(Vec2::ZERO), color));
-+    painter.add(Shape::closed_line(arrow(Vec2::ZERO).to_vec(), Stroke::new(1.5, Color32::WHITE)));
-+    tag(painter, tip + vec2(12.0, 15.0), name, color);
 +}
 +
 +/// A dashed outline in `color` (the others' shapes and text boxes being made).
@@ -731,92 +666,75 @@ index 0000000..34f306a
 +    });
 +
 +    let screen = |p: [f32; 2]| sheet.min + vec2(p[0] * zoom, p[1] * zoom);
-+    let (now, dt) = ui.input(|i| (i.time, i.stable_dt.clamp(0.0, 0.1)));
-+    let k = 1.0 - (-dt / EASE).exp();
-+    let far = clip.width().max(clip.height()) / 4.0 / zoom;
++    let now = ui.input(|i| i.time);
++    // Pointers ease in picture pixels (`zoom` points each); a jump farther than a quarter of the canvas goes at once.
++    let far = f64::from(clip.width().max(clip.height()) / 4.0);
 +    if LANDED.take() {
 +        LANDED_AT.set(now);
 +    }
-+    let mut moving = false;
-+    OTHERS.with_borrow(|others| {
-+        SHOWN.with_borrow_mut(|shown| {
-+            shown.retain(|id, _| others.iter().any(|o| o.id == *id));
-+            let mut pointers = Vec::new();
-+            for o in others {
-+                let (state, color) = (&o.state, rgb(o.color));
-+                let mark = shown.entry(o.id.clone()).or_default();
-+                match stroke_of(&state["stroke"]) {
-+                    Some(stroke) => {
-+                        if mark.stroke.as_ref() != Some(&stroke) {
-+                            mark.changed = now;
-+                        }
-+                        (mark.stroke, mark.until) = (Some(stroke), None);
++    let others = presence::others();
++    let mut pointers = Vec::new();
++    SHOWN.with_borrow_mut(|shown| {
++        shown.retain(|id, _| others.iter().any(|o| o.id == *id));
++        for o in &others {
++            let (state, color) = (&o.state, presence::color(o));
++            let mark = shown.entry(o.id.clone()).or_default();
++            match stroke_of(&state["stroke"]) {
++                Some(stroke) => {
++                    if mark.stroke.as_ref() != Some(&stroke) {
++                        mark.changed = now;
 +                    }
-+                    // Finished: it stays until a change lands after its last point (the picture with it), at most a
-+                    // second.
-+                    None if mark.stroke.is_some() => {
-+                        if LANDED_AT.get() > mark.changed || now > *mark.until.get_or_insert(now + LINGER) {
-+                            (mark.stroke, mark.until) = (None, None);
-+                        } else {
-+                            moving = true;
-+                        }
-+                    }
-+                    None => {}
++                    (mark.stroke, mark.until) = (Some(stroke), None);
 +                }
-+                if let Some((points, size)) = &mark.stroke {
-+                    let (line, width, ink) = (points.iter().map(|p| screen(*p)).collect::<Vec<_>>(), (size * zoom).max(2.0), tint(color));
-+                    painter.add(Shape::line(line.clone(), Stroke::new(width, ink)));
-+                    for p in line {
-+                        painter.circle_filled(p, width / 2.0, ink);
++                // Finished: it stays until a change lands after its last point (the picture with it), at most a
++                // second.
++                None if mark.stroke.is_some() => {
++                    if LANDED_AT.get() > mark.changed || now > *mark.until.get_or_insert(now + LINGER) {
++                        (mark.stroke, mark.until) = (None, None);
++                    } else {
++                        presence::keep_moving();
 +                    }
 +                }
-+                let shape = &state["shape"];
-+                if let (Some(kind), Some(a), Some(b)) = (shape["kind"].as_str(), point(&shape["from"]), point(&shape["to"])) {
-+                    let (a, b) = (screen(a), screen(b));
-+                    let r = Rect::from_two_pos(a, b);
-+                    match kind {
-+                        "line" => dashed(painter, &[a, b], color),
-+                        "rect" => dashed(painter, &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()], color),
-+                        "ellipse" => {
-+                            let ring: Vec<Pos2> = (0..=64).map(|i| i as f32 * std::f32::consts::TAU / 64.0).map(|t| r.center() + vec2(t.cos() * r.width(), t.sin() * r.height()) / 2.0).collect();
-+                            dashed(painter, &ring, color);
-+                        }
-+                        _ => {}
-+                    }
-+                }
-+                let text = &state["text"];
-+                if let (Some(at), Some(size)) = (point(&text["at"]), size(&text["size"])) {
-+                    let words: String = text["text"].as_str().unwrap_or_default().chars().take(MAX_TEXT).collect();
-+                    let galley = painter.layout_no_wrap(words, FontId::proportional((size * zoom).clamp(4.0, 512.0)), tint(color));
-+                    let box_ = Rect::from_min_size(screen(at), galley.size().max(vec2(8.0, size * zoom))).expand(3.0);
-+                    painter.galley(screen(at), galley, color);
-+                    dashed(painter, &[box_.left_top(), box_.right_top(), box_.right_bottom(), box_.left_bottom(), box_.left_top()], color);
-+                }
-+                match point(&state["pointer"]) {
-+                    Some(to) => {
-+                        let s = mark.pointer.get_or_insert(to);
-+                        if (to[0] - s[0]).abs().max((to[1] - s[1]).abs()) > far {
-+                            *s = to;
-+                        }
-+                        s[0] += (to[0] - s[0]) * k;
-+                        s[1] += (to[1] - s[1]) * k;
-+                        if (to[0] - s[0]).abs().max((to[1] - s[1]).abs()) * zoom < 0.5 {
-+                            *s = to;
-+                        } else {
-+                            moving = true;
-+                        }
-+                        pointers.push((screen(*s), color, &o.name));
-+                    }
-+                    None => mark.pointer = None,
++                None => {}
++            }
++            if let Some((points, size)) = &mark.stroke {
++                let (line, width, ink) = (points.iter().map(|p| screen(*p)).collect::<Vec<_>>(), (size * zoom).max(2.0), tint(color));
++                painter.add(Shape::line(line.clone(), Stroke::new(width, ink)));
++                for p in line {
++                    painter.circle_filled(p, width / 2.0, ink);
 +                }
 +            }
-+            for (tip, color, name) in pointers {
-+                pointer(painter, tip, color, name);
++            let shape = &state["shape"];
++            if let (Some(kind), Some(a), Some(b)) = (shape["kind"].as_str(), point(&shape["from"]), point(&shape["to"])) {
++                let (a, b) = (screen(a), screen(b));
++                let r = Rect::from_two_pos(a, b);
++                match kind {
++                    "line" => dashed(painter, &[a, b], color),
++                    "rect" => dashed(painter, &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()], color),
++                    "ellipse" => {
++                        let ring: Vec<Pos2> = (0..=64).map(|i| i as f32 * std::f32::consts::TAU / 64.0).map(|t| r.center() + vec2(t.cos() * r.width(), t.sin() * r.height()) / 2.0).collect();
++                        dashed(painter, &ring, color);
++                    }
++                    _ => {}
++                }
 +            }
-+        });
++            let text = &state["text"];
++            if let (Some(at), Some(size)) = (point(&text["at"]), size(&text["size"])) {
++                let words: String = text["text"].as_str().unwrap_or_default().chars().take(MAX_TEXT).collect();
++                let galley = painter.layout_no_wrap(words, FontId::proportional((size * zoom).clamp(4.0, 512.0)), tint(color));
++                let box_ = Rect::from_min_size(screen(at), galley.size().max(vec2(8.0, size * zoom))).expand(3.0);
++                painter.galley(screen(at), galley, color);
++                dashed(painter, &[box_.left_top(), box_.right_top(), box_.right_bottom(), box_.left_bottom(), box_.left_top()], color);
++            }
++            let eased = point(&state["pointer"]).and_then(|p| presence::ease(ui.ctx(), &o.id, "pointer", p.map(f64::from), [f64::from(zoom); 2], [far; 2]));
++            if let Some(p) = eased {
++                pointers.push((screen(p.map(|v| v as f32)), color, &o.name));
++            }
++        }
 +    });
-+    if moving {
-+        ui.ctx().request_repaint();
++    // Pointers over everything of theirs.
++    for (tip, color, name) in pointers {
++        presence::cursor(painter, tip, color, name);
 +    }
 +}
 diff --git a/src/app/live/tests.rs b/src/app/live/tests.rs

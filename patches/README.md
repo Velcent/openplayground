@@ -1,6 +1,6 @@
 # Patches
 
-Each app's patch files, `patches/<slug>.yaml` and the `patches/<slug>/` folder, are licensed under that app's own licence, its `license:` in [tools.yaml](../tools.yaml). So is the live-collaboration adapter, [`live/playground_live.rs`](live/playground_live.rs), in each app it is compiled into.
+Each app's patch files, `patches/<slug>.yaml` and the `patches/<slug>/` folder, are licensed under that app's own licence, its `license:` in [tools.yaml](../tools.yaml). So is the live-collaboration crate, [`live/kit/`](live/kit/), in each app it is compiled into.
 
 The licence texts:
 

@@ -1,10 +1,11 @@
-// MaterialCraft (substance-designer): run with LIVE_GPU=1 (its 3D view on software GL takes seconds a frame). `ready` opens the Brick wall example from the start screen in each page, so both
-// show the same graph in the same view (the joiner then adopts the owner's package, keeping its view). Nodes are found
-// through the view: presence() gives the pointer in graph coordinates at two places, and a node's card is its `pos`
-// plus half a card. The owner moves Blend (node 4), the editor Levels (node 10): one node's `pos` each, no array
-// shifts; Ctrl+Z is the owner's Undo. point(): the owner clicks Bricks (node 1): pointer and selection. drag(): the
-// owner holds a move of Bricks (presence `moving`); release(): one move back by the same amount (Bricks sits at 0,0,
-// so it lands exactly where it was), then the mouse comes up: no edit.
+// MaterialCraft (substance-designer): run with LIVE_GPU=1 (its 3D view on software GL takes seconds a frame). `ready`
+// opens the Brick Wall template from the start screen's Templates in each page, so both show the same graph in the same
+// view (the joiner then adopts the owner's package, keeping its view). Nodes are found through the view: presence()
+// gives the pointer in graph coordinates at two places, and a node's card is its `pos` plus half a card. The owner moves
+// output node 3, the editor output node 5 (in view as the template opens): one node's `pos` each, no array shifts;
+// Ctrl+Z is the owner's Undo. point(): the owner clicks node 1: pointer and selection. drag(): the owner holds a move
+// of node 1 (presence `moving`); release(): one move back by the same amount, so it lands where it was, then the
+// mouse comes up: no edit.
 import { until } from '../helpers.mjs'
 
 const checkpoint = (page) => page.evaluate(() => {
@@ -14,9 +15,9 @@ const doc = async (page) => JSON.parse(await until(async () => { const t = await
 const presence = (page) => page.evaluate(() => playgroundLiveAdapter.presence())
 // Two animation frames: the app has run a frame for the input before.
 const frames = (page) => page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))))
-// Below the shell's 36 px top bar: the start screen's "Brick wall example" card, and two points over the graph between
-// the example's nodes (its first two rows and columns, in the view the example opens with).
-const EXAMPLE = { x: 768, y: 234 }, CANVAS = [{ x: 470, y: 300 }, { x: 640, y: 300 }]
+// Below the shell's 36 px top bar: the start screen's Templates tab, its Brick Wall card once the list is scrolled
+// 400 px, and two points over the graph between the template's nodes (in the view it opens with).
+const TEMPLATES = { x: 291, y: 61 }, BRICK_WALL = { x: 356, y: 435 }, CANVAS = [{ x: 470, y: 300 }, { x: 640, y: 300 }]
 // Where graph point (x, y) shows: the view from the pointer at two places over the graph.
 async function view(page) {
   const pointer = () => presence(page).then((p) => p?.pointer)
@@ -53,14 +54,19 @@ export default {
   ready: async (page) => {
     await until(async () => !(await checkpoint(page)).startsWith('error'), 120000, 'MaterialCraft to run')
     for (let tries = 0; (await doc(page)).nodes.length < 10; tries++) {
-      if (tries === 4) throw new Error('no example after 4 tries')
-      await page.mouse.click(EXAMPLE.x, EXAMPLE.y)
-      await until(async () => (await doc(page)).nodes.length >= 10, 10000, 'the example').catch(() => {})
+      if (tries === 4) throw new Error('no template after 4 tries')
+      await page.mouse.click(TEMPLATES.x, TEMPLATES.y)
+      await frames(page)
+      await page.mouse.move(640, 500)
+      await page.mouse.wheel(0, 400)
+      await page.waitForTimeout(800)
+      await page.mouse.click(BRICK_WALL.x, BRICK_WALL.y)
+      await until(async () => (await doc(page)).nodes.length >= 10, 10000, 'the template').catch(() => {})
     }
     await frames(page)
   },
-  editA: (page) => move(page, 4, 30, 45),
-  editB: (page) => move(page, 10, -25, 40),
+  editA: (page) => move(page, 3, 30, 45),
+  editB: (page) => move(page, 5, -25, 40),
   undo: async (page) => {
     await page.keyboard.press('Control+z')
   },

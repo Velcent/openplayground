@@ -25,17 +25,17 @@
 // diff is skipped too, so an empty <name>.<channel>.diff skips <name>.diff on that channel; `tidy` deletes the
 // ones that do nothing (build.yml runs it on a repair).
 //
-// Live editing in Playground sessions is an extra on top: the shared adapter (patches/live/playground_live.rs, copied
-// into the tools.yaml `live:` folder), patches/<slug>/live.diff and the rules marked `live: true`. When those no
-// longer fit upstream and a repair doesn't help, build.yml builds the version without them (LIVE=0) rather than
-// nothing; the failure stays on record, so it is retried daily and reported after a day.
+// Live editing in Playground sessions is an extra on top: the playground-live crate (patches/live/kit, copied to
+// <checkout>/playground-live for tools.yaml `live_kit: true`), patches/<slug>/live.diff and the rules marked
+// `live: true`. When those no longer fit upstream and a repair doesn't help, build.yml builds the version without
+// them (LIVE=0) rather than nothing; the failure stays on record, so it is retried daily and reported after a day.
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { cpSync, existsSync, globSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { parse } from 'yaml'
-import { applyDiffs, diffDir, tidyDiffs } from './diffs.mjs'
+import { LIVE_KIT, applyDiffs, diffDir, installLive, tidyDiffs } from './diffs.mjs'
 import { CHANNELS, JUNK, builtAssets, channelAssets, resolveVersion, tools } from './releases.mjs'
 
 const WASM_OPT = process.env.WASM_OPT || 'wasm-opt'
@@ -49,16 +49,13 @@ const WASM_FEATURES = ['bulk-memory', 'bulk-memory-opt', 'call-indirect-overlong
 // checkout, which cargo merges with the app's own (rustflags arrays add up); RUSTFLAGS would replace the app's.
 const SIMD = '[target.wasm32-unknown-unknown]\nrustflags = ["-Ctarget-feature=+simd128"]\n'
 
-// The live-editing adapter template (tools.yaml `live:`), copied into the app before its patches apply.
-const LIVE = new URL('../patches/live/playground_live.rs', import.meta.url)
-
 // Changes when the build recipe or the tool's patches change, so either one triggers a rebuild.
 const buildHash = (t) =>
   createHash('sha256')
     .update(readFileSync(import.meta.filename))
     .update(readFileSync(new URL('diffs.mjs', import.meta.url)))
     .update(t.patches ? readFileSync(t.patches) : '')
-    .update(t.live ? readFileSync(LIVE) : '')
+    .update(t.live_kit ? readdirSync(LIVE_KIT, { recursive: true }).sort().map((f) => f + (f.endsWith('.rs') || f.endsWith('.toml') ? readFileSync(new URL(f, LIVE_KIT), 'utf8') : '')).join('') : '')
     .update(diffDir(t) ? readdirSync(diffDir(t)).sort().map((f) => f + readFileSync(join(diffDir(t), f), 'utf8')).join('') : '')
     .digest('hex')
     .slice(0, 8)
@@ -97,7 +94,7 @@ const wasmBindgenPath = (src, cache) => {
 }
 
 // Whether the tool has live-editing parts to leave out when they fail.
-const hasLive = (t) => !!t.live || !!diffDir(t) && readdirSync(diffDir(t)).some((f) => /^live(\.\w+)?\.diff$/.test(f))
+const hasLive = (t) => !!t.live_kit || !!diffDir(t) && readdirSync(diffDir(t)).some((f) => /^live(\.\w+)?\.diff$/.test(f))
   || !!t.patches && existsSync(t.patches) && (parse(readFileSync(t.patches, 'utf8')) ?? []).some((rule) => rule.live)
 const toolFor = (slug) => tools.find((t) => t.slug === slug) ?? fail(`no tool ${slug} in tools.yaml`)
 const fail = (message) => {
@@ -127,7 +124,7 @@ const prepare = async (slug, channel, { dir = 'src', patch = true, live = proces
   } else {
     run('git', ['clone', '--quiet', '--depth', '1', '--branch', release.tag_name, `https://github.com/${t.repo}.git`, src])
   }
-  if (t.live && patch && live) cpSync(LIVE, join(src, t.live, 'playground_live.rs'))
+  if (patch && live) installLive(src, t)
   const merged = patch ? applyDiffs(src, t, channel, live) : []
   if (t.patches && patch) applyPatches(src, t.patches, live)
   const web = webDir(src)

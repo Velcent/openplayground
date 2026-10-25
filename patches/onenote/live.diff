@@ -65,10 +65,10 @@ index 0000000..830a115
 +}
 diff --git a/crates/ui-egui/src/app/live.rs b/crates/ui-egui/src/app/live.rs
 new file mode 100644
-index 0000000..3838b04
+index 0000000..cc07bf3
 --- /dev/null
 +++ b/crates/ui-egui/src/app/live.rs
-@@ -0,0 +1,553 @@
+@@ -0,0 +1,555 @@
 +// SPDX-License-Identifier: MIT OR Apache-2.0
 +//! Live editing in a Playground session (the shell's `shell/live.js` drives it through `playground_live::web`);
 +//! nothing here runs until the shell connects, and native builds never call it.
@@ -89,15 +89,14 @@ index 0000000..3838b04
 +//!
 +//! While connected, Ctrl+Z and Ctrl+Y (the text boxes' own undo, which would also take back what others typed into
 +//! the same block) go to the session, which takes back only this person's edits (the web entry routes the keys).
++//!
++//! The session and the presence look (pointers, name tags, colors, easing) are the playground-live crate's
++//! (patches/live/kit); the tree's dots, carets, selections and strokes being drawn are NoteCraft's own (`peers.rs`).
 +// The page and tree hooks are web only; native tests use the rest.
 +#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 +
 +#[path = "live/peers.rs"]
 +mod peers;
-+// The template (patches/live/playground_live.rs, copied next to this file): its glue and canonical form.
-+#[path = "playground_live.rs"]
-+#[allow(dead_code)]
-+mod playground_live;
 +#[path = "live/text.rs"]
 +mod text;
 +
@@ -495,7 +494,9 @@ index 0000000..3838b04
 +        adopt(self, document)
 +    }
 +
-+    /// No button held: a click, a text selection being dragged or a scroll bar being moved.
++    /// No button held: a click, a text selection being dragged or a scroll bar being moved. Not the presence look's
++    /// `quiet`, which also waits for no text field focused: the page's text box keeps the keyboard while this person
++    /// writes, and the others' typing goes in then (the caret follows its text).
 +    fn live_quiet(&self) -> bool {
 +        !with_ctx(|ctx| ctx.input(|i| i.pointer.any_down())).unwrap_or(false)
 +    }
@@ -577,14 +578,15 @@ index 0000000..3838b04
 +
 +// ---------------------------------------------------------------- hooks
 +
-+/// The end of each frame, after the window's own: the others' marks in the tree, the page the others are on for
-+/// someone who just joined, the session's frame (remote changes in, this person's out, once quiet), then this
-+/// person's pointer for their presence.
++/// The end of each frame, after the window's own: the others' marks in the tree, the presence look's frame (after
++/// all the marks are drawn), the page the others are on for someone who just joined, the session's frame (remote
++/// changes in, this person's out, once quiet), then this person's pointer for their presence.
 +pub fn frame(app: &mut NoteCraftApp, ctx: &egui::Context) {
 +    CTX.with(|c| {
 +        c.get_or_init(|| ctx.clone());
 +    });
 +    peers::rows(app, ctx);
++    playground_live::presence::end_frame(ctx);
 +    peers::join(app);
 +    playground_live::frame(app);
 +    peers::note(app, ctx);
@@ -624,10 +626,10 @@ index 0000000..3838b04
 +mod tests;
 diff --git a/crates/ui-egui/src/app/live/peers.rs b/crates/ui-egui/src/app/live/peers.rs
 new file mode 100644
-index 0000000..59b0721
+index 0000000..4369263
 --- /dev/null
 +++ b/crates/ui-egui/src/app/live/peers.rs
-@@ -0,0 +1,410 @@
+@@ -0,0 +1,329 @@
 +// SPDX-License-Identifier: MIT OR Apache-2.0
 +//! Presence in a live session. Each person shares the page they are on (its path in the notebooks folder, or the
 +//! notebook or section selected when no page is open), their pointer over the page (from the page's top left, so it
@@ -635,7 +637,8 @@ index 0000000..59b0721
 +//! for the others: a dot in their colour on the tree row of the page they are on (on the nearest row shown when it is
 +//! folded away), and on the same page the stroke they are drawing, their selection, their caret with their name and
 +//! their pointer with its name tag. Pointers ease toward their latest place; carets jump with the typing. Someone who joins with no page open
-+//! lands on the page the others are on.
++//! lands on the page the others are on. Pointers, name tags, colors and easing are the presence look's
++//! (playground_live::presence); the dots, carets, selections and strokes are drawn here in its colors.
 +//! Everything in a state comes from another person: what doesn't read as a path or numbers in range is skipped.
 +// The painting is web only (its hooks are); native tests use the projection.
 +#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -644,8 +647,9 @@ index 0000000..59b0721
 +use super::{Presence, connected, valid};
 +use crate::pageedit;
 +use crate::theme::Tokens;
-+use egui::{Color32, FontId, LayerId, Pos2, Rect, Shape, Stroke, Vec2, vec2};
++use egui::{Color32, LayerId, Pos2, Rect, Shape, Stroke, vec2};
 +use notecraft_formats::markdown::Block;
++use playground_live::presence;
 +use serde_json::{Value, json};
 +use std::cell::RefCell;
 +use std::collections::HashMap;
@@ -653,8 +657,6 @@ index 0000000..59b0721
 +
 +/// The most readings of a stroke being drawn that a presence carries (the newest).
 +const INK_POINTS: usize = 150;
-+/// How long the others' pointers take to go most (1 - 1/e) of the way to where they last were, in seconds.
-+const EASE: f32 = 0.08;
 +
 +/// Where the page is drawn this frame.
 +#[derive(Default)]
@@ -672,9 +674,6 @@ index 0000000..59b0721
 +    static PAGE: RefCell<Page> = RefCell::default();
 +    /// This person's pointer over the page (from its top left), as of the last frame.
 +    static POINTER: RefCell<Option<[f32; 2]>> = const { RefCell::new(None) };
-+    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
-+    /// The others' pointers as last drawn.
-+    static SHOWN: RefCell<HashMap<String, [f32; 2]>> = RefCell::default();
 +    /// The tree rows drawn this frame: path, row, clip.
 +    static ROWS: RefCell<Vec<(PathBuf, Rect, Rect)>> = const { RefCell::new(Vec::new()) };
 +    /// Someone who joined has been taken to the others' page.
@@ -733,7 +732,7 @@ index 0000000..59b0721
 +    if others.is_empty() {
 +        JOINED.set(false);
 +    }
-+    OTHERS.set(others);
++    presence::show(others);
 +}
 +
 +/// A path someone gave, when it is one these notebooks could have.
@@ -751,7 +750,7 @@ index 0000000..59b0721
 +    if !connected() || JOINED.with_borrow(|j| *j) || app.editor.is_some() {
 +        return;
 +    }
-+    let pages: Vec<String> = OTHERS.with_borrow(|o| o.iter().filter_map(page_of).map(str::to_owned).collect());
++    let pages: Vec<String> = presence::others().iter().filter_map(page_of).map(str::to_owned).collect();
 +    let root = app.session.root().to_path_buf();
 +    if let Some(page) = pages.iter().find(|p| valid(&format!("{p}/index.html")) && notecraft_store::tree::page_file(&root.join(p)).is_some()) {
 +        JOINED.set(true);
@@ -806,64 +805,6 @@ index 0000000..59b0721
 +    if connected() {
 +        ROWS.with_borrow_mut(|rows| rows.push((path.to_path_buf(), rect, clip)));
 +    }
-+}
-+
-+fn rgb(c: [u8; 3]) -> Color32 {
-+    Color32::from_rgb(c[0], c[1], c[2])
-+}
-+
-+/// Relative luminance (sRGB) of `c`.
-+fn luminance(c: Color32) -> f32 {
-+    let lin = |v: u8| {
-+        let v = f32::from(v) / 255.0;
-+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-+    };
-+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
-+}
-+
-+fn cut(text: &str, n: usize) -> String {
-+    match text.chars().nth(n) {
-+        Some(_) => text.chars().take(n - 1).chain(['…']).collect(),
-+        None => text.to_owned(),
-+    }
-+}
-+
-+const TAG_PAD: Vec2 = vec2(7.0, 3.0);
-+
-+/// A name tag filled with `color`, its top left at `at` (on a pixel).
-+fn tag(painter: &egui::Painter, at: Pos2, name: &str, color: Color32) {
-+    let ink = if luminance(color) > 0.55 { Color32::from_rgb(0x11, 0x11, 0x11) } else { Color32::WHITE };
-+    let galley = painter.layout_no_wrap(cut(name, 24), FontId::proportional(12.0), ink);
-+    let ppp = painter.pixels_per_point();
-+    let at = (at.to_vec2() * ppp).round().to_pos2() / ppp;
-+    painter.rect_filled(Rect::from_min_size(at, galley.size() + 2.0 * TAG_PAD), 6.0, color);
-+    painter.galley(at + TAG_PAD, galley, color);
-+}
-+
-+/// The pointer arrow, tip at (0, 0), in points.
-+const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
-+
-+/// `points` filled as a fan from the first (the arrow is star-shaped around its tip).
-+fn fan(points: &[Pos2], fill: Color32) -> Shape {
-+    let mut mesh = egui::Mesh::default();
-+    for p in points {
-+        mesh.colored_vertex(*p, fill);
-+    }
-+    for i in 1..points.len() as u32 - 1 {
-+        mesh.add_triangle(0, i, i + 1);
-+    }
-+    Shape::mesh(mesh)
-+}
-+
-+/// A person's pointer: the arrow in their colour with a white outline and a soft shadow, and their name tag.
-+fn pointer(painter: &egui::Painter, tip: Pos2, color: Color32, name: &str) {
-+    let ppp = painter.pixels_per_point();
-+    let tip = (tip.to_vec2() * ppp).round().to_pos2() / ppp;
-+    let arrow = |off: Vec2| ARROW.map(|[x, y]| tip + off + vec2(x, y));
-+    painter.add(fan(&arrow(vec2(0.0, 1.0)), Color32::from_black_alpha(64)));
-+    painter.add(fan(&arrow(Vec2::ZERO), color));
-+    painter.add(Shape::closed_line(arrow(Vec2::ZERO).to_vec(), Stroke::new(1.5, Color32::WHITE)));
-+    tag(painter, tip + vec2(12.0, 15.0), name, color);
 +}
 +
 +/// The type size of a block and whether it is strong, as the page draws it (pageedit's `size_of`).
@@ -936,76 +877,57 @@ index 0000000..59b0721
 +    Some((caret, bands))
 +}
 +
-+/// After the page's blocks: the others on this page, their carets with their names, then their pointers.
++/// After the page's blocks: the others on this page, their carets with their names, then their pointers (eased by
++/// the presence look, which repaints while one is on its way).
 +pub(super) fn page_end(ui: &egui::Ui, ed: &Editor, t: &Tokens) {
-+    OTHERS.with_borrow(|others| {
-+        PAGE.with_borrow(|page| {
-+            SHOWN.with_borrow_mut(|shown| {
-+                let (Some(origin), Some(clip)) = (page.origin, page.clip) else { return };
-+                let root = ROOT.with_borrow(Clone::clone);
-+                let here: Vec<&Presence> = others.iter().filter(|o| page_of(o).is_some_and(|p| root.join(p) == ed.dir)).collect();
-+                shown.retain(|id, _| here.iter().any(|o| o.id == *id));
-+                let painter = ui.painter().with_clip_rect(clip);
-+                // What they are drawing, at its pen's width, in their colour, see-through.
-+                for o in &here {
-+                    let ink = &o.state["ink"];
-+                    let width = coord(&ink["width"]).unwrap_or(3.0).clamp(0.5, 60.0);
-+                    let points: Vec<Pos2> = ink["points"]
-+                        .as_array()
-+                        .into_iter()
-+                        .flatten()
-+                        .take(INK_POINTS)
-+                        .filter_map(|p| Some(origin + vec2(coord(&p[0])?, coord(&p[1])?)))
-+                        .collect();
-+                    let color = rgb(o.color).gamma_multiply(0.7);
-+                    if let [first, ..] = points.as_slice() {
-+                        painter.circle_filled(*first, width / 2.0, color);
-+                    }
-+                    if points.len() > 1 {
-+                        painter.add(Shape::line(points.clone(), Stroke::new(width, color)));
-+                        painter.circle_filled(points[points.len() - 1], width / 2.0, color);
-+                    }
++    let others = presence::others();
++    PAGE.with_borrow(|page| {
++        let (Some(origin), Some(clip)) = (page.origin, page.clip) else { return };
++        let root = ROOT.with_borrow(Clone::clone);
++        let here: Vec<&Presence> = others.iter().filter(|o| page_of(o).is_some_and(|p| root.join(p) == ed.dir)).collect();
++        let painter = ui.painter().with_clip_rect(clip);
++        // What they are drawing, at its pen's width, in their colour, see-through.
++        for o in &here {
++            let ink = &o.state["ink"];
++            let width = coord(&ink["width"]).unwrap_or(3.0).clamp(0.5, 60.0);
++            let points: Vec<Pos2> = ink["points"]
++                .as_array()
++                .into_iter()
++                .flatten()
++                .take(INK_POINTS)
++                .filter_map(|p| Some(origin + vec2(coord(&p[0])?, coord(&p[1])?)))
++                .collect();
++            let color = presence::color(o).gamma_multiply(0.7);
++            if let [first, ..] = points.as_slice() {
++                painter.circle_filled(*first, width / 2.0, color);
++            }
++            if points.len() > 1 {
++                painter.add(Shape::line(points.clone(), Stroke::new(width, color)));
++                painter.circle_filled(points[points.len() - 1], width / 2.0, color);
++            }
++        }
++        for o in &here {
++            let caret = &o.state["caret"];
++            let n = |v: &Value| v.as_u64().and_then(|n| usize::try_from(n).ok()).map(|n| n.min(1_000_000));
++            let (Some(i), Some(b)) = (n(&caret[0]), n(&caret[1])) else { continue };
++            let a = n(&o.state["selection"][1]).filter(|_| n(&o.state["selection"][0]) == Some(i)).unwrap_or(b);
++            if let Some((rect, bands)) = marks(ui, page, ed, i, (a, b), t) {
++                let color = presence::color(o);
++                for band in bands {
++                    painter.rect_filled(band, 2.0, color.gamma_multiply(0.28));
 +                }
-+                for o in &here {
-+                    let caret = &o.state["caret"];
-+                    let n = |v: &Value| v.as_u64().and_then(|n| usize::try_from(n).ok()).map(|n| n.min(1_000_000));
-+                    let (Some(i), Some(b)) = (n(&caret[0]), n(&caret[1])) else { continue };
-+                    let a = n(&o.state["selection"][1]).filter(|_| n(&o.state["selection"][0]) == Some(i)).unwrap_or(b);
-+                    if let Some((rect, bands)) = marks(ui, page, ed, i, (a, b), t) {
-+                        let color = rgb(o.color);
-+                        for band in bands {
-+                            painter.rect_filled(band, 2.0, color.gamma_multiply(0.28));
-+                        }
-+                        painter.rect_filled(rect, 1.0, color);
-+                        tag(&painter, rect.left_top() - vec2(0.0, 19.0), &o.name, color);
-+                    }
-+                }
-+                let k = 1.0 - (-ui.input(|i| i.stable_dt).clamp(0.0, 0.1) / EASE).exp();
-+                let far = clip.width().max(clip.height()) / 4.0;
-+                let mut moving = false;
-+                for o in &here {
-+                    let Some(to) = coord(&o.state["pointer"][0]).zip(coord(&o.state["pointer"][1])).map(|(x, y)| [x, y]) else {
-+                        shown.remove(&o.id);
-+                        continue;
-+                    };
-+                    let s = shown.entry(o.id.clone()).or_insert(to);
-+                    if (to[0] - s[0]).abs().max((to[1] - s[1]).abs()) > far {
-+                        *s = to;
-+                    }
-+                    s[0] += (to[0] - s[0]) * k;
-+                    s[1] += (to[1] - s[1]) * k;
-+                    if (to[0] - s[0]).abs().max((to[1] - s[1]).abs()) < 0.5 {
-+                        *s = to;
-+                    } else {
-+                        moving = true;
-+                    }
-+                    pointer(&painter, origin + vec2(s[0], s[1]), rgb(o.color), &o.name);
-+                }
-+                if moving {
-+                    ui.ctx().request_repaint();
-+                }
-+            });
-+        });
++                painter.rect_filled(rect, 1.0, color);
++                presence::tag(&painter, rect.left_top() - vec2(0.0, 19.0), color, &o.name);
++            }
++        }
++        let far = f64::from(clip.width().max(clip.height()) / 4.0);
++        for o in &here {
++            let Some(to) = coord(&o.state["pointer"][0]).zip(coord(&o.state["pointer"][1])) else { continue };
++            let to = [f64::from(to.0), f64::from(to.1)];
++            if let Some([x, y]) = presence::ease(ui.ctx(), &o.id, "pointer", to, [1.0; 2], [far; 2]) {
++                presence::cursor(&painter, origin + vec2(x as f32, y as f32), presence::color(o), &o.name);
++            }
++        }
 +    });
 +}
 +
@@ -1014,33 +936,32 @@ index 0000000..59b0721
 +pub(super) fn rows(app: &NoteCraftApp, ctx: &egui::Context) {
 +    let root = app.session.root();
 +    ROOT.with_borrow_mut(|r| r.clone_from(&root.to_path_buf()));
++    let others = presence::others();
 +    ROWS.with_borrow(|rows| {
-+        OTHERS.with_borrow(|others| {
-+            let mut dots: HashMap<usize, usize> = HashMap::new();
-+            for o in others {
-+                let Some(page) = page_of(o).map(|p| root.join(p)) else { continue };
-+                let Some(at) = rows
-+                    .iter()
-+                    .enumerate()
-+                    .filter(|(_, (path, ..))| page.starts_with(path))
-+                    .max_by_key(|(_, (path, ..))| path.components().count())
-+                    .map(|(i, _)| i)
-+                else {
-+                    continue;
-+                };
-+                let n = dots.entry(at).or_insert(0);
-+                let (_, rect, clip) = &rows[at];
-+                let painter = ctx.layer_painter(LayerId::background()).with_clip_rect(*clip);
-+                let c = egui::pos2(rect.max.x - 62.0 - *n as f32 * 11.0, rect.center().y);
-+                painter.circle(c, 4.5, rgb(o.color), Stroke::new(1.5, Color32::WHITE));
-+                *n += 1;
-+            }
-+        });
++        let mut dots: HashMap<usize, usize> = HashMap::new();
++        for o in &others {
++            let Some(page) = page_of(o).map(|p| root.join(p)) else { continue };
++            let Some(at) = rows
++                .iter()
++                .enumerate()
++                .filter(|(_, (path, ..))| page.starts_with(path))
++                .max_by_key(|(_, (path, ..))| path.components().count())
++                .map(|(i, _)| i)
++            else {
++                continue;
++            };
++            let n = dots.entry(at).or_insert(0);
++            let (_, rect, clip) = &rows[at];
++            let painter = ctx.layer_painter(LayerId::background()).with_clip_rect(*clip);
++            let c = egui::pos2(rect.max.x - 62.0 - *n as f32 * 11.0, rect.center().y);
++            painter.circle(c, 4.5, presence::color(o), Stroke::new(1.5, Color32::WHITE));
++            *n += 1;
++        }
 +    });
 +}
 diff --git a/crates/ui-egui/src/app/live/tests.rs b/crates/ui-egui/src/app/live/tests.rs
 new file mode 100644
-index 0000000..92f61d5
+index 0000000..fcf1a88
 --- /dev/null
 +++ b/crates/ui-egui/src/app/live/tests.rs
 @@ -0,0 +1,115 @@

@@ -1,9 +1,9 @@
 diff --git a/apps/photocraft-web/src/live.rs b/apps/photocraft-web/src/live.rs
 new file mode 100644
-index 0000000..3294913
+index 0000000..d54b835
 --- /dev/null
 +++ b/apps/photocraft-web/src/live.rs
-@@ -0,0 +1,1245 @@
+@@ -0,0 +1,1235 @@
 +//! Live editing in a Playground session (web only). Playground's `shell/live.js` drives it through [`web::attach`];
 +//! nothing here runs until it connects. The shared document is the set of documents open in the session (the tabs), as
 +//! a checkpoint ([`shared`]): each one's `.pcraft` manifest as canonical JSON without personal views ([`entry`]), then
@@ -13,7 +13,8 @@ index 0000000..3294913
 +//! ([`frame`]), keeping this person's views, and is no step of the native history. While connected, Undo and Redo of
 +//! those documents go to the session ([`undo`]), which reverts only this person's edits. Each person's document,
 +//! pointer, active layers, selection bounds and the gesture under way go to the others ([`presence`]), who see them on
-+//! the canvas and as dots on its tab (`peers`).
++//! the canvas and as dots on its tab (`peers`). The JSON merge and the presence look are the playground-live crate's
++//! (patches/live/kit); its JSON adapter isn't used: this checkpoint is binary.
 +//!
 +//! Checkpoint layout (integers little-endian):
 +//! - `photocraft-live 3\n`;
@@ -24,11 +25,6 @@ index 0000000..3294913
 +//!   of its `.pcraft` zstd frame (0: that tile came earlier); the last piece by u32::MAX instead;
 +//! - u32 count, then per blob the JSON names (ICC profile, EXIF, smart object source, …) in hash order: the hash,
 +//!   u32 n, n bytes of its zstd frame.
-+
-+// The shared template (patches/live/playground_live.rs), copied next to this file by the build.
-+#[path = "playground_live.rs"]
-+#[allow(dead_code)]
-+mod template;
 +
 +use photocraft_doc::{DocId, Document, LayerId};
 +use photocraft_format::{ByteSource, FormatError, LoadOptions, PcraftWriter, SaveOptions};
@@ -187,7 +183,7 @@ index 0000000..3294913
 +    set["documents"].as_array().into_iter().flatten().filter_map(|d| Some((d["id"].as_u64()?, d)))
 +}
 +
-+/// `template::canonical(header)` cut after each surface, in the order [`surfaces`] meets them.
++/// `playground_live::canonical(header)` cut after each surface, in the order [`surfaces`] meets them.
 +fn pieces(header: &Value) -> Vec<Vec<u8>> {
 +    fn last(out: &mut [Vec<u8>]) -> &mut Vec<u8> {
 +        out.last_mut().expect("a piece")
@@ -195,7 +191,7 @@ index 0000000..3294913
 +    fn walk(v: &Value, out: &mut Vec<Vec<u8>>) {
 +        match v {
 +            Value::Object(m) if m.len() == 3 && ["default", "format", "tiles"].iter().all(|k| m.contains_key(*k)) => {
-+                last(out).extend(template::canonical(v));
++                last(out).extend(playground_live::canonical(v));
 +                out.push(Vec::new());
 +            }
 +            Value::Object(m) => {
@@ -205,7 +201,7 @@ index 0000000..3294913
 +                    if i > 0 {
 +                        piece.push(b',');
 +                    }
-+                    piece.extend(template::canonical(&Value::String(key.clone())));
++                    piece.extend(playground_live::canonical(&Value::String(key.clone())));
 +                    piece.push(b':');
 +                    walk(v, out);
 +                }
@@ -221,7 +217,7 @@ index 0000000..3294913
 +                }
 +                last(out).push(b']');
 +            }
-+            scalar => last(out).extend(template::canonical(scalar)),
++            scalar => last(out).extend(playground_live::canonical(scalar)),
 +        }
 +    }
 +    let mut out = vec![Vec::new()];
@@ -337,7 +333,7 @@ index 0000000..3294913
 +        }
 +        sections.push(map);
 +    }
-+    let mut doc = template::parse(&json.concat())?;
++    let mut doc = playground_live::parse(&json.concat())?;
 +    if pieces(&doc).iter().map(Vec::as_slice).ne(json.iter().copied()) {
 +        return Err(invalid("noncanonical document"));
 +    }
@@ -478,7 +474,7 @@ index 0000000..3294913
 +fn merge(base: &[u8], current: &[u8], edited: &[u8]) -> Result<(Vec<u8>, Parts), String> {
 +    let (mut base, mut current, mut edited) = (decode(base)?, decode(current)?, decode(edited)?);
 +    [&mut base, &mut current, &mut edited].into_iter().for_each(|parts| whole_caches(&mut parts.doc, true));
-+    let mut doc = template::merge(&base.doc, &current.doc, &edited.doc, &[])?;
++    let mut doc = playground_live::merge(&base.doc, &current.doc, &edited.doc, &[])?;
 +    whole_caches(&mut doc, false);
 +    [&mut current, &mut edited].into_iter().for_each(|parts| whole_caches(&mut parts.doc, false));
 +    if let Some(docs) = doc["documents"].as_array_mut() {
@@ -488,8 +484,8 @@ index 0000000..3294913
 +    parts.tiles.extend(edited.tiles);
 +    parts.blobs.extend(edited.blobs);
 +    let bytes = write(&parts)?;
-+    let sides: HashSet<Vec<u8>> = [&current.doc, &edited.doc].into_iter().flat_map(|d| documents(d).map(|(_, d)| template::canonical(d))).collect();
-+    for (_, d) in documents(&parts.doc).filter(|(_, d)| !sides.contains(&template::canonical(d))) {
++    let sides: HashSet<Vec<u8>> = [&current.doc, &edited.doc].into_iter().flat_map(|d| documents(d).map(|(_, d)| playground_live::canonical(d))).collect();
++    for (_, d) in documents(&parts.doc).filter(|(_, d)| !sides.contains(&playground_live::canonical(d))) {
 +        document(d, &parts)?;
 +    }
 +    Ok((bytes, parts))
@@ -547,8 +543,6 @@ index 0000000..3294913
 +    /// This person's presence as of the last frame, and the selection bounds it was computed from (by document).
 +    presence: Value,
 +    selection: Option<(std::sync::Weak<Document>, Value)>,
-+    /// The others' presence.
-+    others: Vec<template::Presence>,
 +}
 +
 +thread_local! {
@@ -654,13 +648,14 @@ index 0000000..3294913
 +    let waiting = LIVE.with_borrow_mut(|live| {
 +        live.connected = false;
 +        (live.docs, live.encoded, live.reported) = (Vec::new(), None, None);
-+        (live.presence, live.others) = (Value::Null, Vec::new());
++        live.presence = Value::Null;
 +        #[cfg(target_arch = "wasm32")]
 +        {
 +            live.hooks = None;
 +        }
 +        std::mem::take(&mut live.remote)
 +    });
++    playground_live::presence::show(Vec::new());
 +    for remote in waiting {
 +        (remote.done)(Err("Live editing disconnected".into()));
 +    }
@@ -945,13 +940,8 @@ index 0000000..3294913
 +        set("presence", Closure::<dyn Fn() -> _>::new(presence).into_js_value())?;
 +        let show_presence = |others: JsValue| -> Result<(), JsValue> {
 +            let others: String = js_sys::JSON::stringify(&others)?.into();
-+            let others = super::template::Presence::list(&serde_json::from_str(&others).unwrap_or_default());
-+            LIVE.with_borrow_mut(|live| {
-+                live.others = others;
-+                if let Some(ctx) = &live.ctx {
-+                    ctx.request_repaint();
-+                }
-+            });
++            playground_live::presence::show(playground_live::Presence::list(&serde_json::from_str(&others).unwrap_or_default()));
++            LIVE.with_borrow(|live| live.ctx.as_ref().map(egui::Context::request_repaint));
 +            Ok(())
 +        };
 +        set("showPresence", Closure::<dyn Fn(_) -> _>::new(show_presence).into_js_value())?;
@@ -1251,21 +1241,24 @@ index 0000000..3294913
 +}
 diff --git a/apps/photocraft-web/src/live/peers.rs b/apps/photocraft-web/src/live/peers.rs
 new file mode 100644
-index 0000000..a17120d
+index 0000000..7bbf1e6
 --- /dev/null
 +++ b/apps/photocraft-web/src/live/peers.rs
-@@ -0,0 +1,405 @@
+@@ -0,0 +1,336 @@
 +//! The others in a live session, drawn over the canvas of the document they are on in their colour after the app's own
 +//! frame (`web/live_shell.rs`), so menus, dialogs and popups stay above them, and as dots on that document's tab. First
 +//! the gestures they have under way ([`photocraft_ui_egui::live::gesture`]: a stroke at its brush width, a marquee's or
 +//! lasso's rubber band, a ghost of what a Move drag or Free Transform has so far), then their selection bounds, then
 +//! their pointers with a name tag. Presence arrives about ten times a second: each mark eases toward its person's latest
 +//! state in document pixels, so this person's own scrolling and zooming never lags them. Their states come from other
-+//! people: what doesn't read as numbers in range is skipped.
++//! people: what doesn't read as numbers in range is skipped. The pointers, colours, easing, ghosts and selection bounds
++//! (turned with the view: [`presence::ghost_shape`], [`presence::outline_shape`]) are the playground-live crate's
++//! presence look (patches/live/kit); strokes and rubber bands are drawn here in its colours.
 +
 +use super::LIVE;
-+use egui::{Color32, FontFamily, FontId, Pos2, Rect, Shape, Stroke, Vec2, pos2, vec2};
++use egui::{Color32, FontFamily, FontId, Pos2, Shape, Stroke, Vec2, pos2, vec2};
 +use photocraft_ui_egui::canvas::ViewXform;
++use playground_live::{Presence, presence};
 +use serde_json::Value;
 +use std::cell::RefCell;
 +use std::collections::HashMap;
@@ -1273,24 +1266,19 @@ index 0000000..a17120d
 +/// A point in document pixels.
 +type P = [f32; 2];
 +
-+/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
-+const EASE: f32 = 0.08;
 +/// The most points of a remote path (twice what a presence carries).
 +const MAX_POINTS: usize = 400;
 +
-+/// A person's moving marks as last drawn, in document pixels: their pointer, a ghost's or rubber band's corners, and how
-+/// far (along the path) the drawn end of a stroke or lasso trails its newest point.
++/// How far (along the path) the drawn end of a person's stroke or lasso trails its newest point: what came since the
++/// newest point drawn is drawn as it comes.
 +#[derive(Default)]
-+struct Shown {
-+    pointer: Vec<P>,
-+    ghost: Vec<P>,
-+    band: Vec<P>,
++struct Trail {
 +    tip: Option<P>,
 +    behind: f32,
 +}
 +
 +thread_local! {
-+    static SHOWN: RefCell<HashMap<String, Shown>> = RefCell::default();
++    static TRAILS: RefCell<HashMap<String, Trail>> = RefCell::default();
 +}
 +
 +fn numbers<const N: usize>(v: &Value) -> Option<[f32; N]> {
@@ -1309,15 +1297,15 @@ index 0000000..a17120d
 +    [a, [b[0], a[1]], b, [a[0], b[1]]]
 +}
 +
-+/// What a person's state shows, in document pixels: the ghost's corners, a rubber band's two corners (and whether it is
-+/// an ellipse), a path (a stroke's with its width, or a lasso's) and the pointer.
++/// What a person's state shows, in document pixels: the ghost's four corners, a rubber band's two corners (and whether
++/// it is an ellipse), a path (a stroke's with its width, or a lasso's) and the pointer.
 +struct Targets {
-+    ghost: Vec<P>,
-+    band: Vec<P>,
++    ghost: Option<[f32; 8]>,
++    band: Option<[f32; 4]>,
 +    ellipse: bool,
 +    path: Vec<P>,
 +    width: Option<f32>,
-+    pointer: Vec<P>,
++    pointer: Option<[f32; 2]>,
 +}
 +
 +fn targets(state: &Value) -> Targets {
@@ -1328,50 +1316,37 @@ index 0000000..a17120d
 +        None => points(&state["lasso"], MAX_POINTS),
 +    };
 +    Targets {
-+        ghost: points(&state["ghost"], 4).filter(|g| g.len() == 4).unwrap_or_default(),
-+        band: numbers::<4>(&state["band"]).map(|[x0, y0, x1, y1]| vec![[x0, y0], [x1, y1]]).unwrap_or_default(),
++        ghost: numbers(&state["ghost"]),
++        band: numbers(&state["band"]),
 +        ellipse: state["ellipse"] == true,
 +        path: path.unwrap_or_default(),
 +        width,
-+        pointer: numbers::<2>(&state["pointer"]).map(|p| vec![p]).unwrap_or_default(),
++        pointer: numbers(&state["pointer"]),
 +    }
 +}
 +
-+impl Shown {
-+    /// `k` of the way on toward `t`; a first sight, another kind of mark or a jump of more than `far` (screen points
-+    /// on `xf`) goes at once. Whether a mark is still on its way.
-+    fn step(&mut self, t: &Targets, k: f32, far: f32, xf: &ViewXform) -> bool {
-+        let screen = |p: P| xf.to_screen(p[0], p[1]);
-+        let ease = |s: &mut Vec<P>, t: &[P]| {
-+            if s.len() != t.len() || s.iter().zip(t).any(|(a, b)| (screen(*a) - screen(*b)).length() > far) {
-+                *s = t.to_vec();
-+                return false;
-+            }
-+            let mut moving = false;
-+            for (a, b) in s.iter_mut().zip(t) {
-+                *a = [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k];
-+                match (screen(*a) - screen(*b)).length() < 0.5 {
-+                    true => *a = *b,
-+                    false => moving = true,
-+                }
-+            }
-+            moving
-+        };
-+        let mut moving = ease(&mut self.pointer, &t.pointer);
-+        moving |= ease(&mut self.ghost, &t.ghost);
-+        moving |= ease(&mut self.band, &t.band);
-+        // A path's newest end: what came since the newest point drawn is drawn as it comes.
-+        let tip = t.path.last().copied();
++/// Person `who`'s mark `key` eased toward `to` (`[x, y, …]` in document pixels; [`presence::ease`]); a jump of more than
++/// `far` screen points goes at once.
++fn ease<const N: usize>(ctx: &egui::Context, xf: &ViewXform, who: &str, key: &str, to: Option<[f32; N]>, far: f32) -> Option<[f32; N]> {
++    let px = std::array::from_fn(|i| f64::from(if i % 2 == 0 { xf.zoom_x() } else { xf.zoom }));
++    Some(presence::ease(ctx, who, key, to?.map(f64::from), px, [f64::from(far); N])?.map(|v| v as f32))
++}
++
++impl Trail {
++    /// `k` of the way on toward `path`'s newest point; a trail of more than `far` screen points (`zoom` a pixel) goes at
++    /// once. Whether it still trails.
++    fn step(&mut self, path: &[P], k: f32, far: f32, zoom: f32) -> bool {
++        let tip = path.last().copied();
 +        if tip != self.tip {
-+            let since = self.tip.zip(tip).and_then(|(old, _)| from_end(&t.path, old, 4.0 / xf.zoom.max(1e-3)));
++            let since = self.tip.zip(tip).and_then(|(old, _)| from_end(path, old, 4.0 / zoom.max(1e-3)));
 +            self.behind = since.map_or(0.0, |d| self.behind + d);
 +            self.tip = tip;
 +        }
 +        self.behind *= 1.0 - k;
-+        if self.behind * xf.zoom < 0.5 || self.behind * xf.zoom > far {
++        if self.behind * zoom < 0.5 || self.behind * zoom > far {
 +            self.behind = 0.0;
 +        }
-+        moving || self.behind > 0.0
++        self.behind > 0.0
 +    }
 +}
 +
@@ -1490,77 +1465,17 @@ index 0000000..a17120d
 +    Shape::mesh(mesh)
 +}
 +
-+/// Relative luminance (sRGB) of `c`.
-+fn luminance(c: Color32) -> f32 {
-+    let lin = |v: u8| {
-+        let v = f32::from(v) / 255.0;
-+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-+    };
-+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
-+}
-+
-+/// `name` cut to 24 characters, with "…" when cut.
-+fn tag(name: &str) -> String {
-+    match name.chars().nth(24) {
-+        Some(_) => name.chars().take(23).chain(['…']).collect(),
-+        None => name.to_owned(),
-+    }
-+}
-+
-+/// The pointer arrow, tip at (0, 0), in points.
-+const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
-+
-+/// `points` filled with `fill` as a fan from the first (the arrow is star-shaped around its tip).
-+fn fan(points: &[Pos2], fill: Color32) -> Shape {
-+    let mut mesh = egui::Mesh::default();
-+    for p in points {
-+        mesh.colored_vertex(*p, fill);
-+    }
-+    for i in 1..points.len() as u32 - 1 {
-+        mesh.add_triangle(0, i, i + 1);
-+    }
-+    Shape::mesh(mesh)
-+}
-+
-+/// A person's pointer: the arrow in their colour with a white outline and a soft shadow, and their name tag.
-+fn pointer(painter: &egui::Painter, tip: Pos2, color: Color32, name: &str) {
-+    let ppp = painter.pixels_per_point();
-+    let tip = (tip.to_vec2() * ppp).round().to_pos2() / ppp;
-+    let arrow = |off: Vec2| ARROW.map(|[x, y]| tip + off + vec2(x, y));
-+    painter.add(fan(&arrow(vec2(0.0, 1.0)), Color32::from_black_alpha(64)));
-+    painter.add(fan(&arrow(Vec2::ZERO), color));
-+    painter.add(Shape::closed_line(arrow(Vec2::ZERO).to_vec(), Stroke::new(1.5, Color32::WHITE)));
-+    if name.is_empty() {
-+        return;
-+    }
-+    let ink = if luminance(color) > 0.55 { Color32::from_rgb(0x11, 0x11, 0x11) } else { Color32::WHITE };
-+    let semibold = FontFamily::Name("semibold".into());
-+    let font = match painter.fonts(|f| f.families().contains(&semibold)) {
-+        true => FontId::new(12.0, semibold),
-+        false => FontId::proportional(12.0),
-+    };
-+    let text = painter.layout_no_wrap(tag(name), font, ink);
-+    let pad = vec2(7.0, 3.0);
-+    let at = tip + vec2(12.0, 15.0);
-+    painter.rect_filled(Rect::from_min_size(at, text.size() + 2.0 * pad), 6.0, color);
-+    painter.galley(at + pad, text, ink);
-+}
-+
-+fn color(p: &super::template::Presence) -> Color32 {
-+    Color32::from_rgb(p.color[0], p.color[1], p.color[2])
-+}
-+
 +/// The others on each document tab: a dot each in their colour, stacked in the padding before its title (three at
 +/// most).
-+fn dots(app: &photocraft_ui_egui::PhotocraftApp, ui: &egui::Ui, live: &super::Live) {
++fn dots(app: &photocraft_ui_egui::PhotocraftApp, ui: &egui::Ui, live: &super::Live, others: &[Presence]) {
 +    let edge = Stroke::new(1.0, Color32::from_black_alpha(90));
 +    for (id, tab) in photocraft_ui_egui::live::tabs(app) {
 +        let Some(uid) = super::uid_of(live, id) else { continue };
-+        let on: Vec<_> = live.others.iter().filter(|p| p.state["doc"].as_u64() == Some(uid)).take(3).collect();
++        let on: Vec<_> = others.iter().filter(|p| p.state["doc"].as_u64() == Some(uid)).take(3).collect();
 +        let painter = ui.painter().with_clip_rect(tab);
 +        for (i, p) in on.iter().enumerate() {
 +            let y = (i as f32 - (on.len() - 1) as f32 / 2.0) * 7.0;
-+            painter.circle(pos2(tab.left() + 8.0, tab.center().y + y), 2.5, color(p), edge);
++            painter.circle(pos2(tab.left() + 8.0, tab.center().y + y), 2.5, presence::color(p), edge);
 +        }
 +    }
 +}
@@ -1593,45 +1508,49 @@ index 0000000..a17120d
 +}
 +
 +/// Draws the others on the canvas of the document shown (those on it) and on the tabs, lists the session's documents
-+/// closed here on the Home screen, and asks for another frame while a mark is still on its way.
++/// closed here on the Home screen, and ends the presence look's frame ([`presence::end_frame`]: another frame while a
++/// mark is still on its way).
 +pub fn draw(app: &mut photocraft_ui_egui::PhotocraftApp, ui: &egui::Ui) {
++    // Name tags in PhotoCraft's semibold, where its fonts have it.
++    let semibold = FontFamily::Name("semibold".into());
++    let semibold = ui.painter().fonts(|f| f.families().contains(&semibold)).then(|| FontId::new(12.0, semibold));
++    presence::set_font(semibold.unwrap_or_else(|| FontId::proportional(12.0)));
 +    home(app, ui);
 +    let app = &*app;
++    let others = presence::others();
 +    LIVE.with_borrow(|live| {
-+        dots(app, ui, live);
-+        SHOWN.with_borrow_mut(|shown| {
++        dots(app, ui, live, &others);
++        TRAILS.with_borrow_mut(|trails| {
 +            let here = app.session.active().and_then(|st| super::uid_of(live, st.doc.id));
-+            let others: Vec<_> = live.others.iter().filter(|p| here.is_some() && p.state["doc"].as_u64() == here).collect();
-+            shown.retain(|id, _| others.iter().any(|p| p.id == *id));
++            let others: Vec<_> = others.iter().filter(|p| here.is_some() && p.state["doc"].as_u64() == here).collect();
++            trails.retain(|id, _| others.iter().any(|p| p.id == *id));
 +            let Some(xf) = ViewXform::active(app).filter(|_| !others.is_empty()) else { return };
++            let ctx = ui.ctx();
 +            let painter = ui.painter().with_clip_rect(xf.rect);
-+            let k = 1.0 - (-ui.input(|i| i.stable_dt).clamp(0.0, 0.1) / EASE).exp();
++            let k = 1.0 - (-ui.input(|i| i.stable_dt).clamp(0.0, 0.1) / presence::EASE as f32).exp();
 +            let far = xf.rect.width().max(xf.rect.height()) / 4.0;
 +            let screen = |p: &P| xf.to_screen(p[0], p[1]);
-+            let mut moving = false;
-+            let wanted: Vec<_> = others.iter().map(|p| targets(&p.state)).collect();
-+            for (p, t) in others.iter().zip(&wanted) {
-+                moving |= shown.entry(p.id.clone()).or_default().step(t, k, far, &xf);
-+            }
-+            let peers: Vec<_> = others.iter().zip(&wanted).filter_map(|(p, t)| Some((*p, t, shown.get(&p.id)?))).collect();
-+            for (p, t, s) in &peers {
-+                let color = color(p);
-+                if s.ghost.len() == 4 {
-+                    let fill = color.gamma_multiply(0.28);
-+                    painter.add(Shape::convex_polygon(s.ghost.iter().map(screen).collect(), fill, Stroke::new(1.5, color.gamma_multiply(0.85))));
++            let (mut trailing, mut bounds, mut pointers) = (false, Vec::new(), Vec::new());
++            for p in &others {
++                let (t, color) = (targets(&p.state), presence::color(p));
++                let trail = trails.entry(p.id.clone()).or_default();
++                trailing |= trail.step(&t.path, k, far, xf.zoom);
++                if let Some(g) = ease(ctx, &xf, &p.id, "ghost", t.ghost, far) {
++                    let corners: Vec<Pos2> = g.chunks_exact(2).map(|c| xf.to_screen(c[0], c[1])).collect();
++                    presence::ghost_shape(&painter, &corners, color);
 +                }
-+                let band = match s.band[..] {
-+                    [a, b] if t.ellipse => (0..=64)
++                let band = match ease(ctx, &xf, &p.id, "band", t.band, far) {
++                    Some([x0, y0, x1, y1]) if t.ellipse => (0..=64)
 +                        .map(|i| {
 +                            let r = std::f32::consts::TAU * i as f32 / 64.0;
-+                            let c = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
-+                            screen(&[c[0] + (b[0] - a[0]) / 2.0 * r.cos(), c[1] + (b[1] - a[1]) / 2.0 * r.sin()])
++                            let c = [(x0 + x1) / 2.0, (y0 + y1) / 2.0];
++                            screen(&[c[0] + (x1 - x0) / 2.0 * r.cos(), c[1] + (y1 - y0) / 2.0 * r.sin()])
 +                        })
 +                        .collect(),
-+                    [a, b] => rect(a, b).iter().chain([&a]).map(screen).collect(),
-+                    _ => Vec::new(),
++                    Some([x0, y0, x1, y1]) => rect([x0, y0], [x1, y1]).iter().chain([&[x0, y0]]).map(screen).collect(),
++                    None => Vec::new(),
 +                };
-+                let path: Vec<Pos2> = cut(&t.path, s.behind).iter().map(screen).collect();
++                let path: Vec<Pos2> = cut(&t.path, trail.behind).iter().map(screen).collect();
 +                match t.width {
 +                    Some(w) if !path.is_empty() => {
 +                        let aa = 1.0 / painter.pixels_per_point();
@@ -1640,25 +1559,27 @@ index 0000000..a17120d
 +                    _ => painter.extend(Shape::dashed_line(&path, Stroke::new(1.5, color), 4.0, 3.0)),
 +                }
 +                painter.extend(Shape::dashed_line(&band, Stroke::new(1.5, color), 4.0, 3.0));
-+            }
-+            for (p, ..) in &peers {
 +                if let Some([x0, y0, x1, y1]) = numbers::<4>(&p.state["selection"]) {
 +                    // On pixel edges: a 2-point line there stays crisp.
 +                    let ppp = painter.pixels_per_point();
-+                    let corners = rect([x0, y0], [x1, y1]).iter().map(|p| (screen(p).to_vec2() * ppp).round().to_pos2() / ppp).collect();
-+                    painter.add(Shape::closed_line(corners, Stroke::new(2.0, color(p))));
++                    let corners: Vec<Pos2> = rect([x0, y0], [x1, y1]).iter().map(|p| (screen(p).to_vec2() * ppp).round().to_pos2() / ppp).collect();
++                    bounds.push((corners, color));
 +                }
++                pointers.extend(ease(ctx, &xf, &p.id, "pointer", t.pointer, far).map(|[x, y]| (screen(&[x, y]), *p)));
 +            }
-+            for (p, _, s) in &peers {
-+                if let Some(at) = s.pointer.first().map(screen).filter(|at| xf.rect.contains(*at)) {
-+                    pointer(&painter, at, color(p), &p.name);
-+                }
++            // Selection bounds over everyone's gestures, pointers over everything.
++            for (corners, color) in bounds {
++                presence::outline_shape(&painter, &corners, color);
 +            }
-+            if moving {
-+                ui.ctx().request_repaint();
++            for (at, p) in pointers.into_iter().filter(|(at, _)| xf.rect.contains(*at)) {
++                presence::cursor(&painter, at, presence::color(p), &p.name);
++            }
++            if trailing {
++                presence::keep_moving();
 +            }
 +        });
 +    });
++    presence::end_frame(ui.ctx());
 +}
 diff --git a/apps/photocraft-web/src/web/live_shell.rs b/apps/photocraft-web/src/web/live_shell.rs
 new file mode 100644

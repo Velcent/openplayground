@@ -1,18 +1,19 @@
 diff --git a/apps/wordcraft-web/src/live.rs b/apps/wordcraft-web/src/live.rs
 new file mode 100644
-index 0000000..14b9d43
+index 0000000..32c641f
 --- /dev/null
 +++ b/apps/wordcraft-web/src/live.rs
-@@ -0,0 +1,575 @@
-+//! Playground live editing (`playground_live`): the shared document is the open document's model as JSON (as the
-+//! app's own JSON format writes it, with pictures and kept parts as base64) without what is personal or stamped on
-+//! save: the zoom saved with it, the save times, author and count, and field-code toggles. Text merges character by
-+//! character (`text_merge`). Native undo history stays local; while connected Undo and Redo go to the session.
+@@ -0,0 +1,594 @@
++//! Playground live editing (the playground-live crate, patches/live/kit): the shared document is the open document's
++//! model as JSON (as the app's own JSON format writes it, with pictures and kept parts as base64) without what is
++//! personal or stamped on save: the zoom saved with it, the save times, author and count, and field-code toggles. Text
++//! merges character by character (`text_merge`). Native undo history stays local; while connected Undo and Redo go to
++//! the session.
 +//!
 +//! Presence (`presence`): each person shares their selection in the shared document, their pointer over a page and
 +//! what a gesture under way is doing (an object's frame dragged, a table border dragged, ink being drawn); the others
-+//! are drawn over the pages in their color, eased toward where they are (`web/live.rs` calls [`frame`] after each
-+//! frame).
++//! are drawn over the pages in their color, eased toward where they are, in the kit's look (`web/live.rs` calls
++//! [`frame`] after each frame).
 +//!
 +//! Upstream calls in through two hooks (rules in patches/word.yaml): `wordcraft_engine::LIVE_UNDO` at the top of
 +//! `Session::run` and `wordcraft_engine::LIVE_HISTORY` at the top of the QAT's `qat_enabled`.
@@ -20,12 +21,10 @@ index 0000000..14b9d43
 +// The frame hook and drawing run in the browser only.
 +#![cfg_attr(test, allow(dead_code))]
 +
-+#[path = "playground_live.rs"]
-+#[allow(dead_code)]
-+pub mod playground_live;
 +mod presence;
 +mod text_merge;
 +
++use std::borrow::{Borrow, BorrowMut};
 +use std::cell::{Cell, RefCell};
 +use std::collections::BTreeMap;
 +use std::sync::Arc;
@@ -39,19 +38,32 @@ index 0000000..14b9d43
 +
 +pub const FORMAT: &str = concat!("word:1:", env!("CARGO_PKG_VERSION"));
 +
++/// The app as the session sees it: [`Live`] is the playground-live crate's and WordApp the UI crate's, so the trait
++/// goes on this, around what holds the app (the web shell; the app itself in tests), which it reaches through.
++pub struct Peer<T>(pub T);
++
++impl<T: Borrow<WordApp>> std::ops::Deref for Peer<T> {
++    type Target = WordApp;
++    fn deref(&self) -> &WordApp {
++        self.0.borrow()
++    }
++}
++
++impl<T: BorrowMut<WordApp>> std::ops::DerefMut for Peer<T> {
++    fn deref_mut(&mut self) -> &mut WordApp {
++        self.0.borrow_mut()
++    }
++}
++
 +thread_local! {
 +    /// The shared document's `document_id`: the document open when the session first read it (not the Start screen's
 +    /// placeholder), or the one the Start screen opened for it.
 +    static SHARED: Cell<Option<u64>> = const { Cell::new(None) };
 +    /// The shared document as last seen, still reported and merged into once another document replaced it here.
 +    static LAST: RefCell<Option<Document>> = const { RefCell::new(None) };
-+    /// A pointer is down, or a text field other than the page has the keyboard.
-+    static UI_BUSY: Cell<bool> = const { Cell::new(false) };
 +    static CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
 +    /// This person's pointer over the shared document's pages as of the last frame: page, x, y (points).
 +    static POINTER: Cell<Option<(usize, f64, f64)>> = const { Cell::new(None) };
-+    /// The others in the session, as the shell last gave them, with their marks where this page last drew them.
-+    static OTHERS: RefCell<Vec<presence::Other>> = const { RefCell::new(Vec::new()) };
 +}
 +
 +/// Hooks the engine's Undo and Redo, and the QAT's state of them.
@@ -60,25 +72,28 @@ index 0000000..14b9d43
 +    let _ = wordcraft_engine::LIVE_HISTORY.set(holds);
 +}
 +
-+/// The end of a frame.
-+pub fn frame(app: &mut WordApp, ui: &egui::Ui) {
-+    let ctx = ui.ctx();
-+    UI_BUSY.set(ctx.input(|i| i.pointer.any_down()) || (ctx.memory(|m| m.focused().is_some()) && !app.canvas.focused));
++/// The end of a frame: the others drawn over the pages (name tags in WordCraft's semibold), the presence look's frame
++/// ended (after the drawing, so moving marks keep easing), then the session's frame hook.
++pub fn frame<T: BorrowMut<WordApp>>(peer: &mut Peer<T>, ui: &egui::Ui) {
++    let (ctx, app) = (ui.ctx(), &mut **peer);
 +    CTX.with_borrow_mut(|c| _ = c.get_or_insert_with(|| ctx.clone()));
++    playground_live::presence::set_font(wordcraft_ui_egui::theme::semibold(12.0));
 +    // The shared document's pages are on screen (no Backstage or Start screen over them).
 +    let shown = !app.ui.backstage && app.has_document() && SHARED.get() == Some(app.session.document_id());
 +    let hover = ctx.input(|i| i.pointer.hover_pos()).filter(|p| app.canvas.canvas_rect.is_some_and(|r| r.contains(*p)));
++    let others = playground_live::presence::others();
 +    let mut pointer = None;
-+    if shown && (hover.is_some() || OTHERS.with_borrow(|o| !o.is_empty())) {
++    if shown && (hover.is_some() || !others.is_empty()) {
 +        let layout = app.session.layout();
 +        let round = |v: f32| (f64::from(v) * 10.0).round() / 10.0;
 +        pointer = hover
 +            .and_then(|p| wordcraft_ui_egui::canvas::page_at(&app.canvas.page_rects, &layout, app.canvas.scale, p))
 +            .map(|(page, x, y)| (page, round(x), round(y)));
-+        OTHERS.with_borrow_mut(|others| presence::draw(app, ui, &layout, others));
++        presence::draw(app, ui, &layout, &others);
 +    }
++    playground_live::presence::end_frame(ctx);
 +    POINTER.set(pointer);
-+    playground_live::frame(app);
++    playground_live::frame(peer);
 +}
 +
 +pub fn repaint() {
@@ -269,7 +284,7 @@ index 0000000..14b9d43
 +    if after <= suf { new.len() - after } else { pre }
 +}
 +
-+impl Live for WordApp {
++impl<T: BorrowMut<WordApp>> Live for Peer<T> {
 +    fn live_document(&self) -> Value {
 +        if bound(self) {
 +            LAST.set(Some(self.session.doc.clone()));
@@ -342,7 +357,7 @@ index 0000000..14b9d43
 +    }
 +
 +    fn live_quiet(&self) -> bool {
-+        !UI_BUSY.get() && self.canvas.ime_preedit.is_empty()
++        playground_live::presence::quiet() && self.canvas.ime_preedit.is_empty()
 +    }
 +
 +    fn live_generation(&self) -> Option<u64> {
@@ -396,7 +411,7 @@ index 0000000..14b9d43
 +    }
 +
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        OTHERS.with_borrow_mut(|old| *old = others.into_iter().map(|p| presence::Other::new(p, old)).collect());
++        playground_live::presence::show(others);
 +    }
 +}
 +
@@ -407,10 +422,10 @@ index 0000000..14b9d43
 +    use wordcraft_engine::Session;
 +    use wordcraft_ui_egui::Services;
 +
-+    fn app(text: &[&str]) -> WordApp {
++    fn app(text: &[&str]) -> Peer<WordApp> {
 +        let mut doc = Document::new();
 +        doc.body = text.iter().map(|t| wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text(t, Default::default()))).collect();
-+        WordApp::new(Session::new(doc), Services::default())
++        Peer(WordApp::new(Session::new(doc), Services::default()))
 +    }
 +    fn caret(app: &mut WordApp, block: usize, off: usize) {
 +        app.session.sel = wordcraft_engine::Selection::caret(Pos::body(block, off));
@@ -481,10 +496,14 @@ index 0000000..14b9d43
 +        let done = std::rc::Rc::new(Cell::new(false));
 +        let to = done.clone();
 +        playground_live::queue(Some(start.clone()), edited, Box::new(move |r| to.set(r.is_ok())));
-+        UI_BUSY.set(true);
++        // A frame that ends with a pointer button held (the presence look tells quiet()).
++        let held = egui::Context::default();
++        let press = egui::Event::PointerButton { pos: egui::pos2(10.0, 10.0), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() };
++        held.run_ui(egui::RawInput { events: vec![press], ..Default::default() }, |_| {}).drop_without_applying_deltas();
++        playground_live::presence::end_frame(&held);
 +        playground_live::frame(&mut a);
 +        assert!(!done.get(), "a gesture under way holds remote changes");
-+        UI_BUSY.set(false);
++        playground_live::presence::end_frame(&egui::Context::default());
 +        playground_live::frame(&mut a);
 +        assert!(done.get());
 +        let text: Vec<&str> = a.session.doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.text.as_str()).collect();
@@ -519,7 +538,7 @@ index 0000000..14b9d43
 +        let end = |path: Value, off: usize| json!({"story": "body", "path": path, "off": off});
 +        assert_eq!(mine, json!({"anchor": end(json!([0]), 6), "focus": end(json!([0]), 12)}));
 +        let drawn = |state: Value| {
-+            let other = presence::Other::new(Presence { id: "b".into(), name: "Bob".into(), color: [9, 9, 9], state }, &[]);
++            let other = presence::Other::new(&Presence { id: "b".into(), name: "Bob".into(), color: [9, 9, 9], state });
 +            presence::resolved(&a.session.doc, &other.selection).is_some()
 +        };
 +        assert!(drawn(mine));
@@ -565,7 +584,7 @@ index 0000000..14b9d43
 +    #[test]
 +    fn only_documents_every_page_can_open_pass_the_check() {
 +        let doc = |text: &str, runs: Value| json!({"body": [{"kind": "para", "text": text, "runs": runs}]});
-+        assert!(WordApp::live_check(&project(&Document::new())).is_ok());
++        assert!(Peer::<WordApp>::live_check(&project(&Document::new())).is_ok());
 +        let bad = [
 +            doc("ab", json!([{"len": 1}])),
 +            doc("é", json!([{"len": 1}, {"len": 1}])),
@@ -575,16 +594,16 @@ index 0000000..14b9d43
 +            Value::Null,
 +        ];
 +        for bad in bad {
-+            assert!(WordApp::live_check(&bad).is_err(), "{bad}");
++            assert!(Peer::<WordApp>::live_check(&bad).is_err(), "{bad}");
 +        }
 +    }
 +}
 diff --git a/apps/wordcraft-web/src/live/presence.rs b/apps/wordcraft-web/src/live/presence.rs
 new file mode 100644
-index 0000000..e1714e1
+index 0000000..8b4bc9e
 --- /dev/null
 +++ b/apps/wordcraft-web/src/live/presence.rs
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,273 @@
 +//! Presence: what each person shows the others and how the others are drawn over the pages, in their color.
 +//!
 +//! Shared (page points, `[page, …]`): the selection's ends (`anchor`, `focus`: story, paragraph path, byte offset), the
@@ -597,37 +616,24 @@ index 0000000..e1714e1
 +//! Drawn, under menus and dialogs: the others' gestures (ghosts, border lines, strokes), then their selections (text
 +//! shaded, a picture or shape outlined, the caret as a bar), then their pointers with their names (a name at the caret
 +//! for whoever's pointer is off the pages). Moving marks ease toward where they are, in page points.
++//!
++//! Pointers, name tags, ghosts, outlines, colors and the easing are the playground-live crate's ([`kit`]); text
++//! shading, carets, border lines and strokes are WordCraft's own, in the kit's colors.
 +
 +use egui::epaint::PathShape;
 +use egui::{Color32, Painter, Pos2, Rect, Stroke, pos2, vec2};
++use playground_live::{Presence, presence as kit};
 +use serde_json::{Value, json};
 +use wordcraft_doc::{Document, Pos};
 +use wordcraft_engine::layout::DocLayout;
 +use wordcraft_ui_egui::WordApp;
 +
-+use super::playground_live::Presence;
-+
 +/// The most stroke points a presence carries; the shell sends no presence over 4 KiB.
 +const MAX_STROKE: usize = 200;
 +const MAX_PRESENCE: usize = 4000;
-+/// Names in tags are cut to this many characters.
-+const MAX_NAME: usize = 24;
-+/// How long the others' marks take to go most (1 - 1/e) of the way to where they last were, in seconds.
-+const EASE: f32 = 0.08;
-+/// A pointer's arrow, tip first: egui fills a closed path as a fan from its first point, which this shape allows.
-+const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [12.5, 11.0], [7.3, 11.0], [10.4, 17.3], [7.6, 18.6], [4.5, 12.2], [0.0, 16.0]];
 +
 +/// A mark on a page: the page and its numbers (page points; a frame's angle last, in degrees).
 +type Mark<const N: usize> = (usize, [f32; N]);
-+
-+/// What moves of another person's: the pointer, the frame being dragged and the table border being dragged (with
-+/// whether it is the table's outline).
-+#[derive(Clone, Copy, Default)]
-+struct Marks {
-+    pointer: Option<Mark<2>>,
-+    drag: Option<Mark<5>>,
-+    border: Option<(Mark<4>, bool)>,
-+}
 +
 +/// Another person's presence, read defensively: positions are checked against the document before use.
 +pub(super) struct Other {
@@ -635,15 +641,12 @@ index 0000000..e1714e1
 +    name: String,
 +    color: Color32,
 +    pub(super) selection: Option<(Pos, Pos)>,
-+    /// Where their marks are, as they last showed themselves.
-+    to: Marks,
-+    /// Where this page last drew them, eased toward `to`.
-+    shown: Marks,
++    pointer: Option<Mark<2>>,
++    drag: Option<Mark<5>>,
++    /// The table border being dragged, and whether it is the table's outline.
++    border: Option<(Mark<4>, bool)>,
 +    /// The stroke being drawn: page, pen width (points) and points.
 +    stroke: Option<(usize, f32, Vec<[f32; 2]>)>,
-+    /// The stroke's length as last seen and how far its shown end is behind its newest point (page points); a length of
-+    /// infinity: not seen yet, shown whole at once.
-+    ink: [f32; 2],
 +}
 +
 +/// A number from another person's presence, if it is one worth drawing.
@@ -662,8 +665,8 @@ index 0000000..e1714e1
 +}
 +
 +impl Other {
-+    /// Who `p` is and where, keeping where this page last drew their marks when `old` has them.
-+    pub(super) fn new(p: Presence, old: &[Other]) -> Other {
++    /// Who `p` is and where, as they last showed themselves.
++    pub(super) fn new(p: &Presence) -> Other {
 +        let state = &p.state;
 +        let pos = |key: &str| serde_json::from_value::<Pos>(state[key].clone()).ok();
 +        let s = &state["stroke"];
@@ -671,70 +674,32 @@ index 0000000..e1714e1
 +        let points: Vec<[f32; 2]> = points.unwrap_or_default().chunks_exact(2).map(|p| [p[0], p[1]]).collect();
 +        let page = s["page"].as_u64().and_then(|page| usize::try_from(page).ok());
 +        let stroke = page.zip(number(&s["width"])).filter(|_| points.len() >= 2).map(|(page, width)| (page, width.clamp(0.0, 200.0), points));
-+        let to = Marks {
++        Other {
++            id: p.id.clone(),
++            name: p.name.trim().to_owned(),
++            color: kit::color(p),
++            selection: pos("anchor").zip(pos("focus")),
 +            pointer: mark(&state["pointer"]),
 +            drag: mark(&state["drag"]).filter(|(_, d): &Mark<5>| d[2] >= 0.0 && d[3] >= 0.0),
 +            border: mark(&state["border"]).map(|m| (m, state["border"][5].as_bool() == Some(true))),
-+        };
-+        let (shown, ink) = old.iter().find(|o| o.id == p.id).map_or((Marks::default(), [f32::INFINITY, 0.0]), |o| (o.shown, o.ink));
-+        Other {
-+            name: p.name.trim().to_owned(),
-+            color: Color32::from_rgb(p.color[0], p.color[1], p.color[2]),
-+            selection: pos("anchor").zip(pos("focus")),
-+            id: p.id,
-+            to,
-+            shown,
 +            stroke,
-+            ink,
 +        }
 +    }
 +
-+    /// One frame on toward where they are (`k`: the share of the way, `z`: screen points a page point, `far`: the jump in
-+    /// screen points that goes at once). Whether a mark is still on its way.
-+    fn step(&mut self, k: f32, z: f32, far: f32) -> bool {
-+        let mut moving = ease(&mut self.shown.pointer, self.to.pointer, k, z, far);
-+        if let (Some((_, s)), Some((_, t))) = (&self.shown.drag, &mut self.to.drag) {
-+            // A frame turns the short way round.
-+            t[4] = s[4] + (t[4] - s[4] + 540.0).rem_euclid(360.0) - 180.0;
-+        }
-+        moving |= ease(&mut self.shown.drag, self.to.drag, k, z, far);
-+        // A line and an outline do not turn into each other.
-+        let same = matches!((self.shown.border, self.to.border), (Some((_, a)), Some((_, b))) if a == b);
-+        let mut border = self.shown.border.filter(|_| same).map(|(m, _)| m);
-+        moving |= ease(&mut border, self.to.border.map(|(m, _)| m), k, z, far);
-+        self.shown.border = border.zip(self.to.border.map(|(_, outline)| outline));
-+        if let Some((_, _, points)) = &self.stroke {
-+            let [seen, behind] = &mut self.ink;
-+            let length = length(points);
-+            *behind = (*behind + length - *seen).max(0.0);
-+            *seen = length;
-+            let mut tail = Some((0, [*behind]));
-+            moving |= ease(&mut tail, Some((0, [0.0])), k, z, far);
-+            *behind = tail.map_or(0.0, |(_, [b])| b);
-+        } else {
-+            self.ink = [0.0; 2];
-+        }
-+        moving
++    /// Their mark `key` eased toward `to` (`z`: screen points a page point, `far`: the jump in screen points that goes
++    /// at once); on another page it is another mark, shown at once.
++    fn eased<const N: usize>(&self, ctx: &egui::Context, key: &str, (page, to): Mark<N>, z: f32, far: f32) -> Option<Mark<N>> {
++        let at = kit::ease(ctx, &self.id, &format!("{key} {page}"), to.map(f64::from), [f64::from(z); N], [f64::from(far); N])?;
++        Some((page, at.map(|v| v as f32)))
 +    }
-+}
 +
-+/// `shown` moved `k` of the way to `to` (page points, `z` screen points each): all of it when either is missing, on
-+/// another page, after a jump of more than `far` screen points, or once under half a screen point remains. Whether it is
-+/// still on its way.
-+fn ease<const N: usize>(shown: &mut Option<Mark<N>>, to: Option<Mark<N>>, k: f32, z: f32, far: f32) -> bool {
-+    let (Some((page, s)), Some((to_page, t))) = (shown.as_mut(), to) else {
-+        *shown = to;
-+        return false;
-+    };
-+    let off = |s: &[f32; N]| s.iter().zip(&t).map(|(s, t)| (t - s).abs() * z).fold(0.0, f32::max);
-+    let k = if *page != to_page || off(s) > far { 1.0 } else { k };
-+    *page = to_page;
-+    s.iter_mut().zip(&t).for_each(|(s, t)| *s += (t - *s) * k);
-+    let moving = off(s) >= 0.5;
-+    if !moving {
-+        *s = t;
++    /// The frame being dragged, eased; it turns the short way round.
++    fn frame(&self, ctx: &egui::Context, z: f32, far: f32) -> Option<Mark<5>> {
++        let (page, d) = self.drag?;
++        let (_, [x, y, w, h]) = self.eased(ctx, "drag", (page, [d[0], d[1], d[2], d[3]]), z, far)?;
++        let deg = kit::ease_angle(ctx, &self.id, &format!("turn {page}"), f64::from(d[4]), f64::from(z), f64::from(far))?;
++        Some((page, [x, y, w, h, deg as f32]))
 +    }
-+    moving
 +}
 +
 +fn length(stroke: &[[f32; 2]]) -> f32 {
@@ -783,10 +748,10 @@ index 0000000..e1714e1
 +}
 +
 +/// The others over the pages as this frame drew them, in their colors (see the module's comment). Marks ease toward
-+/// where they are, repainting until they get there.
-+pub(super) fn draw(app: &WordApp, ui: &egui::Ui, layout: &DocLayout, others: &mut [Other]) {
++/// where they are ([`kit::end_frame`], after this, repaints until they get there).
++pub(super) fn draw(app: &WordApp, ui: &egui::Ui, layout: &DocLayout, others: &[Presence]) {
 +    let Some(clip) = app.canvas.canvas_rect else { return };
-+    let p = ui.painter().with_clip_rect(clip);
++    let (ctx, p) = (ui.ctx(), ui.painter().with_clip_rect(clip));
 +    let (doc, hint, rects) = (&app.session.doc, app.session.page_hint, &app.canvas.page_rects);
 +    // A page point on screen, with the page's scale (as the canvas places its own selection).
 +    let screen = |page: usize, x: f32, y: f32| {
@@ -802,42 +767,39 @@ index 0000000..e1714e1
 +        let turn = |q: Pos2| f.center() + vec2((q.x - f.center().x) * k - (q.y - f.center().y) * s, (q.x - f.center().x) * s + (q.y - f.center().y) * k);
 +        Some([f.left_top(), f.right_top(), f.right_bottom(), f.left_bottom()].into_iter().map(turn).collect())
 +    };
-+
-+    let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1);
-+    let (k, z, far) = (1.0 - (-dt / EASE).exp(), app.canvas.scale.max(0.01), 0.25 * clip.width().max(clip.height()));
-+    let mut moving = false;
-+    for o in others.iter_mut() {
-+        moving |= o.step(k, z, far);
-+    }
-+    if moving {
-+        ui.ctx().request_repaint();
-+    }
++    let (z, far) = (app.canvas.scale.max(0.01), 0.25 * clip.width().max(clip.height()));
++    let others: Vec<Other> = others.iter().map(Other::new).collect();
 +
 +    // What they are doing: frames being dragged, table borders, strokes.
-+    for o in others.iter() {
-+        let (fill, edge) = (o.color.gamma_multiply(0.28), Stroke::new(1.5, o.color.gamma_multiply(0.85)));
-+        if let Some((page, d)) = o.shown.drag
++    for o in &others {
++        if let Some((page, d)) = o.frame(ctx, z, far)
 +            && let Some(c) = corners(page, [d[0], d[1], d[2], d[3]], d[4])
 +        {
-+            p.add(PathShape::convex_polygon(c, fill, edge));
++            kit::ghost_shape(&p, &c, o.color);
 +        }
-+        if let Some(((page, l), outline)) = o.shown.border
++        // A line and an outline do not turn into each other.
++        if let Some((m, outline)) = o.border
++            && let Some((page, l)) = o.eased(ctx, if outline { "outline" } else { "border" }, m, z, far)
 +            && let (Some((a, _)), Some((b, _))) = (screen(page, l[0], l[1]), screen(page, l[2], l[3]))
 +        {
 +            if outline {
-+                p.add(PathShape::convex_polygon(vec![a, pos2(b.x, a.y), b, pos2(a.x, b.y)], fill, edge));
++                kit::ghost_shape(&p, &[a, pos2(b.x, a.y), b, pos2(a.x, b.y)], o.color);
 +            } else {
-+                p.line_segment([a, b], Stroke::new(6.0, fill));
-+                p.line_segment([a, b], edge);
++                p.line_segment([a, b], Stroke::new(6.0, o.color.gamma_multiply(0.28)));
++                p.line_segment([a, b], Stroke::new(1.5, o.color.gamma_multiply(0.85)));
 +            }
 +        }
-+        if let Some((page, width, points)) = &o.stroke {
-+            paint_stroke(&p, |q| screen(*page, q[0], q[1]), points, *width, o.ink[1], o.color);
++        // The stroke shown up to a length that eases toward its whole, so its end follows the pen: a stroke started
++        // while they are seen grows from its start, one under way when first seen shows whole.
++        let whole = o.stroke.as_ref().map_or(0.0, |(_, _, points)| length(points));
++        let far = if o.stroke.is_some() { far } else { 0.0 };
++        if let (Some((page, width, points)), Some([shown])) = (&o.stroke, kit::ease(ctx, &o.id, "ink", [f64::from(whole)], [f64::from(z)], [f64::from(far)])) {
++            paint_stroke(&p, |q| screen(*page, q[0], q[1]), points, *width, (whole - shown as f32).max(0.0), o.color);
 +        }
 +    }
 +    // Their selections: text shaded, a picture or shape outlined, the caret.
 +    let mut carets = Vec::new();
-+    for o in others.iter() {
++    for o in &others {
 +        let Some((anchor, focus)) = resolved(doc, &o.selection) else { continue };
 +        let object = (anchor.story == focus.story && anchor.path == focus.path && anchor.off.abs_diff(focus.off) == wordcraft_doc::para::OBJ.len_utf8())
 +            .then(|| if anchor.off < focus.off { anchor } else { focus })
@@ -845,7 +807,7 @@ index 0000000..e1714e1
 +            .and_then(|at| layout.object(at, hint));
 +        if let Some(obj) = object {
 +            if let Some(c) = corners(obj.page, [obj.rect.x, obj.rect.y, obj.rect.w, obj.rect.h], obj.spin.deg) {
-+                p.add(PathShape::closed_line(c, Stroke::new(2.0, o.color)));
++                kit::outline_shape(&p, &c, o.color);
 +            }
 +            continue;
 +        }
@@ -862,19 +824,21 @@ index 0000000..e1714e1
 +            // Turned text (a table cell's text direction): the caret lies across the page.
 +            let end = if c.width > 0.0 { top + vec2(c.width * scale, 0.0) } else { top + vec2(0.0, c.height * scale) };
 +            p.line_segment([top, end], Stroke::new(2.0, o.color));
-+            if o.shown.pointer.is_none() {
-+                carets.push((top, end, o));
++            if o.pointer.is_none() {
++                carets.push((top, end.y.max(top.y), o));
 +            }
 +        }
 +    }
-+    // Their pointers with their names, and a name at the caret of whoever's pointer is off the pages.
-+    for (top, end, o) in carets {
-+        paint_tag(&p, top, Some(end.y.max(top.y)), &o.name, o.color);
++    // Their pointers with their names, and a name just above the caret of whoever's pointer is off the pages (below it
++    // where the view's top would cut the tag).
++    for (top, bottom, o) in carets {
++        let h = kit::tag_size(&p, &o.name).y;
++        let at = if top.y - h - 1.0 >= p.clip_rect().top() { top - vec2(0.0, h + 1.0) } else { pos2(top.x, bottom + 1.0) };
++        kit::tag(&p, at, o.color, &o.name);
 +    }
-+    for o in others.iter() {
-+        if let Some((tip, _)) = o.shown.pointer.and_then(|(page, [x, y])| screen(page, x, y)) {
-+            paint_arrow(&p, tip, o.color);
-+            paint_tag(&p, tip + vec2(12.0, 15.0), None, &o.name, o.color);
++    for o in &others {
++        if let Some((tip, _)) = o.pointer.and_then(|m| o.eased(ctx, "pointer", m, z, far)).and_then(|(page, [x, y])| screen(page, x, y)) {
++            kit::cursor(&p, tip, o.color, &o.name);
 +        }
 +    }
 +}
@@ -913,38 +877,9 @@ index 0000000..e1714e1
 +    }
 +    p.add(PathShape::line(line, stroke));
 +}
-+
-+/// A pointer: the arrow, its tip at `tip`, in `color` with a white edge and a soft shadow.
-+fn paint_arrow(p: &Painter, tip: Pos2, color: Color32) {
-+    let points: Vec<Pos2> = ARROW.iter().map(|&[x, y]| tip + vec2(x, y)).collect();
-+    let shadow = points.iter().map(|q| *q + vec2(0.0, 1.0)).collect();
-+    p.add(PathShape::convex_polygon(shadow, Color32::from_black_alpha(64), Stroke::NONE));
-+    p.add(PathShape::convex_polygon(points, color, Stroke::new(1.5, Color32::WHITE)));
-+}
-+
-+/// A name tag in `color`: its top left at `at`; or, given the bottom of a caret whose top is `at`, just above the caret
-+/// (below it when the view's top would cut the tag). Dark text on light colors.
-+fn paint_tag(p: &Painter, at: Pos2, caret_bottom: Option<f32>, name: &str, color: Color32) {
-+    if name.is_empty() {
-+        return;
-+    }
-+    let name: String = if name.chars().count() > MAX_NAME { name.chars().take(MAX_NAME - 1).chain(['…']).collect() } else { name.into() };
-+    let lin = egui::ecolor::linear_f32_from_gamma_u8;
-+    let luminance = 0.2126 * lin(color.r()) + 0.7152 * lin(color.g()) + 0.0722 * lin(color.b());
-+    let ink = if luminance > 0.55 { Color32::from_gray(0x11) } else { Color32::WHITE };
-+    let text = p.layout_no_wrap(name, wordcraft_ui_egui::theme::semibold(12.0), ink);
-+    let size = text.size() + vec2(14.0, 6.0);
-+    let r = match caret_bottom {
-+        None => Rect::from_min_size(at, size),
-+        Some(_) if at.y - size.y - 1.0 >= p.clip_rect().top() => Rect::from_min_size(at - vec2(0.0, size.y + 1.0), size),
-+        Some(bottom) => Rect::from_min_size(pos2(at.x, bottom + 1.0), size),
-+    };
-+    p.rect_filled(r, 6.0, color);
-+    p.galley(r.min + vec2(7.0, 3.0), text, ink);
-+}
 diff --git a/apps/wordcraft-web/src/live/text_merge.rs b/apps/wordcraft-web/src/live/text_merge.rs
 new file mode 100644
-index 0000000..60c0d1b
+index 0000000..f3473f9
 --- /dev/null
 +++ b/apps/wordcraft-web/src/live/text_merge.rs
 @@ -0,0 +1,440 @@
@@ -961,7 +896,7 @@ index 0000000..60c0d1b
 +
 +use serde_json::{Map, Value};
 +
-+use super::playground_live::{self, Error};
++use playground_live::Error;
 +
 +/// The object replacement character: an inline object's place in a paragraph's text.
 +const OBJ: char = '\u{FFFC}';
@@ -1390,19 +1325,20 @@ index 0000000..60c0d1b
 +}
 diff --git a/apps/wordcraft-web/src/web/live.rs b/apps/wordcraft-web/src/web/live.rs
 new file mode 100644
-index 0000000..3b2715c
+index 0000000..80d0f1b
 --- /dev/null
 +++ b/apps/wordcraft-web/src/web/live.rs
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,79 @@
 +//! Live editing in a Playground session: the page's runner, kept so the session can reach the app, and the shell around
-+//! [`WebShell`] that ends each frame with the session's frame hook (`crate::live`).
++//! [`WebShell`] that ends each frame with the session's frame hook (`crate::live`): the adapter's [`Peer`], which the
++//! session reaches the app through.
 +
 +use std::cell::OnceCell;
 +
 +use wordcraft_ui_egui::WordApp;
 +
 +use super::WebShell;
-+use crate::live::{self as adapter, playground_live};
++use crate::live::{self as adapter, Peer};
 +
 +thread_local! {
 +    static RUNNER: OnceCell<eframe::WebRunner> = const { OnceCell::new() };
@@ -1417,25 +1353,35 @@ index 0000000..3b2715c
 +/// The app eframe runs: `shell`, offered to the page for live editing.
 +pub(super) fn wrap(shell: WebShell) -> Box<dyn eframe::App> {
 +    adapter::install();
-+    let with_app = |with: &mut dyn FnMut(&mut WordApp)| {
-+        RUNNER.with(|runner| runner.get().and_then(|r| r.app_mut::<Live>().map(|mut live| with(&mut live.0.app))).is_some())
++    let with_app = |with: &mut dyn FnMut(&mut Peer<WebShell>)| {
++        RUNNER.with(|runner| runner.get().and_then(|r| r.app_mut::<Peer<WebShell>>().map(|mut peer| with(&mut peer))).is_some())
 +    };
-+    if let Err(e) = playground_live::web::attach::<WordApp>(adapter::FORMAT, with_app, adapter::repaint) {
++    if let Err(e) = playground_live::web::attach::<Peer<WebShell>>(adapter::FORMAT, with_app, adapter::repaint) {
 +        log::error!("live editing unavailable: {e:?}");
 +    }
-+    Box::new(Live(shell))
++    Box::new(Peer(shell))
 +}
 +
-+struct Live(WebShell);
++impl std::borrow::Borrow<WordApp> for WebShell {
++    fn borrow(&self) -> &WordApp {
++        &self.app
++    }
++}
 +
-+impl eframe::App for Live {
++impl std::borrow::BorrowMut<WordApp> for WebShell {
++    fn borrow_mut(&mut self) -> &mut WordApp {
++        &mut self.app
++    }
++}
++
++impl eframe::App for Peer<WebShell> {
 +    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
 +        self.0.logic(ctx, frame);
 +    }
 +
 +    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
 +        self.0.ui(ui, frame);
-+        adapter::frame(&mut self.0.app, ui);
++        adapter::frame(self, ui);
 +    }
 +
 +    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {

@@ -45,20 +45,28 @@
   after: "\n        #[cfg(target_arch = \"wasm32\")]\n        return web::save(self, true);"
 
 
-# Live editing in Playground sessions (patches/mspaint/live.diff + patches/live/playground_live.rs)
+# Live editing in Playground sessions (patches/mspaint/live.diff + the playground-live crate, tools.yaml `live_kit`)
 # What it's for: people in a Playground session paint on the same picture at once: every stroke, shape, fill and text
 #   reaches the others, two people's strokes merge pixel by pixel (both stay, the later on top), each person's Ctrl+Z
 #   takes back only their own, and each sees the others' pointers and the strokes, shapes and text they are making, in
 #   their colour, as they happen.
 # How: the adapter lives in new files: src/app/live.rs (the shared picture as 64×64 tiles, its merge, the session's
-#   frame, the web runner and the adapter; it declares the template, copied next to it, for presence lists) and
-#   src/app/live/peers.rs (presence). These rules only declare it and call in, one line each.
+#   frame, the web runner and the adapter) and src/app/live/peers.rs (presence: pointers, name tags and easing the
+#   kit's, strokes, dashed shapes and text SelfPaint's own). The playground-live crate (patches/live/kit, copied to the
+#   checkout's playground-live/) gives presence lists and the presence look. These rules only declare it and call in,
+#   one line each, and add the crate as a dependency.
 # Verify: node scripts/build.mjs check mspaint head (and LIVE=0), the e2e (tests/live-apps/mspaint.mjs) and
 #   `cargo test live`.
 # If upstream changes: when a line named below changes, anchor on its new spelling; if SelfPaintApp renames the fields
 #   live.rs uses (doc, drag, view, texture, texture_dirty, history, shape_preview, text, text_size) or DragState's
 #   Stroke { last }, follow them there.
 #
+# The adapter's dependency, for the web and for native tests, under target spellings nobody else uses (rule 1 has
+# `all(…)`): the playground-live crate with its presence look (`egui`).
+- live: true
+  file: Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(any(target_arch = \"wasm32\"))'.dependencies]\nplayground-live = { path = \"playground-live\", features = [\"egui\"] }\n\n[target.'cfg(not(target_arch = \"wasm32\"))'.dev-dependencies]\nplayground-live = { path = \"playground-live\", features = [\"egui\"] }\n"
 # The adapter module, a child of the app's module so it reaches SelfPaintApp.
 - live: true
   file: src/app.rs

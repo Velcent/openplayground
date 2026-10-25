@@ -1,0 +1,23 @@
+# Playground live editing as a crate (patches/live/kit in github.com/daijro/openplayground). build.mjs copies it into an
+# app's checkout at playground-live/, for apps whose tools.yaml entry has `live_kit: true`; the app's live.diff depends
+# on it by path and only adds its hooks. Licensed as the app it is compiled into (patches/README.md).
+[package]
+name = "playground-live"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+# The presence look (pointers, name tags, playheads, drag ghosts, selection outlines) for egui apps.
+egui = ["dep:egui"]
+
+[dependencies]
+# Floats read back exactly, so equal documents give equal bytes on every peer.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# The app's own egui: scripts/diffs.mjs installLive replaces this range with the app's egui (or eframe) requirement;
+# the look uses only what these versions share.
+egui = { version = ">=0.35, <0.40", default-features = false, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"

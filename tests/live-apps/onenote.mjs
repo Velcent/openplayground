@@ -1,5 +1,5 @@
-// NoteCraft (onenote): a fresh browser starts with the bundled Welcome notebook open; the joiner then adopts the
-// owner's notebooks (same paths). Rows of the tree are
+// NoteCraft (onenote): a fresh browser starts with the bundled Welcome notebook open, under a privacy welcome that asks
+// what to log (ready() denies it); the joiner then adopts the owner's notebooks (same paths). Rows of the tree are
 // 27 points apart under the shell's bar; a click on a block of the page puts the caret in it; the Draw tab's pens make
 // the pointer draw on the page (its ink.svg), and Type gives it back to the text. The owner types a letter at the
 // start of the welcome page's first paragraph; both editors work on that page. Ctrl+Z (the session's Undo while
@@ -7,7 +7,8 @@
 // drag(): the owner draws, the pen held down (presence `ink`: the stroke so far); release() lets go and takes the
 // stroke back with Ctrl+Z, so nothing has changed, and picks Type again. point(): the owner clicks into the paragraph
 // and rests the pointer on the page (presence: page, pointer, caret). importMedia(): the owner drops a picture on the
-// page and inserts it: the editor and the late viewer get its bytes. Every page is in the document, so opening one is
+// page and inserts it (the Welcome notebook has pictures already: its swatch.png is what arrives): the editor and the
+// late viewer get its bytes. Every page is in the document, so opening one is
 // presence (the tree's dots), not a new document: there is no openTab().
 import { until } from '../helpers.mjs'
 
@@ -15,12 +16,12 @@ const checkpoint = (page) => page.evaluate(() => {
   try { return new TextDecoder().decode(playgroundLiveAdapter.checkpoint()) } catch (e) { return `error: ${e}` }
 })
 const presence = (page) => page.evaluate(() => playgroundLiveAdapter.presence())
-// The first paragraph of the welcome page, tree rows, the
+// The start of the welcome page's first paragraph (under its picture, right of the tree and the page list), the
 // Draw tab with its Type tool and first pen, and somewhere to draw (over the page's words).
-const PARAGRAPH = { x: 410, y: 730 }
+const PARAGRAPH = { x: 493, y: 727 }
 const DRAW = { x: 195, y: 82 }, TYPE = { x: 287, y: 140 }, PEN = { x: 391, y: 140 }, SHEET = { x: 520, y: 470 }
-// The first choice of the dialog a dropped file opens (centred in the window).
-const INSERT_PICTURE = { x: 503, y: 397 }
+// The first choice of the dialog a dropped file opens (centred in the window), and Deny in the privacy welcome.
+const INSERT_PICTURE = { x: 539, y: 375 }, DENY = { x: 527, y: 500 }
 // A letter typed where `at` is, until the shared document has it.
 async function type(page, at, letter) {
   const before = await checkpoint(page)
@@ -43,11 +44,17 @@ const ink = (doc) => !!doc.files?.['welcome-to-notecraft']?.['00-start']?.welcom
 
 export default {
   path: '/head/notecraft/',
+  // The first document is about 8 MB (the Welcome notebook in 13 languages, with its ink): over a relayed connection
+  // it takes minutes to reach the joiner.
+  liveTimeout: 180000,
   url: '/head/notecraft/index.html',
   viewport: { width: 1280, height: 800 },
   ready: async (page) => {
     await until(async () => JSON.parse((await checkpoint(page)).replace(/^error.*/, '{}')).files?.['welcome-to-notecraft']?.['00-start']?.welcome?.['index.html'], 120000, 'the Welcome notebook')
     await page.waitForTimeout(500)
+    // Nothing is logged; the dialog is modal, and the gestures below need the window.
+    await page.mouse.click(DENY.x, DENY.y)
+    await page.waitForTimeout(300)
   },
   drag: async (page) => {
     await penDown(page)
@@ -89,6 +96,6 @@ export default {
     })
     await page.waitForTimeout(800)
     await page.mouse.click(INSERT_PICTURE.x, INSERT_PICTURE.y)
-    await until(async () => Object.keys(JSON.parse(await checkpoint(page)).media ?? {}).length, 10000, 'the picture in the page')
+    await until(async () => JSON.stringify(JSON.parse(await checkpoint(page)).media ?? {}).includes('"swatch.png"'), 10000, 'the picture in the page')
   },
 }

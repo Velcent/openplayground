@@ -49,19 +49,26 @@
   find: 'File ▸ Back Up Library… now and then'
   replace: 'File > Back Up Library now and then'
 
-# Live editing in Playground sessions (patches/lightroom/live.diff + patches/live/playground_live.rs)
+# Live editing in Playground sessions (patches/lightroom/live.diff + the playground-live crate, tools.yaml `live_kit`)
 # What it's for: people in a Playground session edit one LightCraft library together (the catalog: ratings, develop
 #   settings, History, albums…), see each other's pointers and selections, and get each other's imported photos.
 # How: the adapter lives in new files: apps/lightcraft-web/src/live.rs (the shared document, merge, adopt, media,
 #   presence, the session's own library folder), apps/lightcraft-web/src/web/live.rs (the kept runner and the wrapper
 #   that ends each frame with the session's frame hook) and crates/catalog/src/playground.rs (hooks the web build sets;
-#   inert elsewhere). These rules only declare them and call in, each one line at the end of a file or right after a
-#   function's signature.
-# Verify: node scripts/build.mjs check lightroom head|release, then the e2e (tests/live-apps/lightroom.mjs).
+#   inert elsewhere). The playground-live crate (patches/live/kit) gives the session and the presence look (pointers,
+#   name and value tags, ghosts, outlines, easing); its Live trait is implemented on a wrapper of the app (live.rs `App`), the app
+#   being another crate's type. These rules only declare them and call in, each one line at the end of a file, under
+#   [dependencies] or right after a function's signature.
+# Verify: node scripts/build.mjs check lightroom head|release, `cargo test -p lightcraft-web --lib live::`, then the e2e
+#   (tests/live-apps/lightroom.mjs).
 # If upstream changes: when a function named below is renamed, anchor on its new signature; when WebApp, its `app`,
 #   `originals` or `backend` fields are renamed, follow them in web/live.rs.
 #
-# The adapter module (web build; native tests).
+# The adapter module (web build; native tests), and the playground-live crate with its presence look as a dependency.
+- live: true
+  file: apps/lightcraft-web/Cargo.toml
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 - live: true
   file: apps/lightcraft-web/src/lib.rs
   find: '(?![\s\S])'

@@ -1,6 +1,6 @@
 // A tool's diffs (patches/<slug>/<name>.diff, or <name>.<channel>.diff on that channel): see scripts/build.mjs.
 import { spawnSync } from 'node:child_process'
-import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { cpSync, existsSync, globSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { CHANNELS } from './releases.mjs'
 
@@ -8,6 +8,34 @@ import { CHANNELS } from './releases.mjs'
 export const diffDir = (t) => (t.patches && existsSync(t.patches.replace(/\.yaml$/, '')) ? t.patches.replace(/\.yaml$/, '') : null)
 const diffName = (f) => f.replace(new RegExp(`(\\.(${CHANNELS.join('|')}))?\\.diff$`), '')
 const isEmpty = (dir, f) => !readFileSync(join(dir, f), 'utf8').trim()
+
+// The live-editing crate, playground-live (patches/live/kit: the session and the presence look), which apps with
+// `live_kit: true` depend on at <checkout>/playground-live. It goes in before the diffs apply.
+export const LIVE_KIT = new URL('../patches/live/kit/', import.meta.url)
+export const installLive = (src, t) => {
+  if (t.live_kit) {
+    const kit = join(src, 'playground-live')
+    cpSync(LIVE_KIT, kit, { recursive: true })
+    // The kit takes the egui the app asks for: a web crate without a lockfile would otherwise resolve the kit's range
+    // to the newest egui, next to the app's own.
+    const egui = appEgui(src)
+    if (egui) {
+      const manifest = join(kit, 'Cargo.toml')
+      writeFileSync(manifest, readFileSync(manifest, 'utf8').replace(/^(egui = \{ version = )"[^"]*"/m, `$1"${egui}"`))
+    }
+  }
+}
+
+// The egui version requirement an app's manifests give (egui's own, else eframe's, whose versions go together).
+const appEgui = (src) => {
+  const manifests = globSync('**/Cargo.toml', { cwd: src }).filter((f) => !/(^|\/)(target|playground-live)\//.test(f))
+  const text = manifests.sort((a, b) => a.split('/').length - b.split('/').length).map((f) => readFileSync(join(src, f), 'utf8')).join('\n')
+  for (const name of ['egui', 'eframe']) {
+    const m = text.match(new RegExp(`^\\s*${name}\\s*=\\s*(?:"([^"]+)"|\\{[^}\\n]*\\bversion\\s*=\\s*"([^"]+)")`, 'm'))
+    if (m) return m[1] ?? m[2]
+  }
+  return null
+}
 
 // Applies the channel's diffs to the git checkout `src`; returns the files of those upstream already has. Without
 // `live`, the live-editing diff (live.diff) is left out.

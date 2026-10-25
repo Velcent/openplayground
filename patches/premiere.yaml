@@ -318,7 +318,7 @@
   find: '\n[ \t]*if btn\(ui, Icon::Fullscreen,[^{]*\{[^}]*\}'
   replace: ''
 
-# Live editing in Playground sessions (patches/premiere/live.diff + patches/live/playground_live.rs)
+# Live editing in Playground sessions (patches/premiere/live.diff + the playground-live crate, tools.yaml `live_kit`)
 # The adapter lives in new files: crates/ui-egui/src/live.rs (the shared document, merge, adoption, media listing,
 # presence) and apps/filmcraft-web/src/live.rs (the Shell wrapper that ends each frame with the session's frame hook,
 # the adapter's attachment, media files). The rules below only declare them and call in: each inserts one line at the
@@ -328,17 +328,22 @@
 # `cargo test -p filmcraft-ui-egui --lib live::`. If upstream renames a function named below, anchor on its new
 # signature.
 #
-# Rule 10: the template in filmcraft-project (wasm, and debug builds for the native tests).
-# Rule 11: its wasm dependencies, under a target spelling nobody else uses; serde_json reads floats back exactly so
-#   equal documents give equal bytes on every peer. Drop one once the crate has it for wasm itself.
+# Rule 10: the playground-live crate (patches/live/kit: the session and the presence look; tools.yaml `live_kit`)
+#   re-exported from filmcraft-project under its old module name, so the hooks below and in other crates reach it as
+#   before (wasm, and debug builds for the native tests).
+# Rule 11 (two rules): the crate as a dependency of filmcraft-project, and of ui-egui with its look (`egui`).
 - live: true
   file: crates/project/src/lib.rs
   find: '(?![\s\S])'
-  after: "\n// Live editing in a Playground session (patches/live/playground_live.rs).\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))]\npub mod playground_live;\n"
+  after: "\n// Live editing in a Playground session: the playground-live crate (patches/live/kit), for the hooks below.\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))]\npub use ::playground_live;\n"
 - live: true
   file: crates/project/Cargo.toml
-  find: '(?![\s\S])'
-  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\njs-sys = \"0.3\"\nwasm-bindgen = \"0.2\"\nserde_json = { workspace = true, features = [\"float_roundtrip\"] }\n"
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\" }\n"
+- live: true
+  file: crates/ui-egui/Cargo.toml
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 
 # Rules 12–14: ids no one else in the session picks. One counter (`next_id`) numbers every object, so two people
 #   adding at once would get the same id. While connected, each allocator takes playground_live::fresh_id (the

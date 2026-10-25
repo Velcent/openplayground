@@ -25,6 +25,8 @@ const G3 = [1015, 840]
 
 export default {
   path: '/suhina/',
+  // The dev server serves an app folder's index.html only for builds in its own public/.
+  url: '/suhina/index.html',
   viewport: { width: 1400, height: 1000 },
   ready: async (page) => {
     await until(async () => !(await checkpoint(page)).startsWith('error'), 60000, 'the demo project')

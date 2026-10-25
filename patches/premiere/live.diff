@@ -103,10 +103,10 @@ index 0000000..44f1a8c
 +}
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..896f44a
+index 0000000..5c04968
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
-@@ -0,0 +1,707 @@
+@@ -0,0 +1,572 @@
 +//! Live editing in a Playground session (web only). The shared document is the open project (`Project`). What each
 +//! person sees for themselves (selection, playheads, open sequences, Timeline zoom and scroll, panels, the Source
 +//! monitor) already lives outside it, in the engine's `EditorState` and the UI; so does what belongs to this machine:
@@ -114,17 +114,17 @@ index 0000000..896f44a
 +//! `/files/<name>` on the web) travel as session files: the web host reads and installs their bytes.
 +//! Presence: each person's sequence, Timeline pointer (track and time), playhead, selected clips and the clip or
 +//! transition drag under way, drawn on the others' Timeline in that person's color and eased toward where it last was;
-+//! a playhead flies a flag with its person's name at the top of the ruler.
++//! a playhead flies a flag with its person's name at the top of the ruler. The session and that look are the
++//! playground-live crate's (patches/live/kit); this module maps FilmCraft's Timeline to them.
 +
-+use std::cell::{Cell, RefCell};
++use std::cell::Cell;
 +use std::collections::{BTreeSet, HashMap};
 +use std::sync::Arc;
 +
-+use egui::emath::GuiRounding as _;
-+use egui::{Color32, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2, pos2, vec2};
-+use filmcraft_project::playground_live::{self, Live, Presence};
++use egui::{Pos2, Rect, pos2, vec2};
 +use filmcraft_project::{ClipId, MediaClip, MediaRef, Project, ProjectItem, ProjectSettings, Sequence};
 +use filmcraft_time::Tick;
++use playground_live::{self, Live, Presence, presence};
 +use serde_json::{Map, Value, json};
 +
 +use crate::FilmcraftApp;
@@ -132,14 +132,10 @@ index 0000000..896f44a
 +use crate::theme::Tokens;
 +
 +thread_local! {
-+    /// The last frame had a pointer button down or a text field focused.
-+    static INPUT: Cell<bool> = const { Cell::new(false) };
 +    /// Where the pointer was at the end of the last frame that showed the Timeline.
 +    static POINTER: Cell<Option<Pos2>> = const { Cell::new(None) };
 +    /// The Timeline was shown this frame ([`paint_timeline`]).
 +    static SHOWN: Cell<bool> = const { Cell::new(false) };
-+    /// The others in the session, with their marks as this person's Timeline last drew them.
-+    static OTHERS: RefCell<Vec<(Presence, Shown)>> = const { RefCell::new(Vec::new()) };
 +}
 +
 +/// Clips sent as this person's selection, or as a drag's, at most.
@@ -151,79 +147,28 @@ index 0000000..896f44a
 +/// Lists the model keeps in time order (`start`).
 +const TIMED: [&str; 4] = ["items", "transitions", "markers", "captions"];
 +
-+/// How long the others' marks take to go most (1 - 1/e) of the way to their latest place, in seconds.
-+const EASE: f64 = 0.08;
-+
-+/// The most characters of a name tag.
-+const MAX_NAME: usize = 24;
-+
-+/// The end of a frame: [`playground_live::frame`], with what egui knows of the pointer and the keyboard.
++/// The end of a frame: the presence look's (name tags in FilmCraft's semibold) and the session's
++/// ([`playground_live::frame`]), with what egui knows of the pointer.
 +pub fn frame(app: &mut FilmcraftApp, ctx: &egui::Context) {
-+    INPUT.set(ctx.input(|i| i.pointer.any_down()) || ctx.text_edit_focused());
++    presence::set_font(Tokens::semibold(12.0));
++    presence::end_frame(ctx);
 +    POINTER.set(if SHOWN.take() { ctx.pointer_hover_pos() } else { None });
 +    playground_live::frame(app);
 +}
 +
-+/// Another person's moving marks as this Timeline last drew them, eased toward their latest presence: the pointer
-+/// (seconds, row), the playhead (seconds) and a drag's ghosts (whether a transition; start, row, duration). A row counts
-+/// the tracks from the top, plus the fraction down one; -1 is the ruler. All in the sequence's terms, so this person's
-+/// own scrolling and zooming never lag.
++/// Where another person's moving marks go on this Timeline: the pointer (seconds, row), the playhead (seconds) and a
++/// drag's ghosts (whether a transition; start, row, duration). A row counts the tracks from the top, plus the fraction
++/// down one; -1 is the ruler. All in the sequence's terms, so this person's own scrolling and zooming never lag.
 +#[derive(Default)]
-+struct Shown {
++struct Targets {
 +    pointer: Option<[f64; 2]>,
 +    playhead: Option<[f64; 1]>,
 +    ghosts: Vec<(bool, [f64; 3])>,
 +}
 +
-+impl Shown {
-+    /// `dt` seconds on toward `to`; `px`: points a second and a row; `far`: a quarter of the view's width and height,
-+    /// past which a mark goes at once, as it does when first seen or when the drag's ghosts change. Whether a mark is
-+    /// still on its way.
-+    fn step(&mut self, to: Shown, dt: f32, [x, y]: [f64; 2], [fx, fy]: [f64; 2]) -> bool {
-+        let k = 1.0 - (-f64::from(dt.clamp(0.0, 0.1)) / EASE).exp();
-+        let mut moving = ease_to(&mut self.pointer, to.pointer, k, [x, y], [fx, fy]);
-+        moving |= ease_to(&mut self.playhead, to.playhead, k, [x], [fx]);
-+        if self.ghosts.len() == to.ghosts.len() && self.ghosts.iter().zip(&to.ghosts).all(|(s, t)| s.0 == t.0) {
-+            for (s, t) in self.ghosts.iter_mut().zip(to.ghosts) {
-+                moving |= ease(&mut s.1, t.1, k, [x, y, x], [fx, fy, fx]);
-+            }
-+        } else {
-+            self.ghosts = to.ghosts;
-+        }
-+        moving
-+    }
-+}
-+
-+/// [`ease`], where a mark that was not there or is gone goes at once.
-+fn ease_to<const N: usize>(s: &mut Option<[f64; N]>, t: Option<[f64; N]>, k: f64, px: [f64; N], far: [f64; N]) -> bool {
-+    if let (Some(s), Some(t)) = (s.as_mut(), t) {
-+        return ease(s, t, k, px, far);
-+    }
-+    *s = t;
-+    false
-+}
-+
-+/// `s` moved `k` of the way to `t`; all of it after a jump wider than `far` points on an axis, or once under half a
-+/// point remains (`px`: points a unit). Whether it is still on its way.
-+fn ease<const N: usize>(s: &mut [f64; N], t: [f64; N], k: f64, px: [f64; N], far: [f64; N]) -> bool {
-+    let off = |s: &[f64; N], i: usize| ((t[i] - s[i]) * px[i]).abs();
-+    if (0..N).any(|i| !(off(s, i) <= far[i])) {
-+        *s = t;
-+        return false;
-+    }
-+    for i in 0..N {
-+        s[i] += (t[i] - s[i]) * k;
-+    }
-+    let moving = (0..N).any(|i| off(s, i) >= 0.5);
-+    if !moving {
-+        *s = t;
-+    }
-+    moving
-+}
-+
-+/// Where a person's presence `state` puts their marks, in [`Shown`]'s terms (`row`: a track's row from the top).
-+/// Remote data: what does not resolve is left out.
-+fn targets(state: &Value, row: impl Fn(u64) -> Option<f64>) -> Shown {
++/// Where a person's presence `state` puts their marks (`row`: a track's row from the top). Remote data: what does not
++/// resolve is left out.
++fn targets(state: &Value, row: impl Fn(u64) -> Option<f64>) -> Targets {
 +    let seconds = |v: &Value| v.as_i64().map(|t| Tick(t).seconds());
 +    let down = |v: &Value| v.as_f64().filter(|y| (0.0..=1.0).contains(y)).unwrap_or(0.5);
 +    let p = &state["pointer"];
@@ -232,7 +177,7 @@ index 0000000..896f44a
 +        None => Some(-1.0),
 +    };
 +    let ghost = |g: &Value, transition| Some((transition, [seconds(&g[1])?, row(g[0].as_u64()?)?, seconds(&g[2])?.max(0.0)]));
-+    Shown {
++    Targets {
 +        pointer: seconds(&p["time"]).zip(on).map(|(t, on)| [t, on + down(&p["y"])]),
 +        playhead: seconds(&state["playhead"]).map(|t| [t]),
 +        ghosts: (state["ghosts"].as_array().into_iter().flatten().take(MAX_SELECTION))
@@ -244,8 +189,8 @@ index 0000000..896f44a
 +
 +/// The others on this person's Timeline, in their colors, when they show the same sequence: their playheads and the
 +/// ghosts of their drags, then outlines around their selected clips (where the clips are in this person's project),
-+/// then their pointers. Called after the Timeline drew its clips and ruler, before its own playhead (`layout` is this
-+/// frame's), so this person's playhead stays on top.
++/// then their pointers, each eased toward its latest place ([`presence::ease`]). Called after the Timeline drew its
++/// clips and ruler, before its own playhead (`layout` is this frame's), so this person's playhead stays on top.
 +pub fn paint_timeline(app: &FilmcraftApp, ui: &egui::Ui, layout: &Layout) {
 +    SHOWN.set(true);
 +    let (Some(id), Some(seq)) = (app.session.state.active_sequence, app.session.active_sequence()) else { return };
@@ -274,107 +219,42 @@ index 0000000..896f44a
 +    let tall = ui.painter().with_clip_rect(Rect::from_min_max(pos2(content.min.x, ruler.min.y), content.max));
 +    let px = [layout.pps, rows.first().map_or(30.0, |r| f64::from(r.rect.height()))];
 +    let far = [f64::from(content.width()) / 4.0, f64::from(content.height()) / 4.0];
-+    let dt = ui.input(|i| i.stable_dt);
-+    let mut moving = false;
-+    OTHERS.with_borrow_mut(|others| {
-+        let mut here: Vec<_> = others.iter_mut().filter(|(o, _)| o.state["sequence"].as_u64() == Some(id.0)).collect();
-+        for (o, shown) in &mut here {
-+            moving |= shown.step(targets(&o.state, row), dt, px, far);
-+            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
-+            if let Some(at) = shown.playhead.map(|[s]| layout.x_of(Tick::from_seconds_f64(s))).filter(|x| content.x_range().contains(*x)) {
-+                playhead(&tall, tall.round_to_pixel_center(at), [ruler.min.y + 1.0, content.max.y], content.max.x, color, &o.name);
-+            }
-+            for &(transition, [s, v, d]) in &shown.ghosts {
-+                let Some(r) = band(v) else { continue };
-+                let (x0, x1) = (at(s), at(s + d));
-+                let top = if transition { 17.0 } else { 1.0 };
-+                let body = Rect::from_min_max(pos2(x0, r.min.y + top), pos2(x1.max(x0 + 1.0), r.max.y - 1.0));
-+                let edge = Stroke::new(1.5, color.gamma_multiply(0.85));
-+                marks.with_clip_rect(area(r)).rect(body, 0.0, color.gamma_multiply(0.28), edge, StrokeKind::Inside);
++    let ctx = ui.ctx();
++    let others: Vec<Presence> = presence::others().into_iter().filter(|o| o.state["sequence"].as_u64() == Some(id.0)).collect();
++    let mut pointers = Vec::new();
++    for o in &others {
++        let color = presence::color(o);
++        let to = targets(&o.state, row);
++        if let Some([s]) = to.playhead.and_then(|p| presence::ease(ctx, &o.id, "playhead", p, [px[0]], [far[0]])) {
++            let at = layout.x_of(Tick::from_seconds_f64(s));
++            if content.x_range().contains(at) {
++                presence::playhead(&tall, at, [ruler.min.y + 1.0, content.max.y], content.max.x, color, &o.name);
 +            }
 +        }
-+        for (o, _) in &here {
-+            let color = Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
-+            for clip in o.state["selection"].as_array().into_iter().flatten().take(MAX_SELECTION).filter_map(Value::as_u64) {
-+                let Some((track, item)) = seq.find_item(ClipId(clip)) else { continue };
-+                let Some(r) = layout.rows.iter().find(|r| r.track == track) else { continue };
-+                // The Timeline's own selection border (draw_clip), in their color.
-+                let (x0, x1) = (x(item.start), x(item.end()));
-+                let body = Rect::from_min_max(pos2(x0, r.rect.min.y + 1.0), pos2(x1.max(x0 + 1.0), r.rect.max.y - 1.0));
-+                marks.with_clip_rect(area(r.rect)).rect_stroke(body, 0.0, Stroke::new(2.0, color), StrokeKind::Inside);
-+            }
++        for (i, (transition, g)) in to.ghosts.into_iter().enumerate() {
++            let key = format!("{}{i}", if transition { "transition" } else { "ghost" });
++            let Some([s, v, d]) = presence::ease(ctx, &o.id, &key, g, [px[0], px[1], px[0]], [far[0], far[1], far[0]]) else { continue };
++            let Some(r) = band(v) else { continue };
++            let (x0, x1) = (at(s), at(s + d));
++            let top = if transition { 17.0 } else { 1.0 };
++            let body = Rect::from_min_max(pos2(x0, r.min.y + top), pos2(x1.max(x0 + 1.0), r.max.y - 1.0));
++            presence::ghost(&marks.with_clip_rect(area(r)), body, color);
 +        }
-+        for (o, shown) in &here {
-+            let tip = shown.pointer.and_then(|[s, v]| Some(pos2(layout.x_of(Tick::from_seconds_f64(s)), band(v)?.min.y)));
-+            if let Some(tip) = tip.filter(|p| tall.clip_rect().contains(*p)) {
-+                cursor(ui.painter(), tip, Color32::from_rgb(o.color[0], o.color[1], o.color[2]), &o.name);
-+            }
++        for clip in o.state["selection"].as_array().into_iter().flatten().take(MAX_SELECTION).filter_map(Value::as_u64) {
++            let Some((track, item)) = seq.find_item(ClipId(clip)) else { continue };
++            let Some(r) = layout.rows.iter().find(|r| r.track == track) else { continue };
++            // The Timeline's own selection border (draw_clip), in their color.
++            let (x0, x1) = (x(item.start), x(item.end()));
++            let body = Rect::from_min_max(pos2(x0, r.rect.min.y + 1.0), pos2(x1.max(x0 + 1.0), r.rect.max.y - 1.0));
++            presence::outline(&marks.with_clip_rect(area(r.rect)), body, color);
 +        }
-+    });
-+    if moving {
-+        ui.ctx().request_repaint();
++        let pointer = to.pointer.and_then(|p| presence::ease(ctx, &o.id, "pointer", p, px, far));
++        pointers.extend(pointer.and_then(|[s, v]| Some((pos2(layout.x_of(Tick::from_seconds_f64(s)), band(v)?.min.y), o))));
 +    }
-+}
-+
-+/// A pointer at `tip` with a name tag, in `color` (the look every Playground app shares).
-+fn cursor(painter: &egui::Painter, tip: Pos2, color: Color32, name: &str) {
-+    const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
-+    // Star-shaped around the tip (its first point), which is what a filled path's triangle fan needs.
-+    let arrow = |d: Vec2| ARROW.iter().map(|&[x, y]| tip + d + vec2(x, y)).collect::<Vec<_>>();
-+    let shadow = Color32::from_black_alpha(64);
-+    painter.add(Shape::convex_polygon(arrow(vec2(0.0, 1.0)), shadow, Stroke::new(1.5, shadow)));
-+    painter.add(Shape::convex_polygon(arrow(Vec2::ZERO), color, Stroke::new(1.5, Color32::WHITE)));
-+    if name.is_empty() {
-+        return;
++    // Pointers over everyone's marks.
++    for (tip, o) in pointers.into_iter().filter(|(p, _)| tall.clip_rect().contains(*p)) {
++        presence::cursor(ui.painter(), tip, presence::color(o), &o.name);
 +    }
-+    let text = tag_text(painter, name, color);
-+    let tag = Rect::from_min_size((tip + vec2(12.0, 15.0)).round_to_pixels(painter.pixels_per_point()), text.size() + 2.0 * PAD);
-+    painter.rect_filled(tag, 6.0, color);
-+    painter.galley(tag.min + PAD, text, color);
-+}
-+
-+/// The space around a name tag's text.
-+const PAD: Vec2 = vec2(7.0, 3.0);
-+
-+/// A name tag's text: the name cut to [`MAX_NAME`] characters, 12 px semibold, white or (on a light `color`) near-black.
-+fn tag_text(painter: &egui::Painter, name: &str, color: Color32) -> Arc<egui::Galley> {
-+    let name: String = match name.chars().count() > MAX_NAME {
-+        true => name.chars().take(MAX_NAME - 1).chain(['…']).collect(),
-+        false => name.to_owned(),
-+    };
-+    let l = egui::Rgba::from(color);
-+    let ink = match 0.2126 * l.r() + 0.7152 * l.g() + 0.0722 * l.b() > 0.55 {
-+        true => Color32::from_gray(0x11),
-+        false => Color32::WHITE,
-+    };
-+    painter.layout_no_wrap(name, Tokens::semibold(12.0), ink)
-+}
-+
-+/// Another person's playhead at `x` (a pixel centre), from `top` to `bottom`: a line 1.5 px wide in 85% of their
-+/// color, and at its top a flag with their name, in the shared tag look ([`flag`]).
-+fn playhead(painter: &egui::Painter, x: f32, [top, bottom]: [f32; 2], right: f32, color: Color32, name: &str) {
-+    painter.line_segment([pos2(x, top), pos2(x, bottom)], Stroke::new(1.5, color.gamma_multiply(0.85)));
-+    if name.is_empty() {
-+        return;
-+    }
-+    let text = tag_text(painter, name, color);
-+    let (rect, left) = flag(x, top, text.size() + 2.0 * PAD, right);
-+    let rect = rect.round_to_pixels(painter.pixels_per_point());
-+    // Square where it meets the line.
-+    let corners = match left {
-+        true => egui::CornerRadius { ne: 0, ..egui::CornerRadius::same(6) },
-+        false => egui::CornerRadius { nw: 0, ..egui::CornerRadius::same(6) },
-+    };
-+    painter.rect_filled(rect, corners, color);
-+    painter.galley(rect.min + PAD, text, color);
-+}
-+
-+/// Where a playhead's flag of `size` goes on its line at `x` from `top`: hanging right of the line, flush with its left
-+/// edge, or left of it (`true`) where it would pass `right`.
-+fn flag(x: f32, top: f32, size: Vec2, right: f32) -> (Rect, bool) {
-+    let left = x + size.x > right;
-+    let x = if left { x + 0.75 - size.x } else { x - 0.75 };
-+    (Rect::from_min_size(pos2(x, top), size), left)
 +}
 +
 +/// The clips a drag under way has elsewhere so far ([`preview_drag`], what this person's Timeline shows), each as
@@ -589,20 +469,12 @@ index 0000000..896f44a
 +
 +    /// Someone still on the same sequence keeps their marks where this Timeline drew them, to ease on from there.
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        OTHERS.with_borrow_mut(|old| {
-+            let mut new: Vec<(Presence, Shown)> = others.into_iter().map(|o| (o, Shown::default())).collect();
-+            for (o, shown) in &mut new {
-+                if let Some(was) = old.iter_mut().find(|(w, _)| w.id == o.id && w.state["sequence"] == o.state["sequence"]) {
-+                    *shown = std::mem::take(&mut was.1);
-+                }
-+            }
-+            *old = new;
-+        });
++        presence::show(others);
 +    }
 +
 +    fn live_quiet(&self) -> bool {
 +        let s = &self.session;
-+        !INPUT.get() && s.trim_play.dynamic.is_none() && !s.mixrec.active() && !s.mcrec.active() && !s.voiceover.recording()
++        presence::quiet() && s.trim_play.dynamic.is_none() && !s.mixrec.active() && !s.mcrec.active() && !s.voiceover.recording()
 +    }
 +
 +    fn live_generation(&self) -> Option<u64> {
@@ -780,13 +652,6 @@ index 0000000..896f44a
 +        let second = Tick::from_seconds_f64(1.0);
 +        app.tl.drag = Some(Drag::Move { clips: vec![item.id], grab_tick: item.start, start_track: v1, offset: second, track_delta: 0, new_track: None, copy: false });
 +        assert_eq!(app.live_presence()["ghosts"], json!([[v1.0, (item.start + second).0, item.duration.0]]), "a second later, as the Timeline shows it");
-+    }
-+
-+    #[test]
-+    fn a_playhead_flag_hangs_from_its_line_and_stays_in_the_timeline() {
-+        let size = vec2(60.0, 21.0);
-+        assert_eq!(flag(100.5, 31.0, size, 1100.0), (Rect::from_min_size(pos2(99.75, 31.0), size), false));
-+        assert_eq!(flag(1080.5, 31.0, size, 1100.0), (Rect::from_min_size(pos2(1021.25, 31.0), size), true), "near the end it hangs left");
 +    }
 +
 +    #[test]

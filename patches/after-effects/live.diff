@@ -1,19 +1,17 @@
 diff --git a/crates/engine/src/playground.rs b/crates/engine/src/playground.rs
 new file mode 100644
-index 0000000..fb02668
+index 0000000..325ac48
 --- /dev/null
 +++ b/crates/engine/src/playground.rs
-@@ -0,0 +1,60 @@
-+//! Live editing in a Playground session (web only): the adapter template ([`playground_live`]), the shared project's
-+//! binding ([`LIVE_PROJECT`]) and [`Session::execute`]'s first step, which hands Undo, Redo and History jumps to the
-+//! session while the shared project is open. The frontend (`effectcraft_ui_egui::playground`) implements the adapter.
+@@ -0,0 +1,58 @@
++//! Live editing in a Playground session (web only): the shared project's binding ([`LIVE_PROJECT`]) and
++//! [`Session::execute`]'s first step, which hands Undo, Redo and History jumps to the session (the playground-live crate,
++//! patches/live/kit) while the shared project is open. The frontend (`effectcraft_ui_egui::playground`) implements the
++//! adapter.
 +
 +use serde_json::Value;
 +
 +use crate::{EngineError, Result, Session, history};
-+
-+#[path = "playground_live.rs"]
-+pub mod playground_live;
 +
 +thread_local! {
 +    /// The [`crate::scriptui::ScriptUi::project_epoch`] of the project a connected session shares (the frontend sets
@@ -93,10 +91,10 @@ index 0000000..9927650
 +}
 diff --git a/crates/ui-egui/src/playground.rs b/crates/ui-egui/src/playground.rs
 new file mode 100644
-index 0000000..0b8ccd4
+index 0000000..ba7d032
 --- /dev/null
 +++ b/crates/ui-egui/src/playground.rs
-@@ -0,0 +1,1094 @@
+@@ -0,0 +1,954 @@
 +//! Live editing in a Playground session (web only). The shared document is the project open when the session started
 +//! (`Project`), minus what is this person's: the id counter, each comp's Resolution, Draft 3D and Hide Shy Layers
 +//! switches (viewer and Timeline toggles), which footage is missing in this browser, and the Render Queue (its jobs,
@@ -109,21 +107,23 @@ index 0000000..0b8ccd4
 +//! their pointer over its viewer in comp pixels and their selected layers, and what a gesture under way has done so
 +//! far (the document gets it only when the gesture ends): the others' are drawn over the viewer and the Timeline. A
 +//! layer someone else's Pen is drawing a path in takes no presses here until they finish it ([`selectable_layers`]).
++//! The session and the presence look (pointers, name tags, playhead flags, ghosts, outlines, easing) are the
++//! playground-live crate's (patches/live/kit); the paths and dashed rubber bands it has no shape for are drawn here in
++//! its colors.
 +
 +use std::cell::{Cell, RefCell};
-+use std::collections::{BTreeMap, BTreeSet};
++use std::collections::BTreeSet;
 +use std::sync::Arc;
 +
 +use effectcraft_engine::Services;
 +use effectcraft_engine::commands::shape_tool::mask_path;
 +use effectcraft_engine::geom::Mat3;
 +use effectcraft_engine::playground::LIVE_PROJECT;
-+use effectcraft_engine::playground::playground_live::{self, Live, Presence};
 +use effectcraft_engine::render::EvalCtx;
 +use effectcraft_engine::time::Tick;
 +use effectcraft_project::{Comp, Footage, ItemId, ItemKind, Layer, LayerId, LayerSource, Project};
-+use egui::emath::GuiRounding as _;
-+use egui::{Color32, Pos2, Rect, Shape, Stroke, pos2, vec2};
++use egui::{Pos2, Rect, Shape, Stroke, pos2, vec2};
++use playground_live::{Live, Presence, presence};
 +use serde_json::{Value, json};
 +
 +use crate::EffectcraftApp;
@@ -143,18 +143,12 @@ index 0000000..0b8ccd4
 +    static VIEWER: Cell<Option<(u64, egui::LayerId, Rect)>> = const { Cell::new(None) };
 +    /// This person's pointer over the comp viewer in the last frame, in comp pixels.
 +    static POINTER: Cell<Option<[f64; 2]>> = const { Cell::new(None) };
-+    /// The others' presence ([`Live::live_show_presence`]).
-+    static OTHERS: RefCell<Vec<Presence>> = const { RefCell::new(Vec::new()) };
-+    /// The last frame had a pointer button down or a text field focused.
-+    static INPUT: Cell<bool> = const { Cell::new(false) };
 +    /// The last frame had a pointer button down: a gesture may be under way.
 +    static DOWN: Cell<bool> = const { Cell::new(false) };
 +    /// The project and the current time as of the last frame without a button down: what the others have.
 +    static REST: RefCell<Option<(Arc<Project>, Tick)>> = const { RefCell::new(None) };
 +    /// What the comp viewer was drawing in the last frame ([`Drawing`]).
 +    static DRAWING: Cell<Drawing> = const { Cell::new(Drawing { zoom: 1.0, pen: None, band: None }) };
-+    /// The others' marks as last drawn, eased toward their latest presence, by person ([`Shown`]).
-+    static SHOWN: RefCell<BTreeMap<String, Shown>> = const { RefCell::new(BTreeMap::new()) };
 +    /// While connected: the start of this person's id range.
 +    static IDS: Cell<Option<u64>> = const { Cell::new(None) };
 +    /// While connected: the shared project as it last was here, which stays the session's document once another
@@ -230,11 +224,20 @@ index 0000000..0b8ccd4
 +    }
 +}
 +
-+/// The end of a frame: [`playground_live::frame`], with what egui knows of the pointer and the keyboard; then this
-+/// person's gestures for their presence and the others' over the comp viewer (the Timeline draws theirs: [`timeline`]).
++/// The end of a frame: the others over the comp viewer (the Timeline drew theirs: [`timeline`]) and the presence look's
++/// end of frame (name tags in EffectCraft's semibold), then [`playground_live::frame`], which sees this frame's pointer
++/// and keyboard through [`presence::quiet`]; then this person's gestures for their presence.
 +pub fn frame(app: &mut EffectcraftApp, ctx: &egui::Context) {
++    presence::set_font(Tokens::semibold(12.0));
 +    let down = ctx.input(|i| i.pointer.any_down());
-+    INPUT.set(down || ctx.text_edit_focused());
++    // The comp viewer's mapping, when it was shown this frame (`panels::viewer::show` publishes it).
++    let pass = ctx.cumulative_pass_nr();
++    let shown = VIEWER.get().filter(|(p, ..)| *p == pass);
++    let shown = shown.zip(ctx.data(|d| d.get_temp::<ViewerMap>(egui::Id::new("viewer-map"))));
++    if let Some(((_, layer, clip), map)) = shown {
++        draw_viewer(app, &ctx.layer_painter(layer).with_clip_rect(map.area.intersect(clip)), &map);
++    }
++    presence::end_frame(ctx);
 +    bind(app);
 +    playground_live::frame(app);
 +    if open(app) && playground_live::connected() {
@@ -244,10 +247,6 @@ index 0000000..0b8ccd4
 +    if !down {
 +        REST.set(Some((app.session.project.clone(), app.session.time())));
 +    }
-+    // The comp viewer's mapping, when it was shown this frame (`panels::viewer::show` publishes it).
-+    let pass = ctx.cumulative_pass_nr();
-+    let shown = VIEWER.get().filter(|(p, ..)| *p == pass);
-+    let shown = shown.zip(ctx.data(|d| d.get_temp::<ViewerMap>(egui::Id::new("viewer-map"))));
 +    POINTER.set(shown.and_then(|((_, layer, clip), map)| {
 +        let at = ctx.pointer_hover_pos().filter(|p| map.area.intersect(clip).contains(*p))?;
 +        ctx.layer_id_at(at).is_none_or(|l| l == layer).then(|| map.to_comp(at))
@@ -259,31 +258,11 @@ index 0000000..0b8ccd4
 +        }
 +        None => Drawing { zoom: 1.0, pen: None, band: None },
 +    });
-+    let moving = OTHERS.with_borrow(|others| match shown {
-+        Some(((_, layer, clip), map)) => draw_viewer(app, &ctx.layer_painter(layer).with_clip_rect(map.area.intersect(clip)), &map, others, pace(ctx)),
-+        None => false,
-+    });
-+    if moving {
-+        ctx.request_repaint();
-+    }
-+}
-+
-+/// How far the others' marks go this frame toward their latest presence.
-+fn pace(ctx: &egui::Context) -> f64 {
-+    1.0 - (-f64::from(ctx.input(|i| i.stable_dt).clamp(0.0, 0.1)) / EASE).exp()
 +}
 +
 +/// The comp viewer's first step (`panels::viewer::show`): it is on screen this frame, on this layer.
 +pub fn viewer(ui: &egui::Ui) {
 +    VIEWER.set(Some((ui.ctx().cumulative_pass_nr(), ui.layer_id(), ui.clip_rect())));
-+}
-+
-+/// The Timeline, right before it draws this person's CTI (`panels::timeline::show`): the others' marks on it
-+/// ([`draw_timeline`]), so this person's CTI stays on top.
-+pub fn timeline(app: &EffectcraftApp, ui: &egui::Ui) {
-+    if OTHERS.with_borrow(|others| draw_timeline(app, ui.painter(), others, pace(ui.ctx()))) {
-+        ui.ctx().request_repaint();
-+    }
 +}
 +
 +/// The layers eligible for viewer hit tests (`panels::viewer::selectable_layers`) but those someone else's Pen is
@@ -292,7 +271,7 @@ index 0000000..0b8ccd4
 +/// so far: either way it would take presses meant for the layers under it. `panels::viewer::layers_at` (every press's
 +/// hit test) calls this one while it is compiled.
 +pub(crate) fn selectable_layers(comp: &Comp, time: Tick) -> impl Iterator<Item = &Layer> {
-+    let drawn: Vec<u64> = OTHERS.with_borrow(|others| others.iter().filter_map(|p| p.state["pen"].as_u64()).collect());
++    let drawn: Vec<u64> = presence::others().iter().filter_map(|p| p.state["pen"].as_u64()).collect();
 +    crate::panels::viewer::selectable_layers(comp, time).filter(move |l| !drawn.contains(&l.id.0))
 +}
 +
@@ -314,110 +293,51 @@ index 0000000..0b8ccd4
 +/// The most a presence may weigh (the shell sends nothing heavier than 4 KiB).
 +const MAX_PRESENCE: usize = 4000;
 +
-+/// How long the others' marks take to go most (1 - 1/e) of the way to their latest place, in seconds.
-+const EASE: f64 = 0.08;
-+
-+/// A person's marks as this person last drew them, eased toward their latest presence: per mark (a name), its numbers
-+/// in the document's terms (comp pixels, seconds), over the viewer and the Timeline of the comp `page`.
-+#[derive(Default)]
-+struct Shown {
-+    page: u64,
-+    viewer: Marks,
-+    timeline: Marks,
-+}
-+
-+type Marks = Vec<(String, Vec<f64>)>;
-+
-+/// `shown` moved `k` of the way toward `targets` (`px`: screen points per unit), all of the way for a mark new or of
-+/// another shape, a jump of over `far` points, or under half a point left. `moving`: a mark is still on its way.
-+fn ease(shown: &Marks, targets: Marks, k: f64, px: f64, far: f64, moving: &mut bool) -> Marks {
-+    let step = |(name, to): (String, Vec<f64>)| {
-+        let off = |at: &[f64]| at.iter().zip(&to).map(|(a, b)| ((b - a) * px).abs()).fold(0.0, f64::max);
-+        let from = shown.iter().find(|(n, at)| *n == name && at.len() == to.len() && off(at) <= far);
-+        let mut at: Vec<f64> = from.map_or(to.clone(), |(_, at)| at.iter().zip(&to).map(|(a, b)| a + (b - a) * k).collect());
-+        if off(&at) < 0.5 {
-+            at = to;
-+        } else {
-+            *moving = true;
-+        }
-+        (name, at)
-+    };
-+    targets.into_iter().map(step).collect()
-+}
-+
-+/// A person's marks in the same comp: their eased form, from `targets` and how they were last drawn (all new on another
-+/// comp). `timeline`: the Timeline's, else the viewer's.
-+fn eased(person: &Presence, page: u64, timeline: bool, targets: Marks, (k, px, far): (f64, f64, f64), moving: &mut bool) -> Marks {
-+    SHOWN.with_borrow_mut(|shown| {
-+        let s = shown.entry(person.id.clone()).or_default();
-+        if s.page != page {
-+            *s = Shown { page, ..Shown::default() };
-+        }
-+        let marks = if timeline { &mut s.timeline } else { &mut s.viewer };
-+        *marks = ease(marks, targets, k, px, far, moving);
-+        marks.clone()
-+    })
-+}
-+
-+fn mark<'a>(marks: &'a Marks, name: &str) -> Option<&'a [f64]> {
-+    marks.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_slice())
-+}
-+
-+fn color(p: &Presence) -> Color32 {
-+    Color32::from_rgb(p.color[0], p.color[1], p.color[2])
-+}
-+
-+/// The others who show this comp, over its viewer, eased toward their latest presence: under their selected layers'
-+/// outlines the ghosts of the layers they drag where the drag has them so far, their paths being drawn and their
-+/// shape tools' rubber bands; then their pointers with their names, all in their colors. What doesn't resolve here
-+/// (another comp, a layer gone, a wild number) is skipped. Whether a mark is still on its way.
-+fn draw_viewer(app: &EffectcraftApp, painter: &egui::Painter, map: &ViewerMap, others: &[Presence], k: f64) -> bool {
-+    let Some((cid, comp)) = app.session.active_comp_id().and_then(|c| Some((c, app.session.project.comp(c)?))) else { return false };
++/// The others who show this comp, over its viewer, their moving marks eased toward their latest presence in comp pixels
++/// ([`presence::ease`]): under their selected layers' outlines ([`presence::outline_shape`]) the ghosts of the layers
++/// they drag where the drag has them so far ([`presence::ghost_shape`]), their paths being drawn and their shape tools'
++/// rubber bands (lines the presence look has none of, drawn here in its colors); then their pointers with their names
++/// ([`presence::cursor`]). What doesn't resolve here (another comp, a layer gone, a wild number) is skipped.
++fn draw_viewer(app: &EffectcraftApp, painter: &egui::Painter, map: &ViewerMap) {
++    let Some((cid, comp)) = app.session.active_comp_id().and_then(|c| Some((c, app.session.project.comp(c)?))) else { return };
 +    let ectx = EvalCtx { project: &app.session.project, comp_id: cid, comp, time: app.session.time(), expr: app.session.expr.as_deref(), footage: None };
-+    let pace = (k, f64::from(map.zoom), f64::from(map.area.width().max(map.area.height())) / 4.0);
-+    let screen = |c: &[f64]| map.to_screen([c[0], c[1]]);
-+    let (mut under, mut outlines, mut over, mut moving) = (vec![], vec![], vec![], false);
++    let ctx = painter.ctx();
++    // Points per comp pixel, and a jump wider than this goes at once.
++    let (px, far) = (f64::from(map.zoom), f64::from(map.area.width().max(map.area.height())) / 4.0);
++    let screen = |c: [f64; 2]| map.to_screen(c);
++    let others = presence::others();
++    let (mut outlines, mut pointers) = (vec![], vec![]);
 +    for p in others.iter().filter(|p| p.state["page"].as_u64() == Some(cid.0)) {
-+        let (color, state) = (color(p), &p.state);
-+        let mut targets: Marks = point(&state["pointer"]).map(|at| ("pointer".to_string(), at.to_vec())).into_iter().collect();
++        let (color, state) = (presence::color(p), &p.state);
 +        for g in list(&state["ghosts"], 50) {
 +            let id = g[0].as_u64().filter(|id| comp.layers.iter().any(|l| l.id.0 == *id));
-+            if let (Some(id), Some(at)) = (id, points(g, 1, 3, 16)) {
-+                targets.push((format!("ghost {id}"), at.concat()));
++            let (Some(id), Some(at)) = (id, points(g, 1, 3, 16)) else { continue };
++            // The corners ease; an outline of another number of corners starts over.
++            if let Some(at) = presence::ease_list(ctx, &p.id, &format!("ghost {id}"), at.as_flattened(), &[px], &[far]) {
++                presence::ghost_shape(painter, &at.chunks_exact(2).map(|c| screen([c[0], c[1]])).collect::<Vec<_>>(), color);
 +            }
 +        }
 +        // A path's newest point eases (an open one's: a closed path ends where it starts).
-+        let strokes: Vec<_> = list(&state["strokes"], 8).filter_map(|s| points(s, 0, 2, MAX_POINTS)).collect();
-+        for (i, s) in strokes.iter().enumerate().filter(|(_, s)| s.first() != s.last()) {
-+            targets.push((format!("stroke {i}"), s[s.len() - 1].to_vec()));
++        for (i, s) in list(&state["strokes"], 8).filter_map(|s| points(s, 0, 2, MAX_POINTS)).enumerate() {
++            let mut line: Vec<Pos2> = s.iter().map(|c| screen(*c)).collect();
++            let stroke = Stroke::new(2.0, color.gamma_multiply(0.7));
++            if s.first() == s.last() {
++                line.pop();
++                painter.add(Shape::closed_line(line, stroke));
++            } else {
++                if let (Some(end), Some(at)) = (line.last_mut(), presence::ease(ctx, &p.id, &format!("stroke {i}"), s[s.len() - 1], [px; 2], [far; 2])) {
++                    *end = screen(at);
++                }
++                painter.add(Shape::line(line, stroke));
++            }
 +        }
 +        let band = (state["band"].as_array()).and_then(|b| {
 +            let kind = BANDS.into_iter().find(|k| b.first().and_then(Value::as_str) == Some(*k))?;
 +            let [x, y, w, h] = [1, 2, 3, 4].map(|i| b.get(i).and_then(num));
 +            Some((kind, [x?, y?, w.filter(|w| (0.0..1e5).contains(w))?, h.filter(|h| (0.0..1e5).contains(h))?]))
 +        });
-+        if let Some((_, b)) = band {
-+            targets.push(("band".into(), b.to_vec()));
-+        }
-+        let marks = eased(p, cid.0, false, targets, pace, &mut moving);
-+        let (fill, edge) = (color.gamma_multiply(0.28), Stroke::new(1.5, color.gamma_multiply(0.85)));
-+        for (_, at) in marks.iter().filter(|(n, _)| n.starts_with("ghost ")) {
-+            under.push(Shape::convex_polygon(at.chunks(2).map(screen).collect(), fill, edge));
-+        }
-+        for (i, s) in strokes.iter().enumerate() {
-+            let mut line: Vec<Pos2> = s.iter().map(|c| map.to_screen(*c)).collect();
-+            let stroke = Stroke::new(2.0, color.gamma_multiply(0.7));
-+            if s.first() == s.last() {
-+                line.pop();
-+                under.push(Shape::closed_line(line, stroke));
-+            } else {
-+                if let (Some(end), Some(at)) = (line.last_mut(), mark(&marks, &format!("stroke {i}"))) {
-+                    *end = screen(at);
-+                }
-+                under.push(Shape::line(line, stroke));
-+            }
-+        }
-+        if let (Some((kind, _)), Some(b)) = (band, mark(&marks, "band"))
++        if let Some((kind, b)) = band
++            && let Some(b) = presence::ease(ctx, &p.id, "band", b, [px; 4], [far; 4])
 +            && let Some(sp) = mask_path(kind, [b[0], b[1]], [b[2], b[3]])
 +        {
 +            let mut line = flatten(&sp, &Mat3::IDENTITY, map);
@@ -426,42 +346,44 @@ index 0000000..0b8ccd4
 +            {
 +                line.push(first);
 +            }
-+            under.extend(Shape::dashed_line(&line, Stroke::new(1.5, color), 4.0, 3.0));
++            painter.extend(Shape::dashed_line(&line, Stroke::new(1.5, color), 4.0, 3.0));
 +        }
 +        for l in list(&state["selection"], 50).filter_map(|id| comp.layers.iter().find(|l| Some(l.id.0) == id.as_u64())) {
 +            let outline = layer_outline(&ectx, l);
 +            if outline.len() > 2 {
-+                outlines.push(Shape::closed_line(outline.iter().map(|c| map.to_screen(*c)).collect(), Stroke::new(2.0, color)));
++                outlines.push((outline.iter().map(|c| map.to_screen(*c)).collect::<Vec<_>>(), color));
 +            }
 +        }
-+        if let Some(at) = mark(&marks, "pointer") {
-+            cursor(painter, &mut over, screen(at), color, &p.name);
++        if let Some(at) = point(&state["pointer"]).and_then(|at| presence::ease(ctx, &p.id, "pointer", at, [px; 2], [far; 2])) {
++            pointers.push((screen(at), color, &p.name));
 +        }
 +    }
-+    painter.extend(under);
-+    painter.extend(outlines);
-+    painter.extend(over);
-+    moving
++    for (outline, color) in outlines {
++        presence::outline_shape(painter, &outline, color);
++    }
++    for (tip, color, name) in pointers {
++        presence::cursor(painter, tip, color, name);
++    }
 +}
 +
-+/// The others who show this comp, over the Timeline's time graph, eased toward their latest presence: the keyframes
-+/// they drag where the drag has them so far (on the property's row, or the layer's while its properties are folded)
-+/// and the current time they scrub, a line with a flag of their name on the ruler ([`cti`]), in their colors. Whether a
-+/// mark is still on its way.
-+fn draw_timeline(app: &EffectcraftApp, painter: &egui::Painter, others: &[Presence], k: f64) -> bool {
-+    let Some((cid, comp)) = app.session.active_comp_id().and_then(|c| Some((c, app.session.project.comp(c)?))) else { return false };
++/// The Timeline, right before it draws this person's CTI (`panels::timeline::show`), so that CTI stays on top: the
++/// others who show this comp, eased toward their latest presence ([`presence::ease`]): the keyframes they drag where the
++/// drag has them so far (on the property's row, or the layer's while its properties are folded: diamonds,
++/// [`presence::ghost_shape`]) and the current time they scrub ([`presence::playhead`], its flag on the ruler).
++pub fn timeline(app: &EffectcraftApp, ui: &egui::Ui) {
++    let Some((cid, comp)) = app.session.active_comp_id().and_then(|c| Some((c, app.session.project.comp(c)?))) else { return };
 +    // Where the Timeline put its ruler, rows and keys this frame (its automation ids) and its time mapping.
 +    let rect = |id: &str| app.auto.elements.iter().rev().find(|e| e.id == id).map(|e| Rect::from_min_size(pos2(e.rect[0], e.rect[1]), vec2(e.rect[2], e.rect[3])));
-+    let (Some(ruler), Some(rows)) = (rect("timeline.ruler"), rect("timeline.layerMarquee")) else { return false };
-+    let Some((x0, start, pps)) = painter.ctx().data(|d| d.get_temp::<(f32, f64, f64)>(egui::Id::new("timeline-map"))) else { return false };
++    let (Some(ruler), Some(rows)) = (rect("timeline.ruler"), rect("timeline.layerMarquee")) else { return };
++    let Some((x0, start, pps)) = ui.ctx().data(|d| d.get_temp::<(f32, f64, f64)>(egui::Id::new("timeline-map"))) else { return };
 +    let x = |secs: f64| x0 + ((secs - start) * pps) as f32;
-+    let painter = painter.with_clip_rect(Rect::from_x_y_ranges(ruler.x_range(), ruler.min.y..=rows.max.y).intersect(painter.clip_rect()));
++    let painter = ui.painter().with_clip_rect(Rect::from_x_y_ranges(ruler.x_range(), ruler.min.y..=rows.max.y).intersect(ui.clip_rect()));
 +    let key_rows = painter.clip_rect().intersect(Rect::from_x_y_ranges(ruler.x_range(), rows.y_range()));
-+    let pace = (k, pps, f64::from(ruler.width()) / 4.0);
-+    let (mut keys, mut lines, mut moving) = (vec![], vec![], false);
++    let far = f64::from(ruler.width()) / 4.0;
++    let others = presence::others();
++    let mut playheads = vec![];
 +    for p in others.iter().filter(|p| p.state["page"].as_u64() == Some(cid.0)) {
-+        let (color, state) = (color(p), &p.state);
-+        let mut targets: Marks = num(&state["time"]).map(|t| ("time".to_string(), vec![t])).into_iter().collect();
++        let (color, state) = (presence::color(p), &p.state);
 +        // A key on a layer and property of this comp: its row, by the property's or (folded) the layer's automation id.
 +        let row = |key: &Value| {
 +            let [layer, prop] = [0, 1].map(|i| key.get(i).and_then(Value::as_u64));
@@ -470,85 +392,22 @@ index 0000000..0b8ccd4
 +            let r = rect(&format!("timeline.prop.{prop}.row")).or_else(|| rect(&format!("timeline.layer.{}.row", l.id.0)))?;
 +            Some((format!("key {} {prop}", l.id.0), r.center().y))
 +        };
-+        let mut dragged = vec![];
-+        for (i, key) in list(&state["keys"], 50).enumerate() {
-+            if let (Some((name, y)), Some(t)) = (row(key), key.get(2).and_then(num)) {
-+                dragged.push((format!("{name} {i}"), y));
-+                targets.push((format!("{name} {i}"), vec![t]));
++        for (i, key) in list(&state["keys"], 50).enumerate().filter(|_| !app.ui.timeline.graph_editor) {
++            let (Some((name, y)), Some(t)) = (row(key), key.get(2).and_then(num)) else { continue };
++            let Some([t]) = presence::ease(ui.ctx(), &p.id, &format!("{name} {i}"), [t], [pps], [far]) else { continue };
++            let c = pos2(x(t), y);
++            if key_rows.contains(c) {
++                let diamond = vec![c - vec2(0.0, 5.5), c + vec2(5.5, 0.0), c + vec2(0.0, 5.5), c - vec2(5.5, 0.0)];
++                presence::ghost_shape(&painter, &diamond, color);
 +            }
 +        }
-+        let marks = eased(p, cid.0, true, targets, pace, &mut moving);
-+        if !app.ui.timeline.graph_editor {
-+            for (name, y) in dragged {
-+                let Some(&[t]) = mark(&marks, &name) else { continue };
-+                let c = pos2(x(t), y);
-+                if key_rows.contains(c) {
-+                    let diamond = vec![c - vec2(0.0, 5.5), c + vec2(5.5, 0.0), c + vec2(0.0, 5.5), c - vec2(5.5, 0.0)];
-+                    keys.push(Shape::convex_polygon(diamond, color.gamma_multiply(0.28), Stroke::new(1.5, color.gamma_multiply(0.85))));
-+                }
-+            }
-+        }
-+        if let Some(&[t]) = mark(&marks, "time") {
-+            cti(&painter, &mut lines, painter.round_to_pixel_center(x(t)), [ruler.min.y + 1.0, rows.max.y], ruler.max.x, color, &p.name);
++        if let Some([t]) = num(&state["time"]).and_then(|t| presence::ease(ui.ctx(), &p.id, "time", [t], [pps], [far])) {
++            playheads.push((x(t), color, &p.name));
 +        }
 +    }
-+    painter.extend(keys);
-+    painter.extend(lines);
-+    moving
-+}
-+
-+/// A person's pointer at `tip`: an arrow in their color with a white edge over a soft shadow, and their name on a tag
-+/// of their color in white or (a light color) near-black.
-+fn cursor(painter: &egui::Painter, shapes: &mut Vec<Shape>, tip: Pos2, color: Color32, name: &str) {
-+    const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
-+    let tip = pos2(painter.round_to_pixel_center(tip.x), painter.round_to_pixel_center(tip.y));
-+    let arrow = |dy: f32| ARROW.iter().map(|[x, y]| tip + vec2(*x, *y + dy)).collect();
-+    // The fan from the tip fills this (concave) arrow exactly: its corners go round the tip in order.
-+    shapes.push(Shape::convex_polygon(arrow(1.0), Color32::from_black_alpha(64), Stroke::NONE));
-+    shapes.push(Shape::convex_polygon(arrow(0.0), color, Stroke::new(1.5, Color32::WHITE)));
-+    if name.is_empty() {
-+        return;
++    for (at, color, name) in playheads {
++        presence::playhead(&painter, at, [ruler.min.y + 1.0, rows.max.y], ruler.max.x, color, name);
 +    }
-+    let text = tag_text(painter, name, color);
-+    let tag = Rect::from_min_size(tip + vec2(12.0, 15.0), text.size() + 2.0 * PAD);
-+    shapes.push(Shape::rect_filled(tag, 6.0, color));
-+    shapes.push(Shape::galley(tag.min + PAD, text, color));
-+}
-+
-+/// The space around a name tag's text.
-+const PAD: egui::Vec2 = vec2(7.0, 3.0);
-+
-+/// A name tag's text: the name cut to 24 characters, 12 px semibold, white or (on a light `color`) near-black.
-+fn tag_text(painter: &egui::Painter, name: &str, color: Color32) -> Arc<egui::Galley> {
-+    let name: String = if name.chars().count() > 24 { name.chars().take(23).chain(['…']).collect() } else { name.into() };
-+    let ink = if luminance(color) > 0.55 { Color32::from_rgb(0x11, 0x11, 0x11) } else { Color32::WHITE };
-+    painter.layout_no_wrap(name, Tokens::semibold(12.0), ink)
-+}
-+
-+/// Another person's current time at `x` (a pixel centre), from `top` to `bottom`: a line 1.5 px wide in 85% of their
-+/// color, and at its top a flag with their name in the tag's look, hanging right of the line (flush with its left edge)
-+/// or, where it would pass `right`, left of it; square where it meets the line.
-+fn cti(painter: &egui::Painter, shapes: &mut Vec<Shape>, x: f32, [top, bottom]: [f32; 2], right: f32, color: Color32, name: &str) {
-+    shapes.push(Shape::line_segment([pos2(x, top), pos2(x, bottom)], Stroke::new(1.5, color.gamma_multiply(0.85))));
-+    if name.is_empty() {
-+        return;
-+    }
-+    let text = tag_text(painter, name, color);
-+    let size = text.size() + 2.0 * PAD;
-+    let left = x + size.x > right;
-+    let flag = Rect::from_min_size(pos2(if left { x + 0.75 - size.x } else { x - 0.75 }, top), size).round_to_pixels(painter.pixels_per_point());
-+    let corners = if left { egui::CornerRadius { ne: 0, ..egui::CornerRadius::same(6) } } else { egui::CornerRadius { nw: 0, ..egui::CornerRadius::same(6) } };
-+    shapes.push(Shape::rect_filled(flag, corners, color));
-+    shapes.push(Shape::galley(flag.min + PAD, text, color));
-+}
-+
-+/// A color's relative luminance (sRGB, 0 black to 1 white).
-+fn luminance(c: Color32) -> f32 {
-+    let lin = |v: u8| {
-+        let v = f32::from(v) / 255.0;
-+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-+    };
-+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
 +}
 +
 +/// A number from someone else's presence: finite and within reach of any comp or time.
@@ -916,7 +775,7 @@ index 0000000..0b8ccd4
 +
 +    fn live_quiet(&self) -> bool {
 +        // A dialog may hold a preview it takes back on Cancel (Layer Styles); on-canvas text is being typed.
-+        !INPUT.get() && self.dialog.is_none() && self.session.state.text_edit.is_none()
++        presence::quiet() && self.dialog.is_none() && self.session.state.text_edit.is_none()
 +    }
 +
 +    fn live_generation(&self) -> Option<u64> {
@@ -938,8 +797,7 @@ index 0000000..0b8ccd4
 +    }
 +
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        SHOWN.with_borrow_mut(|shown| shown.retain(|id, _| others.iter().any(|p| p.id == *id)));
-+        OTHERS.set(others);
++        presence::show(others);
 +    }
 +
 +    /// Undo steps from the session hold other people's edits: native Undo starts again from here.

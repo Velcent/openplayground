@@ -419,10 +419,10 @@ index 0000000..f4394fb
 +}
 diff --git a/crates/model/src/playground.rs b/crates/model/src/playground.rs
 new file mode 100644
-index 0000000..295f3b0
+index 0000000..c04b1f8
 --- /dev/null
 +++ b/crates/model/src/playground.rs
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,281 @@
 +// SPDX-License-Identifier: MIT OR Apache-2.0
 +//! NoteCraft's browser build in Playground (patches/onenote.yaml in github.com/daijro/openplayground).
 +//! wasm32-unknown-unknown has no files and no clock, so the modules that use them take `std` from here instead (one
@@ -686,6 +686,10 @@ index 0000000..295f3b0
 +            }
 +            pub fn metadata(&self) -> io::Result<Metadata> {
 +                metadata(&self.0)
++            }
++            /// What it is (is_dir, is_file), as its metadata says.
++            pub fn file_type(&self) -> io::Result<Metadata> {
++                self.metadata()
 +            }
 +        }
 +

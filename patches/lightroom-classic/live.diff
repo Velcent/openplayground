@@ -1,9 +1,9 @@
 diff --git a/apps/web/src/live.rs b/apps/web/src/live.rs
 new file mode 100644
-index 0000000..cc08f1d
+index 0000000..811973d
 --- /dev/null
 +++ b/apps/web/src/live.rs
-@@ -0,0 +1,1360 @@
+@@ -0,0 +1,1287 @@
 +//! Playground live editing (`playground_live`): the shared document is the library's catalog as JSON (every photo's
 +//! develop settings, History, Versions, rating, flag, label and metadata; collections including saved Book, Print,
 +//! Slideshow and Web creations, stacks, the keyword list, folder labels, the Map's saved locations), without what only
@@ -14,7 +14,9 @@ index 0000000..cc08f1d
 +//! Each person sees the others' selections outlined on grid and filmstrip cells and their pointer over a photo both
 +//! have open, in their color with their name; and their gestures as they happen (a slider's value, the crop box, brush
 +//! and spot strokes, a straighten line, photos dragged to a collection, text typed into a metadata field), until the
-+//! change itself arrives on release.
++//! change itself arrives on release. Pointers, name and value tags, outlines, ghosts (the crop box's too), colors and
++//! easing are the presence look of the playground-live crate (patches/live/kit); strokes, straighten lines and a
++//! slider's ghost thumb are drawn here in its colors.
 +//!
 +//! Everything lives in new files: this one, `live_web.rs` (the host's side, a child of `web`) and a `live` module in
 +//! the catalog, engine and UI crates. Playground's patches/lightroom-classic.yaml adds the one-line calls into them.
@@ -29,15 +31,34 @@ index 0000000..cc08f1d
 +use lcc_ui_egui::panels::detail::Gesture;
 +use lcc_ui_egui::state::ViewMode;
 +use lcc_ui_egui::{CommandError, LccApp};
-+use playground_live::{Live, Presence};
++use playground_live::{Live, Presence, presence};
 +use serde::Deserialize as _;
 +use serde_json::{Value, json};
 +use std::cell::{Cell, RefCell};
-+use std::collections::{BTreeMap, BTreeSet, HashSet};
++use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 +
-+#[path = "playground_live.rs"]
-+#[allow(dead_code)]
-+mod playground_live;
++/// What holds the app: the web app (live_web.rs) and, in the native tests, the app itself.
++pub trait Host {
++    fn app(&self) -> &LccApp;
++    fn app_mut(&mut self) -> &mut LccApp;
++}
++
++/// The app as the session sees it: [`Live`] is the playground-live crate's and LccApp the UI crate's, so the trait goes
++/// on this, around what holds the app, which it reaches through.
++pub struct Peer<H>(pub H);
++
++impl<H: Host> std::ops::Deref for Peer<H> {
++    type Target = LccApp;
++    fn deref(&self) -> &LccApp {
++        self.0.app()
++    }
++}
++
++impl<H: Host> std::ops::DerefMut for Peer<H> {
++    fn deref_mut(&mut self) -> &mut LccApp {
++        self.0.app_mut()
++    }
++}
 +
 +#[cfg_attr(test, allow(dead_code))]
 +pub const FORMAT: &str = concat!("lightroom-classic:1:", env!("CARGO_PKG_VERSION"));
@@ -53,9 +74,6 @@ index 0000000..cc08f1d
 +}
 +
 +thread_local! {
-+    static POINTER_DOWN: Cell<bool> = const { Cell::new(false) };
-+    /// A text field has the keyboard (a focused slider or button is no edit under way).
-+    static TYPING: Cell<bool> = const { Cell::new(false) };
 +    static MEDIA: RefCell<Media> = RefCell::default();
 +    /// An original arrived from the session since the last frame.
 +    static ARRIVED: Cell<bool> = const { Cell::new(false) };
@@ -69,8 +87,8 @@ index 0000000..cc08f1d
 +    static DROP: Cell<Option<u64>> = const { Cell::new(None) };
 +    /// The metadata field this person is typing into (the Metadata panel's), and its text so far.
 +    static TYPED: RefCell<Option<(&'static str, String)>> = const { RefCell::new(None) };
-+    /// The others in the session, as the shell last gave them, with their marks as this person last drew them.
-+    static OTHERS: RefCell<Vec<(Presence, Shown)>> = const { RefCell::new(Vec::new()) };
++    /// The others' strokes as this person last drew them, by person.
++    static TRAILS: RefCell<HashMap<String, Trail>> = RefCell::default();
 +    /// Others' changes are being merged into this person's work (the end of a frame), and one of them conflicted.
 +    static MERGING: Cell<bool> = const { Cell::new(false) };
 +    static CONFLICTED: Cell<bool> = const { Cell::new(false) };
@@ -86,9 +104,6 @@ index 0000000..cc08f1d
 +/// and saves it on Return or leaving).
 +const META_FIELDS: [&str; 12] =
 +    ["title", "caption", "altText", "extendedDescription", "copyright", "usageTerms", "copyrightUrl", "creator", "location", "city", "state", "country"];
-+
-+/// How long the others' marks take to go most (1 - 1/e) of the way to their latest place, in seconds.
-+const EASE: f64 = 0.08;
 +
 +/// The shared photo this person has open (the loupe, in Library or Develop).
 +fn open_photo(app: &LccApp) -> Option<PhotoId> {
@@ -213,13 +228,10 @@ index 0000000..cc08f1d
 +/// Points of someone's stroke kept at most (a longer one starts again from its newest).
 +const MAX_SHOWN_STROKE: usize = 10_000;
 +
-+/// Another person's moving marks as this person last drew them, eased toward their latest presence in the photo's
-+/// normalized coordinates (so this person's own zooming and panning never lag them): the pointer and the crop box's
-+/// corners; and a stroke, whose points show one after the other as they come.
++/// Another person's stroke as this person last drew it, in the photo's normalized coordinates (so this person's own
++/// zooming and panning never lag it): its points show one after the other as they come, eased like the others' marks.
 +#[derive(Default)]
-+struct Shown {
-+    pointer: Option<[f64; 2]>,
-+    crop: Option<[f64; 8]>,
++struct Trail {
 +    /// The stroke's points so far, and how many of them show (a fraction is that far toward the next).
 +    stroke: Vec<[f64; 2]>,
 +    reveal: f64,
@@ -232,14 +244,11 @@ index 0000000..cc08f1d
 +    painted: Option<Painted>,
 +}
 +
-+impl Shown {
-+    /// `dt` seconds on toward the pointer and crop box of `to`, and toward the end of `stroke` (its newest points);
-+    /// `px`: points a normalized unit across and down; `far`: a quarter of the canvas, past which a mark goes at once (as
-+    /// it does when first seen, and as a stroke first seen shows whole). Whether a mark is still on its way.
-+    fn step(&mut self, to: Shown, stroke: &[[f64; 2]], dt: f32, [x, y]: [f64; 2], [fx, fy]: [f64; 2]) -> bool {
-+        let k = 1.0 - (-f64::from(dt.clamp(0.0, 0.1)) / EASE).exp();
-+        let moving = ease_to(&mut self.pointer, to.pointer, k, [x, y], [fx, fy]);
-+        let moving = ease_to(&mut self.crop, to.crop, k, [x, y, x, y, x, y, x, y], [fx, fy, fx, fy, fx, fy, fx, fy]) | moving;
++impl Trail {
++    /// `dt` seconds on toward the end of `stroke` (its newest points; a stroke first seen shows whole). Whether it is
++    /// still on its way.
++    fn step(&mut self, stroke: &[[f64; 2]], dt: f32) -> bool {
++        let k = 1.0 - (-f64::from(dt.clamp(0.0, 0.1)) / presence::EASE).exp();
 +        // the points after the last one this person has (the same numbers come again until they drop off the front)
 +        match self.stroke.last().and_then(|last| stroke.iter().rposition(|p| p == last)) {
 +            Some(i) if self.stroke.len() < MAX_SHOWN_STROKE => self.stroke.extend_from_slice(&stroke[i + 1..]),
@@ -253,35 +262,8 @@ index 0000000..cc08f1d
 +        if n - self.reveal < 0.05 {
 +            self.reveal = n;
 +        }
-+        moving | (self.reveal < n)
++        self.reveal < n
 +    }
-+}
-+
-+/// [`ease`], where a mark that was not there or is gone goes at once.
-+fn ease_to<const N: usize>(s: &mut Option<[f64; N]>, t: Option<[f64; N]>, k: f64, px: [f64; N], far: [f64; N]) -> bool {
-+    if let (Some(s), Some(t)) = (s.as_mut(), t) {
-+        return ease(s, t, k, px, far);
-+    }
-+    *s = t;
-+    false
-+}
-+
-+/// `s` moved `k` of the way to `t`; all of it after a jump wider than `far` points on an axis, or once under half a
-+/// point remains (`px`: points a unit). Whether it is still on its way.
-+fn ease<const N: usize>(s: &mut [f64; N], t: [f64; N], k: f64, px: [f64; N], far: [f64; N]) -> bool {
-+    let off = |s: &[f64; N], i: usize| ((t[i] - s[i]) * px[i]).abs();
-+    if (0..N).any(|i| !(off(s, i) <= far[i])) {
-+        *s = t;
-+        return false;
-+    }
-+    for i in 0..N {
-+        s[i] += (t[i] - s[i]) * k;
-+    }
-+    let moving = (0..N).any(|i| off(s, i) >= 0.5);
-+    if !moving {
-+        *s = t;
-+    }
-+    moving
 +}
 +
 +/// A normalized point from someone else's presence: two finite numbers near the photo, else nothing.
@@ -298,19 +280,21 @@ index 0000000..cc08f1d
 +}
 +
 +/// The end of a frame in the browser: notes where this person points on the open photo (and the collection row under
-+/// photos being dragged, and the metadata field being typed into), draws the others over the app, then [`frame`].
++/// photos being dragged, and the metadata field being typed into), draws the others over the app (name tags in the
++/// app's 12 px semibold), ends the presence look's frame, then [`frame`].
 +#[cfg(target_arch = "wasm32")]
-+pub fn end_frame(app: &mut LccApp, ctx: &egui::Context) {
-+    let (down, at) = ctx.input(|i| (i.pointer.any_down(), i.pointer.hover_pos()));
-+    TYPING.set(ctx.text_edit_focused());
++pub fn end_frame(app: &mut Peer<impl Host>, ctx: &egui::Context) {
++    let at = ctx.input(|i| i.pointer.hover_pos());
 +    let over_canvas = at.filter(|p| app.canvas_rect.is_some_and(|c| c.contains(*p)));
 +    POINTER.set(Loupe::of(app).zip(over_canvas).map(|(l, p)| l.norm(p.x, p.y).map(round)));
 +    let album = |p: egui::Pos2| app.widgets.iter().filter(|(_, r)| r.contains(p)).find_map(|(k, _)| k.strip_prefix("source:album:")?.parse().ok());
 +    DROP.set(app.ui.dragging_photos.as_ref().and(at).and_then(album));
 +    let draft = |key: &'static str| ctx.data(|d| d.get_temp::<String>(egui::Id::new(("info-field", key)))).map(|text| (key, text));
 +    TYPED.set(META_FIELDS.into_iter().find_map(draft));
++    presence::set_font(lcc_ui_egui::theme::Tokens::get(ctx).semibold(12.0));
 +    show_others(app, ctx);
-+    frame(app, down);
++    presence::end_frame(ctx);
++    frame(app);
 +    if CONFLICTED.take() {
 +        app.toast_error(ctx, "Someone else changed the same setting at the same time: your edit is kept as a draft (Share)");
 +    }
@@ -322,81 +306,86 @@ index 0000000..cc08f1d
 +/// tags (a slider's value beside this person's own slider, the collection photos are dragged to).
 +#[cfg(target_arch = "wasm32")]
 +fn show_others(app: &LccApp, ctx: &egui::Context) {
-+    use egui::{Color32, Pos2, Shape, Stroke, StrokeKind, vec2};
++    use egui::{Pos2, Shape, Stroke, vec2};
 +    // over the panels, under menus and windows
 +    let painter = ctx.layer_painter(egui::LayerId::background());
 +    let ids = |v: &Value| v.as_array().into_iter().flatten().take(MAX_SELECTION).filter_map(Value::as_u64).collect::<HashSet<u64>>();
-+    let color = |o: &Presence| Color32::from_rgb(o.color[0], o.color[1], o.color[2]);
 +    let (loupe, canvas, image) = (Loupe::of(app), app.canvas_rect, app.image_rect);
 +    let on = |l: Loupe, n: [f64; 2]| Pos2::from(l.screen(n));
-+    let ghost = |c: Color32| (c.gamma_multiply(0.28), Stroke::new(1.5, c.gamma_multiply(0.85)));
 +    let dt = ctx.input(|i| i.stable_dt);
-+    let mut moving = false;
-+    OTHERS.with_borrow_mut(|others| {
-+        for (o, shown) in others.iter_mut() {
-+            let (c, s) = (color(o), &o.state);
++    let others = presence::others();
++    // each one's pointer on the photo this person has open, eased once a frame (the straighten line ends at it)
++    let mut pointers = Vec::new();
++    TRAILS.with_borrow_mut(|trails| {
++        trails.retain(|id, _| others.iter().any(|o| o.id == *id));
++        for o in &others {
++            let (c, s) = (presence::color(o), &o.state);
 +            for id in ids(&s["drag"]["photos"]) {
 +                for (r, visible) in cells(app, id) {
-+                    let (fill, edge) = ghost(c);
-+                    painter.with_clip_rect(visible).rect(r, 0.0, fill, edge, StrokeKind::Inside);
++                    presence::ghost(&painter.with_clip_rect(visible), r, c);
 +                }
 +            }
 +            let (Some(l), Some(canvas)) = (loupe.filter(|l| s["page"].as_u64() == Some(l.photo.0)), canvas) else {
-+                *shown = Shown::default();
++                trails.remove(&o.id);
++                pointers.push(None);
 +                continue;
 +            };
-+            let stroke: Vec<[f64; 2]> = s["stroke"]["points"].as_array().into_iter().flatten().take(MAX_STROKE).filter_map(point).collect();
-+            let to = Shown { pointer: point(&s["pointer"]), crop: quad(&s["crop"]), ..Shown::default() };
++            // points a normalized unit across and down; a quarter of the canvas, past which a mark goes at once
 +            let (o0, o1, o2) = (on(l, [0.0, 0.0]), on(l, [1.0, 0.0]), on(l, [0.0, 1.0]));
-+            let px = [o0.distance(o1).into(), o0.distance(o2).into()];
-+            moving |= shown.step(to, &stroke, dt, px, [f64::from(canvas.width() / 4.0), f64::from(canvas.height() / 4.0)]);
++            let px: [f64; 2] = [o0.distance(o1).into(), o0.distance(o2).into()];
++            let far = [f64::from(canvas.width() / 4.0), f64::from(canvas.height() / 4.0)];
++            let pointer = point(&s["pointer"]).and_then(|t| presence::ease(ctx, &o.id, "pointer", t, px, far));
++            pointers.push(pointer.map(|n| on(l, n)));
 +            let p = painter.with_clip_rect(canvas);
-+            if let Some(q) = shown.crop {
-+                let (fill, edge) = ghost(c);
-+                p.add(Shape::convex_polygon(q.chunks_exact(2).map(|n| on(l, [n[0], n[1]])).collect(), fill, edge));
++            let xy = |v: [f64; 2]| std::array::from_fn(|i| v[i % 2]);
++            if let Some(q) = quad(&s["crop"]).and_then(|t| presence::ease(ctx, &o.id, "crop", t, xy(px), xy(far))) {
++                let corners: Vec<Pos2> = q.chunks_exact(2).map(|n| on(l, [n[0], n[1]])).collect();
++                presence::ghost_shape(&p, &corners, c);
 +            }
-+            if !shown.stroke.is_empty() {
++            let stroke: Vec<[f64; 2]> = s["stroke"]["points"].as_array().into_iter().flatten().take(MAX_STROKE).filter_map(point).collect();
++            let trail = trails.entry(o.id.clone()).or_default();
++            if trail.step(&stroke, dt) {
++                presence::keep_moving();
++            }
++            if !trail.stroke.is_empty() {
 +                // the brush's radius on this person's photo, a fraction of its long edge as for the drawer
 +                let long = image.map_or(0.0, |r| r.width().max(r.height()));
 +                let r = (s["stroke"]["size"].as_f64().filter(|v| v.is_finite()).unwrap_or(0.0).clamp(0.0, 1.0) as f32 * long).max(1.0);
-+                live_stroke(ctx, &p, shown, l, canvas, r, o.color);
++                live_stroke(ctx, &p, trail, l, canvas, r, o.color);
 +            }
-+            if let (Some(a), Some(b)) = (point(&s["line"]), shown.pointer) {
++            if let (Some(a), Some(b)) = (point(&s["line"]), pointer) {
 +                p.extend(Shape::dashed_line(&[on(l, a), on(l, b)], Stroke::new(1.5, c), 4.0, 3.0));
 +            }
 +        }
-+        for (i, (o, _)) in others.iter().enumerate() {
-+            let (c, s) = (color(o), &o.state);
-+            for id in ids(&s["selection"]) {
-+                for (r, visible) in cells(app, id) {
-+                    // one inside the other when several people select the same photo
-+                    let inner = r.shrink(1.0 + 3.0 * i.min(8) as f32);
-+                    let p = painter.with_clip_rect(visible);
-+                    p.rect_stroke(inner, 0.0, Stroke::new(2.0, c), StrokeKind::Inside);
-+                    tag(&p, inner.min + vec2(3.0, 3.0), &o.name, c);
-+                }
-+            }
-+            if let Some((row, panel)) = drop_row(app, ctx, s) {
-+                painter.with_clip_rect(panel).rect_stroke(row.shrink2(vec2(8.0, 1.0)), 4.0, Stroke::new(2.0, c), StrokeKind::Inside);
-+            }
-+        }
-+        for (o, shown) in others.iter() {
-+            let (c, s) = (color(o), &o.state);
-+            let here = loupe.filter(|l| s["page"].as_u64() == Some(l.photo.0));
-+            if let (Some(l), Some(canvas), Some(tip)) = (here, canvas, shown.pointer)
-+                && canvas.contains(on(l, tip))
-+            {
-+                cursor(&painter.with_clip_rect(canvas), on(l, tip), c, &o.name);
-+            }
-+            if let Some((row, panel)) = drop_row(app, ctx, s) {
-+                let n = ids(&s["drag"]["photos"]).len();
-+                beside(&painter, row, panel, canvas, &format!("{n} photo{}", if n == 1 { "" } else { "s" }), c);
-+            }
-+            editing(app, &painter, s, c, here.and(image));
-+        }
 +    });
-+    if moving {
-+        ctx.request_repaint();
++    for (i, o) in others.iter().enumerate() {
++        let (c, s) = (presence::color(o), &o.state);
++        for id in ids(&s["selection"]) {
++            for (r, visible) in cells(app, id) {
++                // one inside the other when several people select the same photo
++                let inner = r.shrink(1.0 + 3.0 * i.min(8) as f32);
++                let p = painter.with_clip_rect(visible);
++                presence::outline(&p, inner, c);
++                presence::tag(&p, inner.min + vec2(3.0, 3.0), c, &o.name);
++            }
++        }
++        if let Some((row, panel)) = drop_row(app, ctx, s) {
++            presence::outline(&painter.with_clip_rect(panel), row.shrink2(vec2(8.0, 1.0)), c);
++        }
++    }
++    for (o, tip) in others.iter().zip(pointers) {
++        let (c, s) = (presence::color(o), &o.state);
++        if let (Some(canvas), Some(tip)) = (canvas, tip)
++            && canvas.contains(tip)
++        {
++            presence::cursor(&painter.with_clip_rect(canvas), tip, c, &o.name);
++        }
++        if let Some((row, panel)) = drop_row(app, ctx, s) {
++            let n = ids(&s["drag"]["photos"]).len();
++            beside(&painter, row, panel, canvas, &format!("{n} photo{}", if n == 1 { "" } else { "s" }), c);
++        }
++        let here = loupe.filter(|l| s["page"].as_u64() == Some(l.photo.0));
++        editing(app, &painter, s, c, here.and(image));
 +    }
 +}
 +
@@ -490,7 +479,7 @@ index 0000000..cc08f1d
 +        return Some(anchor);
 +    }
 +    if elsewhere && let Some((r, visible)) = image.map(|r| (r, r)).or_else(|| cells(app, photo).next()) {
-+        tag(&painter.with_clip_rect(visible), egui::pos2(r.left() + 8.0, r.bottom() - 8.0 - tag_size(painter, text).y), text, c);
++        presence::label(&painter.with_clip_rect(visible), egui::pos2(r.left() + 8.0, r.bottom() - 8.0 - presence::label_size(painter, text).y), c, text);
 +    }
 +    None
 +}
@@ -498,16 +487,16 @@ index 0000000..cc08f1d
 +/// A tag beside `anchor` (vertically centred on it), just outside `panel` on the side toward the canvas.
 +#[cfg(target_arch = "wasm32")]
 +fn beside(painter: &egui::Painter, anchor: egui::Rect, panel: egui::Rect, canvas: Option<egui::Rect>, text: &str, color: egui::Color32) {
-+    let size = tag_size(painter, text);
++    let size = presence::label_size(painter, text);
 +    let left = canvas.is_none_or(|c| panel.center().x > c.center().x);
 +    let x = if left { panel.left() - 8.0 - size.x } else { panel.right() + 8.0 };
-+    tag(painter, egui::pos2(x, anchor.center().y - size.y / 2.0), text, color);
++    presence::label(painter, egui::pos2(x, anchor.center().y - size.y / 2.0), color, text);
 +}
 +
 +/// Someone's stroke as far as it shows (`shown`), on photo `l` in this person's `canvas`, as a disc of radius `r`
 +/// (points) all along it in their `color`. Only what is new is painted each frame; a new view paints it again.
 +#[cfg(target_arch = "wasm32")]
-+fn live_stroke(ctx: &egui::Context, painter: &egui::Painter, shown: &mut Shown, l: Loupe, canvas: egui::Rect, r: f32, color: [u8; 3]) {
++fn live_stroke(ctx: &egui::Context, painter: &egui::Painter, shown: &mut Trail, l: Loupe, canvas: egui::Rect, r: f32, color: [u8; 3]) {
 +    if shown.view != l.to_norm {
 +        (shown.view, shown.fed, shown.fed_whole) = (l.to_norm, Vec::new(), 0);
 +    }
@@ -530,7 +519,7 @@ index 0000000..cc08f1d
 +    }
 +    let Some(p) = shown.painted.as_mut() else { return };
 +    if p.stamp(&shown.fed) {
-+        ctx.request_repaint();
++        presence::keep_moving();
 +    }
 +    p.show(ctx, painter);
 +}
@@ -613,71 +602,8 @@ index 0000000..cc08f1d
 +    }
 +}
 +
-+/// The pointer arrow, tip at (0, 0), in points; and the triangles that fill it.
-+#[cfg(target_arch = "wasm32")]
-+const ARROW: [[f32; 2]; 7] = [[0.0, 0.0], [0.0, 16.0], [4.5, 12.2], [7.6, 18.6], [10.4, 17.3], [7.3, 11.0], [12.5, 11.0]];
-+#[cfg(target_arch = "wasm32")]
-+const ARROW_FILL: [[u32; 3]; 5] = [[0, 1, 2], [0, 2, 5], [0, 5, 6], [2, 3, 4], [2, 4, 5]];
-+
-+/// Another person's pointer at `tip`: an arrow in their color with a white edge and a soft shadow, and a tag with their
-+/// name.
-+#[cfg(target_arch = "wasm32")]
-+fn cursor(painter: &egui::Painter, tip: egui::Pos2, color: egui::Color32, name: &str) {
-+    use egui::{Color32, Shape, Stroke, Vec2, epaint::Mesh, vec2};
-+    let arrow = |offset: Vec2, fill: Color32| {
-+        let at = ARROW.map(|[x, y]| tip + offset + vec2(x, y));
-+        let mut mesh = Mesh::default();
-+        at.into_iter().for_each(|p| mesh.colored_vertex(p, fill));
-+        ARROW_FILL.into_iter().for_each(|[a, b, c]| mesh.add_triangle(a, b, c));
-+        (mesh, at.to_vec())
-+    };
-+    let shadow = Color32::from_black_alpha(64);
-+    let (mesh, at) = arrow(vec2(0.0, 1.0), shadow);
-+    painter.add(mesh);
-+    painter.add(Shape::closed_line(at, Stroke::new(1.5, shadow)));
-+    let (mesh, at) = arrow(Vec2::ZERO, color);
-+    painter.add(mesh);
-+    painter.add(Shape::closed_line(at, Stroke::new(1.5, Color32::WHITE)));
-+    if !name.is_empty() {
-+        let name: String = match name.chars().count() > 24 {
-+            true => name.chars().take(23).chain(['…']).collect(),
-+            false => name.to_owned(),
-+        };
-+        tag(painter, tip + vec2(12.0, 15.0), &name, color);
-+    }
-+}
-+
-+/// Inside a tag, in points.
-+#[cfg(target_arch = "wasm32")]
-+const TAG_PAD: egui::Vec2 = egui::vec2(7.0, 3.0);
-+
-+/// A tag's text: 12 points semibold, white, or near black on a light color.
-+#[cfg(target_arch = "wasm32")]
-+fn tag_text(painter: &egui::Painter, text: &str, color: egui::Color32) -> std::sync::Arc<egui::Galley> {
-+    let l = egui::Rgba::from(color);
-+    let ink = if 0.2126 * l.r() + 0.7152 * l.g() + 0.0722 * l.b() > 0.55 { egui::Color32::from_gray(0x11) } else { egui::Color32::WHITE };
-+    let font = lcc_ui_egui::theme::Tokens::get(painter.ctx()).semibold(12.0);
-+    painter.layout_no_wrap(text.to_owned(), font, ink)
-+}
-+
-+#[cfg(target_arch = "wasm32")]
-+fn tag_size(painter: &egui::Painter, text: &str) -> egui::Vec2 {
-+    tag_text(painter, text, egui::Color32::BLACK).size() + 2.0 * TAG_PAD
-+}
-+
-+/// A name or value tag in `color`, its top left at `at`.
-+#[cfg(target_arch = "wasm32")]
-+fn tag(painter: &egui::Painter, at: egui::Pos2, text: &str, color: egui::Color32) {
-+    use egui::emath::GuiRounding as _;
-+    let galley = tag_text(painter, text, color);
-+    let r = egui::Rect::from_min_size(at.round_to_pixels(painter.pixels_per_point()), galley.size() + 2.0 * TAG_PAD);
-+    painter.rect_filled(r, 6.0, color);
-+    painter.galley(r.min + TAG_PAD, galley, color);
-+}
-+
 +/// The end of a frame.
-+pub fn frame(app: &mut LccApp, pointer_down: bool) {
-+    POINTER_DOWN.set(pointer_down);
++pub fn frame(app: &mut Peer<impl Host>) {
 +    if ARRIVED.take() {
 +        // failed renders are retried once the catalog changes (as after a relink); the document itself stays as it is
 +        app.session.catalog.revision = app.session.catalog.revision.wrapping_add(1);
@@ -813,8 +739,8 @@ index 0000000..cc08f1d
 +
 +/// Offers live editing to the Playground shell (nothing happens until it connects), once the stored originals are known.
 +#[cfg(target_arch = "wasm32")]
-+pub async fn attach(
-+    with_app: impl Fn(&mut dyn FnMut(&mut LccApp)) -> bool + 'static,
++pub async fn attach<H: Host + 'static>(
++    with_app: impl Fn(&mut dyn FnMut(&mut Peer<H>)) -> bool + 'static,
 +    repaint: impl Fn() + 'static,
 +    (originals, backend): (Originals, Option<crate::backend::Backend>),
 +) {
@@ -828,7 +754,7 @@ index 0000000..cc08f1d
 +    MEDIA.set(Media { originals: originals.clone(), stored: stored.map(|s| s.into_iter().collect()) });
 +    let _ = lcc_engine::catalog::live::FRESH_ID.set(playground_live::fresh_id);
 +    let _ = lcc_ui_egui::live::COMMAND.set(command);
-+    if let Err(e) = playground_live::web::attach::<LccApp>(FORMAT, with_app, repaint).and_then(|()| media(originals, backend)) {
++    if let Err(e) = playground_live::web::attach::<Peer<H>>(FORMAT, with_app, repaint).and_then(|()| media(originals, backend)) {
 +        log::error!("live editing unavailable: {e:?}");
 +    }
 +}
@@ -938,7 +864,7 @@ index 0000000..cc08f1d
 +    }
 +}
 +
-+impl Live for LccApp {
++impl<H: Host> Live for Peer<H> {
 +    const COUNTERS: &'static [&'static str] = &["next_photo", "next_album", "next_stack"];
 +
 +    fn live_document(&self) -> Value {
@@ -1019,8 +945,7 @@ index 0000000..cc08f1d
 +    }
 +
 +    fn live_quiet(&self) -> bool {
-+        !POINTER_DOWN.get()
-+            && !TYPING.get()
++        presence::quiet()
 +            && self.session.interaction.is_none()
 +            && self.gesture.is_none()
 +            && self.brush_live.is_none()
@@ -1088,18 +1013,8 @@ index 0000000..cc08f1d
 +        state
 +    }
 +
-+    /// Someone still on the same photo (or the library) keeps their marks where this person drew them, to ease on from
-+    /// there.
 +    fn live_show_presence(&mut self, others: Vec<Presence>) {
-+        OTHERS.with_borrow_mut(|old| {
-+            let mut new: Vec<(Presence, Shown)> = others.into_iter().map(|o| (o, Shown::default())).collect();
-+            for (o, shown) in &mut new {
-+                if let Some(was) = old.iter_mut().find(|(w, _)| w.id == o.id && w.state["page"] == o.state["page"]) {
-+                    *shown = std::mem::take(&mut was.1);
-+                }
-+            }
-+            *old = new;
-+        });
++        presence::show(others);
 +    }
 +
 +    fn live_assets_of(document: &Value) -> Vec<String> {
@@ -1118,10 +1033,22 @@ index 0000000..cc08f1d
 +    use playground_live::canonical;
 +    use serde_json::json;
 +
-+    fn demo() -> LccApp {
++    /// The app as a session peer, held by nothing else.
++    type App = Peer<LccApp>;
++
++    impl Host for LccApp {
++        fn app(&self) -> &LccApp {
++            self
++        }
++        fn app_mut(&mut self) -> &mut LccApp {
++            self
++        }
++    }
++
++    fn demo() -> App {
 +        let mut s = Session::new();
 +        lcc_engine::demo::load(&mut s);
-+        LccApp::new(s, Services::default())
++        Peer(LccApp::new(s, Services::default()))
 +    }
 +
 +    #[test]
@@ -1141,15 +1068,15 @@ index 0000000..cc08f1d
 +        a.session.catalog.apply(Op::SetPreview { id: first, entry: Some(preview) }).map_err(|e| e.to_string())?;
 +        let start = canonical(&a.live_document());
 +        assert!(!String::from_utf8_lossy(&start).contains("seen.jpg") && !String::from_utf8_lossy(&start).contains("previews"));
-+        assert!(!String::from_utf8_lossy(&start).contains("stacks") && LccApp::live_check(&playground_live::parse(&start)?).is_ok());
++        assert!(!String::from_utf8_lossy(&start).contains("stacks") && App::live_check(&playground_live::parse(&start)?).is_ok());
 +        a.run("library.next", json!({}))?;
 +        assert_eq!(canonical(&a.live_document()), start, "views are not shared");
 +        let (selected, undo_steps) = (a.session.selection.clone(), a.session.undo.len());
 +        // A merge that no longer holds together (two stacks sharing a photo) is refused, not repaired by every peer.
 +        let mut stacked = playground_live::parse(&start)?;
 +        stacked["stacks"] = json!({"1": {"id": 1, "photos": [1, 2]}, "2": {"id": 2, "photos": [2, 3]}});
-+        assert!(LccApp::live_check(&playground_live::parse(&start)?).is_ok() && LccApp::live_check(&stacked).is_err());
-+        assert!(LccApp::live_check(&Value::Null).is_err());
++        assert!(App::live_check(&playground_live::parse(&start)?).is_ok() && App::live_check(&stacked).is_err());
++        assert!(App::live_check(&Value::Null).is_err());
 +
 +        // B joins with the whole library, then rates a photo A is not on; A merges it at a quiet frame, keeping its
 +        // selection, its own records and its undo history.
@@ -1215,7 +1142,7 @@ index 0000000..cc08f1d
 +        assert_eq!(p.history.last().map(|h| &*h.settings), Some(&*p.develop));
 +        // B's Undo of the stroke (the journal's merge(after, now, before)) keeps A's crop, History its step alone.
 +        let (brushed, both) = (b.live_document(), a.live_document());
-+        let undone = LccApp::live_merge(&brushed, &both, &playground_live::parse(&start)?)?;
++        let undone = App::live_merge(&brushed, &both, &playground_live::parse(&start)?)?;
 +        let p = &undone["photos"][photo.0.to_string()];
 +        assert_eq!((&p["develop"]["crop"], p["develop"]["masks"].as_array().map(Vec::len)), (&both["photos"][photo.0.to_string()]["develop"]["crop"], Some(0)));
 +        assert_eq!((p["history"].as_array().map(Vec::len), &p["history"][0]["settings"]), (Some(1), &p["develop"]));
@@ -1225,7 +1152,7 @@ index 0000000..cc08f1d
 +            *d.pointer_mut(&format!("/photos/{}/develop/light/exposure", photo.0)).ok_or("no exposure")? = v.into();
 +            Ok(d)
 +        };
-+        assert!(LccApp::live_merge(&playground_live::parse(&start)?, &exposure(0.5)?, &exposure(1.0)?).is_err());
++        assert!(App::live_merge(&playground_live::parse(&start)?, &exposure(0.5)?, &exposure(1.0)?).is_err());
 +        playground_live::disconnect();
 +        Ok(())
 +    }
@@ -1268,7 +1195,7 @@ index 0000000..cc08f1d
 +        let originals = Originals::default();
 +        originals.install(&mut a.session);
 +        MEDIA.set(Media { originals: originals.clone(), stored: Some(HashSet::new()) });
-+        assert!(a.live_assets().is_empty() && LccApp::live_assets_of(&a.live_document()).is_empty(), "demo scenes have no original");
++        assert!(a.live_assets().is_empty() && App::live_assets_of(&a.live_document()).is_empty(), "demo scenes have no original");
 +        let bytes = store::png_bytes(8, 8);
 +        let hash = store::content_hash(&bytes);
 +        let path = originals.added("IMG 1.png", &hash, bytes.into());
@@ -1279,7 +1206,7 @@ index 0000000..cc08f1d
 +        seen.local = true;
 +        a.session.catalog.apply(Op::AddPhoto { photo: Box::new(seen) }).map_err(|e| e.to_string())?;
 +        assert_eq!(a.live_assets(), [(hash.clone(), "IMG 1.png".to_string(), true)]);
-+        assert_eq!(LccApp::live_assets_of(&a.live_document()), [hash.clone()]);
++        assert_eq!(App::live_assets_of(&a.live_document()), [hash.clone()]);
 +        // gone from memory, it is still in storage
 +        MEDIA.with_borrow_mut(|m| m.originals = Originals::default());
 +        assert_eq!(a.live_assets(), [(hash, "IMG 1.png".to_string(), true)]);
@@ -1295,7 +1222,7 @@ index 0000000..cc08f1d
 +        b.run("library.select", json!({"ids": [x.0]}))?;
 +        b.run("develop.set", json!({"values": {"light.exposure": 0.5}}))?;
 +        playground_live::connect();
-+        frame(&mut a, false);
++        frame(&mut a);
 +        a.live_adopt(b.live_document())?;
 +        let before = versions(&a, x);
 +        a.run("library.next", json!({}))?;
@@ -1307,7 +1234,7 @@ index 0000000..cc08f1d
 +        a.run("library.next", json!({}))?;
 +        assert_eq!(versions(&a, y), before + 1);
 +        playground_live::disconnect();
-+        frame(&mut a, false);
++        frame(&mut a);
 +        assert!(!lcc_engine::live::is_live(), "not live: every edited photo again");
 +        Ok(())
 +    }
@@ -1321,7 +1248,7 @@ index 0000000..cc08f1d
 +        a.run("preset.apply", json!({"id": "lc.golden-hour"}))?;
 +        let steps = a.session.undo.len();
 +        playground_live::connect();
-+        frame(&mut a, false);
++        frame(&mut a);
 +        // Undo goes to the session; the Presets panel's Amount still undoes its own step
 +        a.run("edit.undo", json!({}))?;
 +        assert_eq!((a.session.undo.len(), playground_live::activity().1), (steps, vec![false]));
@@ -1360,29 +1287,40 @@ index 0000000..cc08f1d
 +        a.run("creation.get", json!({"id": id}))?;
 +        save(&mut a)?;
 +        playground_live::disconnect();
-+        frame(&mut a, false);
++        frame(&mut a);
 +        Ok(())
 +    }
 +}
 diff --git a/apps/web/src/live_web.rs b/apps/web/src/live_web.rs
 new file mode 100644
-index 0000000..257c670
+index 0000000..b656b67
 --- /dev/null
 +++ b/apps/web/src/live_web.rs
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,79 @@
 +//! Playground live editing in the browser host (Playground's patches/lightroom-classic.yaml declares this module in
 +//! `web.rs`, wraps the app the web entry creates with [`wrap`] and opens [`session_library`]): the app runs inside
 +//! [`Shared`], whose frames end with the others' presence drawn and the session's turn, and the live editing hooks
-+//! reach it between frames. A
-+//! Playground invitation's page (`?pg-session=<room id>`) opens a library of its own.
++//! reach it between frames, as the session's [`Peer`] (the playground-live crate's `Live` is on that). A Playground
++//! invitation's page (`?pg-session=<room id>`) opens a library of its own.
 +
 +use std::cell::RefCell;
 +use std::rc::Rc;
 +
 +use super::{WebApp, request_repaint};
++use crate::live::{Host, Peer};
++use lcc_ui_egui::LccApp;
 +
 +/// The web app, shared with the live editing hooks.
-+pub(super) struct Shared(Rc<RefCell<WebApp>>);
++pub(super) struct Shared(Rc<RefCell<Peer<WebApp>>>);
++
++impl Host for WebApp {
++    fn app(&self) -> &LccApp {
++        &self.app
++    }
++    fn app_mut(&mut self) -> &mut LccApp {
++        &mut self.app
++    }
++}
 +
 +/// The app with live editing offered to the Playground shell (nothing happens until it connects).
 +pub(super) fn wrap(mut app: WebApp) -> Box<Shared> {
@@ -1391,10 +1329,10 @@ index 0000000..257c670
 +        app.app.services.restore_library = None;
 +    }
 +    let media = (app.originals.clone(), app.backend.clone());
-+    let app = Rc::new(RefCell::new(app));
++    let app = Rc::new(RefCell::new(Peer(app)));
 +    let live = app.clone();
 +    // between frames only: during one the app is busy
-+    let with_app = move |f: &mut dyn FnMut(&mut lcc_ui_egui::LccApp)| live.try_borrow_mut().map(|mut w| f(&mut w.app)).is_ok();
++    let with_app = move |f: &mut dyn FnMut(&mut Peer<WebApp>)| live.try_borrow_mut().map(|mut w| f(&mut w)).is_ok();
 +    wasm_bindgen_futures::spawn_local(crate::live::attach(with_app, request_repaint, media));
 +    Box::new(Shared(app))
 +}
@@ -1409,33 +1347,33 @@ index 0000000..257c670
 +// ponytail: `on_exit` is not passed on (its signature follows eframe's renderer feature); WebApp has none today
 +impl eframe::App for Shared {
 +    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-+        eframe::App::logic(&mut *self.0.borrow_mut(), ctx, frame);
++        eframe::App::logic(&mut self.0.borrow_mut().0, ctx, frame);
 +    }
 +
 +    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
 +        let mut app = self.0.borrow_mut();
-+        eframe::App::ui(&mut *app, ui, frame);
-+        crate::live::end_frame(&mut app.app, ui.ctx());
++        eframe::App::ui(&mut app.0, ui, frame);
++        crate::live::end_frame(&mut *app, ui.ctx());
 +    }
 +
 +    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-+        eframe::App::raw_input_hook(&mut *self.0.borrow_mut(), ctx, raw_input);
++        eframe::App::raw_input_hook(&mut self.0.borrow_mut().0, ctx, raw_input);
 +    }
 +
 +    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-+        eframe::App::save(&mut *self.0.borrow_mut(), storage);
++        eframe::App::save(&mut self.0.borrow_mut().0, storage);
 +    }
 +
 +    fn auto_save_interval(&self) -> std::time::Duration {
-+        eframe::App::auto_save_interval(&*self.0.borrow())
++        eframe::App::auto_save_interval(&self.0.borrow().0)
 +    }
 +
 +    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-+        eframe::App::clear_color(&*self.0.borrow(), visuals)
++        eframe::App::clear_color(&self.0.borrow().0, visuals)
 +    }
 +
 +    fn persist_egui_memory(&self) -> bool {
-+        eframe::App::persist_egui_memory(&*self.0.borrow())
++        eframe::App::persist_egui_memory(&self.0.borrow().0)
 +    }
 +}
 diff --git a/crates/catalog/src/live.rs b/crates/catalog/src/live.rs
@@ -1557,7 +1495,7 @@ index 0000000..e59c16b
 +}
 diff --git a/crates/ui-egui/src/live.rs b/crates/ui-egui/src/live.rs
 new file mode 100644
-index 0000000..c6c6424
+index 0000000..f42249a
 --- /dev/null
 +++ b/crates/ui-egui/src/live.rs
 @@ -0,0 +1,106 @@

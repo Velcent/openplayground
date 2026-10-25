@@ -8,24 +8,35 @@
     let dark = web_sys::window().and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten()).is_some_and(|m| m.matches());
     let _ = app.run("window.brightness", serde_json::json!({"brightness": if dark { "dark" } else { "light" }}));
 
-# Live editing in Playground sessions (patches/indesign/live.diff + patches/live/playground_live.rs)
+# Live editing in Playground sessions (patches/indesign/live.diff + the playground-live crate, tools.yaml `live_kit`)
 # What it's for: people in a Playground session edit the documents open in it together (every tab opened in the session
 #   is shared; closing one is personal), and see each other's pointer, selected frames and gestures in progress (moves,
 #   resizes, rotations, frames being drawn, Pencil and Pen strokes), in each person's color.
-# How: the adapter lives in new files: apps/designcraft-web/src/live.rs (the session's documents, adopt, ids; it
-#   declares the template), apps/designcraft-web/src/web/live.rs (the kept runner and the app that ends each frame with
-#   the session's frame hook) and crates/ui-egui/src/canvas/live.rs (the session's documents as this person has them,
-#   Undo's hand-off, presence, and the others' marks on the canvas, the tabs and the start screen). These rules only
-#   declare them and call in: most append at the end of a file or follow a function's signature.
+# How: the adapter lives in new files: crates/ui-egui/src/canvas/live.rs (the session's documents as this person has
+#   them, Undo's hand-off, presence, and the others' marks on the canvas, the tabs and the start screen) with its
+#   canvas/live/shared.rs (the session's hooks on DesignApp: the shared documents, adopt, ids; next to DesignApp, as the
+#   crate's trait can't be implemented for it elsewhere), and apps/designcraft-web/src/web/live.rs (the kept runner, the
+#   session attached, and the app that ends each frame for the session). The session and the others' look are the
+#   playground-live crate's (patches/live/kit). These rules only add the crate, declare the files and call in: most
+#   append at the end of a file or follow a function's signature.
 # Verify: node scripts/build.mjs check indesign head|release (and LIVE=0), then the e2e (tests/live-apps/indesign.mjs)
-#   and `cargo test -p designcraft-web live::`.
+#   and `cargo test -p designcraft-ui-egui --lib canvas::live`.
 # If upstream changes: if a function or line named below is renamed or rewritten, anchor on its new form.
 #
-# The web app's adapter module (with the template), for the browser and the web app's native tests.
+# The playground-live crate (patches/live/kit), for the web app and for the canvas, which draws the others with its look
+# (`egui`; the web app ends each frame with it); and js-sys, for the session's document ids in the browser (random).
 - live: true
-  file: apps/designcraft-web/src/main.rs
+  file: apps/designcraft-web/Cargo.toml
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
+- live: true
+  file: crates/ui-egui/Cargo.toml
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
+- live: true
+  file: crates/ui-egui/Cargo.toml
   find: '(?![\s\S])'
-  after: "\n// Live editing in a Playground session.\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
+  after: "\n[target.'cfg(target_arch = \"wasm32\")'.dependencies]\njs-sys = \"0.3\"\n"
 # The web entry keeps its runner for the adapter and wraps its app (web/live.rs, a child module so it reaches
 # WebShell's fields). If upstream renames WebShell or its `app` field, follow it in web/live.rs.
 - live: true
