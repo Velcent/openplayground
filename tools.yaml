@@ -436,3 +436,19 @@ groups:
         icon: icons/selfpaint.png
         accent: "#A77BF0"
         base: "#410D7C"
+
+      - slug: paint-net
+        name: Paint.RS
+        alternative: Paint.NET
+        blurb: Layers, adjustments, effects and plugins.
+        opens: []
+        imports: []
+        repo: daijro/paint.rs
+        license: GPL-3.0-or-later
+        # Its release's web zip is built with wasm-opt -O3 and SIMD already, and carries the licence notices a
+        # plain trunk build leaves out, so Playground serves it as it is. Its live editing is in its own source
+        # (crates/paintrs/src/live.rs), as Honeydew's is.
+        build: false
+        icon: icons/paint-rs.png
+        accent: "#F74C00"
+        base: "#3A1200"
