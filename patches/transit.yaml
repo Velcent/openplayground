@@ -26,6 +26,14 @@
 - file: crates/playback/src/player/mod.rs
   find: '#\[cfg\(not\(target_arch\s*=\s*"wasm32"\)\)\]\s*\n(pub\s+mod\s+monitor;)'
   replace: '$1'
+# MIDI Learn's mapping data (midi_map.rs, plain std/mix/model) compiles on wasm too: MapSpec is exported, the Player's
+# Learn calls are stubbed in player/web.rs.
+- file: crates/playback/src/player/mod.rs
+  find: '#\[cfg\(not\(target_arch\s*=\s*"wasm32"\)\)\]\s*\n(pub\s+mod\s+midi_map;)'
+  replace: '$1'
+- file: crates/playback/src/player/mod.rs
+  find: '#\[cfg\(not\(target_arch\s*=\s*"wasm32"\)\)\]\s*\n(pub\s+use\s+midi_map::MapSpec;)'
+  replace: '$1'
 - file: crates/playback/src/player/mod.rs
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: no MIDI ports (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] mod web;\n#[cfg(target_arch = \"wasm32\")] pub use web::{midi_out, Status as MidiStatus};\n"

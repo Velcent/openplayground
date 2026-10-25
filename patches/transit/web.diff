@@ -331,7 +331,7 @@ new file mode 100644
 +//! ports, so the Player's MIDI read-backs that the studio UI asks for each frame answer "nothing here" (the native
 +//! `midi_out` and `native` modules need the MIDI device layer).
 +
-+use super::{Player, PlayerError, monitor};
++use super::{MapMsg, MapSpec, Player, PlayerError, monitor};
 +
 +/// The external MIDI destinations as the UI reads them: none on the web.
 +pub mod midi_out {
@@ -373,6 +373,29 @@ new file mode 100644
 +    }
 +    pub fn midi_status(&self) -> Result<Status, PlayerError> {
 +        Err(PlayerError::Busy)
++    }
++
++    // MIDI Learn (the mappings are plain data, `midi_map`; no port ever feeds them here).
++    pub fn set_midi_mappings(&self, _specs: Vec<MapSpec>) {}
++    pub fn midi_map_epoch(&self) -> u32 {
++        0
++    }
++    pub fn set_midi_learn(&self, _armed: bool) {}
++    pub fn sync_midi_map(&self, _values: &[(f32, u32)]) {}
++    pub fn take_midi_map_events(&self) -> Vec<MapMsg> {
++        Vec::new()
++    }
++    pub fn midi_map_generation(&self) -> u32 {
++        0
++    }
++    pub fn midi_map_activity(&self) -> u64 {
++        0
++    }
++    pub fn midi_learn_armed(&self) -> bool {
++        false
++    }
++    pub fn midi_map_dropped(&self) -> u64 {
++        0
 +    }
 +}
 diff --git a/crates/transit-playground/Cargo.toml b/crates/transit-playground/Cargo.toml
