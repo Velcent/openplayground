@@ -109,16 +109,20 @@
 #   the browser build, so AutoSave could never fire there. (Status messages time out with it too.)
 # How: the wasm arm returns Date.now() through WEB_NOW_MS, a fn pointer the bridge (rule 7) sets.
 # Verify: with a browser-storage document, type and wait ~3 s: the stored file updates by itself.
-# Newer upstream already reads js_sys::Date::now there; the rule then keeps that body as the fallback.
+# Newer upstream already has a working monotonic browser clock (web_time); the rule is then redundant but
+#   harmless (the bridge's clock takes over), and can be deleted together with the WEB_NOW_MS line in rule 7.
 # If upstream changes: once the newest release has a real wasm clock, delete this and the WEB_NOW_MS line
 #   in rule 7.
 - file: crates/ui-egui/src/lib.rs
-  find: '(pub fn now_ms\(\) -> f64 \{[\s\S]*?#\[cfg\(target_arch = "wasm32"\)\]\s*\{\s*)(0\.0|let ms = js_sys::Date::now\(\);\s*if [^\n]*)'
+  find: 'pub fn now_ms\(\) -> f64 \{'
   replace: |-
     /// playground (patches/word.yaml): the browser clock (`Date.now`), set by the web crate's bridge.
     pub static WEB_NOW_MS: std::sync::OnceLock<fn() -> f64> = std::sync::OnceLock::new();
 
-    $1WEB_NOW_MS.get().map_or_else(|| { $2 }, |now| now())
+    $&
+        if let Some(now) = WEB_NOW_MS.get() {
+            return now();
+        }
 
 # Rule 5/9: Recent documents in browser storage reopen.
 # What it's for: File → Recent lists `browser:` paths after saving there; clicking one ran `file.open
