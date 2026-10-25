@@ -1,109 +1,119 @@
-# SelfPaint in the browser. Upstream's sources build a desktop window only (its web release zip was built from files
-# not in the repository); these patches add the web build Playground serves.
+# PaintCraft (github.com/replicraft/PaintCraft) in the browser: its own browser editor, apps/paintcraft-web (the Classic
+# presentation, MS Paint's look), built the way Playground builds apps. Upstream builds it with pnpm and Astro (a site
+# with a download page); its releases are desktop packages only, so Playground builds its head commit.
 #
 # patches/mspaint/web.diff adds new files only:
-#   Trunk.toml, index.html   the web build at the repository root (build.mjs runs trunk there): the `selfpaint` binary
-#                            on the page's canvas.
-#   src/app/web.rs           the browser side, a child of the app module: web-time's clock, a never-shown stand-in for
-#                            rfd's FileDialog, the preferences in localStorage, Open/Save/Save project through Playground's
-#                            `globalThis.playgroundFiles` (Files, "From computer…", downloads), "Open in SelfPaint", the
-#                            WebRunner, and the stroke being drawn put on screen as it goes (upstream uploads the picture
-#                            only once a stroke ends, so it appeared on release).
-# Native builds see none of this: every rule adds wasm-only lines.
+#   apps/paintcraft-web/Trunk.toml, index.html   the editor alone, for trunk (build.mjs builds the web crate there):
+#                            upstream's page and loader (src/pages/index.astro, src/lib/main.js) with the Japanese and
+#                            Chinese faces the editor needs copied next to the page, in upstream's web-release profile.
+#   apps/paintcraft-web/src/paintcraft-web/app/playground.rs   its files in Playground's Files
+#                            (`globalThis.playgroundFiles`): Open is Files' Open dialog, Save writes the project back to
+#                            its browser file or asks where (browser storage or a download), Export asks where, "Open in
+#                            PaintCraft" and dropped files go through the app's Open (after its unsaved-changes
+#                            question), the leave warning follows the app's unsaved state, and the greeting in the
+#                            status bar says Save keeps a project copy in Files (upstream's says it downloads one).
+# Native builds see none of this: every rule adds wasm-only lines. The browser clipboard (Copy, Paste), the theme
+# following the browser's light/dark preference and the clock are upstream's already.
 
-# Rule 1/7: the web dependencies of src/app/web.rs (all already in Cargo.lock through eframe).
-# Verify: build.mjs check. If upstream adds them itself, drop the duplicates here.
-- file: Cargo.toml
-  find: '(?![\s\S])'
-  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nweb-time = \"1\"\nwasm-bindgen = \"0.2\"\nwasm-bindgen-futures = \"0.4\"\njs-sys = \"0.3\"\nweb-sys = { version = \"0.3\", features = [\"Window\", \"Document\", \"Element\", \"HtmlCanvasElement\", \"Navigator\", \"Storage\"] }\n"
+# Rule 1/6: upstream pins its toolchain (rust-toolchain.toml), which rustup installs without the wasm target: CI then
+# fails with "can't find crate for `core`". The pin also asks for the target here.
+# If upstream lists `targets` itself (or drops the pin), delete this rule.
+- file: rust-toolchain.toml
+  find: '^\[toolchain\]'
+  after: "\ntargets = [\"wasm32-unknown-unknown\"]"
 
-# Rules 2-3/7: the desktop entry point stays out of the web build, which starts the app on the page instead.
-# If upstream changes: anchor on wherever the binary's `fn main` lives.
-- file: src/main.rs
-  find: '^fn\s+main\s*\('
-  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
-- file: src/main.rs
-  find: '(?![\s\S])'
-  after: "\n// Playground's browser build (patches/mspaint.yaml): the app on the page's canvas.\n#[cfg(target_arch = \"wasm32\")]\nfn main() {\n    app::web::start();\n}\n"
+# Rules 2-3/6: the Files module (app/playground.rs), a child of the app module, run after each frame of the app's.
+# If upstream renames the app's module list or its eframe::App::ui, anchor on the new spelling.
+- file: apps/paintcraft-web/src/paintcraft-web/app.rs
+  find: '^mod\s+documents\s*;'
+  after: "\n// Playground's browser build: its files in Playground's Files (patches/mspaint.yaml).\n#[cfg(target_arch = \"wasm32\")]\npub(crate) mod playground;"
+- file: apps/paintcraft-web/src/paintcraft-web/app.rs
+  find: 'fn\s+ui\s*\(\s*&mut\s+self\s*,\s*ui\s*:\s*&mut\s+egui::Ui\s*,[^)]*\)\s*\{\s*self\.show\(ui\);'
+  after: "\n        #[cfg(target_arch = \"wasm32\")]\n        playground::frame(self, ui.ctx());"
 
-# Rule 4/7: the browser side, and the app module's `std`, `rfd` and `craft_settings` names pointing at its shims (a
-# local name shadows the crate's in that module; everything else in std still comes from the real one).
-- file: src/app.rs
-  find: '(?![\s\S])'
-  after: "\n// Playground's browser build (patches/mspaint.yaml): the clock, files, dialogs and settings in the browser.\n#[cfg(target_arch = \"wasm32\")]\npub(crate) mod web;\n#[cfg(target_arch = \"wasm32\")]\nuse web::{craft_settings, rfd, std_web as std};\n"
+# Rules 4-5/6: Open asks Files (WebApp::replace, after the unsaved-changes question), and what Save and Export would
+# download goes to Files (Files::download's one download call); without playgroundFiles both stay upstream's.
+# Verify: Open lists the projects and pictures in Files; Save asks where once, then saves back silently. If upstream
+# renames these calls, follow them.
+- file: apps/paintcraft-web/src/paintcraft-web/app.rs
+  find: '^([ \t]*)self\.files\.open\(ctx,\s*frontend\);'
+  replace: "$1#[cfg(target_arch = \"wasm32\")]\n$1if playground::open(self, frontend) {\n$1    return;\n$1}\n$&"
+- file: apps/paintcraft-web/src/paintcraft-web/files.rs
+  find: 'download_copy\(&bytes,\s*name,\s*mime\)'
+  replace: 'crate::app::playground::save(&bytes, name, format.is_none().then_some((owner, document.state_id))).unwrap_or_else(|| download_copy(&bytes, name, mime))'
 
-# Rules 5-7/7: Open, Save (PNG) and Save project go through the page (the desktop ones run a native dialog on a thread).
-# Verify: Open lists the PNGs in Files; Save asks where once, then saves back. If upstream renames them, follow them.
-- file: src/app.rs
-  find: '\bfn\s+spawn_open\s*\(\s*&mut\s+self\s*\)\s*\{'
-  after: "\n        #[cfg(target_arch = \"wasm32\")]\n        return web::open(self);"
-- file: src/app.rs
-  find: '\bfn\s+spawn_save_png\s*\(\s*&mut\s+self\s*\)\s*\{'
-  after: "\n        #[cfg(target_arch = \"wasm32\")]\n        return web::save(self, false);"
-- file: src/app.rs
-  find: '\bfn\s+spawn_save_project\s*\(\s*&mut\s+self\s*\)\s*\{'
-  after: "\n        #[cfg(target_arch = \"wasm32\")]\n        return web::save(self, true);"
+# Rule 6/6: the Classic ribbon's "Download for desktop" opens /download, upstream's site page, which this build doesn't
+# have (Playground's own pages are at the site's root): it stays hidden on the web. If upstream renames the field, follow.
+- file: apps/paintcraft-web/src/paintcraft-web/app.rs
+  find: 'desktop_download:\s*'
+  after: '!cfg!(target_arch = "wasm32") && '
 
 
 # Live editing in Playground sessions (patches/mspaint/live.diff + the playground-live crate, tools.yaml `live_kit`)
-# What it's for: people in a Playground session paint on the same picture at once: every stroke, shape, fill and text
-#   reaches the others, two people's strokes merge pixel by pixel (both stay, the later on top), each person's Ctrl+Z
-#   takes back only their own, and each sees the others' pointers and the strokes, shapes and text they are making, in
-#   their colour, as they happen.
-# How: the adapter lives in new files: src/app/live.rs (the shared picture as 64×64 tiles, its merge, the session's
-#   frame, the web runner and the adapter) and src/app/live/peers.rs (presence: pointers, name tags and easing the
-#   kit's, strokes, dashed shapes and text SelfPaint's own). The playground-live crate (patches/live/kit, copied to the
-#   checkout's playground-live/) gives presence lists and the presence look. These rules only declare it and call in,
-#   one line each, and add the crate as a dependency.
-# Verify: node scripts/build.mjs check mspaint head (and LIVE=0), the e2e (tests/live-apps/mspaint.mjs) and
-#   `cargo test live`.
-# If upstream changes: when a line named below changes, anchor on its new spelling; if SelfPaintApp renames the fields
-#   live.rs uses (doc, drag, view, texture, texture_dirty, history, shape_preview, text, text_size) or DragState's
-#   Stroke { last }, follow them there.
+# What it's for: people in a Playground session paint on the same picture at once: strokes, shapes, fills, text, crops
+#   and the layers (added, removed, reordered, renamed, hidden) reach the others; edits to different layers or tiles
+#   both stay and two strokes in one tile merge pixel by pixel (the later on top); each person's Ctrl+Z takes back
+#   only their own; each sees the others' pointers with their names, the stroke, shape, marquee, lasso or text they
+#   are making and their selection, in their colour, as it happens.
+# How: the adapter lives in new files: apps/paintcraft-web/src/paintcraft-web/live.rs (the shared picture as JSON:
+#   layers by id, each with its 256×256 tiles that differ from its default, LZ4 and base64; the tile merge; the app's
+#   Live hooks), live/peers.rs (presence: pointers, tags, outlines, ghosts, dashes and easing the kit's, strokes drawn
+#   there), live/tests.rs, and crates/editing/paintcraft-editor/src/session/live.rs (Session::install_remote: a merged
+#   picture published with no history step, the selection kept). The playground-live crate (patches/live/kit, copied
+#   to the checkout's playground-live/) gives the session, its JSON merge and the presence look. These rules only add
+#   the dependencies, declare the modules and call in, one line each or an operand.
+# Verify: node scripts/build.mjs check mspaint head (and LIVE=0), `cargo test -p paintcraft-web live::` and the e2e
+#   (tests/live-apps/mspaint.mjs).
+# If upstream changes: when a line named below changes, anchor on its new spelling; if WebApp renames the fields
+#   live.rs and peers.rs use (editor, paste, zoom), the editor its session, tools or target, or the raster layer its
+#   tile API (tile_versions, read_span, set_block), follow them there.
 #
-# The adapter's dependency, for the web and for native tests, under target spellings nobody else uses (rule 1 has
-# `all(…)`): the playground-live crate with its presence look (`egui`).
+# The web crate's dependencies for the adapter, on every target (natively only its tests use them): the
+# playground-live crate with its presence look (`egui`), serde_json, and the LZ4 codec upstream's formats use.
 - live: true
-  file: Cargo.toml
-  find: '(?![\s\S])'
-  after: "\n[target.'cfg(any(target_arch = \"wasm32\"))'.dependencies]\nplayground-live = { path = \"playground-live\", features = [\"egui\"] }\n\n[target.'cfg(not(target_arch = \"wasm32\"))'.dev-dependencies]\nplayground-live = { path = \"playground-live\", features = [\"egui\"] }\n"
-# The adapter module, a child of the app's module so it reaches SelfPaintApp.
+  file: apps/paintcraft-web/Cargo.toml
+  find: '^\[dependencies\]\n'
+  after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\nserde_json = \"1\"\nlz4_flex.workspace = true\n"
+# The adapter module (web only, and its native tests), offered to the page once the app runs.
 - live: true
-  file: src/app.rs
+  file: apps/paintcraft-web/src/paintcraft-web/lib.rs
   find: '(?![\s\S])'
   after: "\n// Live editing in a Playground session (web only, and its native tests).\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
-# Each change to the picture counts (the shell then hears of it once no stroke is under way).
 - live: true
-  file: src/app.rs
-  find: '\bfn\s+mark_doc_dirty\s*\(\s*&mut\s+self\s*\)\s*\{'
-  after: "\n        #[cfg(target_arch = \"wasm32\")]\n        live::touch();"
-# Undo and Redo: in a session they go to the session.
+  file: apps/paintcraft-web/src/paintcraft-web/lib.rs
+  find: '\.start\(\s*canvas,[^;]*?\.await'
+  after: '.inspect(|()| crate::live::attach(&self.runner))'
+# Session::install_remote (session/live.rs), a child of the session module so it reaches the published state.
 - live: true
-  file: src/app.rs
-  find: '\bfn\s+undo\s*\(\s*&mut\s+self\s*\)\s*\{'
-  after: "\n        #[cfg(target_arch = \"wasm32\")]\n        if live::undo(false) {\n            return;\n        }"
+  file: crates/editing/paintcraft-editor/src/session.rs
+  find: '^mod\s+residency\s*;'
+  after: "\n// Live editing in a Playground session (web, and debug builds for the native tests).\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))]\nmod live;"
+# Each frame ends with the session's (after the canvas drew the others).
 - live: true
-  file: src/app.rs
-  find: '\bfn\s+redo\s*\(\s*&mut\s+self\s*\)\s*\{'
-  after: "\n        #[cfg(target_arch = \"wasm32\")]\n        if live::undo(true) {\n            return;\n        }"
-# The ribbon's Undo and Redo stay enabled in a session.
+  file: apps/paintcraft-web/src/paintcraft-web/app.rs
+  find: 'fn\s+ui\s*\(\s*&mut\s+self\s*,\s*ui\s*:\s*&mut\s+egui::Ui\s*,[^)]*\)\s*\{\s*self\.show\(ui\);'
+  after: "\n        #[cfg(target_arch = \"wasm32\")]\n        crate::live::frame(self, ui.ctx());"
+# Undo and Redo (the ribbon's, the menu's, Ctrl+Z and Ctrl+Y all go through WebApp::action): in a session they go to
+# the session, after the gesture or text draft under way is dropped as upstream's Undo drops it; they stay enabled.
 - live: true
-  file: src/app.rs
-  find: '\bevents\s*=\s*crate::ribbon::show\('
-  before: "#[cfg(target_arch = \"wasm32\")]\n                    if live::connected() {\n                        (ribbon_state.can_undo, ribbon_state.can_redo) = (true, true);\n                    }\n                    "
-# The canvas: after the picture and this person's shape preview, the others' marks (and this person's pointer noted).
+  file: apps/paintcraft-web/src/paintcraft-web/app.rs
+  find: 'Action::Undo\s*=>\s*\{\s*self\.editor\.tools\.cancel_gesture\(\);'
+  after: "\n                if playground_live::undo(false) {\n                    self.editor.cancel();\n                    return;\n                }"
 - live: true
-  file: src/app.rs
-  find: 'self\.show_text_editor\(\s*ui\s*,\s*sheet\s*\)\s*;'
-  before: "#[cfg(target_arch = \"wasm32\")]\n        live::paint(self, ui, &painter, sheet);\n        "
-# The web entry (src/app/web.rs, from web.diff): the runner kept for the adapter, and the app eframe runs wrapped
-# (live::web::wrap: the app's frame, then the session's). If that file changes: the runner is the one `start` creates,
-# and `wrap` takes the `Web` the creator returns.
+  file: apps/paintcraft-web/src/paintcraft-web/app.rs
+  find: 'Action::Redo\s*=>\s*\{\s*self\.editor\.tools\.cancel_gesture\(\);'
+  after: "\n                if playground_live::undo(true) {\n                    self.editor.cancel();\n                    return;\n                }"
 - live: true
-  file: src/app/web.rs
-  find: 'eframe::WebRunner::new\(\)'
-  replace: 'super::live::web::runner()'
+  file: apps/paintcraft-web/src/paintcraft-web/app.rs
+  find: 'can_undo:\s*'
+  after: 'playground_live::connected() || '
 - live: true
-  file: src/app/web.rs
-  find: 'Ok\(Box::new\((Web::new\([^;]*\))\)\)'
-  replace: 'Ok(super::live::web::wrap($1))'
+  file: apps/paintcraft-web/src/paintcraft-web/app.rs
+  find: 'can_redo:\s*'
+  after: 'playground_live::connected() || '
+# The canvas: after the picture, the selection and this person's previews, the others' marks (and this person's
+# pointer noted), before the cursor.
+- live: true
+  file: apps/paintcraft-web/src/paintcraft-web/canvas.rs
+  find: '^([ \t]*)if\s+response\.hovered\(\)\s*&&\s*!self\.blocked\(\)'
+  replace: "$1#[cfg(target_arch = \"wasm32\")]\n$1crate::live::paint(self, ui, &painter, response.rect);\n$&"

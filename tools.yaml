@@ -440,27 +440,24 @@ groups:
         base: "#062E22"
 
       - slug: mspaint
-        name: SelfPaint
-        alternative: Microsoft Paint (experimental)
-        blurb: Draw and paint with a pencil, brushes, an eraser, fills, shapes and text.
-        # Shown when the app opens (shell/topbar.js), until someone ticks "Don't show this again".
-        notice:
-          title: Early preview
-          text: This app is still under heavy development and is only available as an early preview. It isn't meant for real-world use yet. Features are missing, things will break, and your work may be lost. Don't rely on it for anything important.
-        # Its release's web zip is selfpaint-web.zip (not -web-<version>.zip), built from files that aren't in the
-        # repository; patches/mspaint.yaml adds the web build Playground makes from the sources on both channels.
-        opens: [png, jpg, jpeg, sproj]
+        name: PaintCraft
+        alternative: Microsoft Paint
+        blurb: Pencil, brushes, fills, shapes, text, selections and layers, in the classic Paint look.
+        # Its own projects (.pcnd, with layers) and pictures. Upstream's releases are desktop packages only (no web
+        # zip), so like Pro Wave it has the head channel only; patches/mspaint.yaml builds its browser editor
+        # (apps/paintcraft-web, Classic presentation) the way Playground serves apps.
+        opens: [pcnd, png, bmp, jpg, jpeg]
         imports: []
-        repo: selfbin/selfpaint
+        repo: replicraft/PaintCraft
         license: MIT
-        asset: '-web\.zip$'
-        # What the web build compiles (Cargo.lock: dependency changes): README, CI and icon commits don't rebuild it.
-        paths: [src, assets, Cargo.toml, Cargo.lock]
+        # What the web build compiles (Cargo.lock: dependency changes; assets: its fonts and icons): docs, CI, the
+        # desktop app and packaging commits don't rebuild it. One GitHub API request per path per check.
+        paths: [crates, apps/paintcraft-web, assets, Cargo.toml, Cargo.lock, rust-toolchain.toml]
         patches: patches/mspaint.yaml
         live_kit: true
-        icon: icons/selfpaint.png
-        accent: "#A77BF0"
-        base: "#410D7C"
+        icon: icons/paintcraft.png
+        accent: "#1E90F5"
+        base: "#0B2245"
 
       - slug: paint-net
         name: Paint.RS

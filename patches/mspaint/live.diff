@@ -1,563 +1,469 @@
-diff --git a/src/app/live.rs b/src/app/live.rs
+diff --git a/apps/paintcraft-web/src/paintcraft-web/live.rs b/apps/paintcraft-web/src/paintcraft-web/live.rs
 new file mode 100644
-index 0000000..84905a7
+index 0000000..54446a9
 --- /dev/null
-+++ b/src/app/live.rs
-@@ -0,0 +1,526 @@
++++ b/apps/paintcraft-web/src/paintcraft-web/live.rs
+@@ -0,0 +1,431 @@
 +// SPDX-License-Identifier: MIT
-+//! Live editing in a Playground session (patches/mspaint.yaml in github.com/daijro/openplayground). Playground's
-+//! `shell/live.js` drives it through the adapter [`web::attach`] offers; nothing here runs until a session connects.
-+//! Web only; the document functions also run in native tests. A child of the app module, so it reads the app's state.
++//! Live editing in a Playground session (patches/mspaint.yaml in github.com/daijro/openplayground wires it in; the
++//! session and the presence look are the playground-live crate's, patches/live/kit). Web only; the document functions
++//! also run in native tests.
 +//!
-+//! The shared document is the picture: its size and pixels, cut into 64×64 tiles, each a single colour or a PNG, so a
-+//! stroke changes only the bytes of the tiles it touched ([`MAGIC`] for the layout). Two people's edits merge pixel by
-+//! pixel ([`merge`]): both strokes stay, and where both painted the same pixel the later one is on top. A remote change
-+//! goes into the picture at the end of a frame with no stroke under way ([`frame`]) and is no step of the app's own
-+//! history; while connected, Undo and Redo go to the session, which takes back only this person's edits. Each person's
-+//! pointer and the stroke, shape or text they are making go to the others (`peers`). Presence lists and the look of the
-+//! others' pointers are the playground-live crate's (patches/live/kit).
++//! The shared document is the picture: the canvas size and the layers bottom to top, each with its id, name, origin,
++//! visibility, opacity, size and default pixel, and its 256×256 tiles that differ from the default (`"tx,ty"`: the
++//! tile's pixels, straight RGBA cropped to the layer, LZ4-compressed, base64). A stroke changes only the tiles it
++//! touched, so two people's edits to different layers or tiles merge as JSON does (layers by id, tiles by key), and two
++//! edits to one tile merge pixel by pixel ([`merge_tiles`]): both stay, the later on top. A remote change goes in at the
++//! end of a frame with no gesture under way and is no step of the editor's history; while connected, Undo and Redo go
++//! to the session, which takes back only this person's edits. Each person's pointer, the stroke, shape, selection or
++//! text they are making and their selection go to the others (`peers`).
++
++// The page's hooks are web only; native tests use the document functions.
++#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 +
 +mod peers;
-+#[cfg(test)]
-+mod tests;
 +
 +#[cfg(target_arch = "wasm32")]
 +pub use peers::paint;
 +
-+use super::{DragState, SelfPaintApp};
-+use crate::document::Document;
-+use image::RgbaImage;
-+use playground_live::presence;
-+use std::cell::{Cell, RefCell};
-+use std::collections::VecDeque;
++use crate::app::WebApp;
++use crate::editor::MAX_PIXELS;
++use paintcraft_core::types::Rgba;
++use paintcraft_document::{Document, LAYER_COUNT_MAX, Layer};
++use paintcraft_raster::{Admission, RasterLayer, TILE_EDGE, TileVersion};
++use playground_live::{Live, Presence, presence};
++use serde_json::{Map, Value, json};
++use std::cell::{OnceCell, RefCell};
++use std::collections::{BTreeSet, HashMap};
++use uuid::Uuid;
 +
 +/// The document's format: peers whose formats differ do not share a document.
-+pub const FORMAT: &str = "mspaint:1";
-+/// The document: this line; the width and height (u32, little-endian); then each tile in rows from the top left, as a
-+/// u32 n and n bytes: `0 r g b a` for a tile of one colour, else the tile as a PNG (RGBA, 8 bits).
-+const MAGIC: &[u8] = b"selfpaint-live 1\n";
-+const TILE: u32 = 64;
-+/// The app's largest picture side (`Document::new`).
-+const MAX_SIDE: u32 = 8192;
++pub const FORMAT: &str = "paintcraft:1";
++/// The largest layer, in pixels (layers keep what lies off the canvas, so they may be larger than it).
++const MAX_LAYER: u64 = 4 * MAX_PIXELS;
 +
 +fn invalid(e: impl std::fmt::Display) -> String {
 +    format!("Invalid shared picture: {e}")
 +}
 +
-+// ---------------------------------------------------------------- the document
++// ---------------------------------------------------------------- tiles
 +
-+/// The rectangle of tile `i` in a w×h picture: x, y, width, height.
-+fn tile_rect(w: u32, h: u32, i: usize) -> (u32, u32, u32, u32) {
-+    let across = w.div_ceil(TILE);
-+    let (x, y) = (i as u32 % across * TILE, i as u32 / across * TILE);
-+    (x, y, TILE.min(w - x), TILE.min(h - y))
-+}
++const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 +
-+fn tile_count(w: u32, h: u32) -> usize {
-+    (w.div_ceil(TILE) * h.div_ceil(TILE)) as usize
-+}
-+
-+/// The pixels of `rect` in a picture `w` wide, row after row.
-+fn cut(raw: &[u8], w: u32, (x, y, tw, th): (u32, u32, u32, u32)) -> Vec<u8> {
-+    let (w, x, tw) = (w as usize, x as usize, tw as usize);
-+    (y as usize..(y + th) as usize).flat_map(|row| &raw[(row * w + x) * 4..(row * w + x + tw) * 4]).copied().collect()
-+}
-+
-+/// One tile's bytes (see [`MAGIC`]).
-+fn encode(px: &[u8], tw: u32, th: u32) -> Vec<u8> {
-+    use image::ImageEncoder as _;
-+    if px.chunks_exact(4).all(|p| p == &px[..4]) {
-+        return [&[0], &px[..4]].concat();
-+    }
-+    let mut png = Vec::new();
-+    let encoder = image::codecs::png::PngEncoder::new_with_quality(&mut png, image::codecs::png::CompressionType::Fast, image::codecs::png::FilterType::Adaptive);
-+    encoder.write_image(px, tw, th, image::ExtendedColorType::Rgba8).expect("encoding a PNG in memory");
-+    png
-+}
-+
-+fn decode(bytes: &[u8], tw: u32, th: u32) -> Result<Vec<u8>, String> {
-+    if let [0, rgba @ ..] = bytes {
-+        return if rgba.len() == 4 { Ok(rgba.repeat((tw * th) as usize)) } else { Err(invalid("tile")) };
-+    }
-+    // The size in its header first: a PNG from someone else could claim any size.
-+    let size = |at: usize| bytes.get(at..at + 4).map(|n| u32::from_be_bytes(n.try_into().unwrap_or_default()));
-+    if (size(16), size(20)) != (Some(tw), Some(th)) {
-+        return Err(invalid("tile size"));
-+    }
-+    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).map_err(invalid)?.into_rgba8();
-+    if img.dimensions() != (tw, th) {
-+        return Err(invalid("tile size"));
-+    }
-+    Ok(img.into_raw())
-+}
-+
-+/// A document taken apart (its tiles still encoded).
-+struct Doc<'a> {
-+    w: u32,
-+    h: u32,
-+    tiles: Vec<&'a [u8]>,
-+}
-+
-+fn parse(bytes: &[u8]) -> Result<Doc<'_>, String> {
-+    fn take<'a>(rest: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
-+        let (head, tail) = rest.split_at_checked(n).ok_or_else(|| invalid("cut short"))?;
-+        *rest = tail;
-+        Ok(head)
-+    }
-+    let number = |rest: &mut &[u8]| take(rest, 4).map(|n| u32::from_le_bytes(n.try_into().unwrap_or_default()));
-+    let mut rest = bytes.strip_prefix(MAGIC).ok_or_else(|| invalid("not a SelfPaint picture"))?;
-+    let (w, h) = (number(&mut rest)?, number(&mut rest)?);
-+    if !(1..=MAX_SIDE).contains(&w) || !(1..=MAX_SIDE).contains(&h) {
-+        return Err(invalid(format!("{w} × {h} px")));
-+    }
-+    let mut tiles = Vec::with_capacity(tile_count(w, h));
-+    for _ in 0..tile_count(w, h) {
-+        let n = number(&mut rest)? as usize;
-+        tiles.push(take(&mut rest, n)?);
-+    }
-+    if !rest.is_empty() {
-+        return Err(invalid("trailing bytes"));
-+    }
-+    Ok(Doc { w, h, tiles })
-+}
-+
-+fn write(w: u32, h: u32, tiles: &[impl AsRef<[u8]>]) -> Vec<u8> {
-+    let mut out = Vec::with_capacity(MAGIC.len() + 8 + tiles.iter().map(|t| 4 + t.as_ref().len()).sum::<usize>());
-+    out.extend(MAGIC);
-+    out.extend(w.to_le_bytes());
-+    out.extend(h.to_le_bytes());
-+    for tile in tiles {
-+        out.extend((tile.as_ref().len() as u32).to_le_bytes());
-+        out.extend(tile.as_ref());
++fn base64(bytes: &[u8]) -> String {
++    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
++    for chunk in bytes.chunks(3) {
++        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
++        for i in 0..4 {
++            out.push(if i <= chunk.len() { B64[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
++        }
 +    }
 +    out
 +}
 +
-+/// A whole picture as the document.
-+#[cfg(test)]
-+fn document_of(img: &RgbaImage) -> Vec<u8> {
-+    let (w, h) = img.dimensions();
-+    let tiles: Vec<_> = (0..tile_count(w, h)).map(|i| tile_rect(w, h, i)).map(|r| encode(&cut(img.as_raw(), w, r), r.2, r.3)).collect();
-+    write(w, h, &tiles)
-+}
-+
-+/// The picture a document holds.
-+#[cfg(test)]
-+fn picture_of(bytes: &[u8]) -> Result<RgbaImage, String> {
-+    let doc = parse(bytes)?;
-+    let mut img = RgbaImage::new(doc.w, doc.h);
-+    for (i, tile) in doc.tiles.iter().enumerate() {
-+        let r = tile_rect(doc.w, doc.h, i);
-+        paste(&mut img, doc.w, r, &decode(tile, r.2, r.3)?);
++fn unbase64(text: &str) -> Result<Vec<u8>, String> {
++    let s = text.as_bytes();
++    if s.len() % 4 != 0 {
++        return Err(invalid("tile text"));
 +    }
-+    Ok(img)
-+}
-+
-+/// `px` (a tile's pixels) into `rect` of a picture `w` wide.
-+fn paste(raw: &mut [u8], w: u32, (x, y, tw, th): (u32, u32, u32, u32), px: &[u8]) {
-+    let w = w as usize;
-+    for row in 0..th as usize {
-+        let at = ((y as usize + row) * w + x as usize) * 4;
-+        raw[at..at + tw as usize * 4].copy_from_slice(&px[row * tw as usize * 4..(row + 1) * tw as usize * 4]);
-+    }
-+}
-+
-+/// The three-way merge: `current` (the side not accepted yet: this person's unsent work, or the proposal being
-+/// placed) and `edited` (the accepted change) both changed `base`. Each pixel takes the side that changed it; a pixel
-+/// both changed takes `current`'s, which is applied after `edited`, so both strokes stay and the later is on top. A new
-+/// canvas size on one side wins when the other left the picture as it was, and is a conflict otherwise. Tiles the
-+/// result takes that `base` did not have are checked to decode.
-+pub fn merge(base: &[u8], current: &[u8], edited: &[u8]) -> Result<Vec<u8>, String> {
-+    let (b, c, e) = (parse(base)?, parse(current)?, parse(edited)?);
-+    let checked = |doc: &Doc, bytes: &[u8]| -> Result<Vec<u8>, String> {
-+        for (i, tile) in doc.tiles.iter().enumerate() {
-+            let r = tile_rect(doc.w, doc.h, i);
-+            if (doc.w, doc.h) != (b.w, b.h) || *tile != b.tiles[i] {
-+                decode(tile, r.2, r.3)?;
-+            }
++    let mut out = Vec::with_capacity(s.len() / 4 * 3);
++    for (q, chunk) in s.chunks(4).enumerate() {
++        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
++        if pad > 2 || (pad > 0 && q + 1 != s.len() / 4) {
++            return Err(invalid("tile text"));
 +        }
-+        Ok(bytes.to_vec())
++        let mut n = 0u32;
++        for (i, &c) in chunk[..4 - pad].iter().enumerate() {
++            let v = match c {
++                b'A'..=b'Z' => c - b'A',
++                b'a'..=b'z' => c - b'a' + 26,
++                b'0'..=b'9' => c - b'0' + 52,
++                b'+' => 62,
++                b'/' => 63,
++                _ => return Err(invalid("tile text")),
++            };
++            n |= u32::from(v) << (18 - 6 * i);
++        }
++        out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
++    }
++    Ok(out)
++}
++
++/// The size of tile (tx, ty) of a w×h layer: 256×256, cut at the layer's right and bottom edges.
++fn tile_size(w: u32, h: u32, (tx, ty): (u32, u32)) -> (u32, u32) {
++    ((w - tx * TILE_EDGE).min(TILE_EDGE), (h - ty * TILE_EDGE).min(TILE_EDGE))
++}
++
++fn encode(px: &[u8]) -> String {
++    let mut packed = vec![0; lz4_flex::block::get_maximum_output_size(px.len())];
++    let n = lz4_flex::block::compress_into(px, &mut packed).expect("room for the worst case");
++    base64(&packed[..n])
++}
++
++/// A tile's pixels, exactly `len` bytes (the size comes from the layer, never from the data someone sent).
++fn decode(text: &str, len: usize) -> Result<Vec<u8>, String> {
++    let mut px = vec![0; len];
++    let n = lz4_flex::block::decompress_into(&unbase64(text)?, &mut px).map_err(invalid)?;
++    if n == len { Ok(px) } else { Err(invalid("tile size")) }
++}
++
++/// A tile's text, or None when all its pixels are the default (tiles like that are left out).
++fn tile_text(px: &[u8], default: Rgba) -> Option<String> {
++    (!px.chunks_exact(4).all(|p| p == default.0)).then(|| encode(px))
++}
++
++/// The pixels of tile (tx, ty) of a layer.
++fn pixels(raster: &RasterLayer, (tx, ty): (u32, u32)) -> Vec<u8> {
++    let (tw, th) = tile_size(raster.width(), raster.height(), (tx, ty));
++    let mut px = vec![0; (tw * th * 4) as usize];
++    for (row, out) in px.chunks_exact_mut(tw as usize * 4).enumerate() {
++        raster.read_span(i64::from(ty * TILE_EDGE) + row as i64, i64::from(tx * TILE_EDGE), out);
++    }
++    px
++}
++
++fn key((tx, ty): (u32, u32)) -> String {
++    format!("{tx},{ty}")
++}
++
++// ---------------------------------------------------------------- the document
++
++/// A shared layer taken apart.
++struct SharedLayer<'a> {
++    id: Uuid,
++    name: &'a str,
++    origin: (i64, i64),
++    visible: bool,
++    opacity: u8,
++    size: (u32, u32),
++    default: Rgba,
++    tiles: Vec<((u32, u32), &'a str)>,
++}
++
++impl SharedLayer<'_> {
++    fn tile_len(&self, at: (u32, u32)) -> usize {
++        let (tw, th) = tile_size(self.size.0, self.size.1, at);
++        (tw * th * 4) as usize
++    }
++}
++
++/// A shared document taken apart, checked: sizes, ids, tile places. Tiles are decoded later ([`check`], [`install`]).
++fn parse(doc: &Value) -> Result<((u32, u32), Vec<SharedLayer<'_>>), String> {
++    let size = |v: &Value| -> Option<(u32, u32)> {
++        let side = |v: &Value| v.as_u64().filter(|s| (1..=u64::from(paintcraft_document::CANVAS_SIDE_MAX)).contains(s));
++        Some((side(&v[0])? as u32, side(&v[1])? as u32))
 +    };
-+    if (c.w, c.h, e.w, e.h) != (b.w, b.h, b.w, b.h) {
-+        return match (edited == base, current == base) {
-+            (true, _) => checked(&c, current),
-+            (_, true) => checked(&e, edited),
-+            _ => Err("Conflict: the canvas size changed".into()),
++    let canvas = size(&doc["canvas"]).filter(|(w, h)| u64::from(*w) * u64::from(*h) <= MAX_PIXELS).ok_or_else(|| invalid("canvas size"))?;
++    let items = doc["layers"].as_array().filter(|l| l.len() <= LAYER_COUNT_MAX).ok_or_else(|| invalid("layers"))?;
++    let mut ids = BTreeSet::new();
++    let mut layers = Vec::with_capacity(items.len());
++    for l in items {
++        let id = l["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()).filter(|id| ids.insert(*id)).ok_or_else(|| invalid("layer id"))?;
++        let coord = |v: &Value| v.as_i64().filter(|c| c.abs() <= paintcraft_document::COORD_ABS_MAX);
++        let layer = SharedLayer {
++            id,
++            name: l["name"].as_str().ok_or_else(|| invalid("layer name"))?,
++            origin: (|| Some((coord(&l["origin"][0])?, coord(&l["origin"][1])?)))().ok_or_else(|| invalid("layer origin"))?,
++            visible: l["visible"].as_bool().ok_or_else(|| invalid("layer visibility"))?,
++            opacity: l["opacity"].as_u64().and_then(|o| u8::try_from(o).ok()).ok_or_else(|| invalid("layer opacity"))?,
++            size: size(&l["size"]).filter(|(w, h)| u64::from(*w) * u64::from(*h) <= MAX_LAYER).ok_or_else(|| invalid("layer size"))?,
++            default: l["default"].as_str().and_then(Rgba::parse).ok_or_else(|| invalid("layer default"))?,
++            tiles: Vec::new(),
 +        };
-+    }
-+    let mut tiles = Vec::with_capacity(b.tiles.len());
-+    for i in 0..b.tiles.len() {
-+        let (tb, tc, te) = (b.tiles[i], c.tiles[i], e.tiles[i]);
-+        let r = tile_rect(b.w, b.h, i);
-+        let take = |t: &[u8]| -> Result<Vec<u8>, String> {
-+            if t != tb {
-+                decode(t, r.2, r.3)?;
-+            }
-+            Ok(t.to_vec())
-+        };
-+        tiles.push(if te == tb || tc == te {
-+            take(tc)?
-+        } else if tc == tb {
-+            take(te)?
-+        } else {
-+            let (pb, pc, pe) = (decode(tb, r.2, r.3)?, decode(tc, r.2, r.3)?, decode(te, r.2, r.3)?);
-+            let px: Vec<u8> = pb.chunks_exact(4).zip(pc.chunks_exact(4)).zip(pe.chunks_exact(4)).flat_map(|((b, c), e)| if c != b { c } else { e }).copied().collect();
-+            encode(&px, r.2, r.3)
-+        });
-+    }
-+    Ok(write(b.w, b.h, &tiles))
-+}
-+
-+// ---------------------------------------------------------------- the app's document, kept encoded
-+
-+/// The document as last made from the picture or installed into it.
-+#[derive(Default)]
-+struct Cache {
-+    w: u32,
-+    h: u32,
-+    tiles: Vec<Vec<u8>>,
-+    /// The pixels the tiles hold.
-+    pixels: Vec<u8>,
-+    bytes: Vec<u8>,
-+    /// [`CHANGES`] when they were made.
-+    seen: u64,
-+}
-+
-+thread_local! {
-+    static CACHE: RefCell<Cache> = RefCell::default();
-+    /// Counts the app's changes to its picture (`touch`, from the app's mark_doc_dirty).
-+    static CHANGES: Cell<u64> = const { Cell::new(1) };
-+    static SESSION: RefCell<Session> = RefCell::default();
-+}
-+
-+/// The app changed its picture (called where it marks it changed).
-+pub fn touch() {
-+    CHANGES.set(CHANGES.get() + 1);
-+}
-+
-+/// No stroke under way (it paints into the picture as it goes; shapes and text go in at once when done).
-+fn quiet(app: &SelfPaintApp) -> bool {
-+    !matches!(app.drag, DragState::Stroke { .. })
-+}
-+
-+/// The picture as the document: only the tiles that changed since last time are encoded again.
-+fn document(app: &SelfPaintApp) -> Vec<u8> {
-+    CACHE.with_borrow_mut(|c| {
-+        let (w, h, changes) = (app.doc.width(), app.doc.height(), CHANGES.get());
-+        if c.seen == changes && (c.w, c.h) == (w, h) && !c.bytes.is_empty() {
-+            return c.bytes.clone();
++        let (w, h) = layer.size;
++        let mut tiles = Vec::new();
++        for (k, v) in l["tiles"].as_object().ok_or_else(|| invalid("tiles"))? {
++            let at = k.split_once(',').and_then(|(x, y)| Some((x.parse::<u32>().ok()?, y.parse::<u32>().ok()?)));
++            let at = at.filter(|&(x, y)| key((x, y)) == *k && x < w.div_ceil(TILE_EDGE) && y < h.div_ceil(TILE_EDGE)).ok_or_else(|| invalid(format!("tile {k}")))?;
++            tiles.push((at, v.as_str().ok_or_else(|| invalid(format!("tile {k}")))?));
 +        }
-+        let raw = app.doc.pixels.as_raw();
-+        let fresh = (c.w, c.h) != (w, h) || c.pixels.len() != raw.len();
-+        if fresh {
-+            c.pixels.clone_from(raw);
-+            c.tiles = vec![Vec::new(); tile_count(w, h)];
-+        }
-+        // The byte ranges of a tile's rows.
-+        let rows = |(x, y, tw, th): (u32, u32, u32, u32)| (y..y + th).map(move |row| (row * w + x) as usize * 4).map(move |at| at..at + tw as usize * 4);
-+        for i in 0..c.tiles.len() {
-+            let r = tile_rect(w, h, i);
-+            if fresh || rows(r).any(|span| raw[span.clone()] != c.pixels[span]) {
-+                let px = cut(raw, w, r);
-+                paste(&mut c.pixels, w, r, &px);
-+                c.tiles[i] = encode(&px, r.2, r.3);
-+            }
-+        }
-+        (c.w, c.h, c.seen) = (w, h, changes);
-+        c.bytes = write(w, h, &c.tiles);
-+        c.bytes.clone()
-+    })
++        layers.push(SharedLayer { tiles, ..layer });
++    }
++    Ok((canvas, layers))
 +}
 +
-+/// Puts a document into the picture, decoding only the tiles that differ (all of them for a new size), and keeps it
-+/// as the app's document. Not a change of this person's, and no step of the app's history.
-+fn install(app: &mut SelfPaintApp, bytes: &[u8]) -> Result<(), String> {
-+    document(app);
-+    let doc = parse(bytes)?;
-+    let resized = (doc.w, doc.h) != (app.doc.width(), app.doc.height());
-+    let changed = CACHE.with_borrow(|c| {
-+        let tiles = doc.tiles.iter().enumerate().filter(|(i, t)| resized || c.tiles[*i] != **t);
-+        tiles.map(|(i, t)| {
-+            let r = tile_rect(doc.w, doc.h, i);
-+            decode(t, r.2, r.3).map(|px| (r, px))
-+        })
-+        .collect::<Result<Vec<_>, _>>()
-+    })?;
-+    if resized {
-+        app.doc = Document::from_rgba(RgbaImage::new(doc.w, doc.h));
-+    }
-+    let size = [doc.w as usize, doc.h as usize];
-+    let mut texture = app.texture.as_mut().filter(|t| !resized && t.size() == size);
-+    for (r, px) in &changed {
-+        paste(&mut app.doc.pixels, doc.w, *r, px);
-+        // Only the tiles that changed go to the screen.
-+        if let Some(t) = texture.as_mut() {
-+            t.set_partial([r.0 as usize, r.1 as usize], egui::ColorImage::from_rgba_unmultiplied([r.2 as usize, r.3 as usize], px), egui::TextureOptions::LINEAR);
++/// A whole shared document: every tile decodes to its size.
++fn check(doc: &Value) -> Result<(), String> {
++    for layer in parse(doc)?.1 {
++        for &(at, text) in &layer.tiles {
++            decode(text, layer.tile_len(at))?;
 +        }
 +    }
-+    if texture.is_none() {
-+        app.texture_dirty = true;
-+    }
-+    if !changed.is_empty() {
-+        peers::landed();
-+    }
-+    CACHE.with_borrow_mut(|c| {
-+        if resized {
-+            c.pixels.clone_from(app.doc.pixels.as_raw());
-+        } else {
-+            changed.iter().for_each(|(r, px)| paste(&mut c.pixels, doc.w, *r, px));
-+        }
-+        c.tiles = doc.tiles.iter().map(|t| t.to_vec()).collect();
-+        (c.w, c.h, c.seen) = (doc.w, doc.h, CHANGES.get());
-+        c.bytes = bytes.to_vec();
-+    });
 +    Ok(())
 +}
 +
-+// ---------------------------------------------------------------- the session
-+
-+/// A remote change waiting for a quiet frame: `edited` relative to `base`, or with no base a whole document.
-+struct Remote {
-+    base: Option<Vec<u8>>,
-+    edited: Vec<u8>,
-+    done: Box<dyn FnOnce(Result<Option<Vec<u8>>, String>)>,
++thread_local! {
++    /// Each tile's text as last made or installed, by layer and place, with the tile it was made from: a tile that is
++    /// still the same buffer is not encoded again.
++    static TILES: RefCell<HashMap<(Uuid, u32, u32), (TileVersion, Option<String>)>> = RefCell::default();
++    static CTX: OnceCell<eframe::egui::Context> = const { OnceCell::new() };
 +}
 +
-+#[derive(Default)]
-+struct Session {
-+    connected: bool,
-+    remote: VecDeque<Remote>,
-+    /// [`CHANGES`] when the shell was last told.
-+    reported: u64,
-+    #[cfg(target_arch = "wasm32")]
-+    hooks: Option<(js_sys::Function, js_sys::Function)>,
-+}
-+
-+pub fn connected() -> bool {
-+    SESSION.with_borrow(|s| s.connected)
-+}
-+
-+/// At the top of the app's Undo and Redo: while connected they go to the session (whether they did).
-+pub fn undo(redo: bool) -> bool {
-+    #[cfg(target_arch = "wasm32")]
-+    if let Some(undo) = SESSION.with_borrow(|s| s.hooks.as_ref().map(|h| h.1.clone())) {
-+        let _ = undo.call1(&wasm_bindgen::JsValue::NULL, &redo.into());
-+    }
-+    let _ = redo;
-+    connected()
-+}
-+
-+fn adopt(app: &mut SelfPaintApp, base: Option<&[u8]>, edited: &[u8]) -> Result<Option<Vec<u8>>, String> {
-+    let current = document(app);
-+    match base {
-+        Some(base) => install(app, &merge(base, &current, edited)?).map(|()| None),
-+        None => install(app, edited).map(|()| Some(current)),
-+    }
-+}
-+
-+/// The end of each frame: once no stroke is under way, the remote changes waiting go in (whether any did: the next
-+/// frame shows them) and the shell hears of a change of this person's.
-+pub fn frame(app: &mut SelfPaintApp) -> bool {
-+    if !connected() || !quiet(app) {
-+        return false;
-+    }
-+    let waiting = SESSION.with_borrow_mut(|s| std::mem::take(&mut s.remote));
-+    let adopted = !waiting.is_empty();
-+    for remote in waiting {
-+        let result = adopt(app, remote.base.as_deref(), &remote.edited);
-+        (remote.done)(result);
-+    }
-+    let changes = CHANGES.get();
-+    if SESSION.with_borrow_mut(|s| std::mem::replace(&mut s.reported, changes) != changes) {
-+        #[cfg(target_arch = "wasm32")]
-+        if let Some(changed) = SESSION.with_borrow(|s| s.hooks.as_ref().map(|h| h.0.clone())) {
-+            let _ = changed.call0(&wasm_bindgen::JsValue::NULL);
-+        }
-+    }
-+    adopted
-+}
-+
-+/// The session ended: changes still waiting fail, and the app's own Undo starts again from the picture as it is.
-+fn disconnect(app: Option<&mut SelfPaintApp>) {
-+    let waiting = SESSION.with_borrow_mut(|s| {
-+        s.connected = false;
-+        #[cfg(target_arch = "wasm32")]
-+        {
-+            s.hooks = None;
-+        }
-+        std::mem::take(&mut s.remote)
-+    });
-+    for remote in waiting {
-+        (remote.done)(Err("Live editing disconnected".into()));
-+    }
-+    if let Some(app) = app {
-+        app.history.clear();
-+    }
-+    presence::show(Vec::new());
-+}
-+
-+/// The adapter object the shell drives (`shell/live.js`): `format`, `checkpoint()` (throws `busy` mid-stroke),
-+/// `merge(base, current, edited)`, `apply(base | null, edited)` (a promise, settled at the next quiet frame; a whole
-+/// document resolves to the one it replaced), `connect({ changed, undo })`, `disconnect()`, `presence()` and
-+/// `showPresence(others)`; and the web runner and the app wrapped with the session's frame.
-+#[cfg(target_arch = "wasm32")]
-+pub mod web {
-+    use super::{SESSION, SelfPaintApp};
-+    use crate::app::web::Web;
-+    use eframe::egui;
-+    use js_sys::{Function, Object, Promise, Reflect, Uint8Array};
-+    use std::cell::OnceCell;
-+    use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
-+
-+    thread_local! {
-+        static RUNNER: OnceCell<eframe::WebRunner> = const { OnceCell::new() };
-+    }
-+
-+    /// The page's web runner, kept for the adapter.
-+    pub fn runner() -> eframe::WebRunner {
-+        RUNNER.with(|kept| kept.get_or_init(eframe::WebRunner::new).clone())
-+    }
-+
-+    /// Runs `f` on the app, unless it is not running or mid-frame (false).
-+    fn with_app<T>(f: impl FnOnce(&mut SelfPaintApp) -> T) -> Option<T> {
-+        runner().app_mut::<Shell>().map(|mut shell| f(&mut shell.0.0))
-+    }
-+
-+    /// The app eframe runs: the page's app, the presence look's end of frame (repaints while a mark eases), then the
-+    /// session's frame; and the adapter offered to the shell.
-+    pub fn wrap(web: Web) -> Box<dyn eframe::App> {
-+        if let Err(e) = attach() {
-+            web_sys::console::warn_1(&format!("SelfPaint: no live editing: {e:?}").into());
-+        }
-+        Box::new(Shell(web))
-+    }
-+
-+    struct Shell(Web);
-+
-+    impl eframe::App for Shell {
-+        fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-+            eframe::App::ui(&mut self.0, ui, frame);
-+            super::presence::end_frame(ui.ctx());
-+            if super::frame(&mut self.0.0) {
-+                ui.ctx().request_repaint();
-+            }
-+        }
-+
-+        fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-+            eframe::App::clear_color(&self.0, visuals)
-+        }
-+
-+        fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-+            Some(self)
-+        }
-+    }
-+
-+    fn busy() -> JsValue {
-+        "busy".into()
-+    }
-+
-+    fn attach() -> Result<(), JsValue> {
-+        let adapter = Object::new();
-+        let set = |name: &str, value: JsValue| Reflect::set(&adapter, &name.into(), &value).map(drop);
-+        set("format", super::FORMAT.into())?;
-+        let checkpoint = || -> Result<Uint8Array, JsValue> {
-+            let bytes = with_app(|app| super::quiet(app).then(|| super::document(app))).flatten().ok_or_else(busy)?;
-+            Ok(bytes.as_slice().into())
-+        };
-+        set("checkpoint", Closure::<dyn Fn() -> _>::new(checkpoint).into_js_value())?;
-+        let merge = |base: Uint8Array, current: Uint8Array, edited: Uint8Array| -> Result<Uint8Array, JsValue> {
-+            let merged = super::merge(&base.to_vec(), &current.to_vec(), &edited.to_vec()).map_err(|e| JsValue::from_str(&e))?;
-+            Ok(merged.as_slice().into())
-+        };
-+        set("merge", Closure::<dyn Fn(_, _, _) -> _>::new(merge).into_js_value())?;
-+        let apply = |base: JsValue, edited: Uint8Array| -> Promise {
-+            let mut job = Some((base.dyn_ref::<Uint8Array>().map(Uint8Array::to_vec), edited.to_vec()));
-+            Promise::new(&mut |resolve, reject| {
-+                let Some((base, edited)) = job.take() else { return };
-+                let done = Box::new(move |result: Result<Option<Vec<u8>>, String>| {
-+                    let _ = match result {
-+                        Ok(None) => resolve.call0(&JsValue::NULL),
-+                        Ok(Some(replaced)) => resolve.call1(&JsValue::NULL, &Uint8Array::from(replaced.as_slice())),
-+                        Err(e) => reject.call1(&JsValue::NULL, &JsValue::from_str(&e)),
++/// The shared document of `doc` (see the top).
++fn shared(doc: &Document) -> Value {
++    TILES.with_borrow_mut(|cache| {
++        let mut kept = HashMap::new();
++        let layers: Vec<Value> = doc
++            .layers_in_order()
++            .map(|layer| {
++                let raster = &layer.raster;
++                let mut tiles = Map::new();
++                for (c, version) in raster.tile_versions(raster.bounds()).into_iter().flatten() {
++                    let at = (c.tx as u32, c.ty as u32);
++                    let text = match cache.remove(&(layer.id, at.0, at.1)) {
++                        Some((v, text)) if v == version => text,
++                        _ => tile_text(&pixels(raster, at), raster.default_pixel()),
 +                    };
-+                });
-+                let refused = SESSION.with_borrow_mut(|s| {
-+                    if !s.connected {
-+                        return Some(done);
++                    if let Some(text) = &text {
++                        tiles.insert(key(at), text.as_str().into());
 +                    }
-+                    s.remote.push_back(super::Remote { base, edited, done });
-+                    None
-+                });
-+                match refused {
-+                    Some(done) => done(Err("Live editing is not connected".into())),
-+                    None => crate::app::web::repaint(),
++                    kept.insert((layer.id, at.0, at.1), (version, text));
 +                }
++                json!({
++                    "id": layer.id.to_string(),
++                    "name": layer.name,
++                    "origin": [layer.origin.0, layer.origin.1],
++                    "visible": layer.visible,
++                    "opacity": layer.opacity,
++                    "size": [raster.width(), raster.height()],
++                    "default": raster.default_pixel().to_hex(),
++                    "tiles": tiles,
++                })
 +            })
-+        };
-+        set("apply", Closure::<dyn Fn(_, _) -> _>::new(apply).into_js_value())?;
-+        let connect = |hooks: JsValue| -> Result<(), JsValue> {
-+            let get = |name: &str| Reflect::get(&hooks, &name.into())?.dyn_into::<Function>();
-+            let hooks = (get("changed")?, get("undo")?);
-+            SESSION.with_borrow_mut(|s| (s.connected, s.reported, s.hooks) = (true, 0, Some(hooks)));
-+            crate::app::web::repaint();
-+            Ok(())
-+        };
-+        set("connect", Closure::<dyn Fn(_) -> _>::new(connect).into_js_value())?;
-+        let disconnect = || {
-+            if with_app(|app| super::disconnect(Some(app))).is_none() {
-+                super::disconnect(None);
++            .collect();
++        *cache = kept;
++        json!({ "canvas": [doc.canvas.0, doc.canvas.1], "layers": layers })
++    })
++}
++
++/// `shared` as a document: each layer from `current`'s where its size and default are the same (the tiles that did not
++/// change stay the very buffers they were), decoding only the tiles whose text differs.
++fn document_of(shared: &Value, current: &Document) -> Result<Document, String> {
++    let (canvas, layers) = parse(shared)?;
++    TILES.with_borrow_mut(|cache| {
++        let mut roots = Vec::with_capacity(layers.len());
++        let mut out = HashMap::with_capacity(layers.len());
++        let mut adm = Admission::new(paintcraft_core::types::policy::STAGED_PIXELS_MAX);
++        for l in &layers {
++            let old = current.layers.get(&l.id).map(|o| &o.raster).filter(|r| (r.width(), r.height(), r.default_pixel()) == (l.size.0, l.size.1, l.default));
++            let mut raster = old.cloned().unwrap_or_else(|| RasterLayer::new(l.size.0, l.size.1, l.default));
++            // The kept layer's tiles: their text (None: all default) where it is known, else just their place.
++            let (mut known, mut unknown) = (HashMap::new(), BTreeSet::new());
++            for (c, version) in old.into_iter().flat_map(|old| old.tile_versions(old.bounds()).into_iter().flatten()) {
++                let at = (c.tx as u32, c.ty as u32);
++                match cache.get(&(l.id, at.0, at.1)).filter(|(v, _)| *v == version) {
++                    Some((_, text)) => {
++                        known.insert(at, text.as_deref());
++                    }
++                    None => {
++                        unknown.insert(at);
++                    }
++                }
 +            }
-+        };
-+        set("disconnect", Closure::<dyn Fn()>::new(disconnect).into_js_value())?;
-+        let presence = || -> Result<JsValue, JsValue> {
-+            let state = with_app(|app| super::peers::mine(app)).ok_or_else(busy)?;
-+            js_sys::JSON::parse(&state.to_string())
-+        };
-+        set("presence", Closure::<dyn Fn() -> _>::new(presence).into_js_value())?;
-+        let show_presence = |others: JsValue| -> Result<(), JsValue> {
-+            let text: String = js_sys::JSON::stringify(&others)?.into();
-+            super::presence::show(playground_live::Presence::list(&serde_json::from_str(&text).unwrap_or_default()));
-+            crate::app::web::repaint();
-+            Ok(())
-+        };
-+        set("showPresence", Closure::<dyn Fn(_) -> _>::new(show_presence).into_js_value())?;
-+        let global = js_sys::global();
-+        Reflect::set(&global, &"playgroundLiveAdapter".into(), &adapter)?;
-+        let attach = Reflect::get(&global, &"playgroundLive".into()).and_then(|live| Reflect::get(&live, &"attach".into())).ok();
-+        if let Some(attach) = attach.and_then(|f| f.dyn_into::<Function>().ok()) {
-+            attach.call1(&global, &adapter)?;
++            let wanted: HashMap<(u32, u32), &str> = l.tiles.iter().copied().collect();
++            let places: BTreeSet<(u32, u32)> = wanted.keys().chain(known.keys()).chain(&unknown).copied().collect();
++            let mut set = Vec::new();
++            for at in places {
++                let want = wanted.get(&at).copied();
++                // A kept tile with this text already (or a default place of a kept layer, with none) stays.
++                if old.is_some() && !unknown.contains(&at) && known.get(&at).copied().flatten() == want {
++                    continue;
++                }
++                let px = match want {
++                    Some(text) => decode(text, l.tile_len(at))?,
++                    None => l.default.0.repeat(l.tile_len(at) / 4),
++                };
++                raster.set_block(at.0, at.1, &px, &mut adm).map_err(invalid)?;
++                set.push((at, want));
++            }
++            // The tiles just set are known by their text.
++            let versions: HashMap<(u32, u32), TileVersion> = raster.tile_versions(raster.bounds()).into_iter().flatten().map(|(c, v)| ((c.tx as u32, c.ty as u32), v)).collect();
++            for (at, want) in set {
++                if let Some(v) = versions.get(&at) {
++                    cache.insert((l.id, at.0, at.1), (v.clone(), want.map(str::to_owned)));
++                }
++            }
++            roots.push(l.id);
++            out.insert(l.id, Layer { id: l.id, name: l.name.to_owned(), origin: l.origin, visible: l.visible, opacity: l.opacity, raster });
 +        }
++        Ok(Document {
++            document_id: current.document_id,
++            state_id: Uuid::new_v4(),
++            canvas,
++            roots,
++            layers: out,
++            title: current.title.clone(),
++        })
++    })
++}
++
++/// Two people's changes to one tile, pixel by pixel: a pixel `current` (the side placed after `edited`) changed is
++/// its, the others `edited`'s.
++fn merge_tiles(base: &[u8], current: &[u8], edited: &[u8]) -> Vec<u8> {
++    let pixels = base.chunks_exact(4).zip(current.chunks_exact(4)).zip(edited.chunks_exact(4));
++    pixels.flat_map(|((b, c), e)| if c != b { c } else { e }).copied().collect()
++}
++
++/// The three-way merge: tiles both sides changed are merged pixel by pixel into `current`'s side (and `edited`'s set
++/// back to `base`'s), then the JSON merge does the rest: layers by id, fields and tiles by key.
++fn merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
++    // Both sides read as documents first: tile places in range of their layers.
++    let ((_, base_layers), _, _) = (parse(base)?, parse(current)?, parse(edited)?);
++    let (mut current, mut edited) = (current.clone(), edited.clone());
++    for b in &base_layers {
++        let same = |doc: &Value| -> Option<usize> {
++            let layers = doc["layers"].as_array()?;
++            let i = layers.iter().position(|l| l["id"].as_str() == Some(b.id.to_string().as_str()))?;
++            let l = &layers[i];
++            (l["size"] == json!([b.size.0, b.size.1]) && l["default"].as_str().and_then(Rgba::parse) == Some(b.default)).then_some(i)
++        };
++        let (Some(ci), Some(ei)) = (same(&current), same(&edited)) else { continue };
++        let tiles = |doc: &Value, i: usize| doc["layers"][i]["tiles"].as_object().cloned().unwrap_or_default();
++        let (ct, et) = (tiles(&current, ci), tiles(&edited, ei));
++        let bt: HashMap<String, &str> = b.tiles.iter().map(|&(at, text)| (key(at), text)).collect();
++        let keys: BTreeSet<&String> = ct.keys().chain(et.keys()).chain(bt.keys()).collect();
++        for k in keys {
++            let (tb, tc, te) = (bt.get(k).copied(), ct.get(k).and_then(Value::as_str), et.get(k).and_then(Value::as_str));
++            if tb == tc || tb == te {
++                continue;
++            }
++            let at = k.split_once(',').and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?))).ok_or_else(|| invalid(format!("tile {k}")))?;
++            let len = b.tile_len(at);
++            let px = |t: Option<&str>| t.map_or_else(|| Ok(b.default.0.repeat(len / 4)), |t| decode(t, len));
++            let merged = tile_text(&merge_tiles(&px(tb)?, &px(tc)?, &px(te)?), b.default);
++            let put = |doc: &mut Value, i: usize, text: Option<String>| {
++                if let Some(tiles) = doc["layers"][i]["tiles"].as_object_mut() {
++                    match text {
++                        Some(text) => tiles.insert(k.clone(), text.into()),
++                        None => tiles.remove(k.as_str()),
++                    };
++                }
++            };
++            put(&mut current, ci, merged);
++            put(&mut edited, ei, tb.map(str::to_owned));
++        }
++    }
++    playground_live::merge(base, &current, &edited, &[])
++}
++
++// ---------------------------------------------------------------- the app's hooks
++
++impl Live for WebApp {
++    fn live_document(&self) -> Value {
++        shared(self.editor.session.document())
++    }
++
++    fn live_adopt(&mut self, document: Value) -> Result<(), String> {
++        let doc = document_of(&document, self.editor.session.document())?;
++        let resized = doc.canvas != self.editor.session.document().canvas;
++        self.editor.session.install_remote(doc).map_err(|e| e.to_string())?;
++        self.editor.retarget();
++        // A picture of another size is fitted to the view, as one opened is.
++        if resized {
++            self.canvas = crate::canvas::Canvas::default();
++        }
++        peers::landed();
 +        Ok(())
 +    }
++
++    fn live_quiet(&self) -> bool {
++        let tools = &self.editor.tools;
++        presence::quiet()
++            && !tools.gesture_in_progress()
++            && !tools.is_editing_text()
++            && !tools.is_constructing_shape()
++            && tools.floating_selection().is_none()
++            && !self.paste.busy()
++    }
++
++    fn live_generation(&self) -> Option<u64> {
++        Some(self.editor.session.document().state_id.as_u128() as u64)
++    }
++
++    /// The editor's own Undo starts again from the picture as it is (its history holds pictures from before the others'
++    /// changes); a new session, set up as Editor::from_document sets one up, still unsaved if it was.
++    fn live_disconnected(&mut self) {
++        let unsaved = self.editor.session.is_dirty();
++        let mut session = paintcraft_editor::session::Session::new((*self.editor.session.snapshot()).clone());
++        session.set_staged_pixel_budget(MAX_PIXELS * 4);
++        session.set_history_budget(64 * 1024 * 1024);
++        session.set_history_retention(paintcraft_editor::session::HistoryRetention::TrimOldest);
++        if unsaved {
++            session.mark_unsaved();
++        }
++        self.editor.session = session;
++        self.editor.retarget();
++    }
++
++    fn live_presence(&self) -> Value {
++        peers::mine(self)
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        presence::show(others);
++    }
++
++    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
++        merge(base, current, edited)
++    }
++
++    fn live_check(document: &Value) -> Result<(), String> {
++        check(document)
++    }
 +}
-diff --git a/src/app/live/peers.rs b/src/app/live/peers.rs
++
++/// The end of each frame (after the app drew the others): the presence look's, then the session's.
++pub fn frame(app: &mut WebApp, ctx: &eframe::egui::Context) {
++    CTX.with(|c| drop(c.set(ctx.clone())));
++    presence::end_frame(ctx);
++    playground_live::frame(app);
++}
++
++/// Offers the running app to a Playground session (a page without Playground never connects). It fails only when the
++/// page's global object refuses a property.
++#[cfg(target_arch = "wasm32")]
++pub fn attach(runner: &eframe::WebRunner) {
++    let runner = runner.clone();
++    let _ = playground_live::web::attach::<WebApp>(
++        FORMAT,
++        move |with| runner.app_mut::<WebApp>().map(|mut app| with(&mut app)).is_some(),
++        || {
++            CTX.with(|c| c.get().map(eframe::egui::Context::request_repaint));
++        },
++    );
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/apps/paintcraft-web/src/paintcraft-web/live/peers.rs b/apps/paintcraft-web/src/paintcraft-web/live/peers.rs
 new file mode 100644
-index 0000000..f592128
+index 0000000..17c0208
 --- /dev/null
-+++ b/src/app/live/peers.rs
-@@ -0,0 +1,201 @@
++++ b/apps/paintcraft-web/src/paintcraft-web/live/peers.rs
+@@ -0,0 +1,223 @@
 +// SPDX-License-Identifier: MIT
-+//! Presence in a live session. Each person shares their pointer over the picture (in picture pixels, so it lands on
-+//! the same spot at anyone's zoom and scroll) and what they are making: the stroke being drawn (its newest points and
-+//! brush size), the shape being dragged out, the text being typed. Here, for the others, over the picture: their
-+//! stroke in their colour, their shape's outline dashed, their text, then their pointer with their name. Pointers ease
-+//! toward their latest place. A finished stroke stays until the picture with it arrives (at most a second).
-+//! Everything in a state comes from another person: what doesn't read as numbers in range is skipped. Pointers, name
-+//! tags and the easing are the playground-live crate's presence look; strokes, dashed outlines and text are drawn here,
-+//! in the person's colour.
++//! Presence in a live session. Each person shares, in picture pixels (so it lands on the same spot at anyone's zoom and
++//! scroll), their pointer over the picture and what they are making: the stroke being drawn (its points, evenly picked,
++//! and brush size), the shape, polygon, curve, marquee or lasso being dragged out, the text being typed, and their
++//! selection. Here, over the picture, for the others: their stroke in their colour, the rest dashed, their selection
++//! outlined (a ghost while they move it), then their pointer with their name, eased toward its latest place. A finished
++//! stroke stays until the picture with it arrives (at most a second). Everything in a state comes from another person:
++//! what doesn't read as numbers in range is skipped. Pointers, tags, outlines, ghosts, dashes and easing are the
++//! playground-live crate's presence look; strokes are drawn here, in the person's colour.
 +// The painting is web only (its hook is); native tests use the state.
 +#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 +
-+use super::super::{DragState, SelfPaintApp};
-+use super::{connected, presence};
-+use egui::{Color32, FontId, Pos2, Rect, Shape, Stroke, vec2};
++use super::presence;
++use crate::app::WebApp;
++use eframe::egui::{self, Color32, Pos2, Rect, Shape, Stroke, vec2};
++use paintcraft_tools::{Preview, Tool};
 +use serde_json::{Value, json};
 +use std::cell::{Cell, RefCell};
 +use std::collections::HashMap;
 +
-+/// The newest points of a stroke shared (presence stays under 4 KiB).
++/// The points of a stroke, polygon or lasso shared at most (presence stays under 4 KiB).
 +const MAX_POINTS: usize = 150;
-+const MAX_TEXT: usize = 300;
++const MAX_TEXT: usize = 64;
 +/// How long a finished stroke stays while its picture is on the way, in seconds.
 +const LINGER: f64 = 1.0;
 +
@@ -571,9 +477,8 @@ index 0000000..f592128
 +}
 +
 +thread_local! {
-+    /// This person's pointer over the picture and the stroke they are drawing, as of the last frame.
++    /// This person's pointer over the picture, as of the last frame.
 +    static POINTER: Cell<Option<[f32; 2]>> = const { Cell::new(None) };
-+    static STROKE: RefCell<Vec<[f32; 2]>> = const { RefCell::new(Vec::new()) };
 +    static SHOWN: RefCell<HashMap<String, Mark>> = RefCell::default();
 +    /// A remote change went into the picture since the last frame, and when one last did.
 +    static LANDED: Cell<bool> = const { Cell::new(false) };
@@ -581,31 +486,52 @@ index 0000000..f592128
 +}
 +
 +/// To a tenth of a pixel.
-+fn r(v: f32) -> f64 {
-+    (f64::from(v) * 10.0).round() / 10.0
++fn r(v: f64) -> f64 {
++    (v * 10.0).round() / 10.0
 +}
 +
-+fn pt(p: impl Into<[f32; 2]>) -> Value {
-+    let p = p.into();
-+    json!([r(p[0]), r(p[1])])
++/// At most [`MAX_POINTS`] of `points`, evenly picked, the last always in.
++fn sample(points: &[(i64, i64)], scale: f64) -> Value {
++    let step = (points.len() as f64 / MAX_POINTS as f64).max(1.0);
++    let mut picked: Vec<_> = (0..points.len().min(MAX_POINTS)).map(|i| points[(i as f64 * step) as usize]).collect();
++    if let (Some(last), Some(end)) = (picked.last_mut(), points.last()) {
++        *last = *end;
++    }
++    picked.iter().map(|p| json!([r(p.0 as f64 / scale), r(p.1 as f64 / scale)])).collect()
 +}
 +
-+pub(in super::super) fn mine(app: &SelfPaintApp) -> Value {
++fn shape_kind(tool: Tool) -> &'static str {
++    match tool {
++        Tool::Line => "line",
++        Tool::Ellipse => "ellipse",
++        _ => "rect",
++    }
++}
++
++/// This person's presence (see the top).
++pub(super) fn mine(app: &WebApp) -> Value {
 +    let mut s = json!({});
-+    if let Some(p) = POINTER.get() {
-+        s["pointer"] = pt(p);
++    if let Some([x, y]) = POINTER.get() {
++        s["pointer"] = json!([r(x.into()), r(y.into())]);
 +    }
-+    STROKE.with_borrow(|points| {
-+        if !points.is_empty() {
-+            s["stroke"] = json!({ "points": points.iter().map(|p| pt(*p)).collect::<Vec<_>>(), "size": r(app.brush_radius() * 2.0) });
++    let stroke = |stroke: &paintcraft_tools::Stroke| json!({ "points": sample(&stroke.points, f64::from(stroke.point_scale.max(1))), "size": stroke.size });
++    match app.editor.tools.preview() {
++        Some(Preview::Path(path)) => s["stroke"] = stroke(&path),
++        Some(Preview::Paths(paths)) => {
++            if let Some(path) = paths.last() {
++                s["stroke"] = stroke(path);
++            }
 +        }
-+    });
-+    if let Some(p) = &app.shape_preview {
-+        s["shape"] = json!({ "kind": p.shape.as_str(), "from": pt(p.start), "to": pt(p.current), "filled": p.filled });
++        Some(Preview::Shape { tool, from, to, .. }) => s["shape"] = json!({ "kind": shape_kind(tool), "from": [from.0, from.1], "to": [to.0, to.1] }),
++        Some(Preview::Contour(c)) => s["path"] = json!({ "points": sample(&c.points, 1.0), "closed": c.closed }),
++        Some(Preview::SelectionPath { points }) => s["path"] = json!({ "points": sample(&points, 1.0), "closed": true }),
++        Some(Preview::Marquee { from, to }) => s["marquee"] = json!([from.0.min(to.0), from.1.min(to.1), from.0.max(to.0) + 1, from.1.max(to.1) + 1]),
++        Some(Preview::Text { at, text, .. }) => s["text"] = json!({ "at": [at.0, at.1], "text": text.chars().take(MAX_TEXT).collect::<String>() }),
++        Some(Preview::MoveSelection { .. }) => s["moving"] = true.into(),
++        None => {}
 +    }
-+    if app.text.editing {
-+        let text: String = app.text.draft.chars().take(MAX_TEXT).collect();
-+        s["text"] = json!({ "at": pt(app.text.anchor), "text": text, "size": r(app.text_size) });
++    if let Ok(Some(b)) = app.selected_bounds() {
++        s["selection"] = json!([b.x0, b.y0, b.x1, b.y1]);
 +    }
 +    s
 +}
@@ -617,17 +543,24 @@ index 0000000..f592128
 +
 +/// A point someone gave, when it is two numbers of a sane size.
 +fn point(v: &Value) -> Option<[f32; 2]> {
-+    let c = |v: &Value| v.as_f64().filter(|c| c.abs() < 1e5).map(|c| c as f32);
++    let c = |v: &Value| v.as_f64().filter(|c| c.abs() < 1e7).map(|c| c as f32);
 +    Some([c(&v[0])?, c(&v[1])?])
 +}
 +
-+fn size(v: &Value) -> Option<f32> {
-+    v.as_f64().filter(|s| (0.0..1000.0).contains(s)).map(|s| s as f32)
++fn points(v: &Value) -> Option<Vec<[f32; 2]>> {
++    let points: Vec<_> = v.as_array()?.iter().take(MAX_POINTS * 2).map(point).collect::<Option<_>>()?;
++    (!points.is_empty()).then_some(points)
 +}
 +
 +fn stroke_of(v: &Value) -> Option<(Vec<[f32; 2]>, f32)> {
-+    let points: Vec<_> = v["points"].as_array()?.iter().take(MAX_POINTS * 2).map(point).collect::<Option<_>>()?;
-+    (!points.is_empty()).then_some((points, size(&v["size"])?))
++    let size = v["size"].as_f64().filter(|s| (0.0..=1024.0).contains(s))? as f32;
++    Some((points(&v["points"])?, size))
++}
++
++/// A box someone gave: x0, y0, x1, y1.
++fn bounds(v: &Value) -> Option<[f32; 4]> {
++    let (a, b) = (point(&json!([v[0], v[1]]))?, point(&json!([v[2], v[3]]))?);
++    Some([a[0], a[1], b[0], b[1]])
 +}
 +
 +/// `c` at 70% over white, opaque (overlapping dabs of a translucent colour would show darker spots).
@@ -636,38 +569,23 @@ index 0000000..f592128
 +    Color32::from_rgb(mix(c.r()), mix(c.g()), mix(c.b()))
 +}
 +
-+/// A dashed outline in `color` (the others' shapes and text boxes being made).
-+fn dashed(painter: &egui::Painter, points: &[Pos2], color: Color32) {
-+    painter.extend(Shape::dashed_line(points, Stroke::new(1.5, color), 4.0, 3.0));
++fn corners(r: Rect) -> [Pos2; 4] {
++    [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()]
 +}
 +
-+/// In the canvas, after the picture (a line in src/app.rs): notes this person's pointer and stroke, and draws the
-+/// others' strokes, shapes, text and pointers.
-+pub fn paint(app: &SelfPaintApp, ui: &egui::Ui, painter: &egui::Painter, sheet: Rect) {
-+    if !connected() {
-+        POINTER.set(None);
++/// In the canvas, after the picture (a line in canvas.rs): notes this person's pointer, and draws the others' strokes,
++/// shapes, selections and text, then their pointers. `sheet` is where the picture is, `zoom` points per pixel.
++pub fn paint(app: &WebApp, ui: &egui::Ui, painter: &egui::Painter, sheet: Rect) {
++    let zoom = app.zoom;
++    let clip = painter.clip_rect();
++    let hover = ui.input(|i| i.pointer.hover_pos()).filter(|p| clip.contains(*p) && ui.ctx().layer_id_at(*p) == Some(painter.layer_id()));
++    POINTER.set(hover.map(|p| [(p.x - sheet.min.x) / zoom, (p.y - sheet.min.y) / zoom]));
++    if !playground_live::connected() {
 +        return;
 +    }
-+    let zoom = app.view.zoom;
-+    let clip = painter.clip_rect();
-+    let hover = ui.input(|i| i.pointer.hover_pos()).filter(|p| clip.contains(*p) && ui.ctx().layer_id_at(*p).is_none_or(|l| l.order == egui::Order::Background));
-+    POINTER.set(hover.map(|p| [(p.x - sheet.min.x) / zoom, (p.y - sheet.min.y) / zoom]));
-+    STROKE.with_borrow_mut(|points| match app.drag {
-+        DragState::Stroke { last, .. } => {
-+            let p = [last.0, last.1];
-+            if points.last().is_none_or(|q| (q[0] - p[0]).hypot(q[1] - p[1]) * zoom >= 1.0) {
-+                points.push(p);
-+                if points.len() > MAX_POINTS {
-+                    points.remove(0);
-+                }
-+            }
-+        }
-+        _ => points.clear(),
-+    });
-+
-+    let screen = |p: [f32; 2]| sheet.min + vec2(p[0] * zoom, p[1] * zoom);
++    let screen = |p: [f32; 2]| sheet.min + vec2(p[0], p[1]) * zoom;
 +    let now = ui.input(|i| i.time);
-+    // Pointers ease in picture pixels (`zoom` points each); a jump farther than a quarter of the canvas goes at once.
++    // Pointers ease in picture pixels (`zoom` points each); a jump farther than a quarter of the view goes at once.
 +    let far = f64::from(clip.width().max(clip.height()) / 4.0);
 +    if LANDED.take() {
 +        LANDED_AT.set(now);
@@ -686,8 +604,7 @@ index 0000000..f592128
 +                    }
 +                    (mark.stroke, mark.until) = (Some(stroke), None);
 +                }
-+                // Finished: it stays until a change lands after its last point (the picture with it), at most a
-+                // second.
++                // Finished: it stays until a change lands after its last point (the picture with it), at most a second.
 +                None if mark.stroke.is_some() => {
 +                    if LANDED_AT.get() > mark.changed || now > *mark.until.get_or_insert(now + LINGER) {
 +                        (mark.stroke, mark.until) = (None, None);
@@ -704,27 +621,37 @@ index 0000000..f592128
 +                    painter.circle_filled(p, width / 2.0, ink);
 +                }
 +            }
++            if let Some(b) = bounds(&state["selection"]) {
++                let rect = Rect::from_two_pos(screen([b[0], b[1]]), screen([b[2], b[3]]));
++                if state["moving"].as_bool() == Some(true) {
++                    presence::ghost(painter, rect, color);
++                } else {
++                    presence::outline(painter, rect, color);
++                }
++            }
++            if let Some(b) = bounds(&state["marquee"]) {
++                presence::dashed(painter, &corners(Rect::from_two_pos(screen([b[0], b[1]]), screen([b[2], b[3]]))), true, color);
++            }
 +            let shape = &state["shape"];
 +            if let (Some(kind), Some(a), Some(b)) = (shape["kind"].as_str(), point(&shape["from"]), point(&shape["to"])) {
 +                let (a, b) = (screen(a), screen(b));
 +                let r = Rect::from_two_pos(a, b);
 +                match kind {
-+                    "line" => dashed(painter, &[a, b], color),
-+                    "rect" => dashed(painter, &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()], color),
++                    "line" => presence::dashed(painter, &[a, b], false, color),
 +                    "ellipse" => {
-+                        let ring: Vec<Pos2> = (0..=64).map(|i| i as f32 * std::f32::consts::TAU / 64.0).map(|t| r.center() + vec2(t.cos() * r.width(), t.sin() * r.height()) / 2.0).collect();
-+                        dashed(painter, &ring, color);
++                        let ring: Vec<Pos2> = (0..64).map(|i| i as f32 * std::f32::consts::TAU / 64.0).map(|t| r.center() + vec2(t.cos() * r.width(), t.sin() * r.height()) / 2.0).collect();
++                        presence::dashed(painter, &ring, true, color);
 +                    }
-+                    _ => {}
++                    _ => presence::dashed(painter, &corners(r), true, color),
 +                }
 +            }
-+            let text = &state["text"];
-+            if let (Some(at), Some(size)) = (point(&text["at"]), size(&text["size"])) {
-+                let words: String = text["text"].as_str().unwrap_or_default().chars().take(MAX_TEXT).collect();
-+                let galley = painter.layout_no_wrap(words, FontId::proportional((size * zoom).clamp(4.0, 512.0)), tint(color));
-+                let box_ = Rect::from_min_size(screen(at), galley.size().max(vec2(8.0, size * zoom))).expand(3.0);
-+                painter.galley(screen(at), galley, color);
-+                dashed(painter, &[box_.left_top(), box_.right_top(), box_.right_bottom(), box_.left_bottom(), box_.left_top()], color);
++            if let Some(path) = points(&state["path"]["points"]) {
++                let path: Vec<Pos2> = path.into_iter().map(screen).collect();
++                presence::dashed(painter, &path, state["path"]["closed"].as_bool() == Some(true), color);
++            }
++            if let Some(at) = point(&state["text"]["at"]) {
++                let words: String = state["text"]["text"].as_str().unwrap_or_default().chars().take(MAX_TEXT).collect();
++                presence::label(painter, screen(at), color, if words.is_empty() { "…" } else { &words });
 +            }
 +            let eased = point(&state["pointer"]).and_then(|p| presence::ease(ui.ctx(), &o.id, "pointer", p.map(f64::from), [f64::from(zoom); 2], [far; 2]));
 +            if let Some(p) = eased {
@@ -737,39 +664,154 @@ index 0000000..f592128
 +        presence::cursor(painter, tip, color, name);
 +    }
 +}
-diff --git a/src/app/live/tests.rs b/src/app/live/tests.rs
+diff --git a/apps/paintcraft-web/src/paintcraft-web/live/tests.rs b/apps/paintcraft-web/src/paintcraft-web/live/tests.rs
 new file mode 100644
-index 0000000..6562cc8
+index 0000000..d73ba99
 --- /dev/null
-+++ b/src/app/live/tests.rs
-@@ -0,0 +1,30 @@
++++ b/apps/paintcraft-web/src/paintcraft-web/live/tests.rs
+@@ -0,0 +1,123 @@
 +// SPDX-License-Identifier: MIT
 +use super::*;
-+use image::Rgba;
++use crate::editor::WHITE;
++use playground_live::canonical;
++
++const RED: Rgba = Rgba([255, 0, 0, 255]);
++const BLUE: Rgba = Rgba([0, 0, 255, 255]);
++
++fn app() -> WebApp {
++    let mut app = WebApp::new(&eframe::egui::Context::default());
++    app.install(crate::files::Loaded {
++        document: paintcraft_document::new_document(600, 300, Some(WHITE), 0, paintcraft_document::POLICY).unwrap(),
++        name: "test.pcnd".into(),
++        losses: Vec::new(),
++    });
++    app
++}
++
++/// `doc` with the pixels of `rect` in its layer `layer` (bottom first) painted `color`.
++fn painted(doc: &Document, layer: usize, rect: (i64, i64, i64, i64), color: Rgba) -> Document {
++    let mut doc = doc.clone();
++    let id = doc.roots[layer];
++    let area = paintcraft_core::types::Rect { x0: rect.0, y0: rect.1, x1: rect.2, y1: rect.3 };
++    let raster = &mut doc.layers.get_mut(&id).unwrap().raster;
++    raster.fill_rect(&area, color, paintcraft_raster::BlendMode::Replace, &mut Admission::new(u64::MAX)).unwrap();
++    doc
++}
++
++fn pixel(shared: &Value, layer: usize, (x, y): (i64, i64)) -> Rgba {
++    let doc = document_of(shared, &app().editor.session.snapshot()).unwrap();
++    doc.layers[&doc.roots[layer]].raster.get(x, y)
++}
 +
 +#[test]
-+fn concurrent_strokes_both_stay_the_later_on_top_and_undo_takes_back_only_its_own() {
-+    let (white, red, blue) = (Rgba([255, 255, 255, 255]), Rgba([255, 0, 0, 255]), Rgba([0, 0, 255, 255]));
-+    let start = RgbaImage::from_pixel(200, 130, white);
-+    let base = document_of(&start);
-+    assert_eq!(picture_of(&base).unwrap(), start, "a document reads back as its picture");
-+    // Ann paints across row 20 (tile 0), Bob across row 22 and over one of Ann's pixels (tiles 0 and 1): same tile.
-+    let mut ann = start.clone();
-+    (10..60).for_each(|x| ann.put_pixel(x, 20, red));
-+    let mut bob = start.clone();
-+    (30..90).for_each(|x| bob.put_pixel(x, 22, blue));
-+    bob.put_pixel(40, 20, blue);
-+    // Ann's stroke was accepted first; Bob's is placed after it.
-+    let merged = merge(&base, &document_of(&bob), &document_of(&ann)).unwrap();
-+    let both = picture_of(&merged).unwrap();
-+    assert_eq!((both.get_pixel(15, 20), both.get_pixel(80, 22), both.get_pixel(40, 20)), (&red, &blue, &blue));
-+    assert_eq!(merged, document_of(&both), "the merge gives the bytes the picture encodes to");
-+    // Ann's Undo (the journal: merge(after hers, now, before hers)) takes back her pixels, not Bob's over them.
-+    let undone = picture_of(&merge(&document_of(&ann), &merged, &base).unwrap()).unwrap();
-+    assert_eq!((undone.get_pixel(15, 20), undone.get_pixel(40, 20), undone.get_pixel(80, 22)), (&white, &blue, &blue));
-+    // A new canvas size on one side while the other painted is a conflict; alone, it wins.
-+    let resized = document_of(&RgbaImage::from_pixel(64, 64, white));
-+    assert!(merge(&base, &resized, &document_of(&ann)).is_err());
-+    assert_eq!(merge(&base, &resized, &base).unwrap(), resized);
-+    assert!(merge(&base, &base[..base.len() - 1], &base).is_err(), "a cut document is refused");
++fn tiles_read_back_exactly_and_bad_ones_are_refused() {
++    for n in 0..8 {
++        let bytes: Vec<u8> = (0..n).map(|i| (i * 37) as u8).collect();
++        assert_eq!(unbase64(&base64(&bytes)).unwrap(), bytes);
++    }
++    let px: Vec<u8> = (0..256 * 10 * 4).map(|i| (i % 7) as u8).collect();
++    assert_eq!(decode(&encode(&px), px.len()).unwrap(), px);
++    assert!(decode(&encode(&px), px.len() - 4).is_err(), "a tile of another size");
++    assert!(decode("not base64!", 16).is_err());
++    assert!(decode(&base64(&[0xff; 8]), 16).is_err());
++}
++
++#[test]
++fn adopting_gives_the_same_picture_keeps_the_selection_and_is_no_undo_step() {
++    let (mut a, b) = (app(), app());
++    let doc = painted(&b.editor.session.snapshot(), 0, (10, 10, 40, 30), RED);
++    let shared = shared(&doc);
++    check(&shared).unwrap();
++    a.edit(paintcraft_tools::Action::Select { corners: Some(((1, 1), (5, 5))) });
++    let (undo, selection) = (a.editor.session.undo_depth(), a.editor.session.selection());
++    a.live_adopt(shared.clone()).unwrap();
++    assert_eq!(canonical(&a.live_document()), canonical(&shared));
++    assert_eq!(a.editor.session.document().layers[&doc.roots[0]].raster.get(20, 20), RED);
++    assert_eq!((a.editor.session.undo_depth(), a.editor.session.selection()), (undo, selection));
++    // Once the session ends, the editor's own Undo starts from the picture as it is.
++    a.live_disconnected();
++    assert_eq!(a.editor.session.undo_depth(), 0);
++    assert_eq!(canonical(&a.live_document()), canonical(&shared));
++}
++
++#[test]
++fn two_strokes_in_one_tile_both_stay_the_later_on_top_and_undo_takes_back_only_its_own() {
++    let base_doc = app().editor.session.snapshot();
++    let base = shared(&base_doc);
++    // Ann paints across row 20, Bob across row 22 and over one of Ann's pixels: the same tile.
++    let ann = shared(&painted(&base_doc, 0, (10, 20, 60, 21), RED));
++    let bob = shared(&painted(&painted(&base_doc, 0, (30, 22, 90, 23), BLUE), 0, (40, 20, 41, 21), BLUE));
++    // Ann's was accepted first; Bob's is placed after it.
++    let merged = WebApp::live_merge(&base, &bob, &ann).unwrap();
++    WebApp::live_check(&merged).unwrap();
++    assert_eq!([pixel(&merged, 0, (15, 20)), pixel(&merged, 0, (80, 22)), pixel(&merged, 0, (40, 20))], [RED, BLUE, BLUE]);
++    // Ann's Undo (the session's: merge(after hers, now, before hers)) takes back her pixels, not Bob's over them.
++    let undone = WebApp::live_merge(&ann, &merged, &base).unwrap();
++    assert_eq!([pixel(&undone, 0, (15, 20)), pixel(&undone, 0, (40, 20)), pixel(&undone, 0, (80, 22))], [WHITE, BLUE, BLUE]);
++    // Strokes in different tiles merge as JSON does.
++    let far = shared(&painted(&base_doc, 0, (500, 200, 520, 210), BLUE));
++    let both = WebApp::live_merge(&base, &far, &ann).unwrap();
++    assert_eq!([pixel(&both, 0, (15, 20)), pixel(&both, 0, (510, 205))], [RED, BLUE]);
++}
++
++#[test]
++fn a_new_layer_and_paint_on_another_both_stay() {
++    let mut app = app();
++    let base = app.live_document();
++    let painted = shared(&painted(&app.editor.session.snapshot(), 0, (10, 10, 20, 20), RED));
++    app.editor
++        .commit(vec![paintcraft_core::types::json::Value::object([
++            ("op", paintcraft_core::types::json::Value::str("layer.add")),
++            ("ref", paintcraft_core::types::json::Value::str("new")),
++            ("name", paintcraft_core::types::json::Value::str("Overlay")),
++            ("width", paintcraft_core::types::json::Value::Int(600)),
++            ("height", paintcraft_core::types::json::Value::Int(300)),
++            ("origin", paintcraft_core::types::json::Value::object([("x", paintcraft_core::types::json::Value::Int(0)), ("y", paintcraft_core::types::json::Value::Int(0))])),
++            ("default_pixel", paintcraft_core::types::json::Value::str("#00000000")),
++        ])])
++        .unwrap();
++    let layered = app.live_document();
++    let merged = WebApp::live_merge(&base, &painted, &layered).unwrap();
++    assert_eq!(merged["layers"].as_array().unwrap().len(), 2);
++    assert_eq!(pixel(&merged, 0, (15, 15)), RED);
++    app.live_adopt(merged.clone()).unwrap();
++    assert_eq!(canonical(&app.live_document()), canonical(&merged));
++}
++
++#[test]
++fn malformed_pictures_are_refused() {
++    let good = app().live_document();
++    let bad = |f: &dyn Fn(&mut Value)| {
++        let mut doc = good.clone();
++        f(&mut doc);
++        assert!(WebApp::live_check(&doc).is_err(), "{doc}");
++    };
++    bad(&|d| d["canvas"] = json!([100000, 100000]));
++    bad(&|d| d["layers"][0]["id"] = json!("not a uuid"));
++    bad(&|d| d["layers"][0]["tiles"] = json!({ "9,0": encode(&[0; 4]) }));
++    bad(&|d| d["layers"][0]["tiles"] = json!({ "0,0": encode(&[0; 4]) }));
++    bad(&|d| d["layers"][0]["tiles"] = json!({ "00,0": encode(&[0; 4]) }));
++    assert!(WebApp::live_check(&json!(null)).is_err());
++}
+diff --git a/crates/editing/paintcraft-editor/src/session/live.rs b/crates/editing/paintcraft-editor/src/session/live.rs
+new file mode 100644
+index 0000000..4b56544
+--- /dev/null
++++ b/crates/editing/paintcraft-editor/src/session/live.rs
+@@ -0,0 +1,16 @@
++// SPDX-License-Identifier: MIT
++//! Live editing in a Playground session (patches/mspaint.yaml in github.com/daijro/openplayground): a document someone
++//! else's change was merged into, published as the current state with no step in the history. A child of the session
++//! module, so it reaches the published state.
++
++use super::*;
++
++impl Session {
++    /// Publishes `doc` (the shared picture as it now is) without recording it: while connected, Undo goes to the
++    /// session; when it ends, the app starts a new history from the picture as it is. The selection, this person's, stays.
++    pub fn install_remote(&mut self, doc: Document) -> Result<()> {
++        self.epoch = self.next_epoch()?;
++        self.doc = Arc::new(doc);
++        Ok(())
++    }
 +}
