@@ -6,5 +6,5 @@ new file mode 100644
 +use gridcraft_engine::DocState;
 +
 +pub fn new_doc(wb: gridcraft_engine::model::Workbook, title: String) -> DocState {
-+    DocState::new(wb, None, title)
++    DocState::new(wb, None, title, gridcraft_engine::Trust::Local)
 +}
