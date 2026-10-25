@@ -477,3 +477,22 @@ groups:
         icon: icons/paint-rs.png
         accent: "#F74C00"
         base: "#3A1200"
+
+      - slug: davinci-resolve
+        name: Picasso Suite
+        alternative: DaVinci Resolve
+        blurb: Cut and edit video on a multi-track timeline, with linked picture and sound.
+        # Its own projects (.pcsp) and Resolve's (.drp, whose media stay where Resolve kept them). Upstream's releases
+        # are desktop packages only (no web zip), so like Pro Wave it has the head channel only;
+        # patches/davinci-resolve.yaml adds the web build, which reads media with the browser instead of FFmpeg.
+        opens: [pcsp]
+        imports: [mp4, m4v, mov, webm, mkv, png, jpg, jpeg, gif, webp, bmp, wav, mp3, m4a, aac, flac, ogg, opus]
+        repo: fabox-os/Picasso-Suite
+        license: GPL-3.0-or-later
+        # What the web build compiles (Cargo.lock: dependency changes): docs and packaging commits don't rebuild it.
+        paths: [crates, Cargo.toml, Cargo.lock]
+        patches: patches/davinci-resolve.yaml
+        live_kit: true
+        icon: icons/picasso-suite.png
+        accent: "#E8452C"
+        base: "#3A1208"
