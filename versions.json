@@ -14,7 +14,7 @@
   "after-effects": "v0.17.0+f2243df0",
   "after-effects@head": "head-76402b1+f2243df0",
   "acrobat": "v0.14.0+aefd123c",
-  "acrobat@head": "head-d764a8e+aefd123c",
+  "acrobat@head": "head-e90f788+c76aecf5",
   "word": "v0.11.0+fb52ab62",
   "word@head": "head-5dd5e8b+fb52ab62",
   "excel": "v0.12.1+c60fc351",
@@ -32,7 +32,7 @@
   "substance-designer@head": "head-34cbfff+f219bc18",
   "pro-tools": "v0.13.1+2fe1fbe2",
   "pro-tools@head": "head-0a95b6d+2fe1fbe2",
-  "fl-studio": "v0.0.1-web.10",
+  "fl-studio": "v0.0.1-web.16",
   "fl-studio-mobile": "v0.3.4+8d45d178",
   "fl-studio-mobile@head": "head-8c7bddf+8d45d178",
   "ableton-live@head": "head-3067d90+6ff1fb75",
@@ -41,7 +41,7 @@
   "figma": "v0.11.2+8e145431",
   "figma@head": "head-3fc005c+8e145431",
   "mspaint@head": "head-05b5985+f5b32e43",
-  "paint-net": "v0.1.5",
+  "paint-net": "v0.1.6",
   "davinci-resolve@head": "head-e046c6f+488494d9",
   "artcraft-store": "dff1898"
 }
