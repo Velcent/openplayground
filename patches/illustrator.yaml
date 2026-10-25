@@ -140,7 +140,7 @@
 # Verify: rule 2's Verify; the selection box around the text then fits the new font.
 # If upstream changes: anchor on WebShell's per-frame logic.
 - file: apps/*-web/src/web.rs
-  find: 'app\.logic\(ctx\);'
+  find: 'app\.(?:logic|tick)\(ctx\);'
   before: |-
     // playground (patches/illustrator.yaml): the user's installed fonts.
             playground_fonts::frame(ctx, app);
