@@ -53,17 +53,21 @@
   find: '#\[cfg\(feature\s*=\s*"gpu"\)\](?=\s*mod\s+imp\b)'
   replace: '#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]'
 
-# Rule 7/12: the 3D viewport's OpenGL 3.3 shaders as WebGL2 ones (#version 300 es + precision), where they are compiled.
-# Verify: the 3D view shows the material (no "shader compile failed" in the status bar).
-- file: src/gpu3d.rs
-  find: '^([ \t]*)gl\.shader_source\((\w+),\s*&?(\w+)\);'
-  replace: "$1#[cfg(target_arch = \"wasm32\")] let $3 = &crate::playground::glsl_es(&$3);\n$&"
-
-# Rule 7b: glow's web context has no NativeFramebuffer; on wasm the 3D viewport rebinds the default framebuffer (None),
-# which is what eframe's canvas paints to. Verify: build.mjs check. If upstream cfg-gates fb_from itself, drop this.
-- file: src/gpu3d.rs
-  find: '^fn\s+fb_from\s*\('
-  before: "#[cfg(target_arch = \"wasm32\")]\nfn fb_from(_id: i32) -> Option<glow::Framebuffer> { None }\n#[cfg(not(target_arch = \"wasm32\"))]\n"
+# Rule 7: the 3D viewport shares the compute engine's wgpu device (viewer hooks over the `imp` that is CPU on wasm),
+# so they follow `imp`'s condition. Verify: build.mjs check. If upstream cfg-gates them with imp, drop this.
+- file: src/gpu.rs
+  find: '#\[cfg\(feature\s*=\s*"gpu"\)\](?=\s*impl\s+GTex\b)'
+  replace: '#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]'
+- file: src/gpu.rs
+  find: '#\[cfg\(feature\s*=\s*"gpu"\)\](?=\s*pub\s+fn\s+viewer_parts\b)'
+  replace: '#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]'
+- file: src/gpu.rs
+  find: '#\[cfg\(feature\s*=\s*"gpu"\)\](?=\s*pub\s+fn\s+viewer_limits\b)'
+  replace: '#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]'
+# ...and on wasm there is no engine: the viewer hooks report none, so the 3D view takes its CPU path.
+- file: src/gpu.rs
+  find: '(?![\s\S])'
+  after: "\n#[cfg(all(feature = \"gpu\", target_arch = \"wasm32\"))]\nimpl GTex {\n    pub fn buffer(&self) -> &wgpu::Buffer { unreachable!() }\n    pub fn id(&self) -> usize { 0 }\n}\n#[cfg(all(feature = \"gpu\", target_arch = \"wasm32\"))]\npub fn viewer_parts() -> Option<(&'static wgpu::Device, &'static wgpu::Queue)> { None }\n#[cfg(all(feature = \"gpu\", target_arch = \"wasm32\"))]\npub fn viewer_limits() -> Option<wgpu::Limits> { None }\n"
 
 # Rules 8-12/12: threads, files and the clock in the library's modules (see the top).
 - file: src/tex.rs
