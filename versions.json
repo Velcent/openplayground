@@ -18,7 +18,7 @@
   "word": "v0.11.0+7853b844",
   "word@head": "head-6b97197+7853b844",
   "excel": "v0.12.1+c60fc351",
-  "excel@head": "head-4eb2fb5+c60fc351",
+  "excel@head": "head-3b65b9a+c60fc351",
   "powerpoint": "v0.11.1+cc587348",
   "powerpoint@head": "head-14f40c4+cc587348",
   "onenote@head": "head-48a2b5b+d48d8794",
@@ -37,12 +37,12 @@
   "fl-studio-mobile@head": "head-9797e7b+8d45d178",
   "ableton-live@head": "head-3067d90+6ff1fb75",
   "logic-pro@head": "head-34afc76+aca3f040",
-  "transit@head": "head-332cbee+c0d67896",
+  "transit@head": "head-64dbb8a+c0d67896",
   "figma": "v0.11.2+8e145431",
   "figma@head": "head-3fc005c+8e145431",
   "mspaint": "v0.1.0+e077a4ef",
   "mspaint@head": "head-f128ca0+e077a4ef",
   "paint-net": "v0.1.4",
-  "davinci-resolve@head": "head-9fb5324+1a3f416d",
+  "davinci-resolve@head": "head-e046c6f+488494d9",
   "artcraft-store": "dff1898"
 }
