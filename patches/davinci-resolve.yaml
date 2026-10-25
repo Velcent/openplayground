@@ -77,6 +77,9 @@
 # clock and Playground's file dialogs in app.rs; the media check says what reads media instead of looking for FFmpeg,
 # and the render settings say rendering takes the desktop app; and the window has no buttons or edges of its own in a
 # browser tab. If upstream renames what these anchor on, follow.
+- file: crates/picasso-app/src/audio.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock AudioPlayer::start takes (patches/davinci-resolve.yaml).\n#[cfg(target_arch = \"wasm32\")] use picasso_playground::std;\n"
 - file: crates/picasso-app/src/main.rs
   find: '^mod\s+workers\s*;'
   replace: "#[cfg(not(target_arch = \"wasm32\"))]\nmod workers;\n// Playground's browser build (patches/davinci-resolve.yaml).\n#[cfg(target_arch = \"wasm32\")]\nmod web;\n#[cfg(target_arch = \"wasm32\")]\nuse web::{eframe, workers};"
