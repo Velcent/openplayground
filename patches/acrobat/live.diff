@@ -1402,7 +1402,7 @@ index 0000000..bb134c5
 +        }
 +        let width = body.right() - 36.0 - 11.0 * dots.len() as f32 - (body.left() + 46.0);
 +        let detail = if tab.is_some() { "Open in a tab" } else { "Closed here: open it again" };
-+        crate::widgets::row_text(ui, body.min + vec2(46.0, 15.0), crate::bidi::visual(&name), theme::medium(13.5), t.text, width);
++        crate::widgets::row_text(ui, body.min + vec2(46.0, 15.0), &name, theme::medium(13.5), t.text, width);
 +        crate::widgets::row_text(ui, body.min + vec2(46.0, 32.0), detail, theme::regular(11.0), t.text_faint, width);
 +        if theme::hand(resp).on_hover_text(if tab.is_some() { "Go to it" } else { "Open it again" }).clicked() {
 +            chosen = Some((id, tab));
