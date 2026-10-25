@@ -1,0 +1,17 @@
+# Starting in a background tab (openplayground#5): SlideApp::logic took its second call to mean the interface fonts
+# were ready, but while the tab is hidden eframe runs only logic, no UI pass, so egui has no fonts yet and noting the
+# interface text panicked ("No fonts available until first call to Context::run()"), leaving a blank canvas. Ready
+# only once a UI pass has run. Verify: open /deckcraft/ in a background tab, switch to it: the sample deck is drawn.
+# Release only: the newest commit sets fonts_ready in ui_setup, a real UI pass. Delete once the release does too.
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -1597,7 +1597,7 @@
+             theme::install_fonts_with(ctx, &self.ui_fonts.faces);
+             self.styled = true;
+             self.restyle = true;
+-        } else {
++        } else if ctx.cumulative_pass_nr() > 0 {
+             self.fonts_ready = true;
+         }
+         if self.restyle {

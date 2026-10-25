@@ -8,15 +8,6 @@
     let dark = web_sys::window().and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten()).is_some_and(|m| m.matches());
     let _ = app.run("view.dark", serde_json::json!({"on": dark}));
 
-# Starting in a background tab (openplayground#5): SlideApp::logic took its second call to mean the interface fonts
-# were ready, but while the tab is hidden eframe runs only logic, no UI pass, so egui has no fonts yet and noting the
-# interface text panicked ("No fonts available until first call to Context::run()"), leaving a blank canvas. Ready
-# only once a UI pass has run. Verify: open /deckcraft/ in a background tab, switch to it: the sample deck is drawn.
-# Delete once upstream waits for a UI pass itself.
-- file: crates/ui-egui/src/lib.rs
-  find: '\} else \{(?=\s*self\.fonts_ready = true;)'
-  replace: '} else if ctx.cumulative_pass_nr() > 0 {'
-
 
 # ══ Browser storage ══════════════════════════════════════════════════════════════════════════════════════
 # Rules 1–6 connect DeckCraft's browser build to openplayground's file storage. The site's shell
