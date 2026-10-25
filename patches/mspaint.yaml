@@ -36,11 +36,16 @@
 # Verify: Open lists the projects and pictures in Files; Save asks where once, then saves back silently. If upstream
 # renames these calls, follow them.
 - file: apps/paintcraft-web/src/paintcraft-web/app.rs
-  find: '^([ \t]*)self\.files\.open\(ctx,\s*frontend\);'
-  replace: "$1#[cfg(target_arch = \"wasm32\")]\n$1if playground::open(self, frontend) {\n$1    return;\n$1}\n$&"
+  find: '^([ \t]*)self\s*\.files\s*\.open\(\s*ctx,\s*frontend\b'
+  replace: "$1#[cfg(target_arch = \"wasm32\")]\n$1if action == Action::Open && playground::open(self, frontend) {\n$1    return;\n$1}\n$&"
 - file: apps/paintcraft-web/src/paintcraft-web/files.rs
   find: 'download_copy\(&bytes,\s*name,\s*mime\)'
-  replace: 'crate::app::playground::save(&bytes, name, format.is_none().then_some((owner, document.state_id))).unwrap_or_else(|| download_copy(&bytes, name, mime))'
+  replace: 'crate::app::playground::save(&bytes, name, options.format.is_none().then_some((owner, document.state_id))).unwrap_or_else(|| download_copy(&bytes, name, mime))'
+
+# decode_input is files.rs's private decoder (Open's); playground.rs reads handed-in files with it.
+- file: apps/paintcraft-web/src/paintcraft-web/files.rs
+  find: '^fn\s+decode_input\b'
+  replace: 'pub(crate) fn decode_input'
 
 # Rule 6/6: the Classic ribbon's "Download for desktop" opens /download, upstream's site page, which this build doesn't
 # have (Playground's own pages are at the site's root): it stays hidden on the web. If upstream renames the field, follow.

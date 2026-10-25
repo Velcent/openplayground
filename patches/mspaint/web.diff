@@ -175,7 +175,7 @@ index 0000000..642d7df
 +}
 +
 +fn read((name, bytes, path): Handed, profile: Profile) -> Arrived {
-+    Arrived::Opened(crate::files::decode_for_profile(&bytes, name, profile).map_err(|e| e.to_string()), path)
++    Arrived::Opened(crate::files::decode_input(&bytes, name, profile, false).map_err(|e| e.to_string()), path)
 +}
 +
 +/// The app's Open, once it has asked about unsaved changes: a file handed in, else Files' Open dialog. False when the
