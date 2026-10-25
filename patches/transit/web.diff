@@ -1,0 +1,415 @@
+diff --git a/apps/soundcraft-web/src/studio.rs b/apps/soundcraft-web/src/studio.rs
+new file mode 100644
+--- /dev/null
++++ b/apps/soundcraft-web/src/studio.rs
+@@ -0,0 +1,319 @@
++//! transit's own studio UI in the browser, for Playground (patches/transit.yaml in github.com/daijro/openplayground).
++//!
++//! Upstream's page runs SoundCraft's window ([`soundcraft_ui_egui::SoundApp`], web.rs); this one runs the
++//! [`StudioApp`] the desktop app runs (apps/transit), on the demo session (`?empty`: an empty one), with transit's
++//! fonts, playing through cpal's Web Audio host. The page has no file system, so files travel as bytes:
++//!   - File > Open… is Playground's Open dialog (or the browser's picker), "Open in transit" and dropped files open
++//!     sessions and import audio and MIDI at the cursor (as the desktop's dropped files do);
++//!   - a save (always a `.transitz` bundle: the session and its audio) or a bounce goes to Playground's Save As, and
++//!     the next save of the same file name goes back to where that one went;
++//!   - the browser panel's folders, plug-in presets and the Sampler's file picker are not offered.
++
++use serde_json::json;
++use soundcraft_engine::{Engine, io};
++use std::cell::{OnceCell, RefCell};
++use std::collections::HashMap;
++use std::rc::Rc;
++use std::sync::Arc;
++use transit_ui_studio::{Services, StudioApp};
++use wasm_bindgen::{JsCast as _, JsValue};
++
++const CANVAS_ID: &str = "transit_canvas";
++const LOADING_ID: &str = "transit_loading";
++
++thread_local! {
++    static CTX: OnceCell<egui::Context> = const { OnceCell::new() };
++    /// Files picked in Open (name, bytes), for the next frame.
++    static OPENED: RefCell<Vec<(String, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
++    /// Where a file name was last kept in Files (`browser:/…`): its next save goes straight there.
++    static KEPT: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
++}
++
++fn repaint() {
++    CTX.with(|c| c.get().map(egui::Context::request_repaint));
++}
++
++/// The page's web runner, kept so live editing can reach the app.
++pub fn runner() -> eframe::WebRunner {
++    thread_local! {
++        static RUNNER: OnceCell<eframe::WebRunner> = const { OnceCell::new() };
++    }
++    RUNNER.with(|kept| kept.get_or_init(eframe::WebRunner::new).clone())
++}
++
++/// What the page runs.
++fn wrap(shell: Shell) -> Box<dyn eframe::App> {
++    Box::new(shell)
++}
++
++pub fn start() {
++    eframe::WebLogger::init(log::LevelFilter::Info).ok();
++    io::set_deliver(deliver);
++    wasm_bindgen_futures::spawn_local(async {
++        let Some(document) = web_sys::window().and_then(|w| w.document()) else { return };
++        let Some(canvas) = document.get_element_by_id(CANVAS_ID).and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok()) else {
++            log::error!("missing <canvas id=\"{CANVAS_ID}\">");
++            return;
++        };
++        let mut options = eframe::WebOptions::default();
++        if query().contains("webgl")
++            && let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut options.wgpu_options.wgpu_setup
++        {
++            create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
++        }
++        let creator = move |cc: &eframe::CreationContext<'_>| -> Result<Box<dyn eframe::App>, _> {
++            CTX.with(|c| c.set(cc.egui_ctx.clone()).ok());
++            let engine = if query().contains("empty") { Engine::default() } else { soundcraft_engine::demo::demo_engine() };
++            let player = soundcraft_playback::Player::new(Arc::new(engine.session().clone()));
++            let mut app = StudioApp::new(engine, Some(player), services());
++            app.about.app_version = env!("CARGO_PKG_VERSION").to_string();
++            Ok(wrap(Shell { app, inbox: Rc::default(), fonts: false, unsaved: None }))
++        };
++        let result = runner().start(canvas, options, Box::new(creator)).await;
++        if let Some(el) = document.get_element_by_id(LOADING_ID) {
++            match result {
++                Ok(()) => el.remove(),
++                Err(e) => el.set_inner_html(&format!("<p>transit failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>")),
++            }
++        }
++    });
++}
++
++fn query() -> String {
++    web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
++}
++
++fn get(o: &JsValue, k: &str) -> JsValue {
++    js_sys::Reflect::get(o, &k.into()).unwrap_or(JsValue::UNDEFINED)
++}
++
++/// `playgroundFiles[method](...args)`; None when the page has none or it threw.
++fn files(method: &str, args: &[JsValue]) -> Option<JsValue> {
++    let api = Some(get(&js_sys::global(), "playgroundFiles")).filter(JsValue::is_object)?;
++    let f = get(&api, method).dyn_into::<js_sys::Function>().ok()?;
++    f.apply(&api, &args.iter().collect::<js_sys::Array>()).ok()
++}
++
++async fn wait(v: Option<JsValue>) -> Option<JsValue> {
++    let promise = v?.dyn_into::<js_sys::Promise>().ok()?;
++    wasm_bindgen_futures::JsFuture::from(promise).await.ok().filter(|v| !v.is_null() && !v.is_undefined())
++}
++
++fn strings(list: &[&str]) -> JsValue {
++    list.iter().map(|s| JsValue::from(*s)).collect::<js_sys::Array>().into()
++}
++
++fn options(pairs: &[(&str, JsValue)]) -> JsValue {
++    let o = js_sys::Object::new();
++    for (k, v) in pairs {
++        let _ = js_sys::Reflect::set(&o, &(*k).into(), v);
++    }
++    o.into()
++}
++
++/// The studio's file dialogs: File > Open… asks Playground (or the browser) after the frame and the file comes back
++/// on a later one; a save names its file and [`deliver`] asks where it goes.
++fn services() -> Services {
++    Services {
++        pick_open: Some(Box::new(|purpose: &str| {
++            if purpose == "session.open" {
++                wasm_bindgen_futures::spawn_local(pick_session());
++            }
++            None
++        })),
++        pick_save: Some(Box::new(|default: &str| Some(default.to_string()))),
++        confirm: Some(Box::new(|question: &str| web_sys::window().and_then(|w| w.confirm_with_message(question).ok()).unwrap_or(false))),
++        ..Services::default()
++    }
++}
++
++async fn pick_session() {
++    let types = [soundcraft_model::BUNDLE_EXTENSION, soundcraft_model::SESSION_EXTENSION];
++    let picked = match wait(files("open", &[options(&[("types", strings(&types))])])).await {
++        Some(list) => js_sys::Array::from(&list).iter().next().map(|f| (get(&f, "name").as_string().unwrap_or_default(), js_sys::Uint8Array::new(&get(&f, "bytes")).to_vec())),
++        None if get(&js_sys::global(), "playgroundFiles").is_object() => None,
++        None => match rfd::AsyncFileDialog::new().add_filter("transit Session", &types).pick_file().await {
++            Some(f) => Some((f.file_name(), f.read().await)),
++            None => None,
++        },
++    };
++    if let Some(file) = picked {
++        OPENED.with_borrow_mut(|o| o.push(file));
++        repaint();
++    }
++}
++
++/// The engine's delivery hook: a saved session or a bounce goes where its file name went last time, else to
++/// Playground's Save As (which can also download it); a page without Playground downloads it.
++fn deliver(name: &str, bytes: &[u8]) -> Result<(), String> {
++    let data = js_sys::Uint8Array::from(bytes);
++    if let Some(path) = KEPT.with_borrow(|k| k.get(name).cloned()) {
++        files("write", &[path.into(), data.into()]).ok_or("Couldn't save to Files")?;
++        return Ok(());
++    }
++    if !get(&js_sys::global(), "playgroundFiles").is_object() {
++        return download(name, &data);
++    }
++    let ext = name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
++    let asked = files("saveAs", &[options(&[("name", name.into()), ("types", strings(&[ext.as_str()])), ("bytes", data.clone().into())])]);
++    let name = name.to_string();
++    wasm_bindgen_futures::spawn_local(async move {
++        if let Some(path) = wait(asked).await.and_then(|a| get(&a, "path").as_string()) {
++            files("write", &[path.clone().into(), data.into()]);
++            KEPT.with_borrow_mut(|k| k.insert(name, path));
++        }
++    });
++    Ok(())
++}
++
++fn download(name: &str, data: &js_sys::Uint8Array) -> Result<(), String> {
++    let js = |e: JsValue| format!("download failed: {e:?}");
++    let document = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
++    let blob = web_sys::Blob::new_with_u8_array_sequence(&js_sys::Array::of1(data)).map_err(js)?;
++    let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(js)?;
++    let a: web_sys::HtmlAnchorElement = document.create_element("a").map_err(js)?.dyn_into().map_err(|_| "not an anchor")?;
++    a.set_href(&url);
++    a.set_download(name);
++    a.click();
++    // ponytail: the object URL is kept for the page's life; revoke after a timeout if many downloads pile up.
++    Ok(())
++}
++
++/// Dropped files whose bytes are being read, for the next frame.
++type Inbox = Rc<RefCell<Vec<(String, Vec<u8>)>>>;
++
++/// The page's app: the studio, then the files that came in.
++pub struct Shell {
++    pub app: StudioApp,
++    inbox: Inbox,
++    fonts: bool,
++    unsaved: Option<bool>,
++}
++
++impl Shell {
++    /// In the browser a dropped file's path is only its name: its bytes are read instead.
++    fn take_drops(&mut self, ctx: &egui::Context) {
++        let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
++        for f in dropped {
++            let name = f.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Audio.wav".into());
++            let inbox = self.inbox.clone();
++            wasm_bindgen_futures::spawn_local(async move {
++                match f.bytes_async().await {
++                    Ok(bytes) => {
++                        inbox.borrow_mut().push((name, bytes));
++                        repaint();
++                    }
++                    Err(e) => log::error!("couldn't read dropped file {name}: {e}"),
++                }
++            });
++        }
++    }
++
++    /// A session opens, MIDI and audio import at the cursor (each import one undo step, as the commands are).
++    fn handle(&mut self, name: &str, bytes: &[u8]) {
++        let ext = name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
++        let session = [soundcraft_model::BUNDLE_EXTENSION, soundcraft_model::SESSION_EXTENSION].contains(&ext.as_str());
++        if session && transit_ui_studio::finish::refuses(&mut self.app, "session.open") {
++            return;
++        }
++        let at = self.app.cursor();
++        let target = self.app.cursor_track();
++        let e = &mut self.app.engine;
++        let result = if session {
++            let _ = self.app.run("transport.stop", json!({}));
++            io::open_session_bytes(&mut self.app.engine, name, bytes)
++                .map(|missing| if missing.is_empty() { format!("Opened {name}") } else { format!("Opened {name} ({} missing media)", missing.len()) })
++        } else if matches!(ext.as_str(), "mid" | "midi" | "smf") {
++            let before = e.session_arc();
++            io::import_midi_bytes(e, bytes, at, true).map(|_| {
++                e.push_undo("Import MIDI", before);
++                format!("Imported {name}")
++            })
++        } else {
++            let before = e.session_arc();
++            io::import_audio_bytes(e, name, bytes, None, target, at).map(|_| {
++                e.push_undo("Import Audio", before);
++                format!("Imported {name}")
++            })
++        };
++        self.app.status = result.unwrap_or_else(|err| err.to_string());
++    }
++}
++
++impl eframe::App for Shell {
++    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
++        self.take_drops(ctx);
++        let pending: Vec<_> = OPENED.take().into_iter().chain(std::mem::take(&mut *self.inbox.borrow_mut())).collect();
++        for (name, bytes) in pending {
++            self.handle(&name, &bytes);
++        }
++        self.app.logic(ctx);
++        // The studio installs its own fonts on its first frame; transit's go in right after, once (as on the desktop).
++        if !std::mem::replace(&mut self.fonts, true) {
++            ctx.set_fonts(font_definitions());
++        }
++        let unsaved = self.app.engine.is_dirty();
++        if self.unsaved.replace(unsaved) != Some(unsaved) {
++            files("setUnsaved", &[unsaved.into()]);
++        }
++    }
++
++    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
++        self.app.raw_input_hook(raw);
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
++        self.app.ui(ui);
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
++    }
++}
++
++macro_rules! font {
++    ($path:literal) => {
++        Arc::new(egui::FontData::from_static(include_bytes!(concat!("../../transit/assets/fonts/", $path))))
++    };
++}
++
++/// apps/transit's fonts (its `font_definitions`): Inter for the UI, JetBrains Mono for numbers, the extra weights as
++/// named families, over SoundCraft's definitions.
++fn font_definitions() -> egui::FontDefinitions {
++    use egui::FontFamily;
++    let mut defs = soundcraft_ui_egui::fonts::definitions();
++    let faces = [
++        ("inter-regular", font!("inter/Inter-Regular.ttf")),
++        ("inter-medium", font!("inter/Inter-Medium.ttf")),
++        ("inter-semibold", font!("inter/Inter-SemiBold.ttf")),
++        ("inter-bold", font!("inter/Inter-Bold.ttf")),
++        ("mono-regular", font!("jetbrains-mono/JetBrainsMono-Regular.ttf")),
++        ("mono-medium", font!("jetbrains-mono/JetBrainsMono-Medium.ttf")),
++        ("mono-bold", font!("jetbrains-mono/JetBrainsMono-Bold.ttf")),
++    ];
++    for (name, data) in faces {
++        defs.font_data.insert(name.into(), data);
++    }
++    let mut put = |family: FontFamily, face: &str| {
++        let rest = defs.families.get(&family).cloned().unwrap_or_default();
++        let mut list = vec![face.to_string()];
++        list.extend(rest.into_iter().filter(|f| f != face));
++        defs.families.insert(family, list);
++    };
++    put(FontFamily::Proportional, "inter-regular");
++    put(FontFamily::Monospace, "mono-regular");
++    let proportional = defs.families[&FontFamily::Proportional].clone();
++    let monospace = defs.families[&FontFamily::Monospace].clone();
++    let mut named = |name: &str, face: &str, base: &[String]| {
++        let mut list = vec![face.to_string()];
++        list.extend(base.iter().filter(|f| *f != face).cloned());
++        defs.families.insert(FontFamily::Name(name.into()), list);
++    };
++    named("inter-medium", "inter-medium", &proportional);
++    named("inter-semibold", "inter-semibold", &proportional);
++    named("inter-bold", "inter-bold", &proportional);
++    named("mono-medium", "mono-medium", &monospace);
++    named("mono-bold", "mono-bold", &monospace);
++    named("bold", "inter-bold", &proportional);
++    defs
++}
+diff --git a/crates/playback/src/player/web.rs b/crates/playback/src/player/web.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/playback/src/player/web.rs
+@@ -0,0 +1,48 @@
++//! transit in the browser, for Playground (patches/transit.yaml in github.com/daijro/openplayground): a page has no MIDI
++//! ports, so the Player's MIDI read-backs that the studio UI asks for each frame answer "nothing here" (the native
++//! `midi_out` and `native` modules need the MIDI device layer).
++
++use super::{Player, PlayerError, monitor};
++
++/// The external MIDI destinations as the UI reads them: none on the web.
++pub mod midi_out {
++    #[derive(Clone, Debug, PartialEq, Eq)]
++    pub enum DestinationState {
++        Pending,
++        Connected,
++        Missing,
++        Failed(String),
++    }
++
++    #[derive(Clone, Debug, PartialEq, Eq)]
++    pub struct TrackOutput {
++        pub track: soundcraft_model::TrackId,
++        pub port: String,
++        pub state: DestinationState,
++    }
++
++    #[derive(Clone, Debug, Default, PartialEq, Eq)]
++    pub struct OutputStatus {
++        pub tracks: Vec<TrackOutput>,
++    }
++}
++
++/// [`Player::midi_status`]'s answer, the fields the UI reads.
++#[derive(Clone, Debug, Default)]
++pub struct Status {
++    pub timing_quality: Option<crate::device_clock::Quality>,
++    pub output: midi_out::OutputStatus,
++}
++
++impl Player {
++    pub fn set_midi_monitor(&self, _enabled: bool, _show_clock: bool) {}
++    pub fn midi_activity(&self) -> (monitor::Activity, String) {
++        Default::default()
++    }
++    pub fn take_midi_monitor(&self, _events: &mut Vec<monitor::MonitorEvent>, _max: usize) -> monitor::Report {
++        monitor::Report::default()
++    }
++    pub fn midi_status(&self) -> Result<Status, PlayerError> {
++        Err(PlayerError::Busy)
++    }
++}
+diff --git a/crates/transit-playground/Cargo.toml b/crates/transit-playground/Cargo.toml
+new file mode 100644
+--- /dev/null
++++ b/crates/transit-playground/Cargo.toml
+@@ -0,0 +1,12 @@
++# Playground's browser build of transit (patches/transit.yaml in github.com/daijro/openplayground): std's clock as
++# wasm32-unknown-unknown can have it. Native builds compile it empty.
++[package]
++name = "transit-playground"
++version = "0.1.0"
++edition = "2024"
++description = "transit in the browser: the clock std lacks on wasm32-unknown-unknown"
++license = "MIT OR Apache-2.0"
++publish = false
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++web-time = "1"
+diff --git a/crates/transit-playground/src/lib.rs b/crates/transit-playground/src/lib.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/transit-playground/src/lib.rs
+@@ -0,0 +1,16 @@
++//! transit in the browser, for Playground (patches/transit.yaml in github.com/daijro/openplayground).
++//!
++//! wasm32-unknown-unknown has no clock: std's `Instant::now` and `SystemTime::now` panic there ("time not implemented
++//! on this platform"). The modules that read the clock take `std` from here instead, through one
++//! `#[cfg(target_arch = "wasm32")] use transit_playground::std;` line at each one's end (a local `std` shadows the
++//! standard library's name in that module; everything else in it still comes from the real std): `time` is web-time's,
++//! the browser's clock.
++#![cfg(target_arch = "wasm32")]
++
++pub mod std {
++    pub use ::std::*;
++
++    pub mod time {
++        pub use web_time::*;
++    }
++}

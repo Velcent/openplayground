@@ -401,6 +401,26 @@ groups:
         accent: "#4FB0F6"
         base: "#0B2140"
 
+      - slug: transit
+        name: Transit
+        # No `alternative`: Transit is its own name under either naming.
+        blurb: Arrange, record and mix music with a piano roll, mixer and built-in instruments.
+        # Its own sessions (.transit, and .transitz bundles that carry their audio); audio and MIDI files import.
+        # Upstream's releases are desktop packages only (no web zip), so like SubCraft it has the head channel only;
+        # patches/transit.yaml builds its own studio UI for the web.
+        opens: [transit, transitz]
+        imports: [wav, wave, aif, aiff, flac, mp3, ogg, m4a, mid, midi]
+        repo: transit-audio/transit
+        license: MIT OR Apache-2.0
+        # What the web build compiles (Cargo.lock: dependency changes): docs, site, CI and packaging commits don't
+        # rebuild it. One GitHub API request per path per check.
+        paths: [apps/soundcraft-web, crates, assets, Cargo.toml, Cargo.lock]
+        patches: patches/transit.yaml
+        live_kit: true
+        icon: icons/transit.svg
+        accent: "#4CB1F0"
+        base: "#0B2A3D"
+
   - name: Other
     tools:
       - slug: figma

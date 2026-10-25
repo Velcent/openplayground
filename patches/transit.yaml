@@ -1,0 +1,193 @@
+# transit in the browser, with its own studio UI. Upstream (github.com/transit-audio/transit) releases desktop packages
+# only; its apps/soundcraft-web page runs SoundCraft's window (soundcraft_ui_egui::SoundApp), not the studio UI the
+# desktop app runs (transit_ui_studio::StudioApp). These patches build that page with the studio instead, from the head
+# commit.
+#
+# patches/transit/web.diff adds new files only:
+#   apps/soundcraft-web/src/studio.rs   the page: StudioApp on the demo session (`?empty`: an empty one) with transit's
+#                                  fonts, playing through cpal's Web Audio host (index.html already starts the audio at
+#                                  the first click or key). File > Open… is Playground's Open dialog; "Open in transit"
+#                                  and dropped files open sessions or import audio and MIDI at the cursor; a save (a
+#                                  .transitz bundle) or a bounce goes to Playground's Save As, and the next save of that
+#                                  name back there; the unsaved state goes to the page's leave warning.
+#   crates/playback/src/player/web.rs   a page has no MIDI ports: the Player's MIDI read-backs the studio asks for each
+#                                  frame (midi_status, midi_activity, the MIDI Monitor's taps) answer "nothing here".
+#   crates/transit-playground/     wasm32-unknown-unknown has no clock (std's Instant::now and SystemTime::now
+#                                  panic): `std` with web-time's clock. The modules that read the clock take `std` from
+#                                  it on wasm through ONE `use` line at their end (a local `std` shadows the standard
+#                                  library's name in that module; everything else in it still comes from the real std).
+# Native builds see none of this: every rule adds or keeps wasm-only lines.
+#
+# Verify: node scripts/build.mjs check transit head (and LIVE=0), then the e2e (tests/live-apps/transit.mjs).
+
+# Rules 1-2/30: the Player's MIDI on the web. The MIDI Monitor's ring types (monitor.rs, plain std) compile on wasm as
+# they are, so its module loses its native-only gate (a no-op natively); midi_out's types and MidiStatus come from
+# player/web.rs. If upstream gates more of the Player's MIDI API, give player/web.rs the stub.
+- file: crates/playback/src/player/mod.rs
+  find: '#\[cfg\(not\(target_arch\s*=\s*"wasm32"\)\)\]\s*\n(pub\s+mod\s+monitor;)'
+  replace: '$1'
+- file: crates/playback/src/player/mod.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: no MIDI ports (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] mod web;\n#[cfg(target_arch = \"wasm32\")] pub use web::{midi_out, Status as MidiStatus};\n"
+
+# Rules 3-5/30: the page runs studio.rs instead of upstream's web.rs (which stays as it is, uncompiled), with the
+# studio crate as a wasm dependency under a target spelling nobody else uses (`all(...)`). If upstream renames the
+# page's `web` module or its `start`, follow.
+- file: apps/soundcraft-web/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\ntransit-ui-studio = { workspace = true }\n"
+- file: apps/soundcraft-web/src/main.rs
+  find: '\bmod\s+web\s*;'
+  replace: 'mod studio;'
+- file: apps/soundcraft-web/src/main.rs
+  find: '\bweb::start\(\)'
+  replace: 'studio::start()'
+
+# Rules 6-30/30: the clock (crates/transit-playground). The crates that read it depend on it under a target
+# spelling nobody else uses; every non-test module that names Instant or SystemTime and runs in the page takes `std` from
+# it (found with: grep -rln "Instant\|SystemTime" crates/{mix,plugin-host,playback,ui-studio}/src, tests, native-only
+# modules and the studio's autosave aside). A crate root's line would reach its children through their `use super::*`
+# (an ambiguous `std`), so plugin-host's root takes the two names it uses and mix's one call takes `std` in its own
+# block. Upstream's own web page panics the same way at head (Player::new reads the clock since 5447076, issue #67).
+# If upstream starts reading the clock in another module, give it the same line; a missing one panics ("time not
+# implemented on this platform") at the first clock call.
+- file: crates/mix/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\ntransit-playground = { path = \"../transit-playground\" }\n"
+- file: crates/plugin-host/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\ntransit-playground = { path = \"../transit-playground\" }\n"
+- file: crates/playback/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\ntransit-playground = { path = \"../transit-playground\" }\n"
+- file: crates/ui-studio/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\ntransit-playground = { path = \"../transit-playground\" }\n"
+- file: crates/mix/src/lib.rs
+  find: 'let\s+started\s*=\s*std::time::Instant::now\(\);'
+  replace: 'let started = { #[cfg(target_arch = "wasm32")] use transit_playground::std; std::time::Instant::now() };'
+- file: crates/plugin-host/src/lib.rs
+  find: '^use\s+std::time::\{Duration,\s*Instant\};'
+  replace: "#[cfg(not(target_arch = \"wasm32\"))] use std::time::{Duration, Instant};\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std::time::{Duration, Instant};"
+- file: crates/plugin-host/src/phases.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/plugin-host/src/hosted.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/playback/src/devices.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/playback/src/player/handles.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/playback/src/player/runtime.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/playback/src/record.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/playback/src/player/device.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/playback/src/telemetry.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/ui-studio/src/update.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/ui-studio/src/recent.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/ui-studio/src/plugin_header.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/ui-studio/src/midi_monitor.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/ui-studio/src/hardware_measure.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/ui-studio/src/import.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/ui-studio/src/finish.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/ui-studio/src/external_measure.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/ui-studio/src/audio_devices.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/ui-studio/src/keys/step.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+- file: crates/ui-studio/src/browser.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/transit.yaml).\n#[cfg(target_arch = \"wasm32\")] use transit_playground::std;\n"
+
+# Live editing in Playground sessions (patches/transit/live.diff, on the playground-live crate: tools.yaml live_kit)
+# What it's for: people in a Playground session work on the same session at once: tracks (adding, removing, grouping,
+#   names, instruments, devices and their settings, mute, solo, volume, pan, sends), clips (adding, moving, trimming,
+#   looping, fades, gain) and notes, tempo and meter reach the others as they are made; two people's edits to different
+#   tracks or clips both stay; each person's Ctrl+Z takes back only their own edits; imported audio travels as the
+#   session's media, so joining from a link needs no files; a connected session stays open (nothing replaces it). Each
+#   sees the others' pointers with name tags over the arrangement, the piano roll and the mixer strips, with the value
+#   they are setting (volume, pan, clip gain, velocity), the clip they are moving or trimming where it would land, their
+#   selected clips and notes, and their playhead while playing. Personal, never shared: the transport and cursor, the
+#   selection, zoom and scroll, and each track's height, lane view, folding, record arm and input monitor.
+# How: crates/ui-studio/src/live.rs (the shared document, merge, adoption, media, presence and the drawing at the end of
+#   each frame, from the layouts the studio keeps of its last frame) and apps/soundcraft-web/src/studio/live.rs (the
+#   page's app offered to the session, each frame ending with live::frame). These rules only add the dependency, declare
+#   the modules and call in, one line each.
+# Verify: node scripts/build.mjs check transit head, the e2e and `cargo test -p transit-ui-studio --lib live::`.
+# If upstream changes: when a line named below changes, anchor on its new spelling; if StudioApp or its state rename the
+#   fields live.rs reads (arrange.layout, keys.layout, mixer.layout, the gestures, dialog, finish), follow them there.
+#
+# Rules 31-32: Session::alloc, the one id allocator: while connected, an id nobody else adding something at once picks.
+- live: true
+  file: crates/model/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nplayground-live = { path = \"../../playground-live\" }\n"
+- live: true
+  file: crates/model/src/session.rs
+  find: 'pub\s+fn\s+alloc\s*\(\s*&mut\s+self\s*\)\s*->\s*u64\s*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] if playground_live::connected() { return playground_live::fresh_id(&mut self.next_id); }"
+# Rules 33-37: the studio's live module (wasm, and its native tests); StudioApp::run's first step (Undo and Redo go to
+#   the session; every Undo goes through run: the Edit menu, Ctrl+Z, the Undo History); finish::refuses, which every
+#   session-replacing command asks first (and the page's opened files): a connected session stays open; and the
+#   arrangement's drag preview, for the clip being dragged where it would land.
+- live: true
+  file: crates/ui-studio/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(any(target_arch = \"wasm32\"))'.dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\nsoundcraft-audio-io = { workspace = true }\n\n[target.'cfg(not(target_arch = \"wasm32\"))'.dev-dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\nsoundcraft-audio-io = { workspace = true }\n"
+- live: true
+  file: crates/ui-studio/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session (web only, and its native tests).\n#[cfg(any(target_arch = \"wasm32\", test))]\npub mod live;\n"
+- live: true
+  file: crates/ui-studio/src/lib.rs
+  find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\s*,\s*id\s*:\s*&str\s*,\s*params\s*:\s*Value\s*\)\s*->\s*Result<Value,\s*String>\s*\{'
+  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if crate::live::undo(id) { return Ok(Value::Null); }"
+- live: true
+  file: crates/ui-studio/src/finish.rs
+  find: 'pub\s+fn\s+refuses\s*\(\s*app\s*:\s*&mut\s+StudioApp\s*,\s*id\s*:\s*&str\s*\)\s*->\s*bool\s*\{'
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] if crate::live::refuses_session_switch(app, id) { return true; }"
+- live: true
+  file: crates/ui-studio/src/arrange.rs
+  find: 'let\s+preview\s*=\s*drag_preview\([^;]*\);'
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] crate::live::dragging(preview);"
+# Rules 38-40: the page: the crate for web::attach, studio/live.rs, and the app the runner starts wrapped by it.
+- live: true
+  file: apps/soundcraft-web/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(any(target_arch = \"wasm32\"))'.dependencies]\nplayground-live = { path = \"../../playground-live\" }\n"
+- live: true
+  file: apps/soundcraft-web/src/studio.rs
+  find: '(?![\s\S])'
+  after: "\n// Live editing in a Playground session.\nmod live;\n"
+- live: true
+  file: apps/soundcraft-web/src/studio.rs
+  find: 'Box::new\(shell\)'
+  replace: 'live::wrap(shell)'

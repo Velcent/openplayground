@@ -1,0 +1,698 @@
+diff --git a/apps/soundcraft-web/src/studio/live.rs b/apps/soundcraft-web/src/studio/live.rs
+new file mode 100644
+--- /dev/null
++++ b/apps/soundcraft-web/src/studio/live.rs
+@@ -0,0 +1,40 @@
++//! Live editing in a Playground session (patches/transit.yaml in github.com/daijro/openplayground): the page's app
++//! offered to the session, each frame ending with the others drawn and the session's frame hook
++//! (`transit_ui_studio::live`, the model side).
++
++use super::{Shell, repaint, runner};
++use transit_ui_studio::StudioApp;
++
++/// The app the runner starts: `shell`, offered to the page for live editing.
++pub(super) fn wrap(shell: Shell) -> Box<dyn eframe::App> {
++    let attached = playground_live::web::attach::<StudioApp>(
++        concat!("transit:1:", env!("CARGO_PKG_VERSION")),
++        |with| runner().app_mut::<Live>().map(|mut live| with(&mut live.0.app)).is_some(),
++        repaint,
++    );
++    if let Err(e) = attached {
++        log::error!("live editing: {e:?}");
++    }
++    Box::new(Live(shell))
++}
++
++struct Live(Shell);
++
++impl eframe::App for Live {
++    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
++        self.0.logic(ctx, frame);
++    }
++
++    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
++        self.0.raw_input_hook(ctx, raw);
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        self.0.ui(ui, frame);
++        transit_ui_studio::live::frame(&mut self.0.app, ui.ctx());
++    }
++
++    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
++        Some(self)
++    }
++}
+diff --git a/crates/ui-studio/src/live.rs b/crates/ui-studio/src/live.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/ui-studio/src/live.rs
+@@ -0,0 +1,648 @@
++//! Live editing in a Playground session (web only; patches/transit.yaml in github.com/daijro/openplayground), on the
++//! shared playground-live crate. The shared document is the session without anyone's views: no `edit` state
++//! (selection, zoom, scroll, modes), and per track no height, lane view, folder state, pin, record arm or input monitor
++//! (the studio's own view state, `UiState`, never was in the session). Imported audio reaches everyone as session
++//! files, one per source id (the demo's synthesized audio excepted: every browser makes the same). Undo and Redo go to
++//! the session while it is connected; a connected session stays open (nothing replaces it).
++//!
++//! Presence ([`Live::live_presence`]), all in the session's terms so each person draws it through their own zoom and
++//! scroll: the pointer over the arrangement (track, time, how far down the row), the piano roll (clip, tick, pitch) or a
++//! mixer strip (track, how far across and down); the selected clips and notes; the clip being moved or trimmed where it
++//! would land; the playhead while playing; and a value being set (volume, pan, clip gain, velocity), tagged under the
++//! person's name. Drawn with the kit's look ([`presence`]) at the end of each frame, from the layouts the studio keeps
++//! of its last frame, over its panels and under its windows and menus.
++
++use crate::StudioApp;
++use crate::arrange::R4;
++use egui::{Context, Id, LayerId, Order, Pos2, Rect, pos2};
++use playground_live::{Live, Presence, presence};
++use serde::Deserialize as _;
++use serde_json::{Value, json};
++use soundcraft_audio_io::{BitDepth, EncodeOptions, FileFormat, SampleFormat};
++use soundcraft_model::{EditState, Session, Source, SourceAudio, SourceId, Track};
++use std::cell::Cell;
++use std::sync::Arc;
++
++thread_local! {
++    /// The pointer at the end of the last frame.
++    static POINTER: Cell<Option<Pos2>> = const { Cell::new(None) };
++    /// The clip a drag in the arrangement is moving or trimming, where it would land: (track, start, end).
++    static DRAG: Cell<Option<(u64, i64, i64)>> = const { Cell::new(None) };
++    /// The command journal's length when no pointer button was last down: what follows is the gesture's.
++    static PRESSED_AT: Cell<usize> = const { Cell::new(usize::MAX) };
++}
++
++/// Selected or dragged things a presence carries, at most.
++const MAX_ITEMS: usize = 50;
++
++fn rect(r: R4) -> Rect {
++    Rect::from_min_max(pos2(r[0], r[1]), pos2(r[2], r[3]))
++}
++
++/// A remote time (samples, ticks), unless it is no whole number or too far off to draw.
++fn time(v: &Value) -> Option<f64> {
++    v.as_i64().filter(|t| t.unsigned_abs() < 1 << 48).map(|t| t as f64)
++}
++
++/// A remote fraction (0 to 1).
++fn fraction(v: &Value) -> Option<f64> {
++    v.as_f64().filter(|f| (0.0..=1.0).contains(f))
++}
++
++/// The items of a remote list, at most [`MAX_ITEMS`].
++fn items(v: &Value) -> impl Iterator<Item = &Value> {
++    v.as_array().into_iter().flatten().take(MAX_ITEMS)
++}
++
++/// `f` in thousandths: finer than a point, and short in JSON.
++fn fine(f: f32) -> f64 {
++    (f64::from(f) * 1000.0).round() / 1000.0
++}
++
++/// A pointer at `tip` with a name tag and, under it, the `value` they are setting ([`presence::cursor_with`]).
++fn cursor(painter: &egui::Painter, tip: Pos2, o: &Presence) {
++    let value = o.state["value"].as_str().filter(|v| v.len() <= 64).unwrap_or_default();
++    presence::cursor_with(painter, tip, presence::color(o), &o.name, value);
++}
++
++/// Copies what each person keeps of a track for themselves.
++fn keep_views(t: &mut Track, from: &Track) {
++    t.height = from.height;
++    t.view.clone_from(&from.view);
++    t.folder_open = from.folder_open;
++    t.pinned = from.pinned;
++    t.mixer.record_arm = from.mixer.record_arm;
++    t.mixer.input_monitor = from.mixer.input_monitor;
++}
++
++/// A new track's views: what the shared document gives every track.
++fn fresh_track(t: &Track) -> Track {
++    Track::new(t.id, "", t.kind, t.format, t.color)
++}
++
++/// Every playlist's clips in a shared document.
++fn clip_lists(doc: &mut Value) -> impl Iterator<Item = &mut Vec<Value>> {
++    fn items(v: Option<&mut Value>) -> impl Iterator<Item = &mut Value> {
++        v.and_then(Value::as_array_mut).into_iter().flatten()
++    }
++    items(doc.get_mut("tracks")).flat_map(|t| items(t.get_mut("playlists"))).filter_map(|p| p.get_mut("clips").and_then(Value::as_array_mut))
++}
++
++/// Undo and Redo ([`StudioApp::run`]) go to the session while one is connected: true when it took them.
++pub(crate) fn undo(command: &str) -> bool {
++    matches!(command, "edit.undo" | "edit.redo") && playground_live::undo(command == "edit.redo")
++}
++
++/// A connected session shares the open session, which then stays open: no command replaces it (see
++/// [`crate::finish::refuses`]). True when refused; the status line says why.
++pub(crate) fn refuses_session_switch(app: &mut StudioApp, id: &str) -> bool {
++    let refused = playground_live::connected() && matches!(id, "session.new" | "session.open" | "session.close" | "session.revert");
++    if refused {
++        app.status = "Leave the live session first: it shares this session".into();
++    }
++    refused
++}
++
++/// The arrangement's drag preview this frame (arrange.rs `clips` calls it): the clip being moved or trimmed and where
++/// it would land.
++pub(crate) fn dragging(preview: Option<(soundcraft_model::ClipId, soundcraft_model::TrackId, i64, i64, bool)>) {
++    DRAG.set(preview.map(|(_, t, a, b, _)| (t.0, a, b)));
++}
++
++/// Whether two records describe the same audio (saving changes only where it is kept).
++fn same_audio(a: &Source, b: &Source) -> bool {
++    (&a.name, a.channels, a.frames, a.sample_rate) == (&b.name, b.channels, b.frames, b.sample_rate)
++}
++
++/// The arrangement as last drawn, when it shows: its timeline, the samples a point, its scroll and its rows (track,
++/// full row, main lane).
++struct Arrangement {
++    tl: Rect,
++    spp: f64,
++    scroll: i64,
++    rows: Vec<(u64, Rect, Rect)>,
++}
++
++impl Arrangement {
++    fn of(app: &StudioApp) -> Option<Self> {
++        let l = &app.arrange.layout;
++        (!app.ui.mixer_full && l.samples_per_px > 0.0).then(|| Arrangement {
++            tl: rect(l.timeline),
++            spp: l.samples_per_px,
++            scroll: l.scroll,
++            rows: l.tracks.iter().map(|t| (t.id, rect(t.header), rect(t.lane))).collect(),
++        })
++    }
++    fn x(&self, at: f64) -> f32 {
++        self.tl.min.x + ((at - self.scroll as f64) / self.spp) as f32
++    }
++    fn at(&self, x: f32) -> i64 {
++        self.scroll + (f64::from(x - self.tl.min.x) * self.spp).round() as i64
++    }
++    fn row(&self, track: &Value) -> Option<usize> {
++        self.rows.iter().position(|(id, ..)| Some(*id) == track.as_u64())
++    }
++}
++
++/// The piano roll as last drawn, when it shows: the clip, the grid, the mapping of ticks (from the clip's start) and
++/// the visible pitch rows.
++struct Roll {
++    clip: u64,
++    grid: Rect,
++    x0: f64,
++    scroll: f64,
++    ppt: f64,
++    rows: Vec<(u8, Rect)>,
++}
++
++impl Roll {
++    fn of(app: &StudioApp) -> Option<Self> {
++        let k = &app.keys.layout;
++        (k.visible && k.px_per_tick > 0.0).then_some(())?;
++        Some(Roll {
++            clip: k.clip?,
++            grid: rect(k.grid),
++            x0: f64::from(k.grid[0]),
++            scroll: k.scroll_ticks,
++            ppt: k.px_per_tick,
++            rows: k.pitch_rows.iter().map(|(p, r)| (*p, rect(*r))).collect(),
++        })
++    }
++    fn x(&self, tick: f64) -> f32 {
++        (self.x0 + (tick - self.scroll) * self.ppt) as f32
++    }
++    /// Pitch `p` plus how far down its row (0 to 1), where it shows.
++    fn y(&self, pitch: f64) -> Option<f32> {
++        let p = pitch.floor();
++        let (_, r) = self.rows.iter().find(|(q, _)| f64::from(*q) == p)?;
++        Some(r.min.y + (pitch - p) as f32 * r.height())
++    }
++    /// A note's box, `[tick, pitch, length]`.
++    fn note(&self, [tick, pitch, len]: [f64; 3]) -> Option<Rect> {
++        let (_, r) = self.rows.iter().find(|(q, _)| f64::from(*q) == pitch)?;
++        Some(Rect::from_min_max(pos2(self.x(tick), r.min.y + 1.0), pos2(self.x(tick + len).max(self.x(tick) + 3.0), r.max.y - 1.0)))
++    }
++}
++
++/// The mixer's strips as last drawn, when it shows: (track, strip, the area it shows in).
++fn strips(app: &StudioApp) -> Vec<(u64, Rect, Rect)> {
++    let m = &app.mixer.layout;
++    let area = rect(m.area);
++    if !m.visible {
++        return Vec::new();
++    }
++    m.strips.iter().chain(&m.master).map(|s| (s.track, rect(s.rect), area)).collect()
++}
++
++/// Where `p` is, in the session's terms: over a mixer strip (`{strip: track, x, y}`), the piano roll (`{clip, tick,
++/// pitch}`) or the arrangement's tracks (`{track, at, y}`).
++fn pointer(app: &StudioApp, p: Pos2) -> Option<Value> {
++    if let Some((track, r, _)) = strips(app).into_iter().find(|(_, r, area)| r.contains(p) && area.contains(p)) {
++        return Some(json!({"strip": track, "x": fine((p.x - r.min.x) / r.width()), "y": fine((p.y - r.min.y) / r.height())}));
++    }
++    if let Some(roll) = Roll::of(app).filter(|r| r.grid.contains(p)) {
++        let (pitch, r) = roll.rows.iter().find(|(_, r)| (r.min.y..r.max.y).contains(&p.y))?;
++        let pitch = f64::from(*pitch) + fine((p.y - r.min.y) / r.height()).min(0.999);
++        return Some(json!({"clip": roll.clip, "tick": ((f64::from(p.x) - roll.x0) / roll.ppt + roll.scroll).round() as i64, "pitch": pitch}));
++    }
++    let a = Arrangement::of(app).filter(|a| a.tl.contains(p))?;
++    let (track, row, _) = a.rows.iter().find(|(_, r, _)| (r.min.y..r.max.y).contains(&p.y))?;
++    Some(json!({"track": track, "at": a.at(p.x), "y": fine((p.y - row.min.y) / row.height())}))
++}
++
++/// What a command a gesture runs sets, as its tag shows it: volume, pan, clip gain or a note's velocity.
++fn value_text((id, p): &(String, Value)) -> Option<String> {
++    let num = |k: &str| p[k].as_f64().filter(|v| v.is_finite());
++    Some(match id.as_str() {
++        "mix.volume" => format!("Volume {:+.1} dB", num("db")?),
++        "mix.pan" => match num("pan")? {
++            pan if pan.abs() < 0.005 => "Pan C".into(),
++            pan => format!("Pan {}{:.0}", if pan < 0.0 { "L" } else { "R" }, pan.abs() * 100.0),
++        },
++        "clip.gain" => format!("Clip gain {:+.1} dB", num("db")?),
++        "midi.note_edit" => format!("Velocity {}", p["velocity"].as_u64()?),
++        _ => return None,
++    })
++}
++
++/// The end of each frame (the web page's shell calls it): where the pointer is and where the gesture under way started
++/// in the command journal, the others drawn ([`draw`], then [`presence::end_frame`]), then [`playground_live::frame`].
++pub fn frame(app: &mut StudioApp, ctx: &Context) {
++    POINTER.set(ctx.input(|i| i.pointer.hover_pos()));
++    if !ctx.input(|i| i.pointer.any_down()) {
++        PRESSED_AT.set(app.engine.journal.len());
++    }
++    draw(app, ctx);
++    presence::end_frame(ctx);
++    playground_live::frame(app);
++}
++
++/// The others over this person's arrangement, piano roll and mixer, where they show the same things: their playheads
++/// and ghosts, then outlines around what they selected, then their pointers.
++fn draw(app: &StudioApp, ctx: &Context) {
++    let others = presence::others();
++    if others.is_empty() {
++        return;
++    }
++    let layer = ctx.layer_painter(LayerId::new(Order::Background, Id::new("playground-live")));
++    if let Some(a) = Arrangement::of(app).filter(|a| !a.rows.is_empty()) {
++        let painter = layer.with_clip_rect(a.tl);
++        let (w, h) = (f64::from(a.tl.width()) / 4.0, f64::from(a.tl.height()) / 4.0);
++        let px = [1.0 / a.spp, a.rows.first().map_or(40.0, |r| f64::from(r.1.height())), 1.0 / a.spp];
++        let lane = |v: f64| a.rows[(v.max(0.0) as usize).min(a.rows.len() - 1)].2;
++        for o in &others {
++            let (st, color) = (&o.state, presence::color(o));
++            if let Some([at]) = time(&st["playhead"]).and_then(|t| presence::ease(ctx, &o.id, "arrange.playhead", [t], [px[0]], [w])) {
++                presence::playhead(&painter, a.x(at), [a.tl.min.y, a.tl.max.y], a.tl.max.x, color, &o.name);
++            }
++            let g = &st["ghosts"][0];
++            if let Some([s, v, e]) = (time(&g[1]).zip(a.row(&g[0])).zip(time(&g[2])))
++                .and_then(|((s, row), e)| presence::ease(ctx, &o.id, "arrange.ghost", [s, row as f64, e], px, [w, h, w]))
++            {
++                let l = lane(v);
++                presence::ghost(&painter, Rect::from_min_max(pos2(a.x(s), l.min.y + 1.0), pos2(a.x(e).max(a.x(s) + 2.0), l.max.y - 1.0)), color);
++            }
++            for clip in items(&st["selection"]).filter_map(Value::as_u64) {
++                if let Some(c) = app.arrange.layout.clips.iter().find(|c| c.id == clip) {
++                    presence::outline(&painter, rect(c.rect), color);
++                }
++            }
++        }
++        for o in &others {
++            let p = &o.state["pointer"];
++            let target = a.row(&p["track"]).zip(time(&p["at"])).zip(fraction(&p["y"])).map(|((row, at), y)| [at, row as f64 + y]);
++            if let Some([at, v]) = target.and_then(|t| presence::ease(ctx, &o.id, "arrange.pointer", t, [px[0], px[1]], [w, h])) {
++                let i = (v.max(0.0) as usize).min(a.rows.len() - 1);
++                let row = a.rows[i].1;
++                let tip = pos2(a.x(at), row.min.y + (v - i as f64) as f32 * row.height());
++                if a.tl.contains(tip) {
++                    cursor(&painter, tip, o);
++                }
++            }
++        }
++    }
++    if let Some(r) = Roll::of(app) {
++        let painter = layer.with_clip_rect(r.grid);
++        let key_h = r.rows.first().map_or(10.0, |(_, row)| f64::from(row.height()));
++        let note = |n: &Value| Some([time(&n[0])?, n[1].as_u64().filter(|p| *p <= 127)? as f64, time(&n[2]).filter(|l| *l > 0.0)?]);
++        for o in others.iter().filter(|o| o.state["midi"]["clip"].as_u64() == Some(r.clip)) {
++            for n in items(&o.state["midi"]["notes"]).filter_map(note) {
++                if let Some(b) = r.note(n) {
++                    presence::outline(&painter, b, presence::color(o));
++                }
++            }
++            let p = &o.state["pointer"];
++            let target = (p["clip"].as_u64() == Some(r.clip)).then(|| Some([time(&p["tick"])?, p["pitch"].as_f64().filter(|p| (0.0..128.0).contains(p))?])).flatten();
++            let far = [f64::from(r.grid.width()) / 4.0, f64::from(r.grid.height()) / 4.0];
++            if let Some([tick, pitch]) = target.and_then(|t| presence::ease(ctx, &o.id, "keys.pointer", t, [r.ppt, key_h], far))
++                && let Some(y) = r.y(pitch)
++            {
++                cursor(&painter, pos2(r.x(tick), y), o);
++            }
++        }
++    }
++    let strips = strips(app);
++    if let Some(&(_, first, area)) = strips.first() {
++        let painter = layer.with_clip_rect(area);
++        let (px, far) = ([f64::from(first.width()), f64::from(first.height())], [f64::from(area.width()) / 4.0, f64::from(area.height()) / 4.0]);
++        for o in &others {
++            let p = &o.state["pointer"];
++            let on = p["strip"].as_u64().and_then(|t| strips.iter().position(|s| s.0 == t));
++            let target = on.zip(fraction(&p["x"])).zip(fraction(&p["y"])).map(|((i, x), y)| [i as f64 + x, y]);
++            if let Some([v, y]) = target.and_then(|t| presence::ease(ctx, &o.id, "mixer.pointer", t, px, far)) {
++                let i = (v.max(0.0) as usize).min(strips.len() - 1);
++                let s = strips[i].1;
++                cursor(&painter, pos2(s.min.x + (v - i as f64) as f32 * s.width(), s.min.y + y as f32 * s.height()), o);
++            }
++        }
++    }
++}
++
++impl Live for StudioApp {
++    const COUNTERS: &'static [&'static str] = &["next_id"];
++
++    fn live_document(&self) -> Value {
++        let mut s = self.engine.session().clone();
++        for t in &mut s.tracks {
++            keep_views(t, &fresh_track(t));
++        }
++        s.sources.iter_mut().for_each(|s| s.unsaved = false);
++        let mut doc = serde_json::to_value(&s).unwrap_or_default();
++        if let Some(doc) = doc.as_object_mut() {
++            doc.remove("edit");
++        }
++        // Playlists keyed by their name, so clips merge one by one (a track with two of one name merges them whole).
++        for t in doc["tracks"].as_array_mut().into_iter().flatten() {
++            for p in t["playlists"].as_array_mut().into_iter().flatten() {
++                p["id"] = p["name"].clone();
++            }
++        }
++        doc
++    }
++
++    fn live_merge(base: &Value, current: &Value, edited: &Value) -> Result<Value, String> {
++        // A playlist keeps its clips in (start, id) order: merge them as sets (id order on every side), then sort them.
++        let by_id = |doc: &Value| {
++            let mut doc = doc.clone();
++            clip_lists(&mut doc).for_each(|clips| clips.sort_by_key(|c| c["id"].as_u64()));
++            doc
++        };
++        let mut doc = playground_live::merge(&by_id(base), &by_id(current), &by_id(edited), Self::COUNTERS)?;
++        clip_lists(&mut doc).for_each(|clips| clips.sort_by_key(|c| (c["start"].as_i64(), c["id"].as_u64())));
++        // Only a session the app opens.
++        let edit = serde_json::to_value(EditState::default()).map_err(|e| e.to_string())?;
++        doc.as_object_mut().ok_or("Not a session")?.insert("edit".into(), edit);
++        Session::deserialize(&doc).map_err(|e| format!("Invalid session: {e}"))?;
++        doc.as_object_mut().map(|doc| doc.remove("edit"));
++        Ok(doc)
++    }
++
++    fn live_adopt(&mut self, mut document: Value) -> Result<(), String> {
++        let current = self.engine.session();
++        let edit = serde_json::to_value(&current.edit).map_err(|e| e.to_string())?;
++        document.as_object_mut().ok_or("Not a session")?.insert("edit".into(), edit);
++        let mut s: Session = serde_json::from_value(document).map_err(|e| format!("Invalid session: {e}"))?;
++        // Repairs what a merge can break (clip order, a removed active playlist); the id counter stays as shared.
++        let next_id = s.next_id;
++        s.sanitize();
++        s.next_id = next_id;
++        for t in &mut s.tracks {
++            let new = fresh_track(t);
++            keep_views(t, current.track(t.id).unwrap_or(&new));
++        }
++        for src in &mut s.sources {
++            src.unsaved = current.source(src.id).is_some_and(|c| c.unsaved);
++        }
++        s.pool = current.pool.clone();
++        // Source ids before the session were counted on each side: this browser's own audio under a shared source's id
++        // is not that source's (it then arrives as a session file).
++        for src in &s.sources {
++            if current.source(src.id).is_some_and(|c| !same_audio(c, src)) {
++                s.pool.remove(src.id);
++            }
++        }
++        s.folder = current.folder.clone();
++        *self.engine.session_mut() = s;
++        // The piano roll's selection is notes by value: those another person changed are no longer selected.
++        Ok(())
++    }
++
++    fn live_quiet(&self) -> bool {
++        presence::quiet()
++            && self.arrange.gesture.is_none()
++            && self.arrange.loop_drag.is_none()
++            && self.arrange.header_drag.is_none()
++            && self.keys.gesture.is_none()
++            && self.mixer.gesture.is_none()
++            && self.mixer.edit.is_none()
++            && self.finish.rename.is_none()
++            && self.dialog.is_none()
++            && self.finish.job.is_none()
++            && !self.engine.transport.recording
++    }
++
++    fn live_generation(&self) -> Option<u64> {
++        Some(self.engine.revision)
++    }
++
++    /// Forgets Undo and Redo: their steps hold other people's edits. A step pushed with no history kept clears both.
++    fn live_disconnected(&mut self) {
++        let limit = std::mem::replace(&mut self.engine.history_limit, 0);
++        self.engine.push_undo("", Arc::new(Session::default()));
++        self.engine.history_limit = limit;
++    }
++
++    /// `{ selection: [clips], pointer?, ghosts?, playhead?, value?, midi? }` (see [`pointer`], [`dragging`],
++    /// [`value_text`]; `ghosts` [track, start, end] of the clip a drag moves or trims; `midi` `{clip, notes}` the piano
++    /// roll's clip and selected notes as [tick, pitch, length]).
++    fn live_presence(&self) -> Value {
++        let s = self.engine.session();
++        let mut state = json!({"selection": s.edit.selected_clips.iter().take(MAX_ITEMS).collect::<Vec<_>>()});
++        if let Some(p) = POINTER.get().and_then(|p| pointer(self, p)) {
++            state["pointer"] = p;
++        }
++        if let Some((track, a, b)) = DRAG.get()
++            && self.arrange.gesture.is_some()
++        {
++            state["ghosts"] = json!([[track, a, b]]);
++        }
++        if self.is_playing() {
++            state["playhead"] = self.position().into();
++        }
++        if !presence::quiet()
++            && let Some(value) = self.engine.journal.get(PRESSED_AT.get()..).and_then(|j| j.iter().rev().find_map(value_text))
++        {
++            state["value"] = value.into();
++        }
++        if let Some(r) = Roll::of(self) {
++            let notes: Vec<_> = self.keys.selection.iter().take(MAX_ITEMS).map(|n| json!([n.start, n.pitch, n.length])).collect();
++            state["midi"] = json!({"clip": r.clip, "notes": notes});
++        }
++        state
++    }
++
++    fn live_show_presence(&mut self, others: Vec<Presence>) {
++        presence::show(others);
++    }
++
++    fn live_assets(&self) -> Vec<(String, String, bool)> {
++        let (s, demo) = (self.engine.session(), soundcraft_engine::demo::cached_demo_session());
++        let built_in = |id| matches!((s.pool.get(id), demo.pool.get(id)), (Some(a), Some(b)) if Arc::ptr_eq(a, b));
++        s.sources
++            .iter()
++            .filter(|src| !built_in(src.id))
++            .map(|src| (src.id.0.to_string(), format!("{}.wav", src.name), s.pool.contains(src.id)))
++            .collect()
++    }
++
++    /// Every source id (the demo's too, which `live_assets` leaves out: nobody shares it).
++    fn live_assets_of(document: &Value) -> Vec<String> {
++        document["sources"].as_array().into_iter().flatten().filter_map(|s| s["id"].as_u64()).map(|id| id.to_string()).collect()
++    }
++
++    /// The source's audio as a 32-bit float WAV, as a saved bundle carries it.
++    fn live_read_asset(&self, id: &str) -> Option<Vec<u8>> {
++        let audio = self.engine.session().pool.get(SourceId(id.parse().ok()?))?;
++        let wav = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Float32, dither: false, bwf: None };
++        soundcraft_audio_io::encode(&audio.buffer, &wav).ok()
++    }
++
++    /// Into the pool, as opening a bundle decodes it, if it is the audio the source describes and none is here yet (a late
++    /// arrival never replaces it). Only what [`Self::live_read_asset`] sends is decoded: a 32-bit float WAV no bigger
++    /// than that audio, never a compressed file that could decode to far more.
++    fn live_write_asset(&mut self, id: &str, _name: &str, bytes: Vec<u8>) {
++        let s = self.engine.session();
++        let Some(src) = id.parse().ok().and_then(|id| s.source(SourceId(id))) else { return };
++        let most = src.frames.saturating_mul(u64::from(src.channels)).saturating_mul(4).saturating_add(65536);
++        let f32_wav = || {
++            soundcraft_audio_io::detect_format(&bytes, None) == FileFormat::Wav
++                && soundcraft_audio_io::probe(&bytes, None).is_ok_and(|i| (i.format, i.sample_format) == (FileFormat::Wav, SampleFormat::Float32))
++        };
++        if s.pool.contains(src.id) || bytes.len() as u64 > most || !f32_wav() {
++            return;
++        }
++        let Ok((_, buf)) = soundcraft_audio_io::decode(&bytes, Some("wav")) else { return };
++        if (buf.num_channels(), buf.frames() as u64, buf.sample_rate) == (usize::from(src.channels), src.frames, src.sample_rate) {
++            let id = src.id;
++            self.engine.session_mut().pool.insert(id, Arc::new(SourceAudio::new(buf)));
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::Services;
++    use serde_json::json;
++    use soundcraft_engine::Engine;
++    use playground_live::{self as live, canonical};
++    use soundcraft_model::{ChannelFormat, Clip, ClipId, TrackHeight, TrackKind};
++
++    fn two_tracks() -> StudioApp {
++        let mut engine = Engine::default();
++        let s = engine.session_mut();
++        s.add_track(TrackKind::Audio, ChannelFormat::Mono, Some("Kick"));
++        s.add_track(TrackKind::Audio, ChannelFormat::Mono, Some("Snare"));
++        engine.mark_clean();
++        StudioApp::new(engine, None, Services::default())
++    }
++
++    fn mute(app: &mut StudioApp, track: usize) {
++        let id = app.engine.session().tracks[track].id;
++        app.run("mix.mute", json!({"tracks": [id]})).unwrap();
++    }
++
++    #[test]
++    fn the_shared_document_leaves_out_views() {
++        let mut app = two_tracks();
++        let before = canonical(&app.live_document());
++        let s = app.engine.session_mut();
++        s.edit.zoom.samples_per_px = 7.0;
++        s.edit.selection.start = 480;
++        let t = &mut s.tracks[0];
++        (t.height, t.view, t.pinned, t.mixer.record_arm) = (TrackHeight::Large, "volume".into(), true, true);
++        app.ui.track_height = 120.0;
++        assert_eq!(canonical(&app.live_document()), before, "views are not shared");
++        mute(&mut app, 0);
++        let doc = app.live_document();
++        assert!(doc.get("edit").is_none());
++        assert_eq!(doc["tracks"][0]["mixer"]["mute"], true);
++        assert_eq!(doc["tracks"][0]["playlists"][0]["id"], "Kick");
++    }
++
++    #[test]
++    fn adopting_keeps_views_and_is_no_undo_step() {
++        let mut app = two_tracks();
++        let mut other = two_tracks();
++        mute(&mut other, 1);
++        other.engine.session_mut().add_track(TrackKind::Midi, ChannelFormat::Mono, Some("Keys"));
++        let s = app.engine.session_mut();
++        s.edit.selection.start = 480;
++        s.tracks[1].height = TrackHeight::Large;
++        app.live_adopt(other.live_document()).unwrap();
++        let s = app.engine.session();
++        assert!(s.tracks[1].mixer.mute && s.tracks[1].height == TrackHeight::Large && s.edit.selection.start == 480);
++        assert!(!app.engine.can_undo());
++        assert_eq!(canonical(&app.live_document()), canonical(&other.live_document()));
++    }
++
++    #[test]
++    fn a_remote_change_waits_for_the_gesture_and_undo_goes_to_the_session() {
++        let mut app = two_tracks();
++        let mut other = two_tracks();
++        live::connect();
++        let base = canonical(&app.live_document());
++        mute(&mut other, 0);
++        let done = std::rc::Rc::new(std::cell::Cell::new(false));
++        let to = done.clone();
++        live::queue(Some(base), canonical(&other.live_document()), Box::new(move |r| to.set(r.is_ok())));
++        app.dialog = Some(crate::Dialog::Bounce);
++        live::frame(&mut app);
++        assert!(!done.get() && !app.engine.session().tracks[0].mixer.mute, "an open dialog holds remote changes");
++        app.dialog = None;
++        live::frame(&mut app);
++        assert!(done.get() && app.engine.session().tracks[0].mixer.mute);
++        mute(&mut app, 1);
++        app.run("edit.undo", json!({})).unwrap();
++        assert!(app.engine.session().tracks[1].mixer.mute, "Undo is the session's while connected");
++        assert_eq!(live::activity().1, [false]);
++        assert!(app.run("session.new", json!({})).is_err(), "the shared session stays open");
++        live::disconnect();
++        app.live_disconnected();
++        assert!(!app.engine.can_undo());
++    }
++
++    #[test]
++    fn imported_audio_travels_by_source_id_and_installs_without_an_edit() {
++        let with_import = |level: f32, frames: usize| {
++            let mut app = StudioApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
++            let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![level; frames]] };
++            let wav = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Float32, dither: false, bwf: None };
++            let bytes = soundcraft_audio_io::encode(&buf, &wav).unwrap();
++            soundcraft_engine::io::import_audio_bytes(&mut app.engine, "a.wav", &bytes, None, None, 0).unwrap();
++            app
++        };
++        let (owner, mut peer) = (with_import(0.5, 480), with_import(-0.25, 960));
++        let id = owner.engine.session().sources.last().unwrap().id.to_string();
++        assert_eq!(owner.live_assets(), [(id.clone(), "a.wav".into(), true)], "the demo's audio is not shared");
++        assert!(StudioApp::live_assets_of(&owner.live_document()).contains(&id));
++        peer.live_adopt(owner.live_document()).unwrap();
++        assert_eq!(peer.live_assets(), [(id.clone(), "a.wav".into(), false)], "the peer's own audio under that id is not it");
++        let doc = canonical(&peer.live_document());
++        peer.live_write_asset(&id, "a.wav", owner.live_read_asset(&id).unwrap());
++        assert_eq!(peer.live_read_asset(&id), owner.live_read_asset(&id));
++        assert!(canonical(&peer.live_document()) == doc && !peer.engine.can_undo());
++    }
++
++    #[test]
++    fn a_pointer_travels_as_track_time_and_height_and_lands_through_the_viewers_own_zoom() {
++        let mut app = two_tracks();
++        let ids: Vec<u64> = app.engine.session().tracks.iter().map(|t| t.id.0).collect();
++        let row = |id: u64, y0: f32, y1: f32| crate::arrange::TrackRow { id, header: [0.0, y0, 100.0, y1], lane: [100.0, y0, 900.0, y1], ..Default::default() };
++        let l = &mut app.arrange.layout;
++        (l.timeline, l.samples_per_px, l.scroll) = ([100.0, 50.0, 900.0, 600.0], 100.0, 0);
++        l.tracks = vec![row(ids[0], 50.0, 150.0), row(ids[1], 150.0, 250.0)];
++        let p = pointer(&app, pos2(400.0, 200.0)).unwrap();
++        assert_eq!(p, json!({"track": ids[1], "at": 30_000, "y": 0.5}));
++        assert!(pointer(&app, pos2(50.0, 200.0)).is_none(), "over the track headers");
++        let mut other = two_tracks();
++        let l = &mut other.arrange.layout;
++        (l.timeline, l.samples_per_px, l.scroll) = ([100.0, 50.0, 900.0, 600.0], 200.0, 0);
++        l.tracks = vec![row(ids[1], 50.0, 250.0)];
++        let a = Arrangement::of(&other).unwrap();
++        let (row_i, at) = (a.row(&p["track"]).unwrap(), time(&p["at"]).unwrap());
++        assert_eq!((row_i, a.x(at)), (0, 250.0), "half as far at twice the samples per point");
++        other.ui.mixer_full = true;
++        assert!(Arrangement::of(&other).is_none(), "the full mixer hides the arrangement");
++    }
++
++    #[test]
++    fn clips_added_or_moved_at_once_merge_in_start_order() {
++        let mut app = two_tracks();
++        let s = app.engine.session_mut();
++        for (id, at) in [(10, 0), (11, 100), (12, 200), (13, 300)] {
++            s.tracks[0].playlists[0].clips.push(Clip::audio(ClipId(id), "c", SourceId(9), 0, at, 50));
++        }
++        let base = app.live_document();
++        let edited = |edit: &dyn Fn(&mut Session)| {
++            let mut app = two_tracks();
++            app.live_adopt(base.clone()).unwrap();
++            let s = app.engine.session_mut();
++            edit(s);
++            s.tracks[0].playlists[0].sort();
++            app.live_document()
++        };
++        let clip = |s: &mut Session, id: u64, at: i64| s.tracks[0].playlists[0].clips.push(Clip::audio(ClipId(id), "c", SourceId(9), 0, at, 50));
++        let moved = |s: &mut Session, id: u64, at: i64| s.find_clip_mut(ClipId(id)).unwrap().start = at;
++        let added = (edited(&|s| clip(s, 1000, 150)), edited(&|s| clip(s, 2000, 120)));
++        let reordered = (edited(&|s| moved(s, 10, 250)), edited(&|s| moved(s, 13, 50)));
++        for (c, e) in [added, reordered] {
++            let merged = StudioApp::live_merge(&base, &c, &e).unwrap();
++            let starts: Vec<_> = merged["tracks"][0]["playlists"][0]["clips"].as_array().unwrap().iter().map(|c| c["start"].as_i64()).collect();
++            assert!(starts.is_sorted(), "{starts:?}");
++            app.live_adopt(merged.clone()).unwrap();
++            assert_eq!(canonical(&app.live_document()), canonical(&merged), "the receiver does not sort it again");
++        }
++        assert!(StudioApp::live_merge(&base, &base, &json!(null)).is_err());
++    }
++}
