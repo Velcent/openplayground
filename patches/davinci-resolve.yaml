@@ -1,167 +1,19 @@
-# Picasso Suite in the browser. Upstream (github.com/fabox-os/Picasso-Suite) releases desktop packages only; these
-# patches add the web build Playground serves, from its head commit.
+# Picasso Suite in the browser. Upstream (github.com/fabox-os/Picasso-Suite) releases desktop packages only, but its
+# apps/studio is also the WebAssembly entry point (eframe + glow, index.html for trunk); these patches only add what
+# Playground builds it with, from its head commit.
 #
-# patches/davinci-resolve/web.diff adds new files only:
-#   index.html, Trunk.toml          the web build at the repository's root (build.mjs builds there): trunk builds
-#                                   crates/picasso-app's `picasso-suite` binary for the page's canvas.
-#   .cargo/config.toml              getrandom's wasm backend (uuid's random ids), which takes a cfg as well.
-#   crates/picasso-app/src/web.rs   the page's side: on the web the crate root takes `eframe` from here, whose
-#                                   `run_native` starts the app with the desktop's own creator (main runs as on the
-#                                   desktop); File > Open…, Import Media…, Save As… and Export Timeline are Playground's
-#                                   dialogs; "Open in Picasso Suite" opens a project or imports media; what Picasso
-#                                   Suite saves goes to Files; media from the computer and dropped files are kept in
-#                                   Files (/Picasso Suite/Media) so a saved project finds them; a project's media are
-#                                   read from Files.
-#   crates/picasso-app/src/web/workers.rs   the desktop's background threads (viewer, import, thumbnails and waveforms,
-#                                   export) on the page's one thread, with the same API: the viewer renders when asked,
-#                                   the rest is the browser's asynchronous reading. Rendering a file needs FFmpeg, so
-#                                   the Deliver page says it takes the desktop app.
-#   crates/picasso-media/src/web.rs media read by the browser instead of FFmpeg: `<video>`/`<img>` for pictures (a
-#                                   decoder hands back the frame it has and seeks toward the one asked for; the viewer
-#                                   renders again when the seek lands), Web Audio for sound and waveforms.
-#   crates/picasso-playground/      what wasm32-unknown-unknown lacks: `std` with web-time's clock, an in-memory file
-#                                   system, `thread::spawn` queued for after the frame, `env::temp_dir`, `HOME` and
-#                                   `process::id` (as Pro Wave's, patches/logic-pro.yaml). The modules that use them
-#                                   take `std` from it on wasm through ONE `use` line at their end (a local `std`
-#                                   shadows the standard library's name in that module; everything else in it still
-#                                   comes from the real std).
-# Native builds see none of this: every rule adds wasm-only lines.
+# patches/davinci-resolve/web.diff adds new files only: index.html and Trunk.toml at the repository's root (build.mjs
+# builds there; trunk builds apps/studio's `picasso-suite` binary for the page's canvas).
+# If upstream adds its own root Trunk.toml/index.html, or an apps/web crate, drop the diff and the rule below.
 
-# Rules 1-4/18: the wasm-only dependencies, each in a table under a target spelling nobody else uses (`all(...)`), so
-# it never meets one of upstream's. uuid and getrandom (both versions in the lockfile) take the browser's random numbers.
-- file: crates/picasso-app/Cargo.toml
-  find: '(?![\s\S])'
-  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\npicasso-playground = { path = \"../picasso-playground\" }\nwasm-bindgen = \"0.2\"\nwasm-bindgen-futures = \"0.4\"\njs-sys = \"0.3\"\ngetrandom_03 = { package = \"getrandom\", version = \"0.3\", features = [\"wasm_js\"] }\ngetrandom_04 = { package = \"getrandom\", version = \"0.4\", features = [\"wasm_js\"] }\nweb-sys = { version = \"0.3\", features = [\"Window\", \"Document\", \"Element\", \"HtmlCanvasElement\", \"console\"] }\n"
-- file: crates/picasso-media/Cargo.toml
-  find: '(?![\s\S])'
-  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\npicasso-playground = { path = \"../picasso-playground\" }\nwasm-bindgen = \"0.2\"\nwasm-bindgen-futures = \"0.4\"\njs-sys = \"0.3\"\nweb-sys = { version = \"0.3\", features = [\"Window\", \"Document\", \"Element\", \"EventTarget\", \"AddEventListenerOptions\", \"HtmlElement\", \"HtmlMediaElement\", \"HtmlVideoElement\", \"HtmlImageElement\", \"MediaError\", \"HtmlCanvasElement\", \"CanvasRenderingContext2d\", \"ImageData\", \"Blob\", \"Url\", \"BaseAudioContext\", \"OfflineAudioContext\", \"AudioBuffer\"] }\n"
-- file: crates/picasso-core/Cargo.toml
-  find: '(?![\s\S])'
-  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\npicasso-playground = { path = \"../picasso-playground\" }\nuuid = { version = \"1\", features = [\"js\"] }\n"
-- file: crates/picasso-interop/Cargo.toml
-  find: '(?![\s\S])'
-  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\npicasso-playground = { path = \"../picasso-playground\" }\n"
+# The root manifest is a virtual workspace: `cargo check --target wasm32-unknown-unknown` there would also compile
+# the crates that need FFmpeg, so the web build's default is the app alone.
+- file: Cargo.toml
+  find: '^members\s*=\s*\[[^\]]*\]'
+  after: "\ndefault-members = [\"apps/studio\"]"
 
-# Rules 5-7/18: media through the browser (crates/picasso-media/src/web.rs): on wasm the crate's `decode` and `probe`
-# are web.rs's, with the same API. If upstream renames those modules, follow.
-- file: crates/picasso-media/src/lib.rs
-  find: '^pub\s+mod\s+decode\s*;'
-  replace: "#[cfg(not(target_arch = \"wasm32\"))]\npub mod decode;\n#[cfg(target_arch = \"wasm32\")]\npub use web::decode;"
-- file: crates/picasso-media/src/lib.rs
-  find: '^pub\s+mod\s+probe\s*;'
-  replace: "#[cfg(not(target_arch = \"wasm32\"))]\npub mod probe;\n#[cfg(target_arch = \"wasm32\")]\npub use web::probe;"
-- file: crates/picasso-media/src/lib.rs
-  find: '(?![\s\S])'
-  after: "\n// Playground's browser build: media read by the browser (patches/davinci-resolve.yaml).\n#[cfg(target_arch = \"wasm32\")]\npub mod web;\n"
-
-# Rules 8-11/18: the modules that use the clock or files take `std` from crates/picasso-playground on wasm (see the
-# top). Found with: every non-test module outside picasso-media and picasso-render's export (which the web build
-# doesn't run) that names Instant, SystemTime, fs::, File::, thread::spawn, env::temp_dir or process::id. If upstream
-# starts using these in another module, give it the same line; a missing one panics at the first clock or thread call
-# (a file call just fails).
-- file: crates/picasso-core/src/io.rs
-  find: '(?![\s\S])'
-  after: "\n// Playground's browser build: the files (patches/davinci-resolve.yaml).\n#[cfg(target_arch = \"wasm32\")] use picasso_playground::std;\n"
-- file: crates/picasso-interop/src/drp.rs
-  find: '(?![\s\S])'
-  after: "\n// Playground's browser build: the files (patches/davinci-resolve.yaml).\n#[cfg(target_arch = \"wasm32\")] use picasso_playground::std;\n"
-- file: crates/picasso-interop/src/relink.rs
-  find: '(?![\s\S])'
-  after: "\n// Playground's browser build: the files (patches/davinci-resolve.yaml).\n#[cfg(target_arch = \"wasm32\")] use picasso_playground::std;\n"
-- file: crates/picasso-interop/src/otio.rs
-  find: '(?![\s\S])'
-  after: "\n// Playground's browser build: the files (patches/davinci-resolve.yaml).\n#[cfg(target_arch = \"wasm32\")] use picasso_playground::std;\n"
-
-# Rules 12-18/18: the app. main runs as on the desktop with `eframe` from web.rs (its `run_native` starts the page) and
-# the workers from web/workers.rs; the log goes nowhere on the web (its timestamps would read the clock std lacks); the
-# clock and Playground's file dialogs in app.rs; the media check says what reads media instead of looking for FFmpeg,
-# and the render settings say rendering takes the desktop app; and the window has no buttons or edges of its own in a
-# browser tab. If upstream renames what these anchor on, follow.
-- file: crates/picasso-app/src/audio.rs
-  find: '(?![\s\S])'
-  after: "\n// Playground's browser build: the clock AudioPlayer::start takes (patches/davinci-resolve.yaml).\n#[cfg(target_arch = \"wasm32\")] use picasso_playground::std;\n"
-- file: crates/picasso-app/src/main.rs
-  find: '^mod\s+workers\s*;'
-  replace: "#[cfg(not(target_arch = \"wasm32\"))]\nmod workers;\n// Playground's browser build (patches/davinci-resolve.yaml).\n#[cfg(target_arch = \"wasm32\")]\nmod web;\n#[cfg(target_arch = \"wasm32\")]\nuse web::{eframe, workers};"
-- file: crates/picasso-app/src/main.rs
-  find: '^(\s*)env_logger::init\(\);'
-  replace: "$1#[cfg(not(target_arch = \"wasm32\"))]\n$1env_logger::init();"
-- file: crates/picasso-app/src/app.rs
-  find: '(?![\s\S])'
-  after: "\n// Playground's browser build: the clock, Playground's file dialogs and the logo's PNG (patches/davinci-resolve.yaml).\n#[cfg(target_arch = \"wasm32\")] use picasso_playground::std;\n#[cfg(target_arch = \"wasm32\")] use crate::web::{eframe, rfd};\n"
-- file: crates/picasso-app/src/app.rs
-  find: 'let\s+tools_check\s*=\s*picasso_media::tools::check_tools\(\);'
-  replace: "#[cfg(not(target_arch = \"wasm32\"))]\n        let tools_check = picasso_media::tools::check_tools();\n        #[cfg(target_arch = \"wasm32\")]\n        let tools_check: Result<String, picasso_media::MediaError> = Ok(\"Media read by your browser (rendering needs the desktop app)\".into());"
-- file: crates/picasso-app/src/app.rs
-  find: '"No usable encoders found — is FFmpeg installed\?"'
-  replace: 'if cfg!(target_arch = "wasm32") { "Rendering needs FFmpeg: render with Picasso Suite''s desktop app." } else { "No usable encoders found — is FFmpeg installed?" }'
-- file: crates/picasso-app/src/chrome.rs
-  find: 'for\s+\(x,\s*icon\)\s+in\s+buttons\s*\{'
-  replace: 'for (x, icon) in buttons.into_iter().filter(|_| !cfg!(target_arch = "wasm32")) {'
-- file: crates/picasso-app/src/chrome.rs
-  find: 'pub\(crate\)\s+fn\s+resize_edges\s*\([^{]*\{'
-  after: "\n        if cfg!(target_arch = \"wasm32\") { return; }"
-
-# Live editing in Playground sessions (patches/davinci-resolve/live.diff + the playground-live crate, tools.yaml
-# `live_kit: true`)
-# What it's for: people in a Playground session edit the same project at once: media imported, clips placed, moved,
-#   trimmed, split, deleted, enabled, linked, their zoom/position/opacity/volume, tracks added, locked or muted, the
-#   project's settings; each person's Ctrl+Z takes back only their own edits; imported media travel as the session's
-#   files, so joining from a link needs no files. Each sees the others' pointers with name tags, their playheads with a
-#   flag, outlines around their selected clips and ghosts of the clips they are dragging or trimming, on the Cut page's
-#   timeline and the Edit and Deliver pages' timeline. Personal, never shared: the playhead and playback, the
-#   selection, the page and panels, zoom and scroll, the Source viewer.
-# How: crates/picasso-app/src/live.rs, a new file: the app's Live hooks (the shared document is the project as its
-#   file holds it; clips sorted by start after a merge; a merged project checked for overlaps; media by path; presence)
-#   and the two timeline hooks that draw the others with the kit's look (playground_live::presence). The session itself
-#   and that look are the crate's. These rules only add the dependency, declare the module and call in, one line each.
-# Verify: node scripts/build.mjs check davinci-resolve head (and LIVE=0), `cargo test -p picasso-app live` and the e2e
-#   (tests/live-apps/davinci-resolve.mjs).
-# If upstream changes: when a line named below changes, anchor on its new spelling; if PicassoApp renames the fields
-#   live.rs uses (project, version, history, selection, media_selection, playhead) or TimelineState its drag, follow.
-- live: true
-  file: crates/picasso-app/Cargo.toml
-  find: '(?![\s\S])'
-  after: "\n[target.'cfg(any(target_arch = \"wasm32\"))'.dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n\n[target.'cfg(not(target_arch = \"wasm32\"))'.dev-dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
-- live: true
-  file: crates/picasso-app/src/main.rs
-  find: '(?![\s\S])'
-  after: "\n// Live editing in a Playground session (web only, and its native tests).\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
-# Undo and Redo go to the session while connected (which takes back only this person's edits), and stay enabled.
-- live: true
-  file: crates/picasso-app/src/app.rs
-  find: '\bfn\s+undo\s*\(\s*&mut\s+self\s*\)\s*\{'
-  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if playground_live::undo(false) { return; }"
-- live: true
-  file: crates/picasso-app/src/app.rs
-  find: '\bfn\s+redo\s*\(\s*&mut\s+self\s*\)\s*\{'
-  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if playground_live::undo(true) { return; }"
-- live: true
-  file: crates/picasso-app/src/app.rs
-  find: '\bfn\s+cmd_enabled\s*\(\s*&self\s*,\s*cmd\s*:\s*Cmd\s*\)\s*->\s*bool\s*\{'
-  after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if matches!(cmd, Cmd::Undo | Cmd::Redo) && playground_live::connected() { return true; }"
-# The others on the Edit and Deliver pages' timeline (timeline_ui::show): its rows, then the others, before its own
-# playhead. Its drag (clip, move or trim edge, frames, track) goes into this person's presence.
-- live: true
-  file: crates/picasso-app/src/timeline_ui.rs
-  find: '^\s*// Playhead: a red line with a flag on the ruler\.'
-  before: "    #[cfg(target_arch = \"wasm32\")] { for r in &rows { crate::live::row(tracks[r.track].id, r.rect); } crate::live::timeline(ui, &lp, ruler, Rect::from_min_max(pos2(left, ruler.bottom()), area.max), left, state.scroll, state.px_per_frame, state.drag.as_ref().map(|d| (d.clip, match d.mode { DragMode::Move => 0, DragMode::Trim(Edge::Start) => 1, DragMode::Trim(Edge::End) => 2 }, d.delta, d.track)), project); }\n"
-# The others on the Cut page's timeline (cut_detail): each track's row as it is laid out, then the others, before the
-# fixed centre playhead.
-- live: true
-  file: crates/picasso-app/src/cut_page.rs
-  find: 'let\s+h\s*=\s*if\s+t\.kind\s*==\s*TrackKind::Video\s*\{\s*72\.0\s*\}\s*else\s*\{\s*46\.0\s*\};'
-  after: "\n            #[cfg(target_arch = \"wasm32\")] crate::live::row(t.id, Rect::from_min_max(pos2(area.left(), y), pos2(area.right(), y + h - 2.0)));"
-- live: true
-  file: crates/picasso-app/src/cut_page.rs
-  find: '^\s*// Fixed centre playhead'
-  before: "        #[cfg(target_arch = \"wasm32\")] crate::live::timeline(ui, &painter, ruler, Rect::from_min_max(pos2(area.left(), ruler.bottom()), area.max), head_x, self.playhead as f32, px_per_frame, None, &self.project);\n"
-# The page's side (web.rs, from web.diff): each frame ends with the session's, and the running app is offered to it.
-- live: true
-  file: crates/picasso-app/src/web.rs
-  find: '::eframe::App::ui\(&mut\s+self\.app,\s*ui,\s*frame\);'
-  after: "\n        crate::live::frame(&mut self.app, ui.ctx());"
-- live: true
-  file: crates/picasso-app/src/web.rs
-  find: 'let\s+started\s*=\s*runner\(\)\.start\([^;]*\.await;'
-  after: "\n        crate::live::attach();"
+# picasso-ui only links picasso-decode off the web, but read_path names it on both: on wasm the path is never read
+# (CAN_READ_PATHS is false), so the check is false there. Drop the rule once upstream's wasm build compiles.
+- file: crates/picasso-ui/src/platform.rs
+  find: 'picasso_decode::refuse_path\(path\)\.is_none\(\)'
+  replace: '{ #[cfg(not(target_arch = "wasm32"))] { picasso_decode::refuse_path(path).is_none() } #[cfg(target_arch = "wasm32")] { false } }'
