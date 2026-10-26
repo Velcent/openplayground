@@ -15,7 +15,7 @@
   "word": "v0.11.0+c856fa22",
   "word@head": "head-02120c8+c856fa22",
   "excel": "v0.12.1+1ee52f18",
-  "excel@head": "head-d8c5f58+1ee52f18",
+  "excel@head": "head-8117b66+1ee52f18",
   "powerpoint": "v0.11.1+cc587348",
   "powerpoint@head": "head-27009cd+cc587348",
   "onenote@head": "head-23d1909+d48d8794",
@@ -43,6 +43,6 @@
   "fl-studio-mobile@head": "head-8c7bddf+8d45d178",
   "ableton-live@head": "head-3067d90+6ff1fb75",
   "logic-pro@head": "head-34afc76+aca3f040",
-  "transit@head": "head-efa1494+71bdb4dc",
+  "transit@head": "head-5d20cb4+71bdb4dc",
   "artcraft-store": "dff1898"
 }
