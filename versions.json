@@ -13,7 +13,7 @@
   "mspaint@head": "head-0be2f3f+e2043df0",
   "paint-net": "v0.2.0",
   "word": "v0.11.0+c856fa22",
-  "word@head": "head-d859c67+c856fa22",
+  "word@head": "head-02120c8+c856fa22",
   "excel": "v0.12.1+1ee52f18",
   "excel@head": "head-d8c5f58+1ee52f18",
   "powerpoint": "v0.11.1+cc587348",
@@ -43,6 +43,6 @@
   "fl-studio-mobile@head": "head-8c7bddf+8d45d178",
   "ableton-live@head": "head-3067d90+6ff1fb75",
   "logic-pro@head": "head-34afc76+aca3f040",
-  "transit@head": "head-1c69c88+71bdb4dc",
+  "transit@head": "head-9d4243e+71bdb4dc",
   "artcraft-store": "dff1898"
 }
