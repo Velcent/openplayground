@@ -309,6 +309,25 @@ groups:
         accent: "#E8452C"
         base: "#3A1208"
 
+      - slug: pluraleyes
+        name: Align
+        alternative: PluralEyes
+        blurb: Sync camera footage and separately recorded audio by sound and timecode, then export for your editor.
+        # Upstream's desktop app is built with GPUI, which has no browser backend, and its releases are desktop packages
+        # only: patches/pluraleyes.yaml builds its engine for the web with a page of its own (head channel only). Audio
+        # and video go in (MOV, MP4 and audio files; MTS, MXF and R3D need FFmpeg, which a page doesn't have).
+        opens: []
+        imports: [mov, mp4, m4v, wav, wave, bwf, aif, aiff, aifc, mp3, m4a, aac, flac]
+        repo: FedyaLight/align
+        license: GPL-3.0-only
+        # What the web build compiles: the engine's crates (Cargo.lock: dependency changes). The desktop app, CLI, MCP
+        # server, docs and packaging don't rebuild it. One GitHub API request per path per check.
+        paths: [crates/align-core, crates/align-decode, Cargo.lock]
+        patches: patches/pluraleyes.yaml
+        icon: icons/align.png
+        accent: "#7C6CF7"
+        base: "#1E1A47"
+
   - name: 3D
     tools:
       - slug: autocad

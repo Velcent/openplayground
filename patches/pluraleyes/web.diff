@@ -1,0 +1,1792 @@
+diff --git a/apps/align-web/.cargo/config.toml b/apps/align-web/.cargo/config.toml
+new file mode 100644
+index 0000000..ff3af6a
+--- /dev/null
++++ b/apps/align-web/.cargo/config.toml
+@@ -0,0 +1,3 @@
++# Wasm SIMD for the engine's FFTs, as Playground builds its other apps (scripts/build.mjs SIMD).
++[target.wasm32-wasip1]
++rustflags = ["-Ctarget-feature=+simd128"]
+diff --git a/apps/align-web/Cargo.toml b/apps/align-web/Cargo.toml
+new file mode 100644
+index 0000000..9b97a94
+--- /dev/null
++++ b/apps/align-web/Cargo.toml
+@@ -0,0 +1,16 @@
++[package]
++name = "align-web"
++version = "0.1.0"
++edition = "2024"
++publish = false
++
++[lib]
++crate-type = ["cdylib"]
++
++[dependencies]
++align-core = { path = "../../crates/align-core" }
++align-decode = { path = "../../crates/align-decode" }
++serde = { version = "1", features = ["derive"] }
++serde_json = "1"
++
++[workspace]
+diff --git a/apps/align-web/src/lanes.rs b/apps/align-web/src/lanes.rs
+new file mode 100644
+index 0000000..e4d5ed8
+--- /dev/null
++++ b/apps/align-web/src/lanes.rs
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: GPL-3.0-only
++//! The timeline's lanes as Align's desktop app lays them out (crates/align-gpui/src/lane.rs: `final_bars`,
++//! `layout_bars`, `source_name_for`), without GPUI: the result's preview items packed into numbered V and A lanes by
++//! source, for the page to draw.
++use std::collections::{HashMap, HashSet};
++use std::path::Path;
++
++use align_core::export_model::ExportTimeline;
++use align_core::{ClipId, MediaKind, SyncResult, TimelineTrackRequest, allocate};
++use serde::Serialize;
++
++#[derive(Clone, Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct Bar {
++    pub id: String,
++    pub clip_id: String,
++    pub name: String,
++    #[serde(skip)]
++    pub kind: Option<MediaKind>,
++    #[serde(skip)]
++    pub source_key: String,
++    pub start: f64,
++    pub duration: f64,
++    pub confidence: f64,
++    pub matched: bool,
++}
++
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct Lane {
++    pub id: String,
++    /// "V" or "A".
++    pub kind: &'static str,
++    pub number: usize,
++    pub source_name: String,
++    pub clips: Vec<Bar>,
++}
++
++pub struct FinalTimeline {
++    pub bars: Vec<Bar>,
++    pub ruler_timecode: Option<f64>,
++}
++
++pub fn final_bars(result: &SyncResult) -> FinalTimeline {
++    let unmatched: HashSet<ClipId> = result.unmatched.iter().cloned().collect();
++    let Ok(timeline) = ExportTimeline::from_result(result, true) else {
++        return FinalTimeline { bars: Vec::new(), ruler_timecode: None };
++    };
++    let bars = timeline
++        .preview_items(&unmatched)
++        .into_iter()
++        .map(|item| Bar {
++            id: item.id,
++            clip_id: item.clip_id.0,
++            name: item.name,
++            kind: Some(item.kind),
++            source_key: item.source_key,
++            start: item.start,
++            duration: item.duration,
++            confidence: item.confidence,
++            matched: item.matched,
++        })
++        .collect();
++    FinalTimeline { bars, ruler_timecode: timeline.ruler_timecode_start() }
++}
++
++/// Pack bars into V/A numbered lanes.
++pub fn layout_bars(bars: Vec<Bar>) -> Vec<Lane> {
++    let mut lanes = Vec::new();
++    let (video, audio): (Vec<_>, Vec<_>) = bars.into_iter().partition(|bar| bar.kind == Some(MediaKind::Video));
++    for (kind, segments) in [("V", video), ("A", audio)] {
++        let requests: Vec<TimelineTrackRequest> = segments
++            .iter()
++            .map(|b| TimelineTrackRequest::new(b.id.clone(), b.source_key.clone(), b.start, b.duration))
++            .collect();
++        let assignments = allocate(&requests);
++        let mut by_lane: HashMap<usize, Vec<Bar>> = HashMap::new();
++        for bar in segments {
++            by_lane.entry(assignments.get(&bar.id).copied().unwrap_or(0)).or_default().push(bar);
++        }
++        let mut indices: Vec<usize> = by_lane.keys().copied().collect();
++        indices.sort_unstable();
++        for index in indices {
++            let mut sorted = by_lane.remove(&index).unwrap_or_default();
++            sorted.sort_by(|a, b| a.start.total_cmp(&b.start).then_with(|| a.name.cmp(&b.name)));
++            let source_key = sorted.first().map(|b| b.source_key.clone()).unwrap_or_default();
++            let single_source = sorted.iter().all(|b| b.source_key == source_key);
++            lanes.push(Lane {
++                id: format!("{kind}-{index}"),
++                kind,
++                number: index + 1,
++                source_name: if single_source { source_name_for(&source_key) } else { String::new() },
++                clips: sorted,
++            });
++        }
++    }
++    lanes
++}
++
++/// `device:a:b:c` → `a b c`, `span:` → Linked BWF, else folder name.
++pub fn source_name_for(key: &str) -> String {
++    if let Some(rest) = key.strip_prefix("device:") {
++        return rest.replace(':', " ");
++    }
++    if key.starts_with("span:") {
++        return "Linked BWF".to_string();
++    }
++    Path::new(key).file_name().and_then(|n| n.to_str()).unwrap_or("").to_string()
++}
+diff --git a/apps/align-web/src/lib.rs b/apps/align-web/src/lib.rs
+new file mode 100644
+index 0000000..1d6d12d
+--- /dev/null
++++ b/apps/align-web/src/lib.rs
+@@ -0,0 +1,263 @@
++// SPDX-License-Identifier: GPL-3.0-only
++//! Align's engine for Playground's browser build (patches/pluraleyes.yaml in github.com/daijro/openplayground): a
++//! WASI module the page's worker runs (apps/align-web/www/worker.js). Align's desktop app is built with GPUI, which
++//! has no browser backend, so the page has an interface of its own (www/) over the same engine: align-decode's
++//! pipeline and export, and the desktop app's lane layout (lanes.rs, from crates/align-gpui/src/lane.rs).
++//!
++//!   pg_alloc(len) / pg_free(ptr, len)   memory for the page's bytes
++//!   pg_call(json, len) -> u32           one command, {"cmd": …}; 0 done, 1 failed; the reply (JSON) is at
++//!                                       pg_reply_ptr(), pg_reply_len() bytes long
++//!
++//! Commands: `inspect` (the media's clips), `sync` (synchronize; its progress goes to the page as it happens) and
++//! `export` (the last result, as editor timelines in a folder). The import `playground.progress(json, len)` carries
++//! the progress.
++use std::cell::RefCell;
++use std::collections::HashSet;
++use std::path::{Path, PathBuf};
++use std::sync::atomic::AtomicBool;
++
++use align_core::export_model::{ExportAssemblyOptions, ExportTimeline, TimelineExportFormat, UnmatchedPlacement};
++use align_core::{ClipId, SearchAccuracy, SyncResult, file_name};
++use align_decode::backend::BackendKind;
++use align_decode::pipeline::{Phase, Pipeline, PipelineInput, PipelineOptions, PipelineProgress};
++use serde::Deserialize;
++use serde_json::{Value, json};
++
++mod lanes;
++
++#[link(wasm_import_module = "playground")]
++unsafe extern "C" {
++    fn progress(json: *const u8, len: usize);
++}
++
++thread_local! {
++    static REPLY: RefCell<Vec<u8>> = RefCell::default();
++    static PIPELINE: Pipeline = Pipeline::new_in(BackendKind::Portable, Some(PathBuf::from("/.app/cache")));
++    static RESULT: RefCell<Option<SyncResult>> = const { RefCell::new(None) };
++}
++
++fn send_progress(value: &Value) {
++    let text = value.to_string();
++    // SAFETY: both point at live bytes for the call; the page copies them before returning.
++    unsafe { progress(text.as_ptr(), text.len()) }
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn pg_alloc(len: usize) -> *mut u8 {
++    let mut v = Vec::<u8>::with_capacity(len.max(1));
++    let p = v.as_mut_ptr();
++    std::mem::forget(v);
++    p
++}
++
++/// # Safety
++/// `ptr` and `len` came from one [`pg_alloc`].
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn pg_free(ptr: *mut u8, len: usize) {
++    drop(unsafe { Vec::from_raw_parts(ptr, 0, len.max(1)) });
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn pg_reply_ptr() -> *const u8 {
++    REPLY.with_borrow(|r| r.as_ptr())
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn pg_reply_len() -> usize {
++    REPLY.with_borrow(|r| r.len())
++}
++
++/// # Safety
++/// The page's bytes, from [`pg_alloc`].
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn pg_call(ptr: *const u8, len: usize) -> u32 {
++    let text = std::str::from_utf8(unsafe { std::slice::from_raw_parts(ptr, len) }).unwrap_or("");
++    let (code, reply) = match serde_json::from_str::<Value>(text).map_err(|e| e.to_string()).and_then(call) {
++        Ok(v) => (0, v),
++        Err(e) => (1, Value::from(e)),
++    };
++    REPLY.set(reply.to_string().into_bytes());
++    code
++}
++
++fn call(request: Value) -> Result<Value, String> {
++    let cmd = request.get("cmd").and_then(Value::as_str).unwrap_or("").to_string();
++    match cmd.as_str() {
++        "inspect" => inspect(serde_json::from_value(request).map_err(|e| e.to_string())?),
++        "sync" => sync(serde_json::from_value(request).map_err(|e| e.to_string())?),
++        "export" => export(serde_json::from_value(request).map_err(|e| e.to_string())?),
++        _ => Err(format!("no command {cmd}")),
++    }
++}
++
++fn inputs(paths: &[PathBuf]) -> Vec<PipelineInput> {
++    paths.iter().cloned().map(PipelineInput::Media).collect()
++}
++
++#[derive(Deserialize)]
++struct Inspect {
++    paths: Vec<PathBuf>,
++}
++
++/// The media's clips, for the sources list, and what couldn't be read.
++fn inspect(r: Inspect) -> Result<Value, String> {
++    let project = PIPELINE.with(|p| p.open(&inputs(&r.paths))).map_err(|e| e.to_string())?;
++    let clips: Vec<Value> = project
++        .clips
++        .iter()
++        .map(|c| {
++            json!({
++                "id": c.id.0,
++                "url": c.url,
++                "name": file_name(&c.url),
++                "kind": c.kind.as_str(),
++                "duration": c.duration.value as f64 / f64::from(c.duration.timescale.max(1)),
++            })
++        })
++        .collect();
++    Ok(json!({ "clips": clips, "warnings": warnings(&project.warnings) }))
++}
++
++fn warnings(w: &[align_core::SyncWarning]) -> Vec<Value> {
++    w.iter().map(|w| json!({ "url": w.url, "message": w.message })).collect()
++}
++
++#[derive(Deserialize)]
++struct Sync {
++    paths: Vec<PathBuf>,
++    #[serde(default)]
++    accuracy: SearchAccuracy,
++}
++
++fn phase(p: &Phase) -> &'static str {
++    match p {
++        Phase::Inspect => "inspect",
++        Phase::Fingerprint => "fingerprint",
++        Phase::Match => "match",
++        Phase::Refine => "refine",
++        Phase::Solve => "solve",
++    }
++}
++
++/// Synchronizes, sending progress (and each clip's waveform) as it goes; keeps the result for `export`.
++fn sync(r: Sync) -> Result<Value, String> {
++    let options = PipelineOptions { generate_waveform_previews: true, search_accuracy: r.accuracy, ..Default::default() };
++    let on_progress = |p: PipelineProgress| {
++        send_progress(&json!({
++            "phase": phase(&p.phase),
++            "completed": p.completed,
++            "total": p.total,
++            "current": p.current.as_deref().map(file_name),
++            "waveform": p.waveform.as_ref().map(|(id, bins)| json!({ "clip": id.0, "bins": bins })),
++        }))
++    };
++    let cancel = AtomicBool::new(false);
++    let result = PIPELINE
++        .with(|p| p.synchronize(&inputs(&r.paths), &[], &options, Some(&on_progress), &cancel))
++        .map_err(|e| e.to_string())?;
++    let timeline = lanes::final_bars(&result);
++    let lanes = lanes::layout_bars(timeline.bars);
++    let unmatched: HashSet<&ClipId> = result.unmatched.iter().collect();
++    let total = result.project.clips.len();
++    let synced = result.project.clips.iter().filter(|c| !unmatched.contains(&c.id)).count();
++    let reply = json!({
++        "lanes": lanes,
++        "rulerTimecode": timeline.ruler_timecode,
++        "synced": synced,
++        "total": total,
++        "warnings": warnings(&result.project.warnings),
++    });
++    RESULT.set(Some(result));
++    Ok(reply)
++}
++
++#[derive(Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct Export {
++    directory: PathBuf,
++    formats: Vec<TimelineExportFormat>,
++    #[serde(default)]
++    drift: bool,
++    /// Where `/` (Playground's Files) is on the computer the timelines will be opened on.
++    #[serde(default)]
++    media_folder: Option<String>,
++    #[serde(default)]
++    remove_unmatched: bool,
++}
++
++/// The last result as timelines (and drift-corrected audio) in `directory`; the files written.
++fn export(r: Export) -> Result<Value, String> {
++    let result = RESULT.with_borrow(|r| r.clone()).ok_or("Synchronize first.")?;
++    let options = ExportAssemblyOptions {
++        unmatched: if r.remove_unmatched { UnmatchedPlacement::Remove } else { UnmatchedPlacement::ByOrderAndTime },
++        ..Default::default()
++    };
++    let timeline = ExportTimeline::from_result_with_options(&result, options).map_err(|e| e.to_string())?;
++    std::fs::create_dir_all(&r.directory).map_err(|e| e.to_string())?;
++    let cancel = AtomicBool::new(false);
++    let artifacts = PIPELINE
++        .with(|p| {
++            align_decode::export::export_prepared_many(
++                align_decode::export::ExportBatchRequest {
++                    backend: p.backend(),
++                    timelines: std::slice::from_ref(&timeline),
++                    directory: &r.directory,
++                    formats: &r.formats,
++                    correct_drift: r.drift,
++                    include_replaced_sequence: false,
++                    include_media_files: false,
++                    aaf_frame_duration: None,
++                    include_fcpxml_timeline: true,
++                    include_fcpxml_multicam: true,
++                    group_fcpxml_storylines: false,
++                    cancel: &cancel,
++                },
++                Some(&mut |p: align_decode::export::ExportJobProgress| {
++                    send_progress(&json!({ "phase": "export", "completed": p.completed, "total": p.total }))
++                }),
++            )
++        })
++        .map_err(|e| e.to_string())?;
++    let _ = artifacts;
++    // The timelines and the corrected audio they play.
++    let mut files: Vec<PathBuf> = Vec::new();
++    list_files(&r.directory, &mut files);
++    if let Some(folder) = r.media_folder.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
++        for f in &files {
++            relocate(f, folder).map_err(|e| format!("{}: {e}", f.display()))?;
++        }
++    }
++    Ok(json!({ "files": files }))
++}
++
++fn list_files(path: &Path, out: &mut Vec<PathBuf>) {
++    match std::fs::read_dir(path) {
++        Ok(entries) => {
++            for e in entries.flatten() {
++                list_files(&e.path(), out);
++            }
++        }
++        Err(_) if path.is_file() => out.push(path.to_path_buf()),
++        Err(_) => {}
++    }
++}
++
++/// Points a timeline's media at `folder` on the user's computer: the page's paths start at Files (`/`), so
++/// `file:///take.wav` becomes `file:///Users/me/Shoot/take.wav` (XML, FCPXML) and OpenTimelineIO's plain
++/// `"target_url": "/take.wav"` becomes `"/Users/me/Shoot/take.wav"` (the Resolve script reads those).
++fn relocate(file: &Path, folder: &str) -> std::io::Result<()> {
++    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
++    if !matches!(ext.as_str(), "xml" | "fcpxml" | "otio") {
++        return Ok(());
++    }
++    let text = std::fs::read_to_string(file)?;
++    let folder = folder.trim_end_matches(['/', '\\']);
++    let url = align_core::file_url(Path::new(folder));
++    let plain = serde_json::to_string(folder).unwrap_or_default();
++    let plain = &plain[1..plain.len() - 1];
++    let text = text
++        .replace("file:///", &format!("{url}/"))
++        .replace("\"target_url\": \"/", &format!("\"target_url\": \"{plain}/"))
++        .replace("\"target_url\":\"/", &format!("\"target_url\":\"{plain}/"));
++    std::fs::write(file, text)
++}
+diff --git a/apps/align-web/www/app.css b/apps/align-web/www/app.css
+new file mode 100644
+index 0000000..8799d0d
+--- /dev/null
++++ b/apps/align-web/www/app.css
+@@ -0,0 +1,126 @@
++/* SPDX-License-Identifier: GPL-3.0-only
++   Align in Playground (patches/pluraleyes.yaml in github.com/daijro/openplayground): the look of Align's desktop app
++   (crates/align-gpui), light or dark with the system. */
++:root {
++  color-scheme: light dark;
++  --bg: #ffffff;
++  --panel: #f5f5f7;
++  --row: #fbfbfd;
++  --line: #e3e3e8;
++  --grid: #ececf1;
++  --text: #1d1d1f;
++  --muted: #6e6e73;
++  --accent: #0a7cff;
++  --synced: #2fb34d;
++  --unmatched: #f39a1d;
++  --pending: #3b8cff;
++  --clip-text: #ffffff;
++  --shadow: 0 8px 30px rgb(0 0 0 / 0.18);
++  font: 13px/1.4 -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Inter, Roboto, Helvetica, Arial, sans-serif;
++}
++@media (prefers-color-scheme: dark) {
++  :root {
++    --bg: #1e1e20;
++    --panel: #262628;
++    --row: #2a2a2d;
++    --line: #38383c;
++    --grid: #2f2f33;
++    --text: #f2f2f4;
++    --muted: #a1a1a6;
++    --accent: #3a93ff;
++    --shadow: 0 8px 30px rgb(0 0 0 / 0.5);
++  }
++}
++* { box-sizing: border-box; }
++[hidden] { display: none !important; }
++html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
++/* Below Playground's bar (its shell.css sets --pg-bar). */
++#app { position: fixed; inset: var(--pg-bar, 0px) 0 0 0; display: grid; grid-template-rows: auto 1fr auto; }
++button { font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 4px 12px; cursor: pointer; }
++button:hover:not(:disabled) { filter: brightness(0.97); }
++button:disabled { opacity: 0.45; cursor: default; }
++button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
++button.link { background: none; border: none; color: var(--accent); }
++button.link:disabled { color: var(--muted); }
++button.icon { background: none; border: none; padding: 4px; width: 28px; height: 28px; display: grid; place-items: center; }
++button.icon:hover:not(:disabled) { background: var(--panel); }
++button.icon svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
++select, input { font: inherit; color: inherit; }
++select { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 3px 6px; }
++
++.toolbar { display: flex; align-items: center; gap: 6px; padding: 8px 14px; border-bottom: 1px solid var(--line); }
++.toolbar h1 { font-size: 13px; font-weight: 600; margin: 0 0 0 12px; }
++.toolbar .spacer { flex: 1; text-align: center; }
++.quality { display: flex; align-items: center; gap: 6px; padding: 0 4px 0 10px; background: var(--panel); border-radius: 7px; color: var(--muted); }
++.quality select { border: none; background: none; color: var(--text); }
++.menu-host { position: relative; }
++.menu { position: absolute; top: 32px; left: 0; z-index: 10; min-width: 230px; display: grid; padding: 5px; background: var(--bg); border: 1px solid var(--line); border-radius: 9px; box-shadow: var(--shadow); }
++.menu button { background: none; border: none; text-align: left; padding: 6px 10px; border-radius: 6px; }
++.menu button:hover { background: var(--accent); color: #fff; }
++
++#main { position: relative; overflow: hidden; background: var(--bg); }
++.empty { height: 100%; display: grid; place-content: center; justify-items: center; gap: 8px; text-align: center; padding: 24px; }
++.empty img { border-radius: 22px; }
++.empty h2 { font-size: 22px; margin: 8px 0 0; }
++.empty p { color: var(--muted); max-width: 440px; margin: 0 0 8px; }
++.row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
++.drop-hint { position: absolute; inset: 10px; display: grid; place-items: center; border: 2px dashed var(--accent); border-radius: 14px; background: color-mix(in srgb, var(--accent) 8%, transparent); color: var(--accent); font-size: 18px; font-weight: 600; pointer-events: none; }
++
++.sources { height: 100%; overflow: auto; padding: 14px 18px; }
++.sources .count { color: var(--muted); margin: 0 0 8px; font-size: 12px; }
++.group { background: var(--row); border: 1px solid var(--line); border-radius: 9px; margin-bottom: 8px; overflow: hidden; }
++.group > header { display: flex; align-items: center; gap: 10px; padding: 9px 12px; }
++.group > header svg { width: 18px; height: 18px; fill: none; stroke: var(--muted); stroke-width: 1.3; }
++.group > header strong { font-weight: 600; }
++.group > header small { display: block; color: var(--muted); font-size: 11px; }
++.item { display: flex; align-items: center; gap: 10px; padding: 6px 12px 6px 40px; border-top: 1px solid var(--line); }
++.item > span:first-child svg { width: 15px; height: 15px; fill: none; stroke: var(--muted); stroke-width: 1.3; display: block; }
++.item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.item .meta { color: var(--muted); font-variant-numeric: tabular-nums; }
++.item .bad { color: var(--unmatched); }
++.item button.icon { width: 22px; height: 22px; opacity: 0.5; }
++.item button.icon:hover { opacity: 1; }
++
++.timeline { height: 100%; }
++.scroller { height: 100%; overflow: auto; position: relative; }
++.ruler { position: sticky; top: 0; z-index: 3; height: 30px; background: var(--bg); border-bottom: 1px solid var(--line); margin-left: 52px; }
++.ruler span { position: absolute; top: 8px; transform: translateX(-50%); color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
++.lanes { position: relative; }
++.lane { display: flex; height: 39px; border-bottom: 1px solid var(--grid); }
++.lane > .label { position: sticky; left: 0; z-index: 2; flex: none; width: 52px; display: grid; place-items: center; background: var(--bg); color: var(--muted); font-size: 12px; border-right: 1px solid var(--grid); }
++.lane > .track { position: relative; flex: none; }
++.gridline { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--grid); }
++.clip { position: absolute; top: 4px; bottom: 4px; border-radius: 4px; overflow: hidden; color: var(--clip-text); background: var(--synced); box-shadow: inset 0 0 0 1px rgb(0 0 0 / 0.08); }
++.clip.unmatched { background: var(--unmatched); }
++.clip.pending { background: var(--pending); }
++.clip canvas { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0.32; }
++.clip .name { position: absolute; left: 6px; top: 50%; transform: translateY(-50%); display: flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 500; white-space: nowrap; text-shadow: 0 1px 1px rgb(0 0 0 / 0.25); pointer-events: none; }
++.clip .name svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.4; flex: none; }
++
++.status { display: flex; align-items: center; gap: 8px; padding: 6px 14px; border-top: 1px solid var(--line); min-height: 34px; color: var(--text); font-size: 12px; }
++.status .warn { color: var(--unmatched); }
++.status progress { width: 140px; accent-color: var(--accent); }
++.status .spacer { flex: 1; }
++.zoom { display: flex; align-items: center; gap: 6px; color: var(--muted); }
++.zoom input { width: 110px; accent-color: var(--muted); }
++.zoom .dot { width: 9px; height: 9px; border: 1px solid var(--muted); border-radius: 50%; }
++.zoom .dot.small { width: 6px; height: 6px; }
++#zoomPct { width: 42px; text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
++
++dialog.sheet { border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; width: min(520px, 92vw); background: var(--bg); color: var(--text); box-shadow: var(--shadow); }
++dialog.sheet::backdrop { background: rgb(0 0 0 / 0.3); }
++dialog h2 { margin: 0 0 6px; font-size: 15px; }
++dialog .hint, dialog small { color: var(--muted); font-size: 12px; }
++dialog fieldset { border: none; padding: 0; margin: 12px 0; display: grid; gap: 6px; }
++dialog legend { font-weight: 600; margin-bottom: 4px; }
++dialog label { display: flex; gap: 8px; align-items: baseline; }
++dialog label small { margin-left: auto; text-align: right; }
++dialog .field { display: grid; gap: 4px; margin: 12px 0; }
++dialog .field small { margin: 0; text-align: left; }
++dialog .field input { padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); }
++.actions { display: flex; gap: 8px; align-items: center; margin-top: 14px; }
++.actions .spacer { flex: 1; }
++.files-list { max-height: 50vh; overflow: auto; border: 1px solid var(--line); border-radius: 8px; margin-top: 10px; }
++.files-list label { padding: 6px 10px; border-bottom: 1px solid var(--line); align-items: center; }
++.files-list label:last-child { border-bottom: none; }
++.files-list .empty-note { padding: 14px; color: var(--muted); }
+diff --git a/apps/align-web/www/app.js b/apps/align-web/www/app.js
+new file mode 100644
+index 0000000..7583451
+--- /dev/null
++++ b/apps/align-web/www/app.js
+@@ -0,0 +1,456 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Align in Playground (patches/pluraleyes.yaml in github.com/daijro/openplayground): the page. Align's desktop app is
++// built with GPUI, which has no browser backend; this is its workflow over the same engine (worker.js, src/lib.rs):
++// add a shoot, synchronize it, review the lanes, export timelines for an editor.
++//
++// Media come from Playground's Files (globalThis.playgroundFiles) or from the computer (picked or dropped, files or
++// folders), and are read where the engine needs them; nothing from the computer is copied into Files. Files is one
++// flat list, so folders go in names there, as Retake does: "A-CAM › A001.MOV" is /A-CAM/A001.MOV, and each folder is a
++// device of its own on the lanes. An export goes to Files (each file named after the folder chosen) or downloads as
++// one ZIP.
++import { zip } from './zip.js'
++
++const $ = (id) => document.getElementById(id)
++const pg = () => globalThis.playgroundFiles
++const FOLDER = ' › '
++const MEDIA = /\.(mov|mp4|m4v|mts|mxf|r3d|wav|wave|bwf|aif|aiff|aifc|mp3|m4a|aac|caf|flac|ogg|opus)$/i
++const normalize = (p) => '/' + String(p).split('/').filter((s) => s && s !== '.' && s !== '..').join('/')
++const fromApp = (p) => (typeof p === 'string' && p.startsWith('browser:') ? normalize(p.slice(8).split(/\/|\s›\s/).join('/')) : null)
++const toApp = (p) => `browser:/${p.slice(1).split('/').join(FOLDER)}`
++const baseName = (p) => p.split('/').pop()
++const folderOf = (p) => p.slice(0, p.lastIndexOf('/')) || '/'
++const SETTINGS = 'align:settings'
++
++// ---------------------------------------------------------------- the engine, in a worker
++
++const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' })
++const pending = new Map()
++let nextId = 0
++let started
++const ready = new Promise((resolve, reject) => (started = { resolve, reject }))
++let onProgress = () => {}
++worker.onmessage = ({ data }) => {
++  if (data.id !== undefined) {
++    pending.get(data.id)?.(data)
++    pending.delete(data.id)
++  } else if (data.progress) onProgress(data.progress)
++  else if (data.started) started.resolve()
++  else if (data.failed) started.reject(new Error(data.failed))
++}
++worker.onerror = (e) => started.reject(new Error(e.message))
++;(async () => {
++  // Compiled here, where Playground's loader unpacks the .wasm (page-prelude.js), and run in the worker.
++  const module = await WebAssembly.compileStreaming(fetch(new URL('align.wasm', document.baseURI)))
++  worker.postMessage({ start: true, module })
++})().catch((e) => started.reject(e))
++ready.catch((e) => say(`Align couldn't start: ${e.message}`))
++
++/** One engine command: its reply, and the files it wrote ([{ path, bytes }]). */
++async function call(request) {
++  await ready
++  const out = await new Promise((resolve) => {
++    const id = nextId++
++    pending.set(id, resolve)
++    worker.postMessage({ call: true, id, request })
++  })
++  if (out.error) throw new Error(out.error)
++  return { reply: out.reply, written: out.written }
++}
++
++// ---------------------------------------------------------------- state
++
++/** path → { path, name, kind, duration, error, status } */
++const media = new Map()
++let result = null
++let waveforms = new Map()
++let busy = false
++let zoom = 1
++const settings = Object.assign({ quality: 'balanced', mediaFolder: '' }, JSON.parse(localStorage.getItem(SETTINGS) ?? '{}'))
++$('quality').value = settings.quality
++const saveSettings = () => localStorage.setItem(SETTINGS, JSON.stringify(settings))
++
++function say(text, { warn = false, progress = null } = {}) {
++  $('status').textContent = text
++  $('warn').hidden = !warn
++  $('progress').hidden = progress === null
++  if (progress !== null) {
++    if (progress < 0) $('progress').removeAttribute('value')
++    else $('progress').value = progress
++  }
++}
++
++function freePath(path) {
++  if (!media.has(path)) return path
++  const dot = path.lastIndexOf('.')
++  const [stem, ext] = dot > path.lastIndexOf('/') ? [path.slice(0, dot), path.slice(dot)] : [path, '']
++  for (let i = 2; ; i++) if (!media.has(`${stem} (${i})${ext}`)) return `${stem} (${i})${ext}`
++}
++
++/** Hands media to the engine ([{ path, blob } or { path, bytes }]) and reads what they are. */
++async function add(items) {
++  items = items.filter((i) => MEDIA.test(i.path))
++  if (!items.length) return say('Nothing to add: Align takes audio and video files.', { warn: true })
++  for (const item of items) {
++    item.path = freePath(normalize(item.path))
++    media.set(item.path, { path: item.path, name: baseName(item.path), status: 'Queued' })
++    worker.postMessage({ add: true, path: item.path, blob: item.blob, bytes: item.bytes }, item.bytes ? [item.bytes.buffer] : [])
++  }
++  result = null
++  render()
++  say(`Reading ${items.length} ${items.length === 1 ? 'file' : 'files'}…`, { progress: -1 })
++  await inspect()
++}
++
++async function inspect() {
++  const paths = [...media.keys()]
++  if (!paths.length) return render()
++  try {
++    const { reply } = await call({ cmd: 'inspect', paths })
++    for (const c of reply.clips) Object.assign(media.get(c.url) ?? {}, { kind: c.kind, duration: c.duration, error: null, status: 'Ready' })
++    for (const w of reply.warnings) Object.assign(media.get(w.url) ?? {}, { error: w.message })
++  } catch (e) {
++    say(e.message, { warn: true })
++    return render()
++  }
++  render()
++  const n = media.size
++  say(`Ready to analyze ${n} source ${n === 1 ? 'item' : 'items'}.`)
++}
++
++function remove(path) {
++  media.delete(path)
++  worker.postMessage({ remove: path })
++  result = null
++  render()
++  say(media.size ? `Ready to analyze ${media.size} source ${media.size === 1 ? 'item' : 'items'}.` : 'Add your recordings to begin.')
++}
++
++function clear() {
++  for (const path of media.keys()) worker.postMessage({ remove: path })
++  media.clear()
++  result = null
++  waveforms = new Map()
++  render()
++  say('Add your recordings to begin.')
++}
++
++// ---------------------------------------------------------------- adding media
++
++async function addFromFiles() {
++  if (!pg()) return $('pickFiles').click()
++  const list = (await pg().files('browser:/')).filter((p) => MEDIA.test(p)).sort()
++  const box = $('filesList')
++  box.replaceChildren(
++    ...(list.length
++      ? list.map((p) => {
++          const label = document.createElement('label')
++          const input = Object.assign(document.createElement('input'), { type: 'checkbox', value: p, checked: false })
++          label.append(input, ` ${p.slice('browser:/'.length)}`)
++          return label
++        })
++      : [Object.assign(document.createElement('p'), { className: 'empty-note', textContent: 'No audio or video in Files yet. Add from this computer, or drop files here.' })]),
++  )
++  $('filesAll').onclick = () => box.querySelectorAll('input').forEach((i) => (i.checked = true))
++  const dialog = $('filesDialog')
++  dialog.returnValue = ''
++  dialog.showModal()
++  await new Promise((resolve) => dialog.addEventListener('close', resolve, { once: true }))
++  if (dialog.returnValue !== 'add') return
++  const picked = [...box.querySelectorAll('input:checked')].map((i) => i.value)
++  if (!picked.length) return
++  say(`Loading ${picked.length} from Files…`, { progress: -1 })
++  const items = await Promise.all(picked.map(async (p) => ({ path: fromApp(p), bytes: await pg().read(p) })))
++  await add(items)
++}
++
++const fromComputer = (files) => [...files].map((f) => ({ path: '/' + (f.webkitRelativePath || f.name), blob: f }))
++
++/** Files and folders dropped on the page, with their folders' names. */
++async function dropped(dataTransfer) {
++  const entries = [...dataTransfer.items].map((i) => i.webkitGetAsEntry?.()).filter(Boolean)
++  if (!entries.length) return fromComputer(dataTransfer.files)
++  const out = []
++  const walk = async (entry, dir) => {
++    if (entry.isFile) {
++      const file = await new Promise((resolve, reject) => entry.file(resolve, reject))
++      out.push({ path: `${dir}/${file.name}`, blob: file })
++    } else if (entry.isDirectory) {
++      const reader = entry.createReader()
++      for (;;) {
++        const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject))
++        if (!batch.length) break
++        for (const child of batch) await walk(child, `${dir}/${entry.name}`)
++      }
++    }
++  }
++  for (const entry of entries) await walk(entry, '')
++  return out
++}
++
++function chooseAdd(kind) {
++  $('addMenu').hidden = true
++  if (busy) return
++  if (kind === 'files') addFromFiles().catch((e) => say(e.message, { warn: true }))
++  else if (kind === 'computer') $('pickFiles').click()
++  else if (kind === 'folder') $('pickFolder').click()
++}
++
++$('pickFiles').onchange = (e) => (add(fromComputer(e.target.files)), (e.target.value = ''))
++$('pickFolder').onchange = (e) => (add(fromComputer(e.target.files)), (e.target.value = ''))
++$('add').onclick = (e) => {
++  e.stopPropagation()
++  $('addMenu').hidden = !$('addMenu').hidden
++}
++document.addEventListener('click', () => ($('addMenu').hidden = true))
++for (const b of document.querySelectorAll('[data-add]')) b.onclick = () => chooseAdd(b.dataset.add)
++$('clear').onclick = () => !busy && clear()
++
++let depth = 0
++const hasFiles = (e) => [...(e.dataTransfer?.types ?? [])].includes('Files')
++addEventListener('dragenter', (e) => hasFiles(e) && (e.preventDefault(), depth++ === 0 && ($('dropHint').hidden = false)))
++addEventListener('dragover', (e) => hasFiles(e) && e.preventDefault())
++addEventListener('dragleave', (e) => hasFiles(e) && --depth <= 0 && ((depth = 0), ($('dropHint').hidden = true)))
++addEventListener('drop', async (e) => {
++  if (!hasFiles(e)) return
++  e.preventDefault()
++  depth = 0
++  $('dropHint').hidden = true
++  if (!busy) add(await dropped(e.dataTransfer))
++})
++
++// "Open in Align" from Files, and ?open=.
++ready.then(() => pg()?.onOpen((file) => add([{ path: fromApp(file.path) ?? `/${file.name}`, bytes: file.bytes }])))
++
++// ---------------------------------------------------------------- synchronizing
++
++const PHASES = { inspect: 'Reading media', fingerprint: 'Analyzing audio', match: 'Matching', refine: 'Refining', solve: 'Building the timeline', export: 'Exporting' }
++
++async function synchronize() {
++  if (busy || !media.size) return
++  busy = true
++  waveforms = new Map()
++  render()
++  const begun = performance.now()
++  onProgress = (p) => {
++    if (p.waveform) waveforms.set(p.waveform.clip, Float32Array.from(p.waveform.bins))
++    const label = PHASES[p.phase] ?? p.phase
++    say(`${label}${p.total ? ` ${Math.min(p.completed + 1, p.total)} of ${p.total}` : ''}${p.current ? ` · ${p.current}` : '…'}`, { progress: p.total ? p.completed / p.total : -1 })
++    if (p.current) for (const m of media.values()) if (m.name === p.current) m.status = label
++  }
++  say('Starting…', { progress: -1 })
++  try {
++    const { reply } = await call({ cmd: 'sync', paths: [...media.keys()], accuracy: settings.quality })
++    result = reply
++    const seconds = (performance.now() - begun) / 1000
++    say(`Synchronized ${reply.synced} of ${reply.total} clips in ${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)} s.`, { warn: reply.synced < reply.total })
++  } catch (e) {
++    say(e.message, { warn: true })
++  } finally {
++    busy = false
++    onProgress = () => {}
++    render()
++  }
++}
++
++$('sync').onclick = synchronize
++$('quality').onchange = (e) => ((settings.quality = e.target.value), saveSettings())
++
++// ---------------------------------------------------------------- export
++
++async function exportTimelines() {
++  if (busy || !result) return
++  const dialog = $('exportDialog')
++  const form = dialog.querySelector('form')
++  form.mediaFolder.value = settings.mediaFolder
++  dialog.returnValue = ''
++  dialog.showModal()
++  await new Promise((resolve) => dialog.addEventListener('close', resolve, { once: true }))
++  if (dialog.returnValue !== 'export') return
++  const formats = ['premiereXML', 'resolveXML', 'resolveOTIO', 'finalCutProXML'].filter((f) => form[f].checked)
++  if (form.resolveOTIO.checked) formats.push('resolveScript')
++  if (!formats.length) return say('Pick at least one editor to export for.', { warn: true })
++  settings.mediaFolder = form.mediaFolder.value.trim()
++  saveSettings()
++  const name = 'Align Export'
++  const saved = pg() ? await pg().saveAs({ name, types: [] }) : { download: true }
++  if (!saved) return
++  const directory = saved.download ? `/.export/${name}` : fromApp(saved.path)
++  busy = true
++  render()
++  onProgress = (p) => say(`Exporting ${p.completed} of ${p.total}…`, { progress: p.total ? p.completed / p.total : -1 })
++  try {
++    const { written } = await call({ cmd: 'export', directory, formats, drift: form.drift.checked, mediaFolder: settings.mediaFolder || null, removeUnmatched: form.removeUnmatched.checked })
++    const files = written.filter((w) => w.path.startsWith(directory + '/'))
++    if (saved.download) {
++      const entries = files.map((w) => ({ name: `${name}/${w.path.slice(directory.length + 1)}`, bytes: w.bytes }))
++      const blob = zip(entries)
++      if (pg()) pg().download(`${name}.zip`, blob)
++      else Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: `${name}.zip` }).click()
++      say(`Downloaded ${name}.zip: ${files.length} files.`)
++      for (const w of files) worker.postMessage({ remove: w.path })
++    } else {
++      for (const w of files) pg().write(toApp(w.path), w.bytes)
++      say(`Exported ${files.length} files to Files: ${baseName(directory)}.`)
++    }
++  } catch (e) {
++    say(e.message, { warn: true })
++  } finally {
++    busy = false
++    onProgress = () => {}
++    render()
++  }
++}
++
++$('export').onclick = exportTimelines
++
++// ---------------------------------------------------------------- drawing
++
++const ICON = {
++  video: '<svg viewBox="0 0 16 16"><rect x="1.5" y="4" width="9" height="8" rx="1.5"/><path d="M10.5 7l4-2v6l-4-2"/></svg>',
++  audio: '<svg viewBox="0 0 16 16"><path d="M2 8h1M5 5v6M8 3v10M11 6v4M14 8h-1"/></svg>',
++  folder: '<svg viewBox="0 0 20 20"><path d="M2.5 5.5a1 1 0 0 1 1-1h4l1.5 1.5h7.5a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1z"/></svg>',
++}
++const el = (tag, props = {}, ...children) => {
++  const e = Object.assign(document.createElement(tag), props)
++  e.append(...children)
++  return e
++}
++const duration = (s) => {
++  if (s == null) return ''
++  const h = Math.floor(s / 3600)
++  const m = Math.floor((s % 3600) / 60)
++  const sec = s % 60
++  return `${h ? `${h}:${String(m).padStart(2, '0')}` : m}:${sec.toFixed(1).padStart(4, '0')}`
++}
++
++function render() {
++  const has = media.size > 0
++  $('empty').hidden = has
++  $('sources').hidden = !has || !!result
++  $('timeline').hidden = !result
++  $('zoomBox').hidden = !result
++  $('title').textContent = result ? 'Timeline' : 'Sources'
++  $('sync').disabled = busy || !has
++  $('sync').textContent = result ? 'Synchronize Again' : 'Synchronize'
++  $('export').disabled = busy || !result
++  $('add').disabled = $('clear').disabled = busy
++  if (result) drawTimeline()
++  else if (has) drawSources()
++}
++
++function drawSources() {
++  const groups = new Map()
++  for (const m of media.values()) {
++    const dir = folderOf(m.path)
++    if (!groups.has(dir)) groups.set(dir, [])
++    groups.get(dir).push(m)
++  }
++  const box = $('sources')
++  box.replaceChildren(el('p', { className: 'count', textContent: `${media.size} ${media.size === 1 ? 'item' : 'items'}` }))
++  for (const [dir, items] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
++    const head = el('header')
++    head.innerHTML = ICON.folder
++    head.append(el('div', {}, el('strong', { textContent: dir === '/' ? 'Media' : baseName(dir) }), el('small', { textContent: `${items.length} ${items.length === 1 ? 'item' : 'items'} · ${items.filter((i) => !i.error).length === items.length ? (busy ? 'Analyzing' : 'Queued') : 'some can’t be read'}` })))
++    const group = el('div', { className: 'group' }, head)
++    for (const m of items.sort((a, b) => a.name.localeCompare(b.name))) {
++      const icon = el('span')
++      icon.innerHTML = m.kind === 'video' ? ICON.video : ICON.audio
++      const del = el('button', { className: 'icon', title: `Remove ${m.name}`, disabled: busy, onclick: () => remove(m.path) })
++      del.innerHTML = '<svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>'
++      group.append(
++        el('div', { className: 'item' }, icon, el('span', { className: 'name', textContent: m.name, title: m.path }),
++          m.error ? el('span', { className: 'bad', textContent: m.error }) : el('span', { className: 'meta', textContent: busy ? m.status : duration(m.duration) }), del),
++      )
++    }
++    box.append(group)
++  }
++}
++
++const LABEL = 52
++function drawTimeline() {
++  const lanes = result.lanes
++  const end = Math.max(1, ...lanes.flatMap((l) => l.clips.map((c) => c.start + c.duration)))
++  const fit = Math.max(200, $('scroller').clientWidth - LABEL - 24)
++  const pps = (fit * zoom) / end
++  const width = Math.ceil(end * pps) + 24
++  $('zoomPct').textContent = `${Math.round(zoom * 100)}%`
++  // Ruler: a label every step seconds, at least ~90 px apart.
++  const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200]
++  const step = steps.find((s) => s * pps >= 90) ?? 7200
++  const tc = result.rulerTimecode ?? 0
++  const clock = (t) => {
++    const s = Math.round(tc + t)
++    return `${Math.floor(s / 3600)}:${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
++  }
++  const ruler = $('ruler')
++  ruler.style.width = `${width}px`
++  ruler.replaceChildren()
++  const ticks = []
++  for (let t = 0; t <= end + 0.001; t += step) {
++    ruler.append(el('span', { textContent: clock(t), style: `left:${t * pps}px` }))
++    ticks.push(t * pps)
++  }
++  const box = $('lanes')
++  box.replaceChildren()
++  for (const lane of lanes) {
++    const track = el('div', { className: 'track', style: `width:${width}px` })
++    for (const x of ticks) track.append(el('div', { className: 'gridline', style: `left:${x}px` }))
++    lane.clips.forEach((c, i) => {
++      const next = lane.clips[i + 1]
++      const x = c.start * pps
++      const w = Math.max(2, Math.min(c.duration * pps, next ? next.start * pps - x : Infinity))
++      const clip = el('div', { className: `clip ${c.matched ? '' : 'unmatched'}`, style: `left:${x}px;width:${w}px`, title: `${c.name}\n${c.matched ? `Synchronized · confidence ${(c.confidence * 100).toFixed(0)}%` : 'Not matched'}` })
++      const bins = waveforms.get(c.clipId)
++      if (bins && w > 12) clip.append(wave(bins, w))
++      const name = el('span', { className: 'name' })
++      name.innerHTML = lane.kind === 'V' ? ICON.video : ICON.audio
++      name.append(c.name)
++      clip.append(name)
++      track.append(clip)
++    })
++    box.append(el('div', { className: 'lane' }, el('div', { className: 'label', textContent: `${lane.kind}${lane.number}`, title: lane.sourceName }), track))
++  }
++}
++
++function wave(bins, width) {
++  const height = 31
++  const canvas = el('canvas', { width: Math.min(4000, Math.ceil(width)), height })
++  const g = canvas.getContext('2d')
++  g.fillStyle = '#fff'
++  const n = canvas.width
++  for (let x = 0; x < n; x++) {
++    const v = bins[Math.floor((x / n) * bins.length)] ?? 0
++    const h = Math.max(1, v * (height - 6))
++    g.fillRect(x, (height - h) / 2, 1, h)
++  }
++  return canvas
++}
++
++$('zoom').oninput = (e) => {
++  zoom = Number(e.target.value)
++  if (result) drawTimeline()
++}
++$('scroller').addEventListener(
++  'wheel',
++  (e) => {
++    if (!(e.ctrlKey || e.metaKey || e.altKey) || !result) return
++    e.preventDefault()
++    zoom = Math.min(40, Math.max(1, zoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15)))
++    $('zoom').value = zoom
++    drawTimeline()
++  },
++  { passive: false },
++)
++addEventListener('resize', () => result && drawTimeline())
++
++addEventListener('keydown', (e) => {
++  if (!(e.ctrlKey || e.metaKey) || e.altKey || document.querySelector('dialog[open]')) return
++  const k = e.key.toLowerCase()
++  if (k === 'o') chooseAdd('files')
++  else if (k === 'r') synchronize()
++  else if (k === 'e') exportTimelines()
++  else return
++  e.preventDefault()
++})
++
++render()
+diff --git a/apps/align-web/www/engine.js b/apps/align-web/www/engine.js
+new file mode 100644
+index 0000000..28806a9
+--- /dev/null
++++ b/apps/align-web/www/engine.js
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Align in Playground (patches/pluraleyes.yaml in github.com/daijro/openplayground): the engine, a WASI module
++// (apps/align-web/src/lib.rs), over the in-memory files of wasi.js. `call` runs one command; `progress(update)` gets
++// what a running command reports.
++import { Files, wasi } from './wasi.js'
++
++export const files = new Files()
++
++export async function start(source, progress) {
++  const { imports, setMemory } = wasi(files)
++  const decoder = new TextDecoder()
++  const encoder = new TextEncoder()
++  let x
++  const env = {
++    wasi_snapshot_preview1: imports,
++    playground: { progress: (p, l) => progress(JSON.parse(decoder.decode(new Uint8Array(x.memory.buffer, p, l).slice()))) },
++  }
++  source = await source
++  const instance = source instanceof WebAssembly.Module ? await WebAssembly.instantiate(source, env) : (await WebAssembly.instantiate(source, env)).instance
++  x = instance.exports
++  setMemory(x.memory)
++  x._initialize?.()
++  return {
++    /** One command: its reply, or a throw with its error. */
++    call(request) {
++      const bytes = encoder.encode(JSON.stringify(request))
++      const ptr = x.pg_alloc(bytes.length)
++      new Uint8Array(x.memory.buffer, ptr, bytes.length).set(bytes)
++      let code
++      try {
++        code = x.pg_call(ptr, bytes.length)
++      } finally {
++        x.pg_free(ptr, bytes.length)
++      }
++      const reply = JSON.parse(decoder.decode(new Uint8Array(x.memory.buffer, x.pg_reply_ptr(), x.pg_reply_len()).slice()))
++      if (code !== 0) throw new Error(reply)
++      return reply
++    },
++  }
++}
+diff --git a/apps/align-web/www/index.html b/apps/align-web/www/index.html
+new file mode 100644
+index 0000000..90577a5
+--- /dev/null
++++ b/apps/align-web/www/index.html
+@@ -0,0 +1,123 @@
++<!doctype html>
++<!-- SPDX-License-Identifier: GPL-3.0-only
++     Align in Playground (patches/pluraleyes.yaml in github.com/daijro/openplayground): the page over Align's engine. -->
++<html lang="en">
++  <head>
++    <meta charset="utf-8" />
++    <meta name="viewport" content="width=device-width, initial-scale=1" />
++    <title>Align</title>
++    <link rel="stylesheet" href="app.css" />
++    <script type="module" src="app.js"></script>
++  </head>
++  <body>
++    <div id="app">
++      <header class="toolbar">
++        <div class="menu-host">
++          <button id="add" class="icon" title="Add media (Ctrl+O)" aria-haspopup="menu">
++            <svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg>
++          </button>
++          <div id="addMenu" class="menu" role="menu" hidden>
++            <button role="menuitem" data-add="files">From Files…</button>
++            <button role="menuitem" data-add="computer">From this computer…</button>
++            <button role="menuitem" data-add="folder">A folder from this computer…</button>
++          </div>
++        </div>
++        <button id="clear" class="icon" title="Remove all media">
++          <svg viewBox="0 0 16 16"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5" /></svg>
++        </button>
++        <h1 id="title">Sources</h1>
++        <div class="spacer"><button id="sync" class="link" disabled title="Synchronize (Ctrl+R)">Synchronize</button></div>
++        <label class="quality"
++          >Quality:
++          <select id="quality" title="How much analysis to do: higher takes longer">
++            <option value="fast">Fast</option>
++            <option value="balanced" selected>Balanced</option>
++            <option value="thorough">Thorough</option>
++            <option value="deep">Deep</option>
++            <option value="exhaustive">Exhaustive</option>
++          </select>
++        </label>
++        <button id="export" class="primary" disabled title="Export (Ctrl+E)">Export</button>
++      </header>
++
++      <main id="main">
++        <section id="empty" class="empty">
++          <img src="icon.png" alt="" width="96" height="96" />
++          <h2>Drop in the whole shoot.</h2>
++          <p>Cameras and audio recorders, files or folders. Align matches them by sound and timecode on one timeline.</p>
++          <div class="row">
++            <button class="primary" data-add="files">Add from Files…</button>
++            <button data-add="computer">From this computer…</button>
++            <button data-add="folder">A folder…</button>
++          </div>
++        </section>
++        <section id="sources" class="sources" hidden></section>
++        <section id="timeline" class="timeline" hidden>
++          <div id="scroller" class="scroller">
++            <div id="ruler" class="ruler"></div>
++            <div id="lanes" class="lanes"></div>
++          </div>
++        </section>
++        <div id="dropHint" class="drop-hint" hidden>Drop to add</div>
++      </main>
++
++      <footer class="status">
++        <span id="warn" class="warn" hidden>⚠</span>
++        <span id="status">Add your recordings to begin.</span>
++        <progress id="progress" hidden></progress>
++        <span class="spacer"></span>
++        <div class="zoom" id="zoomBox" hidden>
++          <span class="dot small"></span>
++          <input id="zoom" type="range" min="1" max="40" step="0.1" value="1" aria-label="Zoom" />
++          <span class="dot"></span>
++          <span id="zoomPct">100%</span>
++        </div>
++      </footer>
++    </div>
++
++    <dialog id="filesDialog" class="sheet">
++      <form method="dialog">
++        <h2>Add from Files</h2>
++        <p class="hint">Audio and video in Files. Folder names (“A-CAM › A001.MOV”) keep each device on its own lanes.</p>
++        <div id="filesList" class="files-list"></div>
++        <div class="actions">
++          <button type="button" id="filesAll" class="link">Select all</button>
++          <span class="spacer"></span>
++          <button value="">Cancel</button>
++          <button value="add" class="primary">Add</button>
++        </div>
++      </form>
++    </dialog>
++
++    <dialog id="exportDialog" class="sheet">
++      <form method="dialog">
++        <h2>Export</h2>
++        <fieldset>
++          <legend>Timelines for</legend>
++          <label><input type="checkbox" name="premiereXML" checked /> Adobe Premiere Pro <small>FCP 7 XML</small></label>
++          <label><input type="checkbox" name="resolveXML" checked /> DaVinci Resolve <small>XML</small></label>
++          <label><input type="checkbox" name="resolveOTIO" checked /> DaVinci Resolve <small>OpenTimelineIO and import script</small></label>
++          <label><input type="checkbox" name="finalCutProXML" checked /> Final Cut Pro <small>FCPXML, timeline and multicam</small></label>
++        </fieldset>
++        <fieldset>
++          <legend>Options</legend>
++          <label><input type="checkbox" name="drift" checked /> Correct clock drift <small>renders corrected audio for recorders whose clock runs off</small></label>
++          <label><input type="checkbox" name="removeUnmatched" /> Leave out clips that didn't match</label>
++        </fieldset>
++        <label class="field"
++          >Media folder on your computer
++          <input name="mediaFolder" placeholder="/Users/you/Shoot  or  D:\Shoot" spellcheck="false" />
++          <small>Where what you added is on the computer you edit on: the timelines point at your media there. Put the export folder in it too. Leave it empty to relink in your editor.</small>
++        </label>
++        <div class="actions">
++          <span class="spacer"></span>
++          <button value="">Cancel</button>
++          <button value="export" class="primary">Export…</button>
++        </div>
++      </form>
++    </dialog>
++
++    <input id="pickFiles" type="file" multiple hidden accept="audio/*,video/*,.mov,.mp4,.m4v,.mts,.mxf,.wav,.bwf,.aif,.aiff,.mp3,.m4a,.aac,.caf" />
++    <input id="pickFolder" type="file" webkitdirectory hidden />
++  </body>
++</html>
+diff --git a/apps/align-web/www/wasi.js b/apps/align-web/www/wasi.js
+new file mode 100644
+index 0000000..97f311c
+--- /dev/null
++++ b/apps/align-web/www/wasi.js
+@@ -0,0 +1,465 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Align in Playground (patches/pluraleyes.yaml in github.com/daijro/openplayground): the WASI calls its engine makes
++// (wasm32-wasip1), on an in-memory file system (as Retake's, patches/audition/web.diff). A file from the computer
++// stays a Blob ({ blob }), read a slice at a time where it is needed (FileReaderSync, in the worker), so a camera's
++// gigabytes are never copied in. What the engine writes, creates or removes is noted for the page.
++
++const E = { SUCCESS: 0, BADF: 8, EXIST: 20, INVAL: 28, IO: 29, ISDIR: 31, NOENT: 44, NOSYS: 52, NOTDIR: 54, NOTEMPTY: 55 }
++const FILETYPE = { CHAR: 2, DIR: 3, FILE: 4 }
++const OFLAGS = { CREAT: 1, DIRECTORY: 2, EXCL: 4, TRUNC: 8 }
++const FDFLAGS_APPEND = 1
++const RIGHT_WRITE = 1n << 6n
++
++export class WasiExit extends Error {
++  constructor(code) {
++    super(`exit ${code}`)
++    this.code = code
++  }
++}
++
++/** '/a/./b/../c/' -> '/a/c' */
++export const normalize = (path) => {
++  const out = []
++  for (const part of String(path).split('/')) {
++    if (!part || part === '.') continue
++    if (part === '..') out.pop()
++    else out.push(part)
++  }
++  return '/' + out.join('/')
++}
++const parentOf = (p) => (p === '/' ? '/' : normalize(p.slice(0, p.lastIndexOf('/')) || '/'))
++const now = () => BigInt(Date.now()) * 1000000n
++let sync = null
++const reader = () => (sync ??= new FileReaderSync())
++
++/** The files: path -> { dir: true } or { data, size, mtime, stub } (a stub's bytes aren't loaded yet). */
++export class Files {
++  constructor() {
++    this.entries = new Map([['/', { dir: true, mtime: now() }]])
++    /** Paths written, created or removed since the last takeChanges(). */
++    this.changed = new Set()
++    /** Stubs the back end tried to read since the last takeNeeded(). */
++    this.needed = new Set()
++  }
++  get(path) {
++    return this.entries.get(normalize(path))
++  }
++  mkdirs(path, note = true) {
++    path = normalize(path)
++    if (this.entries.get(path)?.dir) return
++    if (path !== '/') this.mkdirs(parentOf(path), note)
++    this.entries.set(path, { dir: true, mtime: now() })
++    if (note) this.changed.add(path)
++  }
++  /** Puts bytes at `path` (from Files, a drop, a picked file): no change is noted unless `note`. */
++  put(path, bytes, note = false) {
++    path = normalize(path)
++    this.mkdirs(parentOf(path), note)
++    this.entries.set(path, { data: bytes, size: bytes.length, mtime: now() })
++    if (note) this.changed.add(path)
++  }
++  /** A file from the computer, read where it is needed. */
++  putBlob(path, blob) {
++    path = normalize(path)
++    this.mkdirs(parentOf(path), false)
++    this.entries.set(path, { blob, size: blob.size, mtime: now() })
++  }
++  /** A file Files has, bytes not loaded. */
++  stub(path) {
++    path = normalize(path)
++    if (this.entries.has(path)) return
++    this.mkdirs(parentOf(path), false)
++    this.entries.set(path, { data: new Uint8Array(0), size: 0, mtime: now(), stub: true })
++  }
++  bytes(path) {
++    const e = this.get(path)
++    return e && !e.dir && !e.stub && !e.blob ? e.data.subarray(0, e.size) : null
++  }
++  remove(path, note = true) {
++    path = normalize(path)
++    for (const p of [...this.entries.keys()]) {
++      if (p === path || p.startsWith(path + '/')) {
++        this.entries.delete(p)
++        if (note) this.changed.add(p)
++      }
++    }
++  }
++  children(dir) {
++    dir = normalize(dir)
++    const prefix = dir === '/' ? '/' : dir + '/'
++    const out = []
++    for (const p of this.entries.keys()) {
++      if (p !== dir && p.startsWith(prefix) && !p.slice(prefix.length).includes('/')) out.push(p.slice(prefix.length))
++    }
++    return out.sort()
++  }
++  takeChanges() {
++    const c = [...this.changed]
++    this.changed.clear()
++    return c
++  }
++  takeNeeded() {
++    const n = [...this.needed]
++    this.needed.clear()
++    return n
++  }
++}
++
++/** The wasi_snapshot_preview1 imports, for `files`; call setMemory once the module is instantiated. */
++export function wasi(files) {
++  let memory
++  const view = () => new DataView(memory.buffer)
++  const bytesAt = (ptr, len) => new Uint8Array(memory.buffer, ptr, len)
++  const decoder = new TextDecoder()
++  const encoder = new TextEncoder()
++  const str = (ptr, len) => decoder.decode(bytesAt(ptr, len).slice())
++  // fd 0-2 are the console, 3 the preopened `/`.
++  const fds = new Map([
++    [0, { stdio: true }],
++    [1, { stdio: true, out: console.log, line: '' }],
++    [2, { stdio: true, out: console.warn, line: '' }],
++    [3, { path: '/', dir: true }],
++  ])
++  let nextFd = 4
++  const resolve = (dirfd, ptr, len) => {
++    const base = fds.get(dirfd)
++    if (!base?.dir) return null
++    return normalize(`${base.path}/${str(ptr, len)}`)
++  }
++  const iovecs = (iovs, n) => {
++    const v = view()
++    const out = []
++    for (let i = 0; i < n; i++) out.push([v.getUint32(iovs + i * 8, true), v.getUint32(iovs + i * 8 + 4, true)])
++    return out
++  }
++  const writeStat = (ptr, e) => {
++    const v = view()
++    for (let i = 0; i < 64; i += 8) v.setBigUint64(ptr + i, 0n, true)
++    v.setUint8(ptr + 16, e.dir ? FILETYPE.DIR : FILETYPE.FILE)
++    v.setBigUint64(ptr + 24, 1n, true)
++    v.setBigUint64(ptr + 32, BigInt(e.dir ? 0 : e.size), true)
++    v.setBigUint64(ptr + 40, e.mtime, true)
++    v.setBigUint64(ptr + 48, e.mtime, true)
++    v.setBigUint64(ptr + 56, e.mtime, true)
++  }
++  const grow = (e, need) => {
++    if (need <= e.data.length) return
++    const next = new Uint8Array(Math.max(need, e.data.length * 2, 4096))
++    next.set(e.data.subarray(0, e.size))
++    e.data = next
++  }
++
++  const imports = {
++    args_get: () => E.SUCCESS,
++    args_sizes_get(argc, bufsize) {
++      view().setUint32(argc, 0, true)
++      view().setUint32(bufsize, 0, true)
++      return E.SUCCESS
++    },
++    environ_get: () => E.SUCCESS,
++    environ_sizes_get(count, bufsize) {
++      view().setUint32(count, 0, true)
++      view().setUint32(bufsize, 0, true)
++      return E.SUCCESS
++    },
++    clock_res_get(id, ptr) {
++      view().setBigUint64(ptr, 1000n, true)
++      return E.SUCCESS
++    },
++    clock_time_get(id, _precision, ptr) {
++      const t = id === 0 ? now() : BigInt(Math.round(performance.now() * 1e6))
++      view().setBigUint64(ptr, t, true)
++      return E.SUCCESS
++    },
++    random_get(ptr, len) {
++      for (let at = 0; at < len; at += 65536) crypto.getRandomValues(bytesAt(ptr + at, Math.min(65536, len - at)))
++      return E.SUCCESS
++    },
++    fd_close(fd) {
++      if (!fds.has(fd)) return E.BADF
++      if (fd > 3) fds.delete(fd)
++      return E.SUCCESS
++    },
++    fd_fdstat_get(fd, ptr) {
++      const f = fds.get(fd)
++      if (!f) return E.BADF
++      const v = view()
++      v.setUint8(ptr, f.stdio ? FILETYPE.CHAR : f.dir ? FILETYPE.DIR : FILETYPE.FILE)
++      v.setUint16(ptr + 2, f.append ? FDFLAGS_APPEND : 0, true)
++      v.setBigUint64(ptr + 8, 0xffffffffffffffffn, true)
++      v.setBigUint64(ptr + 16, 0xffffffffffffffffn, true)
++      return E.SUCCESS
++    },
++    fd_fdstat_set_flags: () => E.SUCCESS,
++    fd_filestat_get(fd, ptr) {
++      const f = fds.get(fd)
++      if (!f) return E.BADF
++      if (f.stdio) {
++        writeStat(ptr, { size: 0, mtime: 0n })
++        view().setUint8(ptr + 16, FILETYPE.CHAR)
++        return E.SUCCESS
++      }
++      const e = files.get(f.path)
++      if (!e) return E.NOENT
++      writeStat(ptr, e)
++      return E.SUCCESS
++    },
++    fd_filestat_set_size(fd, size) {
++      const f = fds.get(fd)
++      const e = f && files.get(f.path)
++      if (!e || e.dir || e.blob) return E.BADF
++      size = Number(size)
++      grow(e, size)
++      if (size > e.size) e.data.fill(0, e.size, size)
++      e.size = size
++      files.changed.add(f.path)
++      return E.SUCCESS
++    },
++    fd_filestat_set_times: () => E.SUCCESS,
++    fd_prestat_get(fd, ptr) {
++      if (fd !== 3) return E.BADF
++      view().setUint8(ptr, 0)
++      view().setUint32(ptr + 4, 1, true)
++      return E.SUCCESS
++    },
++    fd_prestat_dir_name(fd, ptr, len) {
++      if (fd !== 3) return E.BADF
++      bytesAt(ptr, len).set(encoder.encode('/').subarray(0, len))
++      return E.SUCCESS
++    },
++    fd_read(fd, iovs, n, nread) {
++      const f = fds.get(fd)
++      if (!f) return E.BADF
++      if (f.stdio) {
++        view().setUint32(nread, 0, true)
++        return E.SUCCESS
++      }
++      const e = files.get(f.path)
++      if (!e || e.dir) return e ? E.ISDIR : E.BADF
++      let total = 0
++      for (const [buf, len] of iovecs(iovs, n)) {
++        const pos = Number(f.pos)
++        const k = Math.max(0, Math.min(len, e.size - pos))
++        if (e.blob) bytesAt(buf, k).set(new Uint8Array(reader().readAsArrayBuffer(e.blob.slice(pos, pos + k))))
++        else bytesAt(buf, k).set(e.data.subarray(pos, pos + k))
++        f.pos += BigInt(k)
++        total += k
++        if (k < len) break
++      }
++      view().setUint32(nread, total, true)
++      return E.SUCCESS
++    },
++    fd_pread(fd, iovs, n, offset, nread) {
++      const f = fds.get(fd)
++      if (!f || f.stdio) return E.BADF
++      const keep = f.pos
++      f.pos = offset
++      const r = imports.fd_read(fd, iovs, n, nread)
++      f.pos = keep
++      return r
++    },
++    fd_write(fd, iovs, n, nwritten) {
++      const f = fds.get(fd)
++      if (!f) return E.BADF
++      let total = 0
++      if (f.stdio) {
++        for (const [buf, len] of iovecs(iovs, n)) {
++          f.line += decoder.decode(bytesAt(buf, len).slice(), { stream: true })
++          total += len
++        }
++        const lines = f.line.split('\n')
++        f.line = lines.pop()
++        for (const l of lines) f.out?.(l)
++        view().setUint32(nwritten, total, true)
++        return E.SUCCESS
++      }
++      const e = files.get(f.path)
++      if (!e || e.dir || e.blob) return E.BADF
++      if (f.append) f.pos = BigInt(e.size)
++      for (const [buf, len] of iovecs(iovs, n)) {
++        const pos = Number(f.pos)
++        grow(e, pos + len)
++        e.data.set(bytesAt(buf, len), pos)
++        if (pos > e.size) e.data.fill(0, e.size, pos)
++        e.size = Math.max(e.size, pos + len)
++        f.pos += BigInt(len)
++        total += len
++      }
++      e.mtime = now()
++      files.changed.add(f.path)
++      view().setUint32(nwritten, total, true)
++      return E.SUCCESS
++    },
++    fd_pwrite(fd, iovs, n, offset, nwritten) {
++      const f = fds.get(fd)
++      if (!f || f.stdio) return E.BADF
++      const keep = f.pos
++      const append = f.append
++      f.pos = offset
++      f.append = false
++      const r = imports.fd_write(fd, iovs, n, nwritten)
++      f.pos = keep
++      f.append = append
++      return r
++    },
++    fd_seek(fd, offset, whence, ptr) {
++      const f = fds.get(fd)
++      if (!f || f.stdio || f.dir) return E.BADF
++      const e = files.get(f.path)
++      const base = whence === 0 ? 0n : whence === 1 ? f.pos : BigInt(e?.size ?? 0)
++      const pos = base + offset
++      if (pos < 0n) return E.INVAL
++      f.pos = pos
++      view().setBigUint64(ptr, pos, true)
++      return E.SUCCESS
++    },
++    fd_tell(fd, ptr) {
++      const f = fds.get(fd)
++      if (!f || f.stdio) return E.BADF
++      view().setBigUint64(ptr, f.pos, true)
++      return E.SUCCESS
++    },
++    fd_sync: () => E.SUCCESS,
++    fd_datasync: () => E.SUCCESS,
++    fd_advise: () => E.SUCCESS,
++    fd_allocate: () => E.SUCCESS,
++    fd_readdir(fd, buf, len, cookie, used) {
++      const f = fds.get(fd)
++      if (!f?.dir) return E.BADF
++      const names = files.children(f.path)
++      let at = 0
++      const v = view()
++      for (let i = Number(cookie); i < names.length && at < len; i++) {
++        const name = encoder.encode(names[i])
++        const e = files.get(`${f.path}/${names[i]}`)
++        const head = new DataView(new ArrayBuffer(24))
++        head.setBigUint64(0, BigInt(i + 1), true)
++        head.setBigUint64(8, BigInt(i + 1), true)
++        head.setUint32(16, name.length, true)
++        head.setUint8(20, e?.dir ? FILETYPE.DIR : FILETYPE.FILE)
++        const entry = new Uint8Array(24 + name.length)
++        entry.set(new Uint8Array(head.buffer))
++        entry.set(name, 24)
++        const k = Math.min(entry.length, len - at)
++        bytesAt(buf + at, k).set(entry.subarray(0, k))
++        at += k
++      }
++      v.setUint32(used, at, true)
++      return E.SUCCESS
++    },
++    path_create_directory(fd, ptr, len) {
++      const path = resolve(fd, ptr, len)
++      if (!path) return E.BADF
++      if (files.get(path)) return E.EXIST
++      if (!files.get(parentOf(path))?.dir) return E.NOENT
++      files.mkdirs(path)
++      return E.SUCCESS
++    },
++    path_filestat_get(fd, _flags, ptr, len, out) {
++      const path = resolve(fd, ptr, len)
++      if (!path) return E.BADF
++      const e = files.get(path)
++      if (!e) return E.NOENT
++      writeStat(out, e)
++      return E.SUCCESS
++    },
++    path_filestat_set_times: () => E.SUCCESS,
++    path_open(dirfd, _dirflags, ptr, len, oflags, rights, _inheriting, fdflags, out) {
++      const path = resolve(dirfd, ptr, len)
++      if (!path) return E.BADF
++      let e = files.get(path)
++      if (e && oflags & OFLAGS.EXCL && oflags & OFLAGS.CREAT) return E.EXIST
++      if (!e) {
++        if (!(oflags & OFLAGS.CREAT)) return E.NOENT
++        if (!files.get(parentOf(path))?.dir) return E.NOENT
++        files.put(path, new Uint8Array(0), true)
++        e = files.get(path)
++      }
++      if (oflags & OFLAGS.DIRECTORY && !e.dir) return E.NOTDIR
++      if (e.stub) {
++        if (oflags & OFLAGS.TRUNC) {
++          files.put(path, new Uint8Array(0), true)
++          e = files.get(path)
++        } else {
++          files.needed.add(path)
++          return E.IO
++        }
++      }
++      if (e.blob && oflags & OFLAGS.TRUNC) return E.BADF
++      if (!e.dir && oflags & OFLAGS.TRUNC) {
++        e.size = 0
++        e.mtime = now()
++        files.changed.add(path)
++      }
++      const fd = nextFd++
++      fds.set(fd, { path, dir: !!e.dir, pos: 0n, append: !!(fdflags & FDFLAGS_APPEND), write: !!(rights & RIGHT_WRITE) })
++      view().setUint32(out, fd, true)
++      return E.SUCCESS
++    },
++    path_readlink: () => E.INVAL,
++    path_symlink: () => E.NOSYS,
++    path_link: () => E.NOSYS,
++    path_remove_directory(fd, ptr, len) {
++      const path = resolve(fd, ptr, len)
++      if (!path) return E.BADF
++      const e = files.get(path)
++      if (!e) return E.NOENT
++      if (!e.dir) return E.NOTDIR
++      if (files.children(path).length) return E.NOTEMPTY
++      files.remove(path)
++      return E.SUCCESS
++    },
++    path_unlink_file(fd, ptr, len) {
++      const path = resolve(fd, ptr, len)
++      if (!path) return E.BADF
++      const e = files.get(path)
++      if (!e) return E.NOENT
++      if (e.dir) return E.ISDIR
++      files.remove(path)
++      return E.SUCCESS
++    },
++    path_rename(fd, ptr, len, fd2, ptr2, len2) {
++      const from = resolve(fd, ptr, len)
++      const to = resolve(fd2, ptr2, len2)
++      if (!from || !to) return E.BADF
++      const e = files.get(from)
++      if (!e) return E.NOENT
++      if (!files.get(parentOf(to))?.dir) return E.NOENT
++      const moved = [...files.entries].filter(([p]) => p === from || p.startsWith(from + '/'))
++      files.remove(to)
++      files.remove(from)
++      for (const [p, entry] of moved) {
++        const q = to + p.slice(from.length)
++        files.entries.set(q, entry)
++        files.changed.add(q)
++      }
++      for (const f of fds.values()) {
++        if (f.path === from || f.path?.startsWith(from + '/')) f.path = to + f.path.slice(from.length)
++      }
++      return E.SUCCESS
++    },
++    // Sleeps end at once: the page can't wait (the players don't sleep here; see altered-playground).
++    poll_oneoff(subs, events, n, nevents) {
++      const v = view()
++      for (let i = 0; i < n; i++) {
++        const s = subs + i * 48
++        const ev = events + i * 32
++        v.setBigUint64(ev, v.getBigUint64(s, true), true)
++        v.setUint16(ev + 8, 0, true)
++        v.setUint8(ev + 10, v.getUint8(s + 8))
++      }
++      v.setUint32(nevents, n, true)
++      return E.SUCCESS
++    },
++    proc_exit(code) {
++      throw new WasiExit(code)
++    },
++    proc_raise: () => E.NOSYS,
++    sched_yield: () => E.SUCCESS,
++    sock_accept: () => E.NOSYS,
++    sock_recv: () => E.NOSYS,
++    sock_send: () => E.NOSYS,
++    sock_shutdown: () => E.NOSYS,
++  }
++  return { imports, setMemory: (m) => (memory = m) }
++}
+diff --git a/apps/align-web/www/worker.js b/apps/align-web/www/worker.js
+new file mode 100644
+index 0000000..f582b19
+--- /dev/null
++++ b/apps/align-web/www/worker.js
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Align in Playground (patches/pluraleyes.yaml in github.com/daijro/openplayground): the engine in a worker, so the
++// page stays responsive while a shoot synchronizes. Messages:
++//
++//   from the page                                   back
++//   { start, module }                               { started }, or { failed }
++//   { add, path, blob } or { add, path, bytes }     (media for the engine; a Blob is read where it is needed)
++//   { remove, path }
++//   { call, id, request }                           { id, reply } or { id, error }, then the files it wrote:
++//                                                   { id, written: [{ path, bytes }] }
++//   and, while a call runs, its progress: { progress }
++import { files, start } from './engine.js'
++
++let engine = null
++
++onmessage = async ({ data }) => {
++  if (data.start) {
++    try {
++      engine = await start(data.module, (progress) => postMessage({ progress }))
++      postMessage({ started: true })
++    } catch (e) {
++      postMessage({ failed: String(e.message ?? e) })
++    }
++  } else if (data.add) {
++    if (data.blob) files.putBlob(data.path, data.blob)
++    else files.put(data.path, data.bytes)
++  } else if (data.remove) files.remove(data.remove, false)
++  else if (data.call) {
++    files.takeChanges()
++    let reply, error
++    try {
++      reply = engine.call(data.request)
++    } catch (e) {
++      error = String(e.message ?? e)
++    }
++    const written = files
++      .takeChanges()
++      .filter((p) => files.bytes(p))
++      .map((path) => ({ path, bytes: files.bytes(path).slice() }))
++    postMessage({ id: data.id, reply, error, written }, written.map((w) => w.bytes.buffer))
++  }
++}
+diff --git a/apps/align-web/www/zip.js b/apps/align-web/www/zip.js
+new file mode 100644
+index 0000000..78ace41
+--- /dev/null
++++ b/apps/align-web/www/zip.js
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Align in Playground (patches/pluraleyes.yaml in github.com/daijro/openplayground): an export downloaded as one
++// file. A plain ZIP (stored, not compressed: the timelines are small and the audio doesn't shrink).
++const table = new Uint32Array(256).map((_, n) => {
++  let c = n
++  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
++  return c >>> 0
++})
++const crc32 = (bytes) => {
++  let c = 0xffffffff
++  for (const b of bytes) c = table[(c ^ b) & 0xff] ^ (c >>> 8)
++  return (c ^ 0xffffffff) >>> 0
++}
++
++/** [{ name, bytes }] (names with / for folders) as a ZIP Blob. */
++export function zip(entries) {
++  const encoder = new TextEncoder()
++  const parts = []
++  const central = []
++  let offset = 0
++  for (const { name, bytes } of entries) {
++    const n = encoder.encode(name)
++    const crc = crc32(bytes)
++    const local = new DataView(new ArrayBuffer(30))
++    // Signature, version 2.0, flags (bit 11: UTF-8 names), stored, a date, CRC, sizes, name length.
++    local.setUint32(0, 0x04034b50, true)
++    local.setUint16(4, 20, true)
++    local.setUint16(6, 0x0800, true)
++    local.setUint16(12, 0x21, true) // 1 January 1980
++    local.setUint32(14, crc, true)
++    local.setUint32(18, bytes.length, true)
++    local.setUint32(22, bytes.length, true)
++    local.setUint16(26, n.length, true)
++    parts.push(local, n, bytes)
++    const dir = new DataView(new ArrayBuffer(46))
++    dir.setUint32(0, 0x02014b50, true)
++    dir.setUint16(4, 20, true)
++    dir.setUint16(6, 20, true)
++    dir.setUint16(8, 0x0800, true)
++    dir.setUint16(14, 0x21, true)
++    dir.setUint32(16, crc, true)
++    dir.setUint32(20, bytes.length, true)
++    dir.setUint32(24, bytes.length, true)
++    dir.setUint16(28, n.length, true)
++    dir.setUint32(42, offset, true)
++    central.push(dir, n)
++    offset += 30 + n.length + bytes.length
++  }
++  const size = central.reduce((s, p) => s + p.byteLength, 0)
++  const end = new DataView(new ArrayBuffer(22))
++  end.setUint32(0, 0x06054b50, true)
++  end.setUint16(8, entries.length, true)
++  end.setUint16(10, entries.length, true)
++  end.setUint32(12, size, true)
++  end.setUint32(16, offset, true)
++  return new Blob([...parts, ...central, end], { type: 'application/zip' })
++}
+diff --git a/scripts/build-web.sh b/scripts/build-web.sh
+new file mode 100755
+index 0000000..276d4f9
+--- /dev/null
++++ b/scripts/build-web.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++# SPDX-License-Identifier: GPL-3.0-only
++# Playground's browser build of Align (patches/pluraleyes.yaml in github.com/daijro/openplayground), into the folder
++# given ($1): the engine (crates/align-core and align-decode, through apps/align-web) as a wasm32-wasip1 module,
++# align.wasm, and the page in apps/align-web/www, which needs no build step.
++set -euo pipefail
++DIST=$(realpath -m "$1")
++ROOT=$(cd "$(dirname "$0")/.." && pwd)
++TARGET=${CARGO_TARGET_DIR:-$ROOT/apps/align-web/target}
++rustup target add wasm32-wasip1 >/dev/null 2>&1 || true
++
++cd "$ROOT/apps/align-web"
++# The workspace's lock pins the engine's crates.
++cp ../../Cargo.lock .
++cargo build --release --target wasm32-wasip1
++
++mkdir -p "$DIST"
++cp -r www/. "$DIST/"
++cp "$TARGET/wasm32-wasip1/release/align_web.wasm" "$DIST/align.wasm"
++cp "$ROOT/Support/AppIcon.png" "$DIST/icon.png"
