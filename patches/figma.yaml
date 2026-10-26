@@ -58,9 +58,9 @@
   after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if crate::live_playground::undo(self, true) { return Ok(true); }"
 # Branches, refused in a native live session, are refused in the shared document too (their id spaces are per file).
 - live: true
-  file: crates/engine/src/branches.rs
-  find: 'fn\s+refuse_live\s*\([^{]*\{'
-  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] crate::live_playground::refuse_branches(s, cmd, uid)?;"
+  file: crates/engine/src/*.rs
+  find: 'fn\s+(?:refuse_live|live_client_id)\s*\(\s*(?:&(self)|(s)\s*:\s*&Session)\s*,\s*(\w+)\s*:\s*&str\s*,\s*(\w+)\s*:\s*u64\s*\)[^{]*\{'
+  replace: "$&\n        #[cfg(any(target_arch = \"wasm32\", test))] crate::live_playground::refuse_branches($1$2, $3, $4)?;"
 # The Playground drawing (crates/ui-egui/src/live/playground.rs): the others' marks on the canvas, after the document
 # and before this person's own selection and tool overlays (it first hands this person's pointer to the session); dots
 # on each tab for the others on its file; Home's "In this session" (the session's files closed here) after Open files.
