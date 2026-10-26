@@ -32,10 +32,10 @@
   find: '#\[cfg\(not\(target_arch\s*=\s*"wasm32"\)\)\]\s*\n(pub\s+mod\s+midi_map;)'
   replace: '$1'
 - file: crates/playback/src/player/mod.rs
-  find: '#\[cfg\(not\(target_arch\s*=\s*"wasm32"\)\)\]\s*\n(pub\s+use\s+midi_map::MapSpec;)'
+  find: '#\[cfg\(not\(target_arch\s*=\s*"wasm32"\)\)\]\s*\n(pub\s+use\s+midi_map::\{[^}]*\bMapSpec\b[^}]*\};)'
   replace: '$1'
 - file: crates/playback/src/lib.rs
-  find: '(?:#\[cfg\(not\(target_arch\s*=\s*"wasm32"\)\)\]\s*\n)?(pub\s+use\s+player::MapSpec;)'
+  find: '(?:#\[cfg\(not\(target_arch\s*=\s*"wasm32"\)\)\]\s*\n)?(pub\s+use\s+player::(?:MapSpec;|\{[^}]*\bMapSpec\b[^}]*\};))'
   replace: '$1'
 - file: crates/playback/src/player/mod.rs
   find: '(?![\s\S])'
