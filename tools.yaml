@@ -32,8 +32,7 @@
 # Run `make fetch` after editing.
 
 groups:
-  - name: Creative
-    alternative: Adobe Creative Cloud
+  - name: Image
     tools:
       - slug: photoshop
         name: PhotoCraft
@@ -108,72 +107,59 @@ groups:
         accent: "#31A8FF"
         base: "#001E36"
 
-      - slug: premiere
-        name: FilmCraft
-        alternative: Premiere Pro
-        blurb: Video editing, color and sound.
-        opens: [fcproj, mp4, m4v, mov, mkv, webm, avi, mxf, mts, m2ts, mpg, mpeg, 3gp]
-        imports: [wav, aif, aiff, mp3, m4a, aac, flac, ogg, opus, png, jpg, jpeg, gif, webp, tif, tiff, bmp, srt, vtt, scc, edl, fcpxml, otio, aaf, omf]
-        repo: storytold/filmcraft
+      - slug: figma
+        name: FigCraft
+        alternative: Figma
+        blurb: Interface design, components and prototypes.
+        # The web build has no file dialogs; dropped files only import after creating a design.
+        opens: []
+        imports: []
+        repo: storytold/figcraft
         license: MIT OR Apache-2.0
-        icon: icons/filmcraft.png
-        theme: themes/premiere.js
-        patches: patches/premiere.yaml
+        icon: icons/figcraft.png
+        theme: themes/figma.js
+        patches: patches/figma.yaml
         live_kit: true
-        accent: "#9999FF"
-        base: "#00005B"
+        accent: "#02DA96"
+        base: "#062E22"
 
-      - slug: after-effects
-        name: EffectCraft
-        alternative: After Effects
-        blurb: Compositions, keyframes, effects and expressions.
-        opens: [ecproj]
-        imports: [mp4, mov, m4v, mkv, webm, png, jpg, jpeg, gif, webp, tif, tiff, bmp, exr, wav, aif, aiff, mp3, flac, ogg, opus, svg, pdf, ai, eps, psd, psb, gltf, glb, obj, csv, tsv]
-        repo: storytold/effectcraft
-        license: MIT OR Apache-2.0
-        icon: icons/effectcraft.png
-        theme: themes/after-effects.js
-        patches: patches/after-effects.yaml
+      - slug: mspaint
+        name: PaintCraft
+        alternative: Microsoft Paint
+        blurb: Pencil, brushes, fills, shapes, text, selections and layers, in the classic Paint look.
+        # Its own projects (.pcnd, with layers) and pictures. Upstream's releases are desktop packages only (no web
+        # zip), so like Pro Wave it has the head channel only; patches/mspaint.yaml builds its browser editor
+        # (apps/paintcraft-web, Classic presentation) the way Playground serves apps.
+        opens: [pcnd, png, bmp, jpg, jpeg]
+        imports: []
+        repo: replicraft/PaintCraft
+        license: MIT
+        # What the web build compiles (Cargo.lock: dependency changes; assets: its fonts and icons): docs, CI, the
+        # desktop app and packaging commits don't rebuild it. One GitHub API request per path per check.
+        paths: [crates, apps/paintcraft-web, assets, Cargo.toml, Cargo.lock, rust-toolchain.toml]
+        patches: patches/mspaint.yaml
         live_kit: true
-        accent: "#9999FF"
-        base: "#00005B"
+        icon: icons/paintcraft.png
+        accent: "#1E90F5"
+        base: "#0B2245"
 
-      - slug: audition
-        name: Retake
-        alternative: Audition
-        blurb: Multitrack and waveform audio editing for podcasts and voiceover.
-        # Altered Audio Editor, renamed: its name and logo are its authors' trademarks (patches/audition.yaml). Its own
-        # sessions and .sesx sessions; audio files and zips of them import. Upstream's releases are desktop packages
-        # only, so like Pro Wave it has the head channel only; patches/audition.yaml adds the web build.
-        opens: [altaudio, sesx]
-        imports: [wav, wave, aif, aiff, aifc, flac, mp3, m4a, aac, alac, ogg, oga, opus, zip]
-        repo: geekcastradio/altered-audio-editor
+      - slug: paint-net
+        name: Paint.RS
+        alternative: Paint.NET
+        blurb: Layers, adjustments, effects and plugins.
+        opens: []
+        imports: []
+        repo: daijro/paint.rs
         license: GPL-3.0-or-later
-        # What the web build compiles (package-lock.json: the interface's dependencies): docs, CI and release commits
-        # don't rebuild it. One GitHub API request per path per check.
-        paths: [src, src-tauri, package-lock.json]
-        patches: patches/audition.yaml
-        icon: icons/retake.svg
-        accent: "#35D0AE"
-        base: "#0B2A24"
-
-      - slug: acrobat
-        name: PdfCraft
-        alternative: Acrobat Pro
-        blurb: Read, organize, combine, split and secure PDFs.
-        opens: [pdf]
-        imports: [png, jpg, jpeg, tif, tiff, gif, bmp, jp2, j2k, jpx, txt]
-        repo: storytold/pdfcraft
-        license: MIT OR Apache-2.0
-        patches: patches/acrobat.yaml
-        live_kit: true
-        icon: icons/pdfcraft.png
-        theme: themes/acrobat.js
-        accent: "#FA0F00"
-        base: "#3A0400"
+        # Its release's web zip is built with wasm-opt -O3 and SIMD already, and carries the licence notices a
+        # plain trunk build leaves out, so Playground serves it as it is. Its live editing is in its own source
+        # (crates/paintrs/src/live.rs), as Honeydew's is.
+        build: false
+        icon: icons/paint-rs.png
+        accent: "#F74C00"
+        base: "#3A1200"
 
   - name: Office
-    alternative: Microsoft Office
     tools:
       - slug: word
         name: WordCraft
@@ -256,6 +242,72 @@ groups:
         patches: patches/outlook.yaml
         accent: "#28A8EA"
         base: "#0A2767"
+
+      - slug: acrobat
+        name: PdfCraft
+        alternative: Acrobat Pro
+        blurb: Read, organize, combine, split and secure PDFs.
+        opens: [pdf]
+        imports: [png, jpg, jpeg, tif, tiff, gif, bmp, jp2, j2k, jpx, txt]
+        repo: storytold/pdfcraft
+        license: MIT OR Apache-2.0
+        patches: patches/acrobat.yaml
+        live_kit: true
+        icon: icons/pdfcraft.png
+        theme: themes/acrobat.js
+        accent: "#FA0F00"
+        base: "#3A0400"
+
+  - name: Video
+    tools:
+      - slug: premiere
+        name: FilmCraft
+        alternative: Premiere Pro
+        blurb: Video editing, color and sound.
+        opens: [fcproj, mp4, m4v, mov, mkv, webm, avi, mxf, mts, m2ts, mpg, mpeg, 3gp]
+        imports: [wav, aif, aiff, mp3, m4a, aac, flac, ogg, opus, png, jpg, jpeg, gif, webp, tif, tiff, bmp, srt, vtt, scc, edl, fcpxml, otio, aaf, omf]
+        repo: storytold/filmcraft
+        license: MIT OR Apache-2.0
+        icon: icons/filmcraft.png
+        theme: themes/premiere.js
+        patches: patches/premiere.yaml
+        live_kit: true
+        accent: "#9999FF"
+        base: "#00005B"
+
+      - slug: after-effects
+        name: EffectCraft
+        alternative: After Effects
+        blurb: Compositions, keyframes, effects and expressions.
+        opens: [ecproj]
+        imports: [mp4, mov, m4v, mkv, webm, png, jpg, jpeg, gif, webp, tif, tiff, bmp, exr, wav, aif, aiff, mp3, flac, ogg, opus, svg, pdf, ai, eps, psd, psb, gltf, glb, obj, csv, tsv]
+        repo: storytold/effectcraft
+        license: MIT OR Apache-2.0
+        icon: icons/effectcraft.png
+        theme: themes/after-effects.js
+        patches: patches/after-effects.yaml
+        live_kit: true
+        accent: "#9999FF"
+        base: "#00005B"
+
+      - slug: davinci-resolve
+        name: Picasso Suite
+        alternative: DaVinci Resolve
+        blurb: Cut and edit video on a multi-track timeline, with linked picture and sound.
+        # Its own projects (.pcsp) and Resolve's (.drp, whose media stay where Resolve kept them). Upstream's releases
+        # are desktop packages only (no web zip), so like Pro Wave it has the head channel only;
+        # patches/davinci-resolve.yaml adds the web build, which reads media with the browser instead of FFmpeg.
+        opens: [pcsp]
+        imports: [mp4, m4v, mov, webm, mkv, png, jpg, jpeg, gif, webp, bmp, wav, mp3, m4a, aac, flac, ogg, opus]
+        repo: fabox-os/Picasso-Suite
+        license: GPL-3.0-or-later
+        # What the web build compiles (Cargo.lock: dependency changes): docs and packaging commits don't rebuild it.
+        paths: [crates, Cargo.toml, Cargo.lock]
+        patches: patches/davinci-resolve.yaml
+        live_kit: true
+        icon: icons/picasso-suite.png
+        accent: "#E8452C"
+        base: "#3A1208"
 
   - name: 3D
     tools:
@@ -349,6 +401,25 @@ groups:
         accent: "#A673FF"
         base: "#1F0B40"
 
+      - slug: audition
+        name: Retake
+        alternative: Audition
+        blurb: Multitrack and waveform audio editing for podcasts and voiceover.
+        # Altered Audio Editor, renamed: its name and logo are its authors' trademarks (patches/audition.yaml). Its own
+        # sessions and .sesx sessions; audio files and zips of them import. Upstream's releases are desktop packages
+        # only, so like Pro Wave it has the head channel only; patches/audition.yaml adds the web build.
+        opens: [altaudio, sesx]
+        imports: [wav, wave, aif, aiff, aifc, flac, mp3, m4a, aac, alac, ogg, oga, opus, zip]
+        repo: geekcastradio/altered-audio-editor
+        license: GPL-3.0-or-later
+        # What the web build compiles (package-lock.json: the interface's dependencies): docs, CI and release commits
+        # don't rebuild it. One GitHub API request per path per check.
+        paths: [src, src-tauri, package-lock.json]
+        patches: patches/audition.yaml
+        icon: icons/retake.svg
+        accent: "#35D0AE"
+        base: "#0B2A24"
+
       - slug: fl-studio
         name: Lemon Studio
         alternative: FL Studio (experimental)
@@ -439,76 +510,3 @@ groups:
         icon: icons/transit.svg
         accent: "#4CB1F0"
         base: "#0B2A3D"
-
-  - name: Other
-    tools:
-      - slug: figma
-        name: FigCraft
-        alternative: Figma
-        blurb: Interface design, components and prototypes.
-        # The web build has no file dialogs; dropped files only import after creating a design.
-        opens: []
-        imports: []
-        repo: storytold/figcraft
-        license: MIT OR Apache-2.0
-        icon: icons/figcraft.png
-        theme: themes/figma.js
-        patches: patches/figma.yaml
-        live_kit: true
-        accent: "#02DA96"
-        base: "#062E22"
-
-      - slug: mspaint
-        name: PaintCraft
-        alternative: Microsoft Paint
-        blurb: Pencil, brushes, fills, shapes, text, selections and layers, in the classic Paint look.
-        # Its own projects (.pcnd, with layers) and pictures. Upstream's releases are desktop packages only (no web
-        # zip), so like Pro Wave it has the head channel only; patches/mspaint.yaml builds its browser editor
-        # (apps/paintcraft-web, Classic presentation) the way Playground serves apps.
-        opens: [pcnd, png, bmp, jpg, jpeg]
-        imports: []
-        repo: replicraft/PaintCraft
-        license: MIT
-        # What the web build compiles (Cargo.lock: dependency changes; assets: its fonts and icons): docs, CI, the
-        # desktop app and packaging commits don't rebuild it. One GitHub API request per path per check.
-        paths: [crates, apps/paintcraft-web, assets, Cargo.toml, Cargo.lock, rust-toolchain.toml]
-        patches: patches/mspaint.yaml
-        live_kit: true
-        icon: icons/paintcraft.png
-        accent: "#1E90F5"
-        base: "#0B2245"
-
-      - slug: paint-net
-        name: Paint.RS
-        alternative: Paint.NET
-        blurb: Layers, adjustments, effects and plugins.
-        opens: []
-        imports: []
-        repo: daijro/paint.rs
-        license: GPL-3.0-or-later
-        # Its release's web zip is built with wasm-opt -O3 and SIMD already, and carries the licence notices a
-        # plain trunk build leaves out, so Playground serves it as it is. Its live editing is in its own source
-        # (crates/paintrs/src/live.rs), as Honeydew's is.
-        build: false
-        icon: icons/paint-rs.png
-        accent: "#F74C00"
-        base: "#3A1200"
-
-      - slug: davinci-resolve
-        name: Picasso Suite
-        alternative: DaVinci Resolve
-        blurb: Cut and edit video on a multi-track timeline, with linked picture and sound.
-        # Its own projects (.pcsp) and Resolve's (.drp, whose media stay where Resolve kept them). Upstream's releases
-        # are desktop packages only (no web zip), so like Pro Wave it has the head channel only;
-        # patches/davinci-resolve.yaml adds the web build, which reads media with the browser instead of FFmpeg.
-        opens: [pcsp]
-        imports: [mp4, m4v, mov, webm, mkv, png, jpg, jpeg, gif, webp, bmp, wav, mp3, m4a, aac, flac, ogg, opus]
-        repo: fabox-os/Picasso-Suite
-        license: GPL-3.0-or-later
-        # What the web build compiles (Cargo.lock: dependency changes): docs and packaging commits don't rebuild it.
-        paths: [crates, Cargo.toml, Cargo.lock]
-        patches: patches/davinci-resolve.yaml
-        live_kit: true
-        icon: icons/picasso-suite.png
-        accent: "#E8452C"
-        base: "#3A1208"
