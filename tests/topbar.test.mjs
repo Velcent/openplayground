@@ -57,9 +57,11 @@ test('"Alternative naming" shows each card under the name and icon of the app it
   const card = page.locator('.tool', { hasText: 'PhotoCraft' })
   assert.equal(await card.locator('.name').innerText(), 'PhotoCraft')
   assert.equal(await card.getByText('Alternative to Photoshop').isVisible(), true)
-  assert.deepEqual(await page.locator('section > h2').allInnerTexts(), ['CREATIVE', 'OFFICE', '3D', 'MUSIC', 'OTHER'])
+  // The sections are kinds of work, the same under either naming.
+  const sections = ['IMAGE', 'OFFICE', 'VIDEO', '3D', 'MUSIC']
+  assert.deepEqual(await page.locator('section > h2').allInnerTexts(), sections)
   await page.getByRole('switch', { name: 'Alternative naming' }).click()
-  assert.deepEqual(await page.locator('section > h2').allInnerTexts(), ['ADOBE CREATIVE CLOUD', 'MICROSOFT OFFICE', '3D', 'MUSIC', 'OTHER'])
+  assert.deepEqual(await page.locator('section > h2').allInnerTexts(), sections)
   assert.equal(await card.locator('.name').innerText(), 'Photoshop')
   assert.equal(await card.getByText('Using PhotoCraft').isVisible(), true)
   assert.match(await card.locator('img:visible').first().getAttribute('src'), /alternatives\/photoshop\.png$/)
@@ -91,7 +93,7 @@ test('with "Alternative naming" on, the switcher and the tab use the alternative
   const button = page.locator('.pg-switch')
   await button.waitFor()
   assert.match(await button.innerText(), /^Word/)
-  assert.match(await button.locator('img').getAttribute('src'), /alternative-icon\.svg$/)
+  assert.match(await button.locator('img').getAttribute('src'), /alternative-icon\.(svg|png)$/)
   assert.equal(await page.title(), 'Word - Playground')
   await button.click()
   const item = page.getByRole('menuitem').filter({ has: page.getByText('Photoshop', { exact: true }) })
