@@ -25,10 +25,16 @@
   find: '(?![\s\S])'
   after: "\n// Live editing in a Playground session (web only).\npub mod live_playground;\n"
 # Session::mark_saved: a save of the shared PDF keeps the shared graph (its /ModDate is not everyone's change).
+#   (Session lives in lib.rs or in session.rs, by version; the glob finds either.)
 - live: true
-  file: crates/engine/src/lib.rs
+  file: crates/engine/src/*.rs
   find: 'pub\s+fn\s+mark_saved\s*\([^{]*\{'
-  after: "\n        if live_playground::keeps_graph(id) { return self.live_mark_saved(id); }"
+  after: "\n        if crate::live_playground::keeps_graph(id) { return self.live_mark_saved(id); }"
+# Session::show_released, which live_playground (a child of the crate root) calls after a failed refresh.
+- live: true
+  file: crates/engine/src/*.rs
+  find: '(?<!pub\(crate\) )\bfn\s+show_released\b'
+  replace: 'pub(crate) fn show_released'
 # The app's live module (web, and the native tests), outside src/, and the playground-live crate (patches/live/kit:
 #   the session and the presence look, `egui`) it uses.
 - live: true
