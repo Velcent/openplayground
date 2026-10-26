@@ -800,7 +800,7 @@ index 0000000..e3f4174
 +        return Err("a workbook without sheets".into());
 +    }
 +    let active = local.active().map(|sh| &sh.name);
-+    wb.active_sheet = wb.sheets.iter().position(|sh| Some(&sh.name) == active).unwrap_or(local.active_sheet.min(wb.sheets.len() - 1));
++    wb.active_sheet = wb.sheets.iter().position(|sh| Some(&sh.name) == active).unwrap_or(usize::from(local.active_sheet.clone()).min(wb.sheets.len() - 1)).into();
 +    wb.names.extend(local.names.iter().filter(|n| n.name == WATCH).cloned());
 +    (wb.preserved, wb.source_dir) = (local.preserved.clone(), local.source_dir.clone());
 +    Ok(wb)
@@ -951,7 +951,7 @@ index 0000000..e3f4174
 +            state["object"] = id.into();
 +        }
 +        let z = grid.geo.as_ref().map_or(1.0, |g| g.z);
-+        let marks = [("drag", drag(&grid.drag, sh, sel)), ("stroke", stroke(&grid.ink, z)), ("typing", typing(self, d.wb.active_sheet, sh))];
++        let marks = [("drag", drag(&grid.drag, sh, sel)), ("stroke", stroke(&grid.ink, z)), ("typing", typing(self, usize::from(d.wb.active_sheet.clone()), sh))];
 +        for (key, mark) in marks {
 +            if let Some(mark) = mark {
 +                state[key] = mark;
@@ -1047,7 +1047,7 @@ index 0000000..e3f4174
 +        b.live_adopt(doc.clone()).unwrap();
 +        assert_eq!(canonical(&b.live_document()), canonical(&doc), "the workbook arrives whole");
 +        let d = b.session.active().unwrap();
-+        assert_eq!(d.wb.sheets[d.wb.active_sheet].name, "Notes", "this person's active sheet");
++        assert_eq!(d.wb.sheets[usize::from(d.wb.active_sheet.clone())].name, "Notes", "this person's active sheet");
 +        assert_eq!(d.wb.sheets[1].zoom, 70, "and zoom stay");
 +        assert_eq!(d.wb.sheets[0].value(CellRef::parse("B1").unwrap()), CellValue::Number(6.0), "results are recalculated");
 +        assert_eq!(d.undo.len(), undo, "no native undo step");
