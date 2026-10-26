@@ -12,6 +12,12 @@
   find: '^members\s*=\s*\[[^\]]*\]'
   after: "\ndefault-members = [\"apps/studio\"]"
 
+# picasso-ui's prefs.rs calls tracing::warn! on every target, but only declares tracing off the web. Declare it for
+# wasm too (the workspace already pins it). Drop the rule once upstream declares it for wasm32.
+- file: crates/picasso-ui/Cargo.toml
+  find: '\[target\.''cfg\(target_arch = "wasm32"\)''\.dependencies\]'
+  after: "\ntracing.workspace = true"
+
 # picasso-ui only links picasso-decode off the web, but read_path names it on both: on wasm the path is never read
 # (CAN_READ_PATHS is false), so the check is false there. Drop the rule once upstream's wasm build compiles.
 - file: crates/picasso-ui/src/platform.rs
