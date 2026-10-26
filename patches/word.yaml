@@ -132,13 +132,19 @@
 # Verify: save a document to browser storage, then within the same session (the Recent list isn't kept
 #   across reloads on the web) File → Open: it's under Recent; clicking it opens it.
 # If upstream changes: anchor on the Recent list's click handler. The anchor is the `file.open {path}` call
-#   itself, in either spelling: the click handler's `let _ = app.run(…);` (releases) or open_recent's
-#   `app.run(…)?;` (head since 2026-10-19); the original call stays as the `else`.
+#   open_recent function (named by its signature, since its body calls file.open directly in releases and
+#   through open_file in newer commits); a `browser:` path returns early, the rest runs as upstream.
 - file: crates/ui-egui/src/backstage.rs
-  find: '(?:let\s+_\s*=\s*)?app\.run\(\s*"file\.open"\s*,\s*json!\(\{\s*"path"\s*:\s*(\w+)\s*\}\)\s*\)\??;'
+  find: 'fn open_recent\((\w+): &mut WordApp, (\w+): &str\) -> Result<\(\), String> \{'
   replace: |-
-    // playground (patches/word.yaml): a browser-storage document reopens through the browser.
-        if let (true, Some(open)) = ($1.starts_with("browser:"), &app.services.open_path_async) { open(&$1); } else { $& }
+    $&
+        // playground (patches/word.yaml): a browser-storage document reopens through the browser.
+        if let (true, Some(open)) = ($2.starts_with("browser:"), &$1.services.open_path_async) {
+            open($2);
+            $1.ui.backstage = false;
+            $1.canvas.want_focus = true;
+            return Ok(());
+        }
 
 # Rule 6/9: switch it on at startup.
 # What it's for: AutoSave back on (the desktop default; the browser build turned it off because it had
