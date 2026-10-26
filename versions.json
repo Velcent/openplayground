@@ -1,6 +1,6 @@
 {
   "photoshop": "v0.16.0+47ed6f70",
-  "photoshop@head": "head-59cb4c4+47ed6f70",
+  "photoshop@head": "head-d641b96+47ed6f70",
   "illustrator": "v0.17.0+a0154ec7",
   "indesign": "v0.13.0+1f3bc8cd",
   "indesign@head": "head-ed8aabd+1f3bc8cd",
@@ -21,7 +21,7 @@
   "onenote@head": "head-23d1909+d48d8794",
   "outlook": "v0.1.1+8822edc6",
   "outlook@head": "head-e3ee1af+8822edc6",
-  "acrobat": "v0.14.0+c76aecf5",
+  "acrobat": "v0.14.0+565513c0",
   "acrobat@head": "head-d28d047+565513c0",
   "premiere": "v0.13.0+67b9b627",
   "premiere@head": "head-8fda2f2+67b9b627",
@@ -43,6 +43,6 @@
   "fl-studio-mobile@head": "head-8c7bddf+8d45d178",
   "ableton-live@head": "head-3067d90+6ff1fb75",
   "logic-pro@head": "head-34afc76+aca3f040",
-  "transit@head": "head-df12ab2+71bdb4dc",
+  "transit@head": "head-f42c6c6+71bdb4dc",
   "artcraft-store": "dff1898"
 }
