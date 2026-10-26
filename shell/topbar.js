@@ -1,4 +1,5 @@
-// The bar above every app: back to the dashboard, switch apps, this build's version, Files, its source code and fullscreen.
+// The bar above every app: back to the dashboard, switch apps, this build's version, sharing, its source code, its
+// license, Files and fullscreen.
 import { appHref, currentApp, loadApps } from './apps.js'
 import { toggleStack } from './stack.js'
 import { mountShare } from './share.js'
@@ -111,6 +112,79 @@ export async function mountTopbar() {
   )
   bar.append(menu)
   if (build?.source) mountSource(bar, app, build.source)
+  mountLicense(bar, app, build)
+}
+
+// License: the app's copyright and licence, and that Playground changed it (tools.yaml `copyright` and `license`, the
+// build's patches and date): the notices its licence asks a copy, and an interactive program, to show (GPL-3.0 §4, §5;
+// MIT; Apache-2.0 §4). The full texts load from the app's repository at this build's version when asked for.
+const LICENCES = {
+  MIT: 'the MIT License',
+  'Apache-2.0': 'the Apache License, Version 2.0',
+  'GPL-3.0-only': 'the GNU General Public License, version 3',
+  'GPL-3.0-or-later': 'the GNU General Public License as published by the Free Software Foundation, either version 3 of the License or (at your option) any later version',
+}
+const WARRANTY = {
+  gpl: 'It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.',
+  other: 'It is provided “as is”, without warranty of any kind, express or implied, including the warranties of merchantability, fitness for a particular purpose and noninfringement.',
+}
+function mountLicense(bar, app, build) {
+  if (!app.license) return
+  const name = (app.own ?? app).name
+  const src = build?.source ?? null
+  const ref = src?.ref ?? 'HEAD'
+  const ids = app.license.split(' OR ')
+  const gpl = ids.some((id) => id.startsWith('GPL'))
+  const terms = ids.map((id) => LICENCES[id] ?? id).join(' or ') + (ids.length > 1 ? ', at your option' : '')
+  const files = src?.licenses ?? ids.map((id) => ({ id, file: ids.length > 1 ? `LICENSE-${id.split('-')[0].toUpperCase()}` : 'LICENSE' }))
+  const raw = (file) => `https://raw.githubusercontent.com/${app.repo}/${ref}/${file}`
+  const page = (file) => `https://github.com/${app.repo}/blob/${ref}/${file}`
+  const link = (href, text) => h('a', { href, target: '_blank', rel: 'noopener' }, text)
+  const modified = src?.patches?.length > 0
+  const built = build?.built ? new Date(build.built).toLocaleDateString('en', { year: 'numeric', month: 'long', day: 'numeric' }) : null
+  const open = () =>
+    modal(
+      (done) => {
+        const texts = h('div', { class: 'pg-license-texts', hidden: true })
+        const full = h('button', { class: 'pg-btn', type: 'button' }, 'Show the full license')
+        full.addEventListener('click', async () => {
+          full.disabled = true
+          texts.hidden = false
+          // The licence files, and a NOTICE where the app has one (Apache-2.0 asks that it travel with the work).
+          for (const file of [...files.map((f) => f.file), 'NOTICE']) {
+            const text = await fetch(raw(file)).then((r) => (r.ok ? r.text() : null)).catch(() => null)
+            if (text) texts.append(h('h3', {}, file), h('pre', {}, text))
+            else if (file !== 'NOTICE') texts.append(h('p', {}, `Couldn’t load ${file} here: `, link(page(file), 'read it on GitHub'), '.'))
+          }
+          full.remove()
+        })
+        const close = h('button', { class: 'pg-btn pg-primary', type: 'button', onclick: () => done(null) }, 'Close')
+        const el = h(
+          'div',
+          { class: 'pg-choice pg-license' },
+          h('h2', { class: 'pg-title' }, `${name} license`),
+          h('p', { class: 'pg-license-copyright' }, (app.copyright.length ? app.copyright : [`Copyright (c) the ${name} contributors`]).map((line) => h('span', {}, line))),
+          h('p', {}, `${name} is free software: you can redistribute it and/or modify it under the terms of ${terms}.`),
+          h('p', {}, gpl ? WARRANTY.gpl : WARRANTY.other),
+          modified
+            ? h('p', {}, `Playground modified it to run in a browser${built ? `; this build was made on ${built}` : ''}. Its changes are the patch files below, under the same license.`)
+            : null,
+          h(
+            'ul',
+            { class: 'pg-license-links' },
+            h('li', {}, 'Source: ', link(src?.url ?? `https://github.com/${app.repo}`, `${app.repo}${src ? ` at ${src.ref}` : ''}`)),
+            files.map((f) => h('li', {}, `License (${f.id}): `, link(page(f.file), f.file))),
+            modified ? src.patches.map((p) => h('li', {}, 'Patches: ', link(p.url, p.path))) : null,
+          ),
+          texts,
+          h('div', { class: 'pg-actions' }, full, close),
+        )
+        return { el, focus: () => close.focus() }
+      },
+      { label: `${name} license` },
+    )
+  const button = h('button', { class: 'pg-bar-btn pg-license-btn', type: 'button', 'aria-haspopup': 'dialog', title: 'Copyright and license', onclick: open }, icon('license'), h('span', { class: 'pg-label' }, 'License'))
+  bar.querySelector('.pg-files').before(button)
 }
 
 // Source: the app's code at the version this build is of, its licence there, and the patch files Playground built it
@@ -133,8 +207,9 @@ function mountSource(bar, app, src) {
         ]
       : h('p', { class: 'pg-source-note' }, `This is ${own}'s own release, unpatched.`),
   )
-  const button = h('button', { class: 'pg-bar-btn', type: 'button', popovertarget: 'pg-source', 'aria-haspopup': 'menu', 'aria-label': 'Source code', title: 'Source code' }, icon('code'), h('span', { class: 'pg-label' }, 'Source'))
-  bar.querySelector('.pg-files').after(button)
+  const button = h('button', { class: 'pg-bar-btn pg-source-btn', type: 'button', popovertarget: 'pg-source', 'aria-haspopup': 'menu', 'aria-label': 'Source code', title: 'Source code' }, icon('code'), h('span', { class: 'pg-label' }, 'Source'))
+  // Source, then License (mountLicense), then Files.
+  bar.querySelector('.pg-files').before(button)
   bar.append(menu)
 }
 

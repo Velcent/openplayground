@@ -115,6 +115,14 @@ body > canvas:first-of-type, body > canvas#lemon-canvas {
 /* The Source menu (topbar.js) hangs from the bar's right end. */
 .pg-source { inset: calc(var(--pg-bar) + 4px) 8px auto auto; }
 .pg-source-note { margin: 8px 16px 4px; color: var(--pg-muted); font-size: 12px; }
+.pg-modal:has(.pg-choice.pg-license) { width: min(620px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); }
+.pg-license { overflow: auto; }
+.pg-license p { margin: 0; line-height: 1.5; }
+.pg-license-copyright span { display: block; font-weight: 500; }
+.pg-license-links { margin: 0; padding-left: 18px; color: var(--pg-muted); line-height: 1.7; }
+.pg-license a { color: var(--pg-accent); }
+.pg-license-texts h3 { margin: 12px 0 6px; font: 500 13px var(--pg-font); }
+.pg-license-texts pre { margin: 0; max-height: 40vh; overflow: auto; padding: 10px 12px; border-radius: 6px; background: var(--pg-raised); font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
 @media (max-width: 560px) {
   .pg-version, .pg-label { display: none; }
 }

@@ -4,6 +4,7 @@
 #
 #   repo:   GitHub repo to download the web build from
 #   license: the app's licence (SPDX id, from its LICENSE file), which its patches here are under too (patches/README.md).
+#   copyright: its copyright line(s), as its LICENSE, NOTICE or README states them, for the bar's License notice
 #           The bar's Source menu links its LICENSE file, or LICENSE-MIT and LICENSE-APACHE for "MIT OR Apache-2.0".
 #   tag:    release tag to pin (optional; default: the newest non-prerelease that has a matching asset, else
 #           the newest pre-release that has one, for repos that have only pre-releases so far)
@@ -42,6 +43,7 @@ groups:
         imports: [dng, cr2, cr3, nef, nrw, arw, pef, orf, rw2, raf, svg, svgz, pbm, pgm, ppm, pam, pfm, abr, grd, aco, ase, afdesign, afpub]
         repo: storytold/photocraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 ArtCraft Team and the PhotoCraft contributors"
         icon: icons/photocraft.png
         theme: themes/photoshop.js
         patches: patches/photoshop.yaml
@@ -57,6 +59,7 @@ groups:
         imports: [pdf, png, jpg, jpeg, gif, webp, tif, tiff, bmp, dxf, txt, gpl, ase]
         repo: storytold/vectorcraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 ArtCraft Team and the VectorCraft contributors"
         icon: icons/vectorcraft.png
         theme: themes/illustrator.js
         patches: patches/illustrator.yaml
@@ -72,6 +75,7 @@ groups:
         imports: [png, jpg, jpeg, gif, webp, tif, tiff, bmp, psd, svg, pdf, ai, txt, docx, rtf, md, xlsx, ase]
         repo: storytold/designcraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 ArtCraft Team and the DesignCraft contributors"
         icon: icons/designcraft.png
         theme: themes/indesign.js
         patches: patches/indesign.yaml
@@ -87,6 +91,7 @@ groups:
         imports: [jpg, jpeg, png, tif, tiff, webp, psd, jxl, gif, bmp, heic, avif]
         repo: storytold/lightcraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 ArtCraft Team and the LightCraft contributors"
         icon: icons/lightcraft.png
         patches: patches/lightroom.yaml
         live_kit: true
@@ -101,6 +106,7 @@ groups:
         imports: [jpg, jpeg, png, tif, tiff, webp, psd, jxl, gif, bmp, heic, avif]
         repo: emmertex/lightcraft-classic
         license: MIT
+        copyright: ["Copyright (c) the LightCraft contributors", "Copyright (c) the PhotoCraft contributors", "Copyright (c) the project contributors"]
         icon: icons/lightcraft-classic.svg
         patches: patches/lightroom-classic.yaml
         live_kit: true
@@ -116,6 +122,7 @@ groups:
         imports: []
         repo: storytold/figcraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 ArtCraft Team and the FigCraft contributors"
         icon: icons/figcraft.png
         theme: themes/figma.js
         patches: patches/figma.yaml
@@ -134,6 +141,7 @@ groups:
         imports: []
         repo: replicraft/PaintCraft
         license: MIT
+        copyright: "Copyright (c) 2026 replicraft"
         # What the web build compiles (Cargo.lock: dependency changes; assets: its fonts and icons): docs, CI, the
         # desktop app and packaging commits don't rebuild it. One GitHub API request per path per check.
         paths: [crates, apps/paintcraft-web, assets, Cargo.toml, Cargo.lock, rust-toolchain.toml]
@@ -151,6 +159,7 @@ groups:
         imports: []
         repo: daijro/paint.rs
         license: GPL-3.0-or-later
+        copyright: "Copyright (C) 2026-present paint.rs contributors"
         # Its release's web zip is built with wasm-opt -O3 and SIMD already, and carries the licence notices a
         # plain trunk build leaves out, so Playground serves it as it is. Its live editing is in its own source
         # (crates/paintrs/src/live.rs), as Honeydew's is.
@@ -169,6 +178,7 @@ groups:
         imports: [png, jpg, jpeg, gif, webp, bmp]
         repo: storytold/wordcraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 ArtCraft Team and the WordCraft contributors"
         icon: icons/wordcraft.svg
         theme: themes/word.js
         patches: patches/word.yaml
@@ -184,6 +194,7 @@ groups:
         imports: [txt, json, tab]
         repo: storytold/gridcraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 ArtCraft Team and the GridCraft contributors"
         icon: icons/gridcraft.svg
         theme: themes/excel.js
         patches: patches/excel.yaml
@@ -199,6 +210,7 @@ groups:
         imports: [png, jpg, jpeg, gif, webp, bmp, tif, tiff, wav, mp3, m4a, aac, flac, ogg, opus, aif, aiff, mp4, m4v, mov, webm, txt, md]
         repo: storytold/deckcraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 ArtCraft Team and the DeckCraft contributors"
         icon: icons/deckcraft.png
         theme: themes/powerpoint.js
         patches: patches/powerpoint.yaml
@@ -217,6 +229,7 @@ groups:
         imports: []
         repo: AlienTechSoftware/notecraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 AlienTech Software and the NoteCraft contributors"
         # What the web build compiles (Cargo.lock: dependency changes; the engine embeds docs/demo/DemoNotebook):
         # README, other docs and CI commits don't rebuild it.
         paths: [crates, assets, docs/demo/DemoNotebook, Cargo.toml, Cargo.lock, rust-toolchain.toml]
@@ -235,6 +248,7 @@ groups:
         imports: []
         repo: MonkeySaint/mailcraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 the MailCraft contributors"
         # Its web zip is mailcraft-<version>-web.zip; its branch is master.
         asset: '-web\.zip$'
         branch: master
@@ -251,6 +265,7 @@ groups:
         imports: [png, jpg, jpeg, tif, tiff, gif, bmp, jp2, j2k, jpx, txt]
         repo: storytold/pdfcraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 ArtCraft Team and the PdfCraft contributors"
         patches: patches/acrobat.yaml
         live_kit: true
         icon: icons/pdfcraft.png
@@ -268,6 +283,7 @@ groups:
         imports: [wav, aif, aiff, mp3, m4a, aac, flac, ogg, opus, png, jpg, jpeg, gif, webp, tif, tiff, bmp, srt, vtt, scc, edl, fcpxml, otio, aaf, omf]
         repo: storytold/filmcraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 ArtCraft Team and the FilmCraft contributors"
         icon: icons/filmcraft.png
         theme: themes/premiere.js
         patches: patches/premiere.yaml
@@ -283,6 +299,7 @@ groups:
         imports: [mp4, mov, m4v, mkv, webm, png, jpg, jpeg, gif, webp, tif, tiff, bmp, exr, wav, aif, aiff, mp3, flac, ogg, opus, svg, pdf, ai, eps, psd, psb, gltf, glb, obj, csv, tsv]
         repo: storytold/effectcraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 ArtCraft Team and the EffectCraft contributors"
         icon: icons/effectcraft.png
         theme: themes/after-effects.js
         patches: patches/after-effects.yaml
@@ -301,6 +318,8 @@ groups:
         imports: [mp4, m4v, mov, webm, mkv, png, jpg, jpeg, gif, webp, bmp, wav, mp3, m4a, aac, flac, ogg, opus]
         repo: fabox-os/Picasso-Suite
         license: GPL-3.0-or-later
+        # Upstream states no copyright line (its LICENSE is the GPL text, its README none): its owner and contributors.
+        copyright: "Copyright (c) fabox-os and the Picasso Suite contributors"
         # What the web build compiles (Cargo.lock: dependency changes): docs and packaging commits don't rebuild it.
         paths: [crates, Cargo.toml, Cargo.lock]
         patches: patches/davinci-resolve.yaml
@@ -320,6 +339,7 @@ groups:
         imports: [mov, mp4, m4v, wav, wave, bwf, aif, aiff, aifc, mp3, m4a, aac, flac]
         repo: FedyaLight/align
         license: GPL-3.0-only
+        copyright: "Copyright (c) 2026 Align contributors"
         # What the web build compiles: the engine's crates (Cargo.lock: dependency changes). The desktop app, CLI, MCP
         # server, docs and packaging don't rebuild it. One GitHub API request per path per check.
         paths: [crates/align-core, crates/align-decode, Cargo.lock]
@@ -338,6 +358,7 @@ groups:
         imports: []
         repo: storytold/cadcraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 ArtCraft Team and the CADCraft contributors"
         patches: patches/autocad.yaml
         live_kit: true
         icon: icons/cadcraft.png
@@ -353,6 +374,7 @@ groups:
         imports: []
         repo: bherbruck/solvecraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 SolidCraft contributors"
         # Its web zip is solidcraft-web-<version>.zip (the default pattern; the old solvecraft-<tag>-web.zip naming
         # stopped at v0.1.1); nightlies are pre-releases.
         # The web app and what it compiles (dependency changes show up in Cargo.lock; the root Cargo.toml holds
@@ -373,6 +395,7 @@ groups:
         imports: []
         repo: Aalzard/subcraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) Aalzard and the SubCraft contributors"
         # Pinned: upstream removed its browser version right after this commit (4c3aacf, "Remove the browser version …
         # (ADR-0038)"), so newer commits have no web build. patches/substance-painter.yaml fits this commit.
         commit: 71e49fde7e4e1dba188a6589c9e5a139d1e3d9d5
@@ -392,6 +415,7 @@ groups:
         imports: []
         repo: PiJellyPin/MaterialCraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 PiJellyPin and MaterialCraft contributors"
         # What the web build compiles: README and docs commits don't rebuild it.
         paths: [src, assets, build.rs, Cargo.toml]
         patches: patches/substance-designer.yaml
@@ -410,6 +434,7 @@ groups:
         imports: []
         repo: storytold/soundcraft
         license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 ArtCraft Team and the SoundCraft contributors"
         patches: patches/pro-tools.yaml
         live_kit: true
         branch: main
@@ -431,6 +456,7 @@ groups:
         imports: [wav, wave, aif, aiff, aifc, flac, mp3, m4a, aac, alac, ogg, oga, opus, zip]
         repo: geekcastradio/altered-audio-editor
         license: GPL-3.0-or-later
+        copyright: "Copyright (c) The GeekCast Radio Network, LLC"
         # What the web build compiles (package-lock.json: the interface's dependencies): docs, CI and release commits
         # don't rebuild it. One GitHub API request per path per check.
         paths: [src, src-tauri, package-lock.json]
@@ -451,6 +477,7 @@ groups:
         imports: []
         repo: daijro/Lemon-Studio-web
         license: GPL-3.0-or-later
+        copyright: "Copyright (C) 2026 ItsAlphaNeon and the Lemon Studio contributors"
         asset: '^lemon-studio-web\.zip$'
         build: false
         isolated: true
@@ -466,6 +493,7 @@ groups:
         imports: [flp, zip]
         repo: daijro/honeydew
         license: GPL-3.0-or-later
+        copyright: "Copyright (c) 2026 The Honeydew contributors"
         icon: icons/honeydew.svg
         patches: patches/fl-studio-mobile.yaml
         accent: "#CDE397"
@@ -481,6 +509,7 @@ groups:
         imports: [wav, aif, aiff, flac, mp3, ogg, mid, midi]
         repo: suhina-daw/suhina-daw
         license: GPL-3.0-or-later
+        copyright: "Copyright (C) 2026 the Suhina contributors"
         # What the web build compiles (Cargo.lock: dependency changes): docs, CI and the desktop apps' commits don't
         # rebuild it. One GitHub API request per path per check.
         paths: [crates, devices, assets, Cargo.toml, Cargo.lock]
@@ -501,6 +530,7 @@ groups:
         imports: [wav, wave, aif, aiff, aifc, flac]
         repo: fabox-os/Pro-Wave
         license: GPL-3.0-or-later
+        copyright: "Copyright (C) 2026 the ProWave contributors"
         # What the web build compiles (Cargo.lock: dependency changes): docs, CI and packaging commits don't rebuild
         # it. One GitHub API request per path per check.
         paths: [crates, Cargo.toml, Cargo.lock]
@@ -521,6 +551,8 @@ groups:
         imports: [wav, wave, aif, aiff, flac, mp3, ogg, m4a, mid, midi]
         repo: transit-audio/transit
         license: MIT OR Apache-2.0
+        # Its LICENSE-MIT and NOTICE carry SoundCraft's line: transit is based on SoundCraft by storytold.
+        copyright: "Copyright (c) 2026 ArtCraft Team and the SoundCraft contributors"
         # What the web build compiles (Cargo.lock: dependency changes): docs, site, CI and packaging commits don't
         # rebuild it. One GitHub API request per path per check.
         paths: [apps/soundcraft-web, crates, assets, Cargo.toml, Cargo.lock]

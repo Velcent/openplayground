@@ -124,6 +124,38 @@ test('Source links the app’s code at this build’s version and the patches at
   }
 })
 
+test('License shows the app’s copyright, its licence terms and warranty notice, and that Playground changed it', async () => {
+  for (const [slug, terms, warranty] of [
+    ['word', /the MIT License or the Apache License, Version 2\.0, at your option/, /without warranty of any kind/],
+    ['fl-studio-mobile', /GNU General Public License .*version 3 of the License or \(at your option\) any later version/, /WITHOUT ANY WARRANTY/],
+  ]) {
+    const app = apps.find((a) => a.slug === slug)
+    const build = app.release ?? app.head
+    const page = await openPage(browser, `${site.url}${build.path}`)
+    await page.getByRole('button', { name: 'License' }).click()
+    const text = await page.getByRole('dialog', { name: `${app.name} license` }).innerText()
+    assert.ok(app.copyright.length, `${slug} has a copyright line in tools.yaml`)
+    for (const line of app.copyright) assert.ok(text.includes(line), `${slug}: ${line}`)
+    assert.match(text, terms)
+    assert.match(text, warranty)
+    if (build.source?.patches.length) assert.match(text, /Playground modified it to run in a browser/)
+    await page.keyboard.press('Escape')
+    await page.context().close()
+  }
+})
+
+test('the bar reads Source, License, then Files', async () => {
+  const page = await openPage(browser, `${site.url}${wordPath()}`)
+  await page.getByRole('button', { name: 'License' }).waitFor()
+  const labels = await page.locator('.pg-bar .pg-bar-btn .pg-label').allInnerTexts()
+  assert.deepEqual(labels.filter((l) => ['Source', 'License', 'Files'].includes(l)), ['Source', 'License', 'Files'])
+})
+
+test('every app in tools.yaml names its copyright', async () => {
+  const { tools } = await import('../scripts/releases.mjs')
+  for (const t of tools) assert.ok([t.copyright].flat().filter(Boolean).length, `${t.slug} has no copyright in tools.yaml`)
+})
+
 test('Files fans out the stack; its Open Files item opens the explorer popup, and Esc closes it', async () => {
   const page = await openPage(browser, `${site.url}${wordPath()}`)
   await page.getByRole('button', { name: 'Files' }).click()

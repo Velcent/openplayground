@@ -105,9 +105,11 @@ const appsJson = () => ({
         const release = installed(t, 'release')
         const head = installed(t, 'head')
         if (!release && !head) return []
-        const channel = (s) => s && { path: s.path, label: s.label, date: s.date ?? null, source: source(t, s) }
+        // built: when our build was made (its asset's date), for the License notice's "modified" date.
+        const channel = (s) => s && { path: s.path, label: s.label, date: s.date ?? null, built: s.built ? (s.updated_at ?? null) : null, source: source(t, s) }
         return [{
           slug: t.slug, name: t.name, alternative: t.alternative ?? null, blurb: t.blurb, accent: t.accent, opens: t.opens ?? [], imports: t.imports ?? [], notice: t.notice ?? null,
+          repo: t.repo, license: t.license ?? null, copyright: [t.copyright ?? []].flat(),
           icon: `${(release ?? head).path}site-icon${extname(t.icon)}`,
           alternativeIcon: alternativeIcon(t) ? `${(release ?? head).path}alternative-icon${extname(alternativeIcon(t))}` : null,
           release: channel(release) ?? null, head: channel(head) ?? null,

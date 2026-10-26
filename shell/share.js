@@ -33,7 +33,8 @@ export async function mountShare(bar, app, here, groups = []) {
   const count = h('span', {class:'pg-share-count'}, 'Share')
   const progress = h('progress', {class:'pg-share-progress',max:'1',value:'0',hidden:true,'aria-label':'File sync progress'})
   const control = h('button', {class:'pg-bar-btn pg-share',type:'button','aria-label':'Share files',onclick:()=>show()}, icon('people'), count, progress)
-  bar.querySelector('.pg-files').before(control)
+  // First in the bar's group: before Source, License and Files, whichever the bar has.
+  bar.querySelector('.pg-source-btn, .pg-license-btn, .pg-files').before(control)
   const update = () => {
     const active = session && !session.stopped
     const people = active ? session.peers.size+1 : 0
