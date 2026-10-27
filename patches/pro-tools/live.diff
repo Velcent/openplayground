@@ -107,7 +107,9 @@ index 0000000..3ef6251
 +//! bands, strokes, fades, control ghosts and where the tags go are SoundCraft's own, in its colors.
 +//! A child of the Edit window's module, for its drag preview and lane geometry.
 +
-+use super::{clip_name_height, clip_preview_fades, drag_plan, fade_curve_points, midi_clip_span, ops, plugin_range, rect, sample_at, x_of};
++// Where the Edit window's helpers live differs between versions: patches/pro-tools/live-compat*.diff.
++mod compat;
++use compat::{clip_name_height, clip_preview_fades, drag_plan, fade_curve_points, midi_clip_span, ops, plugin_range, rect, sample_at, x_of};
 +use crate::widgets::{db_text, fader_slot, pan_text};
 +use crate::{Gesture, MainWindow, SoundApp};
 +use egui::{Color32, Context, Id, LayerId, Order, Painter, Pos2, Rect, Shape, Stroke, Ui, Vec2, pos2, vec2};

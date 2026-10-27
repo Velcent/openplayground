@@ -1,0 +1,7 @@
+diff --git a/crates/ui-egui/src/edit_window/live/compat.rs b/crates/ui-egui/src/edit_window/live/compat.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/ui-egui/src/edit_window/live/compat.rs
+@@ -0,0 +1,2 @@
++//! The Edit window's helpers [`super`] uses, where this version of SoundCraft has them (all in `edit_window`).
++pub(super) use crate::edit_window::{clip_name_height, clip_preview_fades, drag_plan, fade_curve_points, midi_clip_span, ops, plugin_range, rect, sample_at, x_of};

@@ -1,0 +1,32 @@
+diff --git a/crates/ui-egui/src/edit_window/live/compat.rs b/crates/ui-egui/src/edit_window/live/compat.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/ui-egui/src/edit_window/live/compat.rs
+@@ -0,0 +1,27 @@
++//! The Edit window's helpers [`super`] uses, where this version of SoundCraft has them (in its submodules).
++use crate::Gesture;
++use soundcraft_model::{Clip, Fade};
++
++pub(super) use crate::edit_window::automation::plugin_range;
++pub(super) use crate::edit_window::clips::{clip_name_height, fade_curve_points};
++pub(super) use crate::edit_window::drag::drag_plan;
++pub(super) use crate::edit_window::input::midi_clip_span;
++pub(super) use crate::edit_window::layout::{rect, sample_at, x_of};
++pub(super) use crate::edit_window::ops;
++
++/// The clip's fades as the Edit window previews them under `gesture` (clips.rs keeps its own private).
++pub(super) fn clip_preview_fades(clip: &Clip, gesture: Option<&Gesture>) -> (Fade, Fade) {
++    let (mut fade_in, mut fade_out) = (clip.fade_in, clip.fade_out);
++    match gesture {
++        Some(Gesture::Fade { clip: id, fade_in: side, to, .. }) if *id == clip.id => {
++            if let Some(fade) = crate::edit_window::drag::fade_drag_preview(clip, *side, *to) {
++                if *side { fade_in = fade } else { fade_out = fade }
++            }
++        }
++        Some(Gesture::FadeCurve { clip: id, fade_in: side, curvature, .. }) if *id == clip.id => {
++            if *side { fade_in.curvature = *curvature } else { fade_out.curvature = *curvature }
++        }
++        _ => {}
++    }
++    (fade_in, fade_out)
++}

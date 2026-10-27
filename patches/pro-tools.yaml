@@ -39,19 +39,19 @@
   find: '(?![\s\S])'
   after: "\n// Live editing in a Playground session (web only).\n#[cfg(any(target_arch = \"wasm32\", test))]\npub mod live;\n"
 - live: true
-  file: crates/ui-egui/src/lib.rs
-  find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\b[^{]*\{'
+  file: crates/ui-egui/src/**/*.rs
+  find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\s*,\s*id:\s*&str\b[^{]*\{'
   after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if crate::edit_window::live::undo(id) { return Ok(Default::default()); }"
 - live: true
   file: crates/ui-egui/src/bounce.rs
   find: 'pub\s+fn\s+refuses_session_switch\s*\([^{]*\{'
   after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] if crate::edit_window::live::refuses_session_switch(app) { return true; }"
 - live: true
-  file: crates/ui-egui/src/edit_window.rs
-  find: '^fn\s+overlay\s*\([^{]*\{'
-  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] live::draw_presence(app, ui);"
+  file: crates/ui-egui/src/edit_window{.rs,/overlay.rs}
+  find: '^(?:pub(?:\([a-z]+\))?\s+)?fn\s+overlay\s*\([^{]*\{'
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] crate::edit_window::live::draw_presence(app, ui);"
 - live: true
-  file: crates/ui-egui/src/midi_editor.rs
+  file: crates/ui-egui/src/{,panels/}midi_editor.rs
   find: '^[ \t]*let\s+resp\s*=\s*ui\.interact\(\s*roll\b'
   before: "    #[cfg(any(target_arch = \"wasm32\", test))] crate::edit_window::live::midi(ui, cid, roll, &x_of, &y_of);\n"
 - live: true
