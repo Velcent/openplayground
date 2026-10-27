@@ -33,7 +33,7 @@
 # leaving unsaved work instead), updates (MixStudio has no update check; Playground serves new builds). Native builds see
 # none of this: every rule adds wasm-only lines, or moves a native-only dependency into a native-only table.
 
-# Rules 1-6/48: the dependencies. ONNX Runtime (stems), ureq (the model download), SQLite (Engine DJ) and rfd (native
+# Rules 1-6/49: the dependencies. ONNX Runtime (stems), ureq (the model download), SQLite (Engine DJ) and rfd (native
 # file dialogs) have no browser side: rule 1 opens a native-only table at the end and rules 2-5 move each one's line
 # into it. Rule 6 adds the wasm-only ones, under a target spelling nobody else uses (`all(...)`): web-time's clock,
 # wasm-bindgen for the page, and cpal's `wasm-bindgen` feature, its Web Audio host (the version follows upstream's). If
@@ -57,7 +57,7 @@
   find: '(?![\s\S])'
   after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nweb-time = \"1\"\nwasm-bindgen = \"0.2\"\nwasm-bindgen-futures = \"0.4\"\njs-sys = \"0.3\"\nweb-sys = { version = \"0.3\", features = [\"Window\", \"Document\", \"Element\", \"HtmlCanvasElement\"] }\ncpal = { version = \"*\", features = [\"wasm-bindgen\"] }\n"
 
-# Rules 7-22/48: the modules that use the clock, files, threads, HOME or the process id take `std` from src/playground.rs
+# Rules 7-22/49: the modules that use the clock, files, threads, HOME or the process id take `std` from src/playground.rs
 # on wasm (see the top), and main.rs declares it. Found with: every non-test module that names Instant, SystemTime,
 # fs::, File::, OpenOptions, thread::spawn / Builder, env:: or process::id, except stems.rs (its file use is all behind
 # stem separation, off here), dialogs.rs and main.rs (desktop dialogs and command-line modes; the demo's files are
@@ -114,7 +114,7 @@
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: the clock, files and process id (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
 
-# Rules 23-25/48: the audio worker on the web (src/audio/web.rs): no thread is started, and its loop runs in turns at the
+# Rules 23-25/49: the audio worker on the web (src/audio/web.rs): no thread is started, and its loop runs in turns at the
 # start of each Web Audio callback (and after each frame, from app/web.rs). If upstream renames WorkerGuard::start's
 # queues or DeviceReader::fill, follow.
 - file: src/audio.rs
@@ -127,7 +127,7 @@
   find: '\bfn\s+fill<T:\s*Copy>\s*\([\s\S]*?\)\s*\{'
   after: "\n        #[cfg(target_arch = \"wasm32\")] web::pump();"
 
-# Rules 26-35/48: the app (src/app/web.rs). `app::run` starts the page instead of a window; the stem-separation worker
+# Rules 26-35/49: the app (src/app/web.rs). `app::run` starts the page instead of a window; the stem-separation worker
 # (a thread waiting on its queue) is not started, and "Separate stems" says it isn't available here instead of offering
 # the model download; Add tracks, Open mix… / Save as… / Export, Import DJ library and Locate (persistence.rs) use
 # Playground's dialogs: each asks, then sends the app the same message as the desktop's dialog thread, and Add music
@@ -164,10 +164,11 @@
   find: 'let\s+dir\s*=\s*crate::library::config_dir\(\)\.join\("sources"\)\s*;'
   after: "\n                #[cfg(target_arch = \"wasm32\")] let dir = std::path::PathBuf::from(web::DROPPED);"
 
-# Rules 36-38/48: background work that waits on a channel cannot wait on a page's one thread. The recovery worker (a
+# Rules 36-39/49: background work that waits on a channel cannot wait on a page's one thread. The recovery worker (a
 # thread serving its queue for the whole session) is not started: autosave is off with the demo mix, which every page
 # starts with, so nothing is queued that needs it. The library's helper threads with a timeout (DJ library imports,
-# "Find DJ libraries") run in place, since crossbeam's timed wait reads std's clock. Adding an imported library checks the file
+# "Find DJ libraries", a track's analysis) run in place, since crossbeam's timed wait reads std's clock. The analysis
+# job's thread handle is the shadow std's (src/playground.rs: JoinHandle). Adding an imported library checks the file
 # through `std::fs` (Path::exists asks the real file system, which has none of the page's files). If upstream changes
 # these, follow.
 - file: src/recovery.rs
@@ -177,10 +178,13 @@
   find: '\bpub\s+fn\s+with_timeout\b[^{]*->\s*Option<T>\s*\{'
   after: "\n    #[cfg(target_arch = \"wasm32\")] return { let _ = t; Some(f()) };"
 - file: src/library.rs
+  find: '\bfn\s+analyse_job\b[^{]*\{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")] return (crate::analysis::load_analysis(&PathBuf::from(path)).map(|a| (a.bpm, a.key, a.duration)).map_err(|e| e.to_string()), None);"
+- file: src/library.rs
   find: 'if\s+!p\.exists\(\)\s*\{\s*return\s+Err\(format!\("\{\}\s+not\s+found"'
   replace: 'if std::fs::metadata(p).is_err() { return Err(format!("{} not found"'
 
-# Rules 39-48/48: what has no browser side, given a stand-in on wasm (the native code is kept as it is, behind
+# Rules 40-49/49: what has no browser side, given a stand-in on wasm (the native code is kept as it is, behind
 # `cfg(not(target_arch = "wasm32"))`). FLAC export encodes on this thread (flacenc's multithreaded encoder starts
 # threads); Engine DJ databases (SQLite; also main.rs's command-line self-test of them) and rfd's portal dialog report
 # they aren't available; so do stem separation (ONNX Runtime) and its model download (ureq), which the app never asks

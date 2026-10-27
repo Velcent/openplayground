@@ -19,7 +19,7 @@ new file mode 100755
 index 0000000..bfb6f97
 --- /dev/null
 +++ b/.cargo/playground-cxx.sh
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,17 @@
 +#!/bin/sh
 +# Key lock's C++ (the signalsmith-stretch crate) for wasm32-unknown-unknown, for Playground's browser build of MixStudio
 +# (patches/dj-studio.yaml in github.com/daijro/openplayground): clang with the C++ standard library headers of wasi-sdk
@@ -28,10 +28,13 @@ index 0000000..bfb6f97
 +set -e
 +sysroot=${WASI_SYSROOT:-${CARGO_TARGET_DIR:-$(dirname "$0")/../target}/wasi-sysroot-22}
 +if [ ! -d "$sysroot/include/wasm32-wasi" ]; then
-+  mkdir -p "$sysroot.part"
++  # cc runs several of these at once: each fetches into a folder of its own and moves it into place in one step;
++  # one that finds the place taken drops its copy.
++  part="$sysroot.part.$$"
++  mkdir -p "$part"
 +  curl -sSfL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-22/wasi-sysroot-22.0.tar.gz \
-+    | tar -xz -C "$sysroot.part" --strip-components=1 wasi-sysroot/include
-+  rm -rf "$sysroot" && mv "$sysroot.part" "$sysroot"
++    | tar -xz -C "$part" --strip-components=1 wasi-sysroot/include
++  mv -T "$part" "$sysroot" 2>/dev/null || rm -rf "$part"
 +fi
 +exec "${CLANG:-clang}" "$@" --target=wasm32-wasi --sysroot="$sysroot" -fno-exceptions -fno-rtti -Wno-deprecated
 diff --git a/Trunk.toml b/Trunk.toml
@@ -495,7 +498,7 @@ new file mode 100644
 index 0000000..b00a5fa
 --- /dev/null
 +++ b/src/playground.rs
-@@ -0,0 +1,635 @@
+@@ -0,0 +1,646 @@
 +// SPDX-License-Identifier: MIT
 +//! MixStudio in the browser, for Playground (patches/dj-studio.yaml in github.com/daijro/openplayground).
 +//!
@@ -617,17 +620,28 @@ index 0000000..b00a5fa
 +        }
 +
 +        /// Queues `f` for [`run_spawned`]: a page has one thread, and the frame should be drawn before it waits.
-+        pub fn spawn<F, T>(f: F) -> Queued
++        pub fn spawn<F, T>(f: F) -> JoinHandle<T>
 +        where
 +            F: FnOnce() -> T + Send + 'static,
 +            T: Send + 'static,
 +        {
 +            QUEUED.with_borrow_mut(|q| q.push(Box::new(move || drop(f()))));
-+            Queued
++            Queued(::std::marker::PhantomData)
 +        }
 +
-+        /// What [`spawn`] gives back: the work waits for [`run_spawned`].
-+        pub struct Queued;
++        /// What [`spawn`] gives back: the work waits for [`run_spawned`]. Under std's name too, for code that names
++        /// `std::thread::JoinHandle` (library.rs's analysis job): nothing on the page's one thread waits for it, so it
++        /// reads as finished.
++        pub struct Queued<T = ()>(::std::marker::PhantomData<T>);
++        pub type JoinHandle<T> = Queued<T>;
++        impl<T> Queued<T> {
++            pub fn is_finished(&self) -> bool {
++                true
++            }
++            pub fn join(self) -> ::std::thread::Result<()> {
++                Ok(())
++            }
++        }
 +
 +        /// std's thread builder (the library's helper threads), queuing like [`spawn`].
 +        pub struct Builder;
@@ -638,7 +652,7 @@ index 0000000..b00a5fa
 +            pub fn name(self, _name: String) -> Self {
 +                self
 +            }
-+            pub fn spawn<F, T>(self, f: F) -> ::std::io::Result<Queued>
++            pub fn spawn<F, T>(self, f: F) -> ::std::io::Result<JoinHandle<T>>
 +            where
 +                F: FnOnce() -> T + Send + 'static,
 +                T: Send + 'static,
