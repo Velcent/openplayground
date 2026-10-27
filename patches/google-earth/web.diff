@@ -1,0 +1,2010 @@
+diff --git a/Trunk.toml b/Trunk.toml
+new file mode 100644
+index 0000000..7ece4cd
+--- /dev/null
++++ b/Trunk.toml
+@@ -0,0 +1,7 @@
++# EarthCraft in the browser, for Playground (patches/google-earth.yaml in github.com/daijro/openplayground).
++# Build with: trunk build --release   (from the repository's root)
++[build]
++target = "index.html"
++public_url = "./"
++filehash = true
++dist = "target/trunk-dist"
+diff --git a/apps/earthcraft/src/app/explorer/web.rs b/apps/earthcraft/src/app/explorer/web.rs
+new file mode 100644
+index 0000000..9a15862
+--- /dev/null
++++ b/apps/earthcraft/src/app/explorer/web.rs
+@@ -0,0 +1,24 @@
++// SPDX-License-Identifier: MIT
++//! The Explorer's pickers in Playground's browser build (patches/google-earth.yaml in github.com/daijro/openplayground):
++//! Playground's dialogs answer after the frame (app/web.rs), and their answer lands here, as the desktop's dialog
++//! answer does in explorer.rs.
++use earthcraft_data::files::FileJobs;
++use std::path::PathBuf;
++
++impl super::Explorer {
++    /// An image picked for the planet's texture, or for its sky.
++    pub(in crate::app) fn picked_image(&mut self, path: String, sky: bool) {
++        if sky {
++            self.sky_path = path;
++            self.sky_bytes = None;
++        } else {
++            self.image_path = path;
++            self.image_bytes = None;
++        }
++    }
++
++    /// Where Save planet… put the planet.
++    pub(in crate::app) fn picked_save(&mut self, path: PathBuf, jobs: &FileJobs) {
++        self.request_save(path, jobs);
++    }
++}
+diff --git a/apps/earthcraft/src/app/web.rs b/apps/earthcraft/src/app/web.rs
+new file mode 100644
+index 0000000..fb420c6
+--- /dev/null
++++ b/apps/earthcraft/src/app/web.rs
+@@ -0,0 +1,381 @@
++// SPDX-License-Identifier: MIT
++//! EarthCraft in the browser, for Playground (patches/google-earth.yaml in github.com/daijro/openplayground): the
++//! desktop window on the page's canvas, and its files in Playground's Files.
++//!
++//! `main` runs as on the desktop: the crate root takes [`eframe`] (and [`self_update`]) from here on the web, whose
++//! `run_native` starts the app on the page with the desktop's own creator. Files live in memory
++//! (earthcraft-playground's `std::fs`, where `HOME` is `/`): a file from Files comes in at its path
++//! (`browser:/Places/trip.kml` is `/Places/trip.kml` here), and whatever EarthCraft writes outside its own folders (a
++//! saved KML or planet, a screenshot in `/EarthCraft`) goes to Files after the frame. Open KML…, Save As…, the
++//! Explorer's planet and image pickers are Playground's dialogs ([`rfd`]); "Open in EarthCraft" opens a KML/KMZ (or a
++//! planet), as a file dropped on the globe does.
++use super::App;
++use ::eframe::egui;
++use earthcraft_playground::std::fs;
++use std::cell::{Cell, OnceCell, RefCell};
++use std::path::{Path, PathBuf};
++use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
++
++/// EarthCraft's own folders in memory, never copied to Files: settings and caches (`~/.cache`), scratch files.
++const OWN: [&str; 2] = ["/tmp", "/.cache"];
++/// Where dropped files are kept.
++const DROPS: &str = "/tmp/EarthCraft dropped";
++/// Where a file opened from the computer is kept.
++const FROM_COMPUTER: &str = "/EarthCraft/Opened";
++/// Where a save to download is written first; the page hands it to the browser once written.
++const DOWNLOADS: &str = "/tmp/EarthCraft downloads";
++
++/// What a file dialog was for (see [`rfd`]).
++#[derive(Clone, Copy, PartialEq, Debug)]
++enum Kind {
++    Kml,
++    Planet,
++    /// The Explorer's planet texture, or its sky.
++    Image { sky: bool },
++}
++
++impl Kind {
++    fn of(extensions: &[String], sky: bool) -> Self {
++        if extensions.iter().any(|e| e.eq_ignore_ascii_case("kml")) {
++            Kind::Kml
++        } else if extensions.iter().any(|e| e == "earthplanet") {
++            Kind::Planet
++        } else {
++            Kind::Image { sky }
++        }
++    }
++    fn types(self) -> JsValue {
++        let types: &[&str] = match self {
++            Kind::Kml => &["kml", "kmz"],
++            Kind::Planet => &["earthplanet"],
++            Kind::Image { .. } => &["png", "jpg", "jpeg"],
++        };
++        types.iter().map(|t| JsValue::from(*t)).collect::<js_sys::Array>().into()
++    }
++}
++
++/// A dialog the app asked for this frame.
++#[derive(Clone, Debug)]
++enum Ask {
++    Open(Kind),
++    Save(Kind, String),
++}
++
++thread_local! {
++    static CTX: OnceCell<egui::Context> = const { OnceCell::new() };
++    static ASKED: RefCell<Option<Ask>> = const { RefCell::new(None) };
++    /// The Explorer is drawing its sky row (explorer.rs says so on the web), so an image picked now is the sky.
++    static SKY: Cell<bool> = const { Cell::new(false) };
++    /// Files from Playground (Open, "Open in EarthCraft"), and what they were picked for, for the next frame.
++    static OPENED: RefCell<Vec<(PathBuf, Option<Kind>)>> = const { RefCell::new(Vec::new()) };
++    /// Where Save As… put a file, for the next frame.
++    static SAVED: RefCell<Vec<(PathBuf, Kind)>> = const { RefCell::new(Vec::new()) };
++    /// Dropped files whose bytes are in memory now, for the next frame.
++    static DROPPED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
++}
++
++fn repaint() {
++    CTX.with(|c| c.get().map(egui::Context::request_repaint));
++}
++
++/// The Explorer's sky row is next: an image picked from here on, this frame, is the sky's.
++pub(super) fn sky_section() {
++    SKY.set(true);
++}
++
++/// The aircraft layer's checkbox on the web: off, saying why.
++pub(super) fn no_flights(ui: &mut egui::Ui, label: &str) {
++    ui.add_enabled(false, egui::Checkbox::new(&mut false, label)).on_disabled_hover_text(
++        "Live aircraft are off in the browser: OpenSky and ADSB.lol don't let other sites' pages read their feeds.",
++    );
++}
++
++/// The desktop's eframe, with `run_native` starting the app on the page instead.
++pub(crate) mod eframe {
++    pub use ::eframe::*;
++
++    /// The desktop window's options, which a page has no use for.
++    #[derive(Default)]
++    #[allow(dead_code)]
++    pub struct NativeOptions {
++        pub viewport: egui::ViewportBuilder,
++        pub wgpu_options: egui_wgpu::WgpuConfiguration,
++    }
++
++    /// Starts the app on the page's canvas, made by `creator` once the page's context exists; returns at once.
++    pub fn run_native(_name: &str, _options: NativeOptions, creator: super::Creator) -> ::eframe::Result {
++        super::start(creator)
++    }
++}
++
++/// The desktop's updater restart, which a page never asks for (there are no updates to install here).
++pub(crate) mod self_update {
++    pub mod restart {
++        pub fn restart() -> std::io::Result<std::convert::Infallible> {
++            Err(std::io::Error::other("a page doesn't restart"))
++        }
++    }
++}
++
++/// The desktop's file dialogs: on the web they ask Playground's after the frame ([`Web::after`]) and give nothing now.
++pub(crate) mod rfd {
++    use std::path::{Path, PathBuf};
++
++    #[derive(Default)]
++    pub struct FileDialog {
++        extensions: Vec<String>,
++        name: Option<String>,
++    }
++
++    impl FileDialog {
++        pub fn new() -> Self {
++            Self::default()
++        }
++        pub fn add_filter(mut self, _name: impl Into<String>, extensions: &[impl ToString]) -> Self {
++            self.extensions.extend(extensions.iter().map(ToString::to_string));
++            self
++        }
++        pub fn set_title(self, _title: impl Into<String>) -> Self {
++            self
++        }
++        pub fn set_file_name(mut self, name: impl Into<String>) -> Self {
++            self.name = Some(name.into());
++            self
++        }
++        pub fn set_directory(self, _dir: impl AsRef<Path>) -> Self {
++            self
++        }
++        pub fn pick_file(self) -> Option<PathBuf> {
++            let kind = super::Kind::of(&self.extensions, super::SKY.get());
++            super::ASKED.set(Some(super::Ask::Open(kind)));
++            None
++        }
++        pub fn save_file(self) -> Option<PathBuf> {
++            let kind = super::Kind::of(&self.extensions, false);
++            let name = self.name.unwrap_or_else(|| "placemarks.kml".into());
++            super::ASKED.set(Some(super::Ask::Save(kind, name)));
++            None
++        }
++        /// A page can't name a folder of the computer: the folder stays as typed.
++        pub fn pick_folder(self) -> Option<PathBuf> {
++            None
++        }
++    }
++}
++
++fn get(o: &JsValue, k: &str) -> JsValue {
++    js_sys::Reflect::get(o, &k.into()).unwrap_or(JsValue::UNDEFINED)
++}
++
++/// `playgroundFiles[method](...args)`; None when the page has none or it threw.
++fn call(method: &str, args: &[JsValue]) -> Option<JsValue> {
++    let api = Some(get(&js_sys::global(), "playgroundFiles")).filter(JsValue::is_object)?;
++    let f = get(&api, method).dyn_into::<js_sys::Function>().ok()?;
++    f.apply(&api, &args.iter().collect::<js_sys::Array>()).ok()
++}
++
++async fn wait(v: Option<JsValue>) -> Option<JsValue> {
++    let promise = v?.dyn_into::<js_sys::Promise>().ok()?;
++    wasm_bindgen_futures::JsFuture::from(promise).await.ok().filter(|v| !v.is_null() && !v.is_undefined())
++}
++
++fn options(pairs: &[(&str, JsValue)]) -> JsValue {
++    let o = js_sys::Object::new();
++    for (k, v) in pairs {
++        let _ = js_sys::Reflect::set(&o, &(*k).into(), v);
++    }
++    o.into()
++}
++
++/// A file from Files (`{ path, name, bytes }`) into memory at its path; one from the computer goes to
++/// `/EarthCraft/Opened`.
++fn bring_in(file: &JsValue) -> Option<PathBuf> {
++    let name = get(file, "name").as_string()?;
++    let path = match get(file, "path").as_string().and_then(|p| p.strip_prefix("browser:").map(PathBuf::from)) {
++        Some(path) => path,
++        None => Path::new(FROM_COMPUTER).join(Path::new(&name).file_name()?),
++    };
++    fs::put(&path, js_sys::Uint8Array::new(&get(file, "bytes")).to_vec());
++    Some(path)
++}
++
++fn opened(file: JsValue, kind: Option<Kind>) {
++    if let Some(path) = bring_in(&file) {
++        OPENED.with_borrow_mut(|o| o.push((path, kind)));
++        repaint();
++    }
++}
++
++fn extension(path: &Path) -> String {
++    path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase()
++}
++
++/// The page's app: the window, then what it asked of the page.
++pub(crate) struct Web {
++    app: App,
++}
++
++impl Web {
++    /// After the window's frame: files that came in, the dialogs it asked for, and what it wrote.
++    fn after(&mut self) {
++        SKY.set(false);
++        for (path, kind) in OPENED.take() {
++            let app = &mut self.app;
++            match kind {
++                Some(Kind::Image { sky }) => app.explorer.picked_image(path.to_string_lossy().into_owned(), sky),
++                _ if extension(&path) == "earthplanet" => app.explorer.request_open(path, &app.file_jobs),
++                _ => app.load_kml_from(&path),
++            }
++        }
++        for (path, kind) in SAVED.take() {
++            match kind {
++                Kind::Planet => self.app.explorer.picked_save(path, &self.app.file_jobs),
++                _ => self.app.save_kml_to(path),
++            }
++        }
++        match ASKED.take() {
++            Some(Ask::Open(kind)) => {
++                let asked = call("open", &[options(&[("types", kind.types())])]);
++                wasm_bindgen_futures::spawn_local(async move {
++                    if let Some(file) = wait(asked).await.and_then(|p| js_sys::Array::from(&p).iter().next()) {
++                        opened(file, Some(kind));
++                    }
++                });
++            }
++            Some(Ask::Save(kind, name)) => {
++                let asked = call("saveAs", &[options(&[("name", name.as_str().into()), ("types", kind.types())])]);
++                wasm_bindgen_futures::spawn_local(async move {
++                    let Some(answer) = wait(asked).await else { return };
++                    let path = match get(&answer, "path").as_string() {
++                        Some(p) => p.strip_prefix("browser:").map(PathBuf::from),
++                        // "Download to device": written in memory first, then handed to the browser (below).
++                        None => Some(Path::new(DOWNLOADS).join(&name)),
++                    };
++                    if let Some(mut path) = path {
++                        if path.extension().is_none() {
++                            path.set_extension(if kind == Kind::Planet { "earthplanet" } else { "kml" });
++                        }
++                        SAVED.with_borrow_mut(|s| s.push((path, kind)));
++                        repaint();
++                    }
++                });
++            }
++            None => {}
++        }
++        for p in fs::changes() {
++            if p.starts_with(DOWNLOADS) {
++                if let (Ok(bytes), Some(name)) = (fs::read(&p), p.file_name()) {
++                    let bytes = js_sys::Uint8Array::from(bytes.as_slice());
++                    call("download", &[name.to_string_lossy().as_ref().into(), bytes.into()]);
++                    let _ = fs::remove_file(&p);
++                    fs::changes();
++                }
++                continue;
++            }
++            if OWN.iter().any(|own| p.starts_with(own)) {
++                continue;
++            }
++            let target = JsValue::from(format!("browser:{}", p.display()));
++            match fs::metadata(&p) {
++                Ok(m) if m.is_file() => {
++                    call("write", &[target, js_sys::Uint8Array::from(fs::read(&p).unwrap_or_default().as_slice()).into()]);
++                }
++                Ok(_) => {}
++                Err(_) => {
++                    call("remove", &[target]);
++                }
++            }
++        }
++    }
++}
++
++/// A dropped file, in memory.
++#[derive(Debug)]
++struct InMemory(PathBuf);
++
++impl egui::DroppedFile for InMemory {
++    fn path(&self) -> &Path {
++        &self.0
++    }
++    fn bytes_async(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + '_>> {
++        let bytes = fs::read(&self.0).map_err(|e| e.to_string());
++        Box::pin(async move { bytes })
++    }
++}
++
++impl ::eframe::App for Web {
++    fn raw_input_hook(&mut self, _: &egui::Context, raw_input: &mut egui::RawInput) {
++        // A dropped file is only a name on the web: once its bytes are in memory under DROPS, a later frame drops
++        // that file instead, as the desktop window gets it.
++        raw_input.dropped_files.extend(DROPPED.take().into_iter().map(|p| std::sync::Arc::new(InMemory(p)) as _));
++        for f in std::mem::take(&mut raw_input.dropped_files) {
++            if f.path().parent() == Some(Path::new(DROPS)) {
++                raw_input.dropped_files.push(f);
++                continue;
++            }
++            wasm_bindgen_futures::spawn_local(async move {
++                if let (Ok(bytes), Some(name)) = (f.bytes_async().await, f.path().file_name()) {
++                    let path = Path::new(DROPS).join(name);
++                    fs::put(&path, bytes);
++                    DROPPED.with_borrow_mut(|d| d.push(path));
++                    repaint();
++                }
++            });
++        }
++    }
++
++    fn logic(&mut self, ctx: &egui::Context, frame: &mut ::eframe::Frame) {
++        ::eframe::App::logic(&mut self.app, ctx, frame);
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut ::eframe::Frame) {
++        ::eframe::App::ui(&mut self.app, ui, frame);
++        self.after();
++        // A link (a source's credit, Releases) opens in a new tab, as the desktop opens the browser, rather than
++        // replacing the app.
++        ui.ctx().output_mut(|o| {
++            for command in &mut o.commands {
++                if let egui::OutputCommand::OpenUrl(url) = command {
++                    url.new_tab = true;
++                }
++            }
++        });
++    }
++
++    fn on_exit(&mut self) {
++        ::eframe::App::on_exit(&mut self.app);
++    }
++}
++
++/// The desktop's app creator, as `main` hands it over (a `Box<App>`, not eframe's `dyn App`).
++pub(crate) type Creator = Box<dyn FnOnce(&::eframe::CreationContext<'_>) -> Result<Box<App>, DynError>>;
++type DynError = Box<dyn std::error::Error + Send + Sync>;
++
++/// [`eframe::run_native`] on the web: the app is made by the desktop's creator against the page's context, so the
++/// services it starts wake the page.
++fn start(creator: Creator) -> ::eframe::Result {
++    std::panic::set_hook(Box::new(|info| web_sys::console::error_1(&format!("EarthCraft: {info}").into())));
++    call("onOpen", &[Closure::<dyn Fn(JsValue)>::new(|file| opened(file, None)).into_js_value()]);
++    wasm_bindgen_futures::spawn_local(async move {
++        let document = web_sys::window().and_then(|w| w.document()).expect("no document");
++        let canvas = document
++            .get_element_by_id("earthcraft_canvas")
++            .and_then(|c| c.dyn_into::<web_sys::HtmlCanvasElement>().ok())
++            .expect("no #earthcraft_canvas");
++        let creator = move |cc: &::eframe::CreationContext<'_>| -> Result<Box<dyn ::eframe::App>, DynError> {
++            CTX.with(|c| c.set(cc.egui_ctx.clone()).ok());
++            Ok(Box::new(Web { app: *creator(cc)? }))
++        };
++        let runner = ::eframe::WebRunner::new();
++        let started = runner.start(canvas, ::eframe::WebOptions::default(), Box::new(creator)).await;
++        // The runner lives as long as the page.
++        std::mem::forget(runner);
++        if let Some(loading) = document.get_element_by_id("earthcraft_loading") {
++            match started {
++                Ok(()) => loading.remove(),
++                Err(e) => loading.set_text_content(Some(&format!("EarthCraft could not start: {e:?}"))),
++            }
++        }
++    });
++    Ok(())
++}
+diff --git a/crates/earthcraft-data/src/boundaries/updates/web.rs b/crates/earthcraft-data/src/boundaries/updates/web.rs
+new file mode 100644
+index 0000000..27e54e7
+--- /dev/null
++++ b/crates/earthcraft-data/src/boundaries/updates/web.rs
+@@ -0,0 +1,29 @@
++// SPDX-License-Identifier: MIT
++//! Boundary patches in Playground's browser build (patches/google-earth.yaml in github.com/daijro/openplayground): the
++//! same ordered merge as the desktop's preparation thread, done when the app asks for the latest snapshot, since a
++//! page has one thread. The loaders wake the app after each layer they send (boundaries/load.rs), as on the desktop.
++use super::{BoundaryData, BoundarySnapshot, Patch, apply};
++use std::cell::RefCell;
++use std::sync::{Arc, mpsc};
++
++pub struct BoundaryUpdates {
++    patches: mpsc::Receiver<Patch>,
++    data: RefCell<Arc<BoundaryData>>,
++}
++
++impl BoundaryUpdates {
++    pub fn new(patches: mpsc::Receiver<Patch>, _repaint: impl Fn() + Send + 'static) -> std::io::Result<Self> {
++        Ok(Self { patches, data: RefCell::default() })
++    }
++
++    /// Merges the patches that arrived, in order, into one snapshot.
++    pub fn take_latest(&self) -> Option<BoundarySnapshot> {
++        let mut data = self.data.borrow_mut();
++        let mut changed = false;
++        for patch in self.patches.try_iter() {
++            apply(Arc::make_mut(&mut data), patch);
++            changed = true;
++        }
++        changed.then(|| BoundarySnapshot { data: data.clone(), names: Arc::new(data.labels.clone()) })
++    }
++}
+diff --git a/crates/earthcraft-data/src/tiles/disk/web.rs b/crates/earthcraft-data/src/tiles/disk/web.rs
+new file mode 100644
+index 0000000..bb9201c
+--- /dev/null
++++ b/crates/earthcraft-data/src/tiles/disk/web.rs
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: MIT
++//! The imagery disk cache in Playground's browser build (patches/google-earth.yaml in github.com/daijro/openplayground):
++//! it keeps nothing. The desktop keeps fetched tiles in MBTiles files through SQLite on a worker thread, which a page
++//! has neither of; here the browser's own HTTP cache keeps the tiles it fetched, and decoded tiles stay in the
++//! in-memory cache (tiles/cache.rs) as on the desktop. Same calls as mbtiles.rs.
++use std::path::{Path, PathBuf};
++
++pub(super) struct Mbtiles {
++    limit: u64,
++}
++
++impl Mbtiles {
++    #[cfg(test)]
++    pub(super) fn new(_root: PathBuf) -> Self {
++        Self { limit: super::DEFAULT_DISK_BUDGET_BYTES }
++    }
++    pub(super) fn with_limit(_root: PathBuf, limit: u64) -> Self {
++        Self { limit }
++    }
++    pub(super) fn limit(&self) -> u64 {
++        self.limit
++    }
++    pub(super) async fn read(&self, _path: &Path) -> Result<Option<Vec<u8>>, crate::Error> {
++        Ok(None)
++    }
++    pub(super) async fn write_owned(&self, _path: &Path, _bytes: Vec<u8>) -> Result<(), crate::Error> {
++        Ok(())
++    }
++    pub(super) async fn invalidate(&self, _path: &Path) -> Result<(), crate::Error> {
++        Ok(())
++    }
++    pub(super) async fn clear(&self) -> Result<(), crate::Error> {
++        Ok(())
++    }
++    pub(super) async fn usage(&self) -> Result<u64, crate::Error> {
++        Ok(0)
++    }
++}
+diff --git a/crates/earthcraft-data/src/updater/web.rs b/crates/earthcraft-data/src/updater/web.rs
+new file mode 100644
+index 0000000..9e999ae
+--- /dev/null
++++ b/crates/earthcraft-data/src/updater/web.rs
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: MIT
++//! Updates in Playground's browser build (patches/google-earth.yaml in github.com/daijro/openplayground): there are
++//! none to install. Playground serves the newest EarthCraft it has built, so the startup check finds the page up to
++//! date, and the desktop's download-and-replace (self_update, which has no browser side) is never offered. Same calls
++//! as release.rs.
++use super::Snapshot;
++use std::{path::Path, sync::Arc};
++use tokio::sync::watch;
++
++#[derive(Clone)]
++pub(super) struct SelectedRelease {
++    pub(super) version: String,
++}
++
++pub(super) fn is_development_path(_: &Path) -> bool {
++    false
++}
++
++pub(super) fn manual_install_reason(_: &Path) -> Option<String> {
++    None
++}
++
++pub(super) async fn check() -> Result<Option<SelectedRelease>, crate::Error> {
++    Ok(None)
++}
++
++pub(super) async fn install(
++    _selected: &SelectedRelease,
++    _sender: watch::Sender<Snapshot>,
++    _repaint: Arc<dyn Fn() + Send + Sync>,
++) -> Result<bool, crate::Error> {
++    Ok(false)
++}
+diff --git a/crates/earthcraft-playground/Cargo.toml b/crates/earthcraft-playground/Cargo.toml
+new file mode 100644
+index 0000000..17e844f
+--- /dev/null
++++ b/crates/earthcraft-playground/Cargo.toml
+@@ -0,0 +1,13 @@
++# Playground's browser build of EarthCraft (patches/google-earth.yaml in github.com/daijro/openplayground): std's clock,
++# files and threads as wasm32-unknown-unknown can have them, and a stand-in for Moka's cache. Native builds compile it
++# empty.
++[package]
++name = "earthcraft-playground"
++version = "0.1.0"
++edition = "2024"
++description = "EarthCraft in the browser: the clock, files and threads std lacks on wasm32-unknown-unknown"
++license = "MIT"
++publish = false
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++web-time = "1"
+diff --git a/crates/earthcraft-playground/reqwest/Cargo.toml b/crates/earthcraft-playground/reqwest/Cargo.toml
+new file mode 100644
+index 0000000..5db6949
+--- /dev/null
++++ b/crates/earthcraft-playground/reqwest/Cargo.toml
+@@ -0,0 +1,18 @@
++# Playground's browser build of EarthCraft (patches/google-earth.yaml in github.com/daijro/openplayground): the part of
++# reqwest crates/earthcraft-data uses, over the browser's fetch. Native builds compile it empty.
++[package]
++name = "earthcraft-playground-reqwest"
++version = "0.1.0"
++edition = "2024"
++description = "EarthCraft in the browser: reqwest's client over the browser's fetch, with Send futures"
++license = "MIT"
++publish = false
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++reqwest = { version = "0.13", default-features = false }
++bytes = "1"
++serde = "1"
++serde_json = "1"
++serde_urlencoded = "0.7"
++tokio = { version = "1", default-features = false, features = ["sync"] }
++wasm-bindgen-futures = "0.4"
+diff --git a/crates/earthcraft-playground/reqwest/src/lib.rs b/crates/earthcraft-playground/reqwest/src/lib.rs
+new file mode 100644
+index 0000000..3a958bd
+--- /dev/null
++++ b/crates/earthcraft-playground/reqwest/src/lib.rs
+@@ -0,0 +1,212 @@
++// SPDX-License-Identifier: MIT
++//! EarthCraft in the browser, for Playground (patches/google-earth.yaml in github.com/daijro/openplayground): the part of
++//! reqwest crates/earthcraft-data uses, over the browser's fetch. The crate takes it as `reqwest` on wasm (an `extern
++//! crate … as reqwest` at its root; the real reqwest is a native-only dependency there).
++//!
++//! reqwest's own wasm client is fetch too, but its futures hold the page's JavaScript objects, which are not Send (the
++//! crate's tasks are), and it has no connect/read timeouts and no `chunk`. Here each request runs on the page's event
++//! loop and hands back its whole answer, so everything the crate holds is plain bytes:
++//!   - the browser sends its own User-Agent (a script can't set it), so `user_agent` is dropped;
++//!   - a timeout is the request's whole time (`read_timeout` counts as one when no `timeout` is set);
++//!   - `chunk` gives the body in one piece; the crate's size limits still apply after it.
++//! Only servers that allow other sites' pages to read them (CORS) answer; the others fail as a network error does.
++#![cfg(target_arch = "wasm32")]
++
++use bytes::Bytes;
++use std::time::Duration;
++pub use reqwest::{Method, StatusCode};
++
++/// A request that failed, or came back with an error status.
++#[derive(Debug)]
++pub struct Error {
++    message: String,
++    status: Option<StatusCode>,
++}
++impl std::fmt::Display for Error {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str(&self.message)
++    }
++}
++impl std::error::Error for Error {}
++impl Error {
++    fn new(message: impl ToString) -> Self {
++        Self { message: message.to_string(), status: None }
++    }
++    pub fn status(&self) -> Option<StatusCode> {
++        self.status
++    }
++    pub fn is_status(&self) -> bool {
++        self.status.is_some()
++    }
++}
++impl From<reqwest::Error> for Error {
++    fn from(error: reqwest::Error) -> Self {
++        Self { status: error.status(), message: error.to_string() }
++    }
++}
++pub type Result<T> = std::result::Result<T, Error>;
++
++#[derive(Clone, Debug, Default)]
++pub struct Client {
++    timeout: Option<Duration>,
++}
++impl Client {
++    pub fn new() -> Self {
++        Self::default()
++    }
++    pub fn builder() -> ClientBuilder {
++        ClientBuilder::default()
++    }
++    pub fn get(&self, url: impl AsRef<str>) -> RequestBuilder {
++        self.request(Method::GET, url)
++    }
++    pub fn post(&self, url: impl AsRef<str>) -> RequestBuilder {
++        self.request(Method::POST, url)
++    }
++    pub fn request(&self, method: Method, url: impl AsRef<str>) -> RequestBuilder {
++        RequestBuilder { method, url: url.as_ref().into(), headers: Vec::new(), body: None, timeout: self.timeout, error: None }
++    }
++}
++
++#[derive(Debug, Default)]
++pub struct ClientBuilder {
++    timeout: Option<Duration>,
++    read_timeout: Option<Duration>,
++}
++impl ClientBuilder {
++    pub fn user_agent<V>(self, _: V) -> Self {
++        self
++    }
++    pub fn timeout(mut self, timeout: Duration) -> Self {
++        self.timeout = Some(timeout);
++        self
++    }
++    pub fn connect_timeout(self, _: Duration) -> Self {
++        self
++    }
++    pub fn read_timeout(mut self, timeout: Duration) -> Self {
++        self.read_timeout = Some(timeout);
++        self
++    }
++    pub fn no_proxy(self) -> Self {
++        self
++    }
++    pub fn build(self) -> Result<Client> {
++        Ok(Client { timeout: self.timeout.or(self.read_timeout) })
++    }
++}
++
++#[derive(Debug)]
++pub struct RequestBuilder {
++    method: Method,
++    url: String,
++    headers: Vec<(String, String)>,
++    body: Option<Vec<u8>>,
++    timeout: Option<Duration>,
++    error: Option<String>,
++}
++impl RequestBuilder {
++    pub fn header(mut self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
++        self.headers.push((name.as_ref().into(), value.as_ref().into()));
++        self
++    }
++    pub fn query<T: serde::Serialize + ?Sized>(mut self, query: &T) -> Self {
++        match serde_urlencoded::to_string(query) {
++            Ok(q) if !q.is_empty() => {
++                self.url.push(if self.url.contains('?') { '&' } else { '?' });
++                self.url.push_str(&q);
++            }
++            Ok(_) => {}
++            Err(error) => self.error = Some(error.to_string()),
++        }
++        self
++    }
++    pub fn form<T: serde::Serialize + ?Sized>(mut self, form: &T) -> Self {
++        match serde_urlencoded::to_string(form) {
++            Ok(body) => {
++                self.body = Some(body.into_bytes());
++                self.headers.push(("Content-Type".into(), "application/x-www-form-urlencoded".into()));
++            }
++            Err(error) => self.error = Some(error.to_string()),
++        }
++        self
++    }
++    pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
++        self.body = Some(body.into());
++        self
++    }
++    pub fn timeout(mut self, timeout: Duration) -> Self {
++        self.timeout = Some(timeout);
++        self
++    }
++    /// Fetches on the page's event loop; the answer comes back whole.
++    pub async fn send(self) -> Result<Response> {
++        if let Some(error) = self.error {
++            return Err(Error::new(error));
++        }
++        let (answer, response) = tokio::sync::oneshot::channel();
++        let url = self.url.clone();
++        wasm_bindgen_futures::spawn_local(async move {
++            let mut result = self.fetch(true).await;
++            // A header of the app's own (Digitraffic-User, TomTom-Api-Key) makes the browser ask the server first,
++            // and a server that doesn't answer that question can't be read: ask again without them.
++            if result.as_ref().is_err_and(|e| e.status.is_none()) && self.headers.iter().any(|(n, _)| !safelisted(n)) {
++                result = self.fetch(false).await;
++            }
++            let _ = answer.send(result);
++        });
++        response.await.map_err(|_| Error::new(format!("request for {url} was dropped")))?
++    }
++
++    async fn fetch(&self, all_headers: bool) -> Result<Response> {
++        let mut request = reqwest::Client::new().request(self.method.clone(), &self.url);
++        for (name, value) in self.headers.iter().filter(|(n, _)| all_headers || safelisted(n)) {
++            request = request.header(name, value);
++        }
++        if let Some(body) = &self.body {
++            request = request.body(body.clone());
++        }
++        if let Some(timeout) = self.timeout {
++            request = request.timeout(timeout);
++        }
++        let response = request.send().await?;
++        let status = response.status();
++        Ok(Response { status, url: self.url.clone(), body: Some(response.bytes().await?) })
++    }
++}
++
++/// Headers a page sends to another site without asking it first.
++fn safelisted(name: &str) -> bool {
++    ["accept", "accept-language", "content-language", "content-type"].iter().any(|s| name.eq_ignore_ascii_case(s))
++}
++
++#[derive(Debug)]
++pub struct Response {
++    status: StatusCode,
++    url: String,
++    body: Option<Bytes>,
++}
++impl Response {
++    pub fn status(&self) -> StatusCode {
++        self.status
++    }
++    pub fn error_for_status(self) -> Result<Self> {
++        if self.status.is_client_error() || self.status.is_server_error() {
++            return Err(Error { message: format!("HTTP status {} for url ({})", self.status, self.url), status: Some(self.status) });
++        }
++        Ok(self)
++    }
++    /// The whole body the first time, then None.
++    pub async fn chunk(&mut self) -> Result<Option<Bytes>> {
++        Ok(self.body.take())
++    }
++    pub async fn bytes(self) -> Result<Bytes> {
++        Ok(self.body.unwrap_or_default())
++    }
++    pub async fn text(self) -> Result<String> {
++        Ok(String::from_utf8_lossy(&self.body.unwrap_or_default()).into_owned())
++    }
++    pub async fn json<T: serde::de::DeserializeOwned>(self) -> Result<T> {
++        serde_json::from_slice(&self.body.unwrap_or_default()).map_err(Error::new)
++    }
++}
+diff --git a/crates/earthcraft-playground/src/lib.rs b/crates/earthcraft-playground/src/lib.rs
+new file mode 100644
+index 0000000..fd66f47
+--- /dev/null
++++ b/crates/earthcraft-playground/src/lib.rs
+@@ -0,0 +1,602 @@
++// SPDX-License-Identifier: MIT
++//! EarthCraft in the browser, for Playground (patches/google-earth.yaml in github.com/daijro/openplayground).
++//!
++//! wasm32-unknown-unknown has no clock, no files, no threads and no process: `Instant::now` and `SystemTime::now`
++//! panic there, every file call fails (`path::absolute` too), and `env::temp_dir` and `process::id` panic. The modules
++//! that use them take `std` from here instead, through one `#[cfg(target_arch = "wasm32")] use
++//! earthcraft_playground::std;` line at each one's end (a local `std` shadows the standard library's name in that
++//! module; everything else in it still comes from the real std):
++//!   time     web-time's Instant and SystemTime;
++//!   fs       an in-memory file system (settings, caches, KML and screenshots), each change noted for the page to
++//!            mirror to Playground's Files;
++//!   path     `absolute` is the path from `/`;
++//!   thread   `spawn` takes the work but never runs it: the one service that still asks for a thread here (the
++//!            settings writer) waits for work in a loop, which a page's one thread can't do;
++//!   env      `HOME` is `/` and `temp_dir` is `/tmp`, both in memory (settings and caches go to `/.cache`, which
++//!            every page starts without; screenshots and saved places to `/EarthCraft`, a folder of Files too);
++//!   process  `id` is 1.
++//! And [`moka`]: Moka's cache reads std's clock on every call, so the decoded-tile cache (crates/earthcraft-data's
++//! tiles/cache.rs) takes this stand-in on wasm: the same weighted capacity, evicting the least recently used.
++#![cfg(target_arch = "wasm32")]
++
++pub mod std {
++    pub use ::std::*;
++
++    pub mod time {
++        pub use web_time::*;
++    }
++
++    pub mod path {
++        pub use ::std::path::*;
++
++        /// Paths start at `/` in memory (std's has no current folder on wasm and fails).
++        pub fn absolute<P: AsRef<Path>>(path: P) -> ::std::io::Result<PathBuf> {
++            Ok(super::fs::key(path.as_ref()))
++        }
++    }
++
++    pub mod process {
++        pub use ::std::process::*;
++
++        /// The page is one process (std's panics on wasm).
++        pub fn id() -> u32 {
++            1
++        }
++    }
++
++    pub mod env {
++        pub use ::std::env::*;
++        use ::std::ffi::{OsStr, OsString};
++        use ::std::path::PathBuf;
++
++        /// A folder in the in-memory files (std's panics on wasm).
++        pub fn temp_dir() -> PathBuf {
++            PathBuf::from("/tmp")
++        }
++
++        /// `HOME` is `/`: settings and caches go to the in-memory files. Nothing else is set.
++        pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
++            (key.as_ref() == "HOME").then(|| OsString::from("/"))
++        }
++
++        pub fn var<K: AsRef<OsStr>>(key: K) -> Result<String, VarError> {
++            var_os(key).map(|v| v.to_string_lossy().into_owned()).ok_or(VarError::NotPresent)
++        }
++    }
++
++    pub mod thread {
++        pub use ::std::thread::*;
++        use ::std::io;
++
++        /// Takes the thread's work and drops it unrun: see the crate's notes.
++        pub fn spawn<F, T>(f: F) -> JoinHandle<T>
++        where
++            F: FnOnce() -> T + Send + 'static,
++            T: Send + 'static,
++        {
++            drop(f);
++            JoinHandle(::std::marker::PhantomData)
++        }
++
++        /// What [`spawn`] gives back: a thread that never ran.
++        pub struct JoinHandle<T>(::std::marker::PhantomData<T>);
++        impl<T> JoinHandle<T> {
++            pub fn join(self) -> Result<T> {
++                Err(Box::new("a page runs no threads"))
++            }
++            pub fn is_finished(&self) -> bool {
++                true
++            }
++        }
++
++        #[derive(Default)]
++        pub struct Builder;
++        impl Builder {
++            pub fn new() -> Self {
++                Builder
++            }
++            pub fn name(self, _: String) -> Self {
++                self
++            }
++            pub fn stack_size(self, _: usize) -> Self {
++                self
++            }
++            pub fn spawn<F, T>(self, f: F) -> io::Result<JoinHandle<T>>
++            where
++                F: FnOnce() -> T + Send + 'static,
++                T: Send + 'static,
++            {
++                Ok(spawn(f))
++            }
++        }
++    }
++
++    pub mod fs {
++        pub use ::std::fs::*;
++        use ::std::cell::RefCell;
++        use ::std::collections::{BTreeMap, BTreeSet};
++        use ::std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
++        use ::std::path::{Component, Path, PathBuf};
++
++        enum Entry {
++            Dir,
++            File(Vec<u8>, web_time::SystemTime),
++        }
++
++        #[derive(Default)]
++        struct Tree {
++            entries: BTreeMap<PathBuf, Entry>,
++            /// Paths written, created or removed since the last [`changes`].
++            changed: BTreeSet<PathBuf>,
++        }
++
++        thread_local! {
++            static TREE: RefCell<Tree> = RefCell::default();
++        }
++
++        fn with<T>(f: impl FnOnce(&mut Tree) -> T) -> T {
++            TREE.with(|t| f(&mut t.borrow_mut()))
++        }
++
++        /// `/a/./b/../c` -> `/a/c`: one spelling per file (relative paths start at `/`).
++        pub fn key(p: &Path) -> PathBuf {
++            let mut out = PathBuf::from("/");
++            for c in p.components() {
++                match c {
++                    Component::ParentDir => {
++                        out.pop();
++                    }
++                    Component::Normal(n) => out.push(n),
++                    _ => {}
++                }
++            }
++            out
++        }
++
++        fn missing(p: &Path) -> io::Error {
++            io::Error::new(io::ErrorKind::NotFound, format!("{} does not exist", p.display()))
++        }
++
++        impl Tree {
++            fn mark(&mut self, p: PathBuf) {
++                self.changed.insert(p);
++            }
++            fn parents(&mut self, p: &Path) {
++                for dir in p.ancestors().skip(1) {
++                    self.entries.entry(dir.to_path_buf()).or_insert(Entry::Dir);
++                }
++            }
++            fn put(&mut self, p: PathBuf, bytes: Vec<u8>) {
++                self.parents(&p);
++                self.entries.insert(p, Entry::File(bytes, web_time::SystemTime::now()));
++            }
++            /// `p` and everything below it.
++            fn below(&self, p: &Path) -> Vec<PathBuf> {
++                self.entries.range(p.to_path_buf()..).map(|(k, _)| k).take_while(|k| k.starts_with(p)).cloned().collect()
++            }
++        }
++
++        /// Stores a file without noting a change (files the page brings in from Files or a drop).
++        pub fn put(p: &Path, bytes: Vec<u8>) {
++            with(|t| t.put(key(p), bytes));
++        }
++
++        /// The paths changed since the last call: each now holds what the page's storage should hold, or is gone.
++        pub fn changes() -> Vec<PathBuf> {
++            with(|t| ::std::mem::take(&mut t.changed).into_iter().collect())
++        }
++
++        pub fn exists<P: AsRef<Path>>(p: P) -> io::Result<bool> {
++            Ok(metadata(p).is_ok())
++        }
++
++        pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(p: P, bytes: C) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                t.put(p.clone(), bytes.as_ref().to_vec());
++                t.mark(p);
++            });
++            Ok(())
++        }
++
++        pub fn read<P: AsRef<Path>>(p: P) -> io::Result<Vec<u8>> {
++            TREE.with(|t| match t.borrow().entries.get(&key(p.as_ref())) {
++                Some(Entry::File(bytes, _)) => Ok(bytes.clone()),
++                _ => Err(missing(p.as_ref())),
++            })
++        }
++
++        pub fn read_to_string<P: AsRef<Path>>(p: P) -> io::Result<String> {
++            String::from_utf8(read(p)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
++        }
++
++        pub fn create_dir_all<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                if !t.entries.contains_key(&p) {
++                    t.parents(&p);
++                    t.entries.insert(p.clone(), Entry::Dir);
++                    t.mark(p);
++                }
++            });
++            Ok(())
++        }
++
++        pub fn create_dir<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            if metadata(p.as_ref()).is_ok() {
++                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists", p.as_ref().display())));
++            }
++            create_dir_all(p)
++        }
++
++        pub fn remove_file<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| match t.entries.get(&p) {
++                Some(Entry::File(..)) => {
++                    t.entries.remove(&p);
++                    t.mark(p);
++                    Ok(())
++                }
++                _ => Err(missing(&p)),
++            })
++        }
++
++        pub fn remove_dir_all<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                let gone = t.below(&p);
++                if gone.is_empty() {
++                    return Err(missing(&p));
++                }
++                for g in gone {
++                    t.entries.remove(&g);
++                    t.mark(g);
++                }
++                Ok(())
++            })
++        }
++
++        pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
++            let (from, to) = (key(from.as_ref()), key(to.as_ref()));
++            let bytes = read(&from)?;
++            with(|t| {
++                t.entries.remove(&from);
++                t.mark(from);
++                t.put(to.clone(), bytes);
++                t.mark(to);
++            });
++            Ok(())
++        }
++
++        pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
++            let bytes = read(from)?;
++            let n = bytes.len() as u64;
++            write(to, bytes)?;
++            Ok(n)
++        }
++
++        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++        pub struct FileType(bool);
++        impl FileType {
++            pub fn is_file(&self) -> bool {
++                self.0
++            }
++            pub fn is_dir(&self) -> bool {
++                !self.0
++            }
++            pub fn is_symlink(&self) -> bool {
++                false
++            }
++        }
++
++        #[derive(Clone, Debug)]
++        pub struct Metadata(Option<(u64, web_time::SystemTime)>);
++        impl Metadata {
++            pub fn len(&self) -> u64 {
++                self.0.map_or(0, |(n, _)| n)
++            }
++            pub fn is_file(&self) -> bool {
++                self.0.is_some()
++            }
++            pub fn is_dir(&self) -> bool {
++                self.0.is_none()
++            }
++            pub fn is_symlink(&self) -> bool {
++                false
++            }
++            pub fn file_type(&self) -> FileType {
++                FileType(self.is_file())
++            }
++            pub fn modified(&self) -> io::Result<web_time::SystemTime> {
++                Ok(self.0.map_or(web_time::SystemTime::UNIX_EPOCH, |(_, t)| t))
++            }
++        }
++
++        pub fn metadata<P: AsRef<Path>>(p: P) -> io::Result<Metadata> {
++            TREE.with(|t| match t.borrow().entries.get(&key(p.as_ref())) {
++                Some(Entry::File(bytes, at)) => Ok(Metadata(Some((bytes.len() as u64, *at)))),
++                Some(Entry::Dir) => Ok(Metadata(None)),
++                None => Err(missing(p.as_ref())),
++            })
++        }
++
++        /// No links in memory: the same as [`metadata`].
++        pub fn symlink_metadata<P: AsRef<Path>>(p: P) -> io::Result<Metadata> {
++            metadata(p)
++        }
++
++        pub struct DirEntry(PathBuf);
++        impl DirEntry {
++            pub fn path(&self) -> PathBuf {
++                self.0.clone()
++            }
++            pub fn file_name(&self) -> ::std::ffi::OsString {
++                self.0.file_name().unwrap_or_default().to_os_string()
++            }
++            pub fn metadata(&self) -> io::Result<Metadata> {
++                metadata(&self.0)
++            }
++            pub fn file_type(&self) -> io::Result<FileType> {
++                Ok(metadata(&self.0)?.file_type())
++            }
++        }
++
++        pub type ReadDir = ::std::vec::IntoIter<io::Result<DirEntry>>;
++
++        pub fn read_dir<P: AsRef<Path>>(p: P) -> io::Result<ReadDir> {
++            let dir = key(p.as_ref());
++            if !metadata(&dir)?.is_dir() {
++                return Err(io::Error::other(format!("{} is not a folder", dir.display())));
++            }
++            let entries = TREE.with(|t| {
++                t.borrow().below(&dir).into_iter().filter(|k| k.parent() == Some(&dir)).map(|k| Ok(DirEntry(k))).collect::<Vec<_>>()
++            });
++            Ok(entries.into_iter())
++        }
++
++        /// A file's bytes, read whole when it opens; one opened for writing is stored back when flushed or dropped.
++        pub struct File {
++            data: Cursor<Vec<u8>>,
++            /// Where written bytes go, for a file opened to write.
++            to: Option<PathBuf>,
++            dirty: bool,
++        }
++
++        impl File {
++            pub fn open<P: AsRef<Path>>(p: P) -> io::Result<File> {
++                Ok(File { data: Cursor::new(read(p)?), to: None, dirty: false })
++            }
++            pub fn create<P: AsRef<Path>>(p: P) -> io::Result<File> {
++                write(p.as_ref(), [])?;
++                Ok(File { data: Cursor::new(Vec::new()), to: Some(key(p.as_ref())), dirty: false })
++            }
++            pub fn metadata(&self) -> io::Result<Metadata> {
++                Ok(Metadata(Some((self.data.get_ref().len() as u64, web_time::SystemTime::now()))))
++            }
++            pub fn sync_all(&self) -> io::Result<()> {
++                Ok(())
++            }
++            fn store(&mut self) {
++                if let (true, Some(to)) = (self.dirty, &self.to) {
++                    let _ = write(to, self.data.get_ref());
++                    self.dirty = false;
++                }
++            }
++        }
++
++        impl Read for File {
++            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++                self.data.read(buf)
++            }
++        }
++
++        impl Seek for File {
++            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
++                self.data.seek(pos)
++            }
++        }
++
++        impl Write for File {
++            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++                if self.to.is_none() {
++                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the file is open to read"));
++                }
++                self.dirty = true;
++                self.data.write(buf)
++            }
++            fn flush(&mut self) -> io::Result<()> {
++                self.store();
++                Ok(())
++            }
++        }
++
++        impl Drop for File {
++            fn drop(&mut self) {
++                self.store();
++            }
++        }
++
++        /// `create_new` (screenshots never overwrite) and plain writes; reads go through [`File::open`].
++        #[derive(Clone, Debug, Default)]
++        pub struct OpenOptions {
++            write: bool,
++            create_new: bool,
++        }
++        impl OpenOptions {
++            pub fn new() -> Self {
++                Self::default()
++            }
++            pub fn read(&mut self, _: bool) -> &mut Self {
++                self
++            }
++            pub fn write(&mut self, write: bool) -> &mut Self {
++                self.write = write;
++                self
++            }
++            pub fn create(&mut self, _: bool) -> &mut Self {
++                self
++            }
++            pub fn truncate(&mut self, _: bool) -> &mut Self {
++                self
++            }
++            pub fn create_new(&mut self, create_new: bool) -> &mut Self {
++                self.create_new = create_new;
++                self
++            }
++            pub fn open<P: AsRef<Path>>(&self, p: P) -> io::Result<File> {
++                if self.create_new && metadata(p.as_ref()).is_ok() {
++                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists", p.as_ref().display())));
++                }
++                if self.write { File::create(p) } else { File::open(p) }
++            }
++        }
++    }
++}
++
++/// Moka's sync cache, as tiles/cache.rs uses it: a weighted capacity, least recently used out first.
++pub mod moka {
++    pub mod policy {
++        /// Only least-recently-used eviction is kept here, whichever is asked for.
++        #[derive(Clone, Copy, Debug, Default)]
++        pub struct EvictionPolicy;
++        impl EvictionPolicy {
++            pub fn lru() -> Self {
++                EvictionPolicy
++            }
++            pub fn tiny_lfu() -> Self {
++                EvictionPolicy
++            }
++        }
++    }
++
++    pub mod sync {
++        use super::policy::EvictionPolicy;
++        use ::std::collections::HashMap;
++        use ::std::hash::{BuildHasher, Hash, RandomState};
++        use ::std::marker::PhantomData;
++        use ::std::sync::{Arc, Mutex};
++
++        type Weigher<K, V> = Box<dyn Fn(&K, &V) -> u32 + Send + Sync>;
++
++        struct Entries<K, V, S> {
++            map: HashMap<Arc<K>, (V, u32, u64), S>,
++            weight: u64,
++            tick: u64,
++        }
++
++        pub struct Cache<K, V, S = RandomState> {
++            entries: Mutex<Entries<K, V, S>>,
++            capacity: u64,
++            weigher: Option<Weigher<K, V>>,
++        }
++
++        pub struct CacheBuilder<K, V, C> {
++            capacity: u64,
++            weigher: Option<Weigher<K, V>>,
++            cache: PhantomData<C>,
++        }
++
++        impl<K, V, C> CacheBuilder<K, V, C>
++        where
++            K: Hash + Eq + Send + Sync + 'static,
++            V: Clone + Send + Sync + 'static,
++        {
++            pub fn name(self, _: &str) -> Self {
++                self
++            }
++            pub fn max_capacity(mut self, capacity: u64) -> Self {
++                self.capacity = capacity;
++                self
++            }
++            pub fn weigher(mut self, weigher: impl Fn(&K, &V) -> u32 + Send + Sync + 'static) -> Self {
++                self.weigher = Some(Box::new(weigher));
++                self
++            }
++            pub fn eviction_policy(self, _: EvictionPolicy) -> Self {
++                self
++            }
++            pub fn build_with_hasher<S: BuildHasher + Clone + Send + Sync + 'static>(self, hasher: S) -> Cache<K, V, S> {
++                Cache {
++                    entries: Mutex::new(Entries { map: HashMap::with_hasher(hasher), weight: 0, tick: 0 }),
++                    capacity: self.capacity,
++                    weigher: self.weigher,
++                }
++            }
++            pub fn build(self) -> Cache<K, V> {
++                self.build_with_hasher(RandomState::new())
++            }
++        }
++
++        impl<K, V> Cache<K, V>
++        where
++            K: Hash + Eq + Send + Sync + 'static,
++            V: Clone + Send + Sync + 'static,
++        {
++            pub fn builder() -> CacheBuilder<K, V, Cache<K, V>> {
++                CacheBuilder { capacity: u64::MAX, weigher: None, cache: PhantomData }
++            }
++        }
++
++        impl<K, V, S> Cache<K, V, S>
++        where
++            K: Hash + Eq + Send + Sync + 'static,
++            V: Clone + Send + Sync + 'static,
++            S: BuildHasher + Clone + Send + Sync + 'static,
++        {
++            pub fn get(&self, key: &K) -> Option<V> {
++                let mut e = self.entries.lock().unwrap();
++                e.tick += 1;
++                let tick = e.tick;
++                e.map.get_mut(key).map(|(v, _, used)| {
++                    *used = tick;
++                    v.clone()
++                })
++            }
++            pub fn contains_key(&self, key: &K) -> bool {
++                self.entries.lock().unwrap().map.contains_key(key)
++            }
++            pub fn insert(&self, key: K, value: V) {
++                let weight = self.weigher.as_ref().map_or(1, |w| w(&key, &value));
++                let mut e = self.entries.lock().unwrap();
++                e.tick += 1;
++                let tick = e.tick;
++                if let Some((_, old, _)) = e.map.insert(Arc::new(key), (value, weight, tick)) {
++                    e.weight -= old as u64;
++                }
++                e.weight += weight as u64;
++                // ponytail: a full scan per eviction (a few thousand tiles at most); a heap if it ever shows in profiles.
++                while e.weight > self.capacity {
++                    let Some(oldest) = e.map.iter().min_by_key(|(_, (_, _, used))| *used).map(|(k, _)| k.clone()) else {
++                        break;
++                    };
++                    if let Some((_, w, _)) = e.map.remove(&oldest) {
++                        e.weight -= w as u64;
++                    }
++                }
++            }
++            pub fn invalidate(&self, key: &K) {
++                let mut e = self.entries.lock().unwrap();
++                if let Some((_, w, _)) = e.map.remove(key) {
++                    e.weight -= w as u64;
++                }
++            }
++            pub fn invalidate_all(&self) {
++                let mut e = self.entries.lock().unwrap();
++                e.map.clear();
++                e.weight = 0;
++            }
++            pub fn weighted_size(&self) -> u64 {
++                self.entries.lock().unwrap().weight
++            }
++            pub fn entry_count(&self) -> u64 {
++                self.entries.lock().unwrap().map.len() as u64
++            }
++            pub fn run_pending_tasks(&self) {}
++            /// A snapshot, as Moka's iterator is.
++            pub fn iter(&self) -> ::std::vec::IntoIter<(Arc<K>, V)> {
++                let e = self.entries.lock().unwrap();
++                e.map.iter().map(|(k, (v, _, _))| (k.clone(), v.clone())).collect::<Vec<_>>().into_iter()
++            }
++        }
++    }
++}
+diff --git a/crates/earthcraft-playground/tokio/Cargo.toml b/crates/earthcraft-playground/tokio/Cargo.toml
+new file mode 100644
+index 0000000..7350209
+--- /dev/null
++++ b/crates/earthcraft-playground/tokio/Cargo.toml
+@@ -0,0 +1,17 @@
++# Playground's browser build of EarthCraft (patches/google-earth.yaml in github.com/daijro/openplayground): the part of
++# Tokio crates/earthcraft-data uses, on the page's one thread. Native builds compile it empty.
++[package]
++name = "earthcraft-playground-tokio"
++version = "0.1.0"
++edition = "2024"
++description = "EarthCraft in the browser: Tokio's runtime, tasks, timers and files on a page's one thread"
++license = "MIT"
++publish = false
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++earthcraft-playground = { path = ".." }
++tokio = { version = "1", default-features = false, features = ["sync", "macros", "io-util"] }
++wasm-bindgen = "0.2"
++wasm-bindgen-futures = "0.4"
++js-sys = "0.3"
++web-time = "1"
+diff --git a/crates/earthcraft-playground/tokio/src/lib.rs b/crates/earthcraft-playground/tokio/src/lib.rs
+new file mode 100644
+index 0000000..74ba7ce
+--- /dev/null
++++ b/crates/earthcraft-playground/tokio/src/lib.rs
+@@ -0,0 +1,353 @@
++// SPDX-License-Identifier: MIT
++//! EarthCraft in the browser, for Playground (patches/google-earth.yaml in github.com/daijro/openplayground): the part of
++//! Tokio crates/earthcraft-data uses, as a page can have it. The crate takes it as `tokio` on wasm (an `extern crate …
++//! as tokio` at its root; the real Tokio is a native-only dependency there).
++//!
++//! Tokio's runtime needs threads and a clock that wasm32-unknown-unknown lacks. Here:
++//!   runtime, spawn   tasks run on the page's event loop (wasm-bindgen-futures), so the network waits in the browser
++//!                    and the page stays responsive; the runtime's thread counts mean nothing;
++//!   spawn_blocking   runs its work at once, on the one thread (the decoders and JSON parsing it is given);
++//!   time             timers are the browser's `setTimeout`, and Instant is web-time's (the crate's modules take
++//!                    `std::time` from earthcraft-playground too, so the two agree);
++//!   fs               the in-memory files of earthcraft-playground's `std::fs`;
++//!   sync, io, select!, join!   Tokio's own, which need no runtime.
++//! Every future here is Send, as Tokio's are, so the crate's own `Send` bounds hold.
++#![cfg(target_arch = "wasm32")]
++
++pub use tokio::{io, join, pin, select, sync, try_join};
++pub use task::spawn;
++
++pub mod task {
++    use std::future::Future;
++    use std::pin::Pin;
++    use std::sync::atomic::{AtomicBool, Ordering};
++    use std::sync::{Arc, Mutex};
++    use std::task::{Context, Poll, Waker};
++    use tokio::sync::oneshot;
++
++    /// A task stopped by [`JoinHandle::abort`] (a panic stops the whole page instead).
++    #[derive(Debug)]
++    pub struct JoinError;
++    impl std::fmt::Display for JoinError {
++        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++            f.write_str("task was cancelled")
++        }
++    }
++    impl std::error::Error for JoinError {}
++    impl JoinError {
++        pub fn is_cancelled(&self) -> bool {
++            true
++        }
++        pub fn is_panic(&self) -> bool {
++            false
++        }
++    }
++
++    #[derive(Default)]
++    struct Abort {
++        aborted: AtomicBool,
++        waker: Mutex<Option<Waker>>,
++    }
++
++    /// The task's output, or [`JoinError`] once it is aborted.
++    pub struct JoinHandle<T> {
++        output: oneshot::Receiver<T>,
++        abort: Arc<Abort>,
++    }
++    impl<T> JoinHandle<T> {
++        pub fn abort(&self) {
++            self.abort.aborted.store(true, Ordering::Relaxed);
++            if let Some(waker) = self.abort.waker.lock().unwrap().take() {
++                waker.wake();
++            }
++        }
++        pub fn is_finished(&self) -> bool {
++            self.output.is_terminated() || !self.output.is_empty()
++        }
++    }
++    impl<T> Future for JoinHandle<T> {
++        type Output = Result<T, JoinError>;
++        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++            Pin::new(&mut self.output).poll(cx).map(|r| r.map_err(|_| JoinError))
++        }
++    }
++
++    /// Runs `future` on the page's event loop.
++    pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
++    where
++        F: Future + 'static,
++        F::Output: 'static,
++    {
++        let (send, output) = oneshot::channel();
++        let abort = Arc::new(Abort::default());
++        let watch = abort.clone();
++        let mut future = Box::pin(future);
++        wasm_bindgen_futures::spawn_local(async move {
++            let finished = std::future::poll_fn(|cx| {
++                if watch.aborted.load(Ordering::Relaxed) {
++                    return Poll::Ready(None);
++                }
++                *watch.waker.lock().unwrap() = Some(cx.waker().clone());
++                future.as_mut().poll(cx).map(Some)
++            })
++            .await;
++            if let Some(value) = finished {
++                let _ = send.send(value);
++            }
++        });
++        JoinHandle { output, abort }
++    }
++
++    /// Runs `work` now, on the page's one thread.
++    pub fn spawn_blocking<F, T>(work: F) -> JoinHandle<T>
++    where
++        F: FnOnce() -> T + Send + 'static,
++        T: Send + 'static,
++    {
++        let (send, output) = oneshot::channel();
++        let _ = send.send(work());
++        JoinHandle { output, abort: Arc::default() }
++    }
++
++    /// Tasks whose outputs come back in the order they finish.
++    pub struct JoinSet<T> {
++        tasks: Vec<JoinHandle<T>>,
++    }
++    impl<T> Default for JoinSet<T> {
++        fn default() -> Self {
++            Self { tasks: Vec::new() }
++        }
++    }
++    impl<T: 'static> JoinSet<T> {
++        pub fn new() -> Self {
++            Self::default()
++        }
++        pub fn spawn<F: Future<Output = T> + 'static>(&mut self, future: F) {
++            self.tasks.push(spawn(future));
++        }
++        pub fn len(&self) -> usize {
++            self.tasks.len()
++        }
++        pub fn is_empty(&self) -> bool {
++            self.tasks.is_empty()
++        }
++        pub fn abort_all(&mut self) {
++            self.tasks.iter().for_each(JoinHandle::abort);
++        }
++        pub async fn join_next(&mut self) -> Option<Result<T, JoinError>> {
++            if self.tasks.is_empty() {
++                return None;
++            }
++            std::future::poll_fn(|cx| {
++                for i in 0..self.tasks.len() {
++                    if let Poll::Ready(output) = Pin::new(&mut self.tasks[i]).poll(cx) {
++                        self.tasks.swap_remove(i);
++                        return Poll::Ready(Some(output));
++                    }
++                }
++                Poll::Pending
++            })
++            .await
++        }
++    }
++    impl<T> Drop for JoinSet<T> {
++        fn drop(&mut self) {
++            self.tasks.iter().for_each(JoinHandle::abort);
++        }
++    }
++}
++
++pub mod runtime {
++    use crate::task::{JoinHandle, spawn};
++    use std::future::Future;
++
++    /// The page's event loop: there is one, whatever the builder asks for.
++    #[derive(Clone, Debug, Default)]
++    pub struct Handle;
++    impl Handle {
++        pub fn current() -> Self {
++            Handle
++        }
++        pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
++        where
++            F: Future + 'static,
++            F::Output: 'static,
++        {
++            spawn(future)
++        }
++    }
++
++    #[derive(Debug, Default)]
++    pub struct Runtime {
++        handle: Handle,
++    }
++    impl Runtime {
++        pub fn handle(&self) -> &Handle {
++            &self.handle
++        }
++        pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
++        where
++            F: Future + 'static,
++            F::Output: 'static,
++        {
++            spawn(future)
++        }
++    }
++
++    #[derive(Debug, Default)]
++    pub struct Builder;
++    impl Builder {
++        pub fn new_multi_thread() -> Self {
++            Builder
++        }
++        pub fn new_current_thread() -> Self {
++            Builder
++        }
++        pub fn worker_threads(&mut self, _: usize) -> &mut Self {
++            self
++        }
++        pub fn max_blocking_threads(&mut self, _: usize) -> &mut Self {
++            self
++        }
++        pub fn thread_name(&mut self, _: impl Into<String>) -> &mut Self {
++            self
++        }
++        pub fn enable_all(&mut self) -> &mut Self {
++            self
++        }
++        pub fn enable_time(&mut self) -> &mut Self {
++            self
++        }
++        pub fn build(&mut self) -> std::io::Result<Runtime> {
++            Ok(Runtime::default())
++        }
++    }
++}
++
++pub mod time {
++    use std::future::Future;
++    use std::pin::Pin;
++    use std::sync::atomic::{AtomicBool, Ordering};
++    use std::sync::{Arc, Mutex};
++    use std::task::{Context, Poll, Waker};
++    pub use std::time::Duration;
++    pub use web_time::Instant;
++    use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
++
++    #[wasm_bindgen]
++    extern "C" {
++        #[wasm_bindgen(js_name = setTimeout)]
++        fn set_timeout(handler: &js_sys::Function, ms: i32) -> JsValue;
++    }
++
++    #[derive(Default)]
++    struct Timer {
++        fired: AtomicBool,
++        waker: Mutex<Option<Waker>>,
++    }
++
++    /// Done once the browser's timer fires.
++    pub struct Sleep(Arc<Timer>);
++    impl Future for Sleep {
++        type Output = ();
++        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
++            *self.0.waker.lock().unwrap() = Some(cx.waker().clone());
++            if self.0.fired.load(Ordering::Relaxed) { Poll::Ready(()) } else { Poll::Pending }
++        }
++    }
++
++    pub fn sleep(duration: Duration) -> Sleep {
++        let timer = Arc::new(Timer::default());
++        let fire = timer.clone();
++        let handler = Closure::once_into_js(move || {
++            fire.fired.store(true, Ordering::Relaxed);
++            if let Some(waker) = fire.waker.lock().unwrap().take() {
++                waker.wake();
++            }
++        });
++        set_timeout(handler.unchecked_ref(), duration.as_millis().min(i32::MAX as u128) as i32);
++        Sleep(timer)
++    }
++
++    pub fn sleep_until(deadline: Instant) -> Sleep {
++        sleep(deadline.saturating_duration_since(Instant::now()))
++    }
++
++    pub mod error {
++        /// The time ran out before the future finished.
++        #[derive(Debug, PartialEq, Eq)]
++        pub struct Elapsed;
++        impl std::fmt::Display for Elapsed {
++            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++                f.write_str("deadline has elapsed")
++            }
++        }
++        impl std::error::Error for Elapsed {}
++    }
++
++    pub async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, error::Elapsed> {
++        let mut future = std::pin::pin!(future);
++        let mut timer = sleep(duration);
++        std::future::poll_fn(|cx| {
++            if let Poll::Ready(value) = future.as_mut().poll(cx) {
++                return Poll::Ready(Ok(value));
++            }
++            Pin::new(&mut timer).poll(cx).map(|()| Err(error::Elapsed))
++        })
++        .await
++    }
++}
++
++/// The in-memory files, as Tokio's async calls.
++pub mod fs {
++    use earthcraft_playground::std::fs;
++    use std::io::{self, Write as _};
++    use std::path::Path;
++    use std::pin::Pin;
++    use std::task::{Context, Poll};
++    pub use fs::Metadata;
++
++    pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
++        fs::read(path)
++    }
++    pub async fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
++        fs::read_to_string(path)
++    }
++    pub async fn write(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> io::Result<()> {
++        fs::write(path, bytes)
++    }
++    pub async fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
++        fs::create_dir_all(path)
++    }
++    pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
++        fs::rename(from, to)
++    }
++    pub async fn remove_file(path: impl AsRef<Path>) -> io::Result<()> {
++        fs::remove_file(path)
++    }
++    pub async fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
++        fs::remove_dir_all(path)
++    }
++    pub async fn metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
++        fs::metadata(path)
++    }
++
++    /// A file being written, stored when flushed or dropped.
++    pub struct File(fs::File);
++    impl File {
++        pub async fn create(path: impl AsRef<Path>) -> io::Result<File> {
++            fs::File::create(path).map(File)
++        }
++    }
++    impl tokio::io::AsyncWrite for File {
++        fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
++            Poll::Ready(self.0.write(buf))
++        }
++        fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Ready(self.0.flush())
++        }
++        fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Ready(self.0.flush())
++        }
++    }
++}
+diff --git a/crates/earthcraft-render/src/aircraft/worker/web.rs b/crates/earthcraft-render/src/aircraft/worker/web.rs
+new file mode 100644
+index 0000000..448f92b
+--- /dev/null
++++ b/crates/earthcraft-render/src/aircraft/worker/web.rs
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: MIT
++//! Aircraft projection in Playground's browser build (patches/google-earth.yaml in github.com/daijro/openplayground):
++//! a page has one thread, so a submitted view is projected at once, by the same preparer, and handed over on the app's
++//! next take. Same calls as the worker in worker.rs. (The aircraft layer itself is off on the web: its feeds don't
++//! answer other sites' pages.)
++use super::{AircraftGeometry, AircraftPreparer, ProjectionInput};
++use std::cell::RefCell;
++use std::sync::Arc;
++
++pub struct AircraftWorker {
++    preparer: RefCell<AircraftPreparer>,
++    completed: RefCell<Option<Arc<AircraftGeometry>>>,
++    repaint: Box<dyn Fn()>,
++}
++
++impl AircraftWorker {
++    pub fn new(repaint: impl Fn() + Send + 'static) -> std::io::Result<Self> {
++        Ok(Self { preparer: RefCell::default(), completed: RefCell::default(), repaint: Box::new(repaint) })
++    }
++    pub fn submit(&self, input: ProjectionInput) {
++        let geometry = self.preparer.borrow_mut().prepare(input);
++        *self.completed.borrow_mut() = Some(geometry);
++        (self.repaint)();
++    }
++    pub fn take_completed(&self) -> Option<Arc<AircraftGeometry>> {
++        self.completed.take()
++    }
++}
+diff --git a/crates/earthcraft-render/src/live_layers/worker/web.rs b/crates/earthcraft-render/src/live_layers/worker/web.rs
+new file mode 100644
+index 0000000..25eae3f
+--- /dev/null
++++ b/crates/earthcraft-render/src/live_layers/worker/web.rs
+@@ -0,0 +1,27 @@
++// SPDX-License-Identifier: MIT
++//! Live layer preparation (roads, ships, satellites, traffic) in Playground's browser build (patches/google-earth.yaml
++//! in github.com/daijro/openplayground): a page has one thread, so a submitted view is prepared at once, by the same
++//! preparer, and handed over on the app's next take. Same calls as the worker in worker.rs.
++use super::{LiveGeometry, LiveInput, LivePreparer};
++use std::cell::RefCell;
++use std::sync::Arc;
++
++pub struct LiveWorker {
++    preparer: RefCell<LivePreparer>,
++    completed: RefCell<Option<Arc<LiveGeometry>>>,
++    repaint: Box<dyn Fn()>,
++}
++
++impl LiveWorker {
++    pub fn new(repaint: impl Fn() + Send + 'static) -> std::io::Result<Self> {
++        Ok(Self { preparer: RefCell::default(), completed: RefCell::default(), repaint: Box::new(repaint) })
++    }
++    pub fn submit(&self, input: LiveInput) {
++        let geometry = self.preparer.borrow_mut().prepare(input);
++        *self.completed.borrow_mut() = Some(geometry);
++        (self.repaint)();
++    }
++    pub fn take_completed(&self) -> Option<Arc<LiveGeometry>> {
++        self.completed.take()
++    }
++}
+diff --git a/crates/earthcraft-render/src/overlays/worker/web.rs b/crates/earthcraft-render/src/overlays/worker/web.rs
+new file mode 100644
+index 0000000..d79dbda
+--- /dev/null
++++ b/crates/earthcraft-render/src/overlays/worker/web.rs
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: MIT
++//! Border and label preparation in Playground's browser build (patches/google-earth.yaml in
++//! github.com/daijro/openplayground): a page has one thread, so a submitted view is prepared at once, by the same
++//! preparer, and handed over on the app's next take. Same calls as the worker in worker.rs.
++use super::{OverlayGeometry, OverlayInput, OverlayPreparer, OverlayView};
++use earthcraft_data::boundaries::BoundaryData;
++use std::cell::RefCell;
++use std::sync::Arc;
++
++pub struct OverlayWorker {
++    preparer: RefCell<OverlayPreparer>,
++    completed: RefCell<Option<Arc<OverlayGeometry>>>,
++    repaint: Box<dyn Fn()>,
++}
++
++impl OverlayWorker {
++    pub fn new(repaint: impl Fn() + Send + 'static) -> std::io::Result<Self> {
++        Ok(Self { preparer: RefCell::default(), completed: RefCell::default(), repaint: Box::new(repaint) })
++    }
++    pub fn submit(&self, view: OverlayView, data: Arc<BoundaryData>) {
++        let geometry = self.preparer.borrow_mut().prepare(OverlayInput { view, data });
++        *self.completed.borrow_mut() = Some(geometry);
++        (self.repaint)();
++    }
++    pub fn take_completed(&self) -> Option<Arc<OverlayGeometry>> {
++        self.completed.take()
++    }
++}
+diff --git a/crates/earthcraft-render/src/worker/web.rs b/crates/earthcraft-render/src/worker/web.rs
+new file mode 100644
+index 0000000..ff1a8f0
+--- /dev/null
++++ b/crates/earthcraft-render/src/worker/web.rs
+@@ -0,0 +1,78 @@
++// SPDX-License-Identifier: MIT
++//! The frame coordinator in Playground's browser build (patches/google-earth.yaml in github.com/daijro/openplayground):
++//! a page has one thread, so a submitted view is rasterized at once, on it (with Rayon running on that thread too),
++//! and published for the app to take on its next frame, as the desktop's coordinator thread publishes it. Same calls
++//! as the coordinator in worker.rs; the frame is still one behind the request, and the app still draws reduced
++//! rasters while the globe moves (view.rs).
++use super::{RenderRequest, RenderedFrame};
++use std::cell::RefCell;
++
++type Render = Box<dyn FnMut(&RenderRequest, Vec<u8>) -> crate::RenderedView>;
++
++pub struct RenderWorker<T = ()> {
++    render: RefCell<Render>,
++    prepare: RefCell<Box<dyn FnMut(&RenderRequest, &[u8]) -> T>>,
++    admit: Box<dyn Fn(&crate::RenderedView)>,
++    repaint: Box<dyn Fn()>,
++    completed: RefCell<Option<RenderedFrame<T>>>,
++    spare: RefCell<Option<Vec<u8>>>,
++}
++
++impl RenderWorker {
++    pub fn new(
++        render: impl FnMut(&RenderRequest, Vec<u8>) -> crate::RenderedView + Send + 'static,
++        repaint: impl Fn() + Send + 'static,
++        admit: impl Fn(&crate::RenderedView) + Send + 'static,
++    ) -> std::io::Result<Self> {
++        Self::with_prepare(render, repaint, admit, |_, _| ())
++    }
++}
++
++impl<T: Send + 'static> RenderWorker<T> {
++    pub fn with_prepare(
++        render: impl FnMut(&RenderRequest, Vec<u8>) -> crate::RenderedView + Send + 'static,
++        repaint: impl Fn() + Send + 'static,
++        admit: impl Fn(&crate::RenderedView) + Send + 'static,
++        prepare: impl FnMut(&RenderRequest, &[u8]) -> T + Send + 'static,
++    ) -> std::io::Result<Self> {
++        Ok(Self {
++            render: RefCell::new(Box::new(render)),
++            prepare: RefCell::new(Box::new(prepare)),
++            admit: Box::new(admit),
++            repaint: Box::new(repaint),
++            completed: RefCell::default(),
++            spare: RefCell::default(),
++        })
++    }
++
++    pub fn recycle(&self, buffer: Vec<u8>) {
++        *self.spare.borrow_mut() = Some(buffer);
++    }
++
++    pub fn submit(&self, request: RenderRequest) {
++        let buffer = self.spare.take().unwrap_or_default();
++        let frame = (self.render.borrow_mut())(&request, buffer);
++        let prepared = (self.prepare.borrow_mut())(&request, &frame.pixels);
++        (self.admit)(&frame);
++        if let Some(previous) = self.completed.take() {
++            *self.spare.borrow_mut() = Some(previous.pixels);
++        }
++        let required = frame.required_tiles();
++        *self.completed.borrow_mut() = Some(RenderedFrame {
++            prepared,
++            request,
++            pixels: frame.pixels,
++            waiting: frame.waiting,
++            required,
++        });
++        (self.repaint)();
++    }
++
++    pub fn take_completed(&self, presentation: u64) -> Option<RenderedFrame<T>> {
++        self.completed.take().filter(|frame| frame.request.presentation == presentation)
++    }
++
++    pub fn is_idle(&self) -> bool {
++        true
++    }
++}
+diff --git a/index.html b/index.html
+new file mode 100644
+index 0000000..5ddf63e
+--- /dev/null
++++ b/index.html
+@@ -0,0 +1,20 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
++  <title>EarthCraft</title>
++  <!-- EarthCraft in the browser, for Playground (patches/google-earth.yaml in github.com/daijro/openplayground). -->
++  <link data-trunk rel="rust" href="apps/earthcraft/Cargo.toml" data-bin="earthcraft" data-wasm-opt="0" />
++  <style>
++    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
++    #earthcraft_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
++    #earthcraft_loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
++      color: #dcdee2; font: 14px system-ui, sans-serif; pointer-events: none; }
++  </style>
++</head>
++<body>
++  <canvas id="earthcraft_canvas"></canvas>
++  <div id="earthcraft_loading">Loading EarthCraft&hellip;</div>
++</body>
++</html>

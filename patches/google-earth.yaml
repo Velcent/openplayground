@@ -1,0 +1,326 @@
+# EarthCraft in the browser. Upstream (github.com/therichronicles/EarthCraft) has no browser build (no wasm32 code at
+# all) and releases desktop packages only; these patches add the web build Playground serves, from its head commit.
+#
+# patches/google-earth/web.diff adds new files only:
+#   index.html, Trunk.toml     the web build at the repository's root (build.mjs builds there): trunk builds
+#                              apps/earthcraft's `earthcraft` binary for the page's canvas.
+#   apps/earthcraft/src/app/web.rs   the page's side: `main` runs as on the desktop, and the crate root takes `eframe`
+#                              (and `self_update`) from here, whose `run_native` starts the app on the canvas; Open KML…,
+#                              Save As…, and the Explorer's planet and image pickers are Playground's dialogs (`rfd`);
+#                              "Open in EarthCraft" opens a KML/KMZ (or a planet), as a file dropped on the globe does;
+#                              what EarthCraft writes outside its own folders (a saved KML or planet, a screenshot in
+#                              /EarthCraft) goes to Files after the frame, and a save to download is handed to the
+#                              browser once written; links open in a new tab, as the desktop opens the browser.
+#   apps/earthcraft/src/app/explorer/web.rs   where the Explorer's picker answers land.
+#   crates/earthcraft-playground/   what wasm32-unknown-unknown lacks: `std` with web-time's clock, an in-memory file
+#                              system and `path::absolute`, `HOME` (`/`: settings and caches in memory), `env::temp_dir`,
+#                              `process::id`, and a `thread::spawn` that never runs its work (the settings writer's loop,
+#                              which waits for work); and a stand-in for Moka's cache, which reads std's clock. The
+#                              modules that use them take `std` from it on wasm through ONE `use` line at their end (a
+#                              local `std` shadows the standard library's name in that module; everything else in it still
+#                              comes from the real std).
+#     tokio/, reqwest/         Tokio and reqwest as a page has them, which crates/earthcraft-data takes under their own
+#                              names on wasm: tasks on the page's event loop, the browser's timers, the in-memory files;
+#                              requests through the browser's fetch, with every future Send as the crate expects.
+#   crates/earthcraft-render/src/{worker,overlays/worker,live_layers/worker,aircraft/worker}/web.rs   the frame
+#                              coordinator and the overlay, live-layer and aircraft preparation without their threads:
+#                              a submitted view is rasterized (or prepared) at once, on the page's one thread (Rayon runs
+#                              there too), and published for the app's next frame, as each thread publishes it.
+#   crates/earthcraft-data/src/boundaries/updates/web.rs   the boundary merge without its thread, when the app asks.
+#   crates/earthcraft-data/src/tiles/disk/web.rs   no imagery disk cache (MBTiles through SQLite on a worker thread):
+#                              the browser's HTTP cache keeps fetched tiles, and decoded ones stay in memory as on the
+#                              desktop.
+#   crates/earthcraft-data/src/updater/web.rs   no updates: Playground serves the newest build.
+#
+# The globe is upstream's default CPU ray-caster (glam/wide with wasm SIMD, on one thread), drawn as an egui texture;
+# eframe draws through wgpu on WebGPU where the browser has it, else on WebGL2 (wgpu's `webgl` feature, added below).
+# egui's own shaders run on both. Upstream's experimental GPU globe renderer (WGSL compute shaders, opt-in with
+# EARTHCRAFT_RENDERER, which a page can't set) stays off: it waits on the GPU with pollster::block_on, which a page
+# can't do, and WebGL2 has no compute shaders at all.
+#
+# Data sources, checked from a page on 2026-10-27 (CORS: whether a page on another site may read them):
+#   on    Esri World Imagery and Wayback (and its release list), OpenStreetMap and OpenTopoMap tiles, Mapterhorn terrain,
+#         Natural Earth borders and names (raw.githubusercontent.com), RainViewer radar, Matt Eason's cloud map,
+#         OpenSeaFeed AIS ships (asked again without EarthCraft's Digitraffic-User header, whose preflight it refuses)
+#         and Fintraffic's (Digitraffic) fallback, CelesTrak satellites, Nominatim search and Photon suggestions, Overpass
+#         roads and worldwide municipal borders (overpass-api.de answers pages; both Overpass servers were often busy or
+#         slow while testing), TomTom traffic (with the user's key, as on the desktop).
+#   off   live aircraft: OpenSky answers only its own site and ADSB.lol sends no CORS header, so the layer's checkbox is
+#         greyed out, saying why.
+#   untested  IBGE's Brazilian municipal and metropolitan outlines (servicodados.ibge.gov.br didn't answer from here).
+# Also off on the web: installed fonts (a page can't list them; Settings says the font worker can't start), choosing
+# folders (Settings' Browse: the paths stay as typed), settings kept between visits (they live for the page), narrated
+# tours' system speech, and updates. Native builds see none of this: every rule adds wasm-only lines, or moves a
+# native-only dependency into a native-only table.
+
+# Rules 1-16/79: the dependencies. Tokio (threads, sockets, files), reqwest, Moka, SQLite (the tile cache) and
+# self_update have no browser side: a native-only table opens at the end of each manifest and each one's line moves into
+# it, and rfd's non-Linux table leaves out wasm (a page's dialogs are Playground's). The wasm-only ones go under a target
+# spelling nobody else uses (`all(...)`): the playground crates, wgpu's WebGL2 backend, sys-locale's browser language
+# (the page follows the browser's English or Portuguese, as the desktop follows the system), wasm-bindgen for the page.
+# crates/earthcraft-data then takes the playground's Tokio and reqwest under their own names (an `extern crate … as` at
+# its root puts the name in every module's scope), and SQLite's two error kinds are native-only. If upstream drops or
+# renames one of the moved dependencies, drop its rule.
+- file: crates/earthcraft-data/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n# Playground's web build (patches/google-earth.yaml): what has no browser side.\n[target.'cfg(not(target_arch = \"wasm32\"))'.dependencies]\n"
+- file: crates/earthcraft-data/Cargo.toml
+  find: '^(tokio\.workspace\s*=[^\n]*)\n([\s\S]*)$'
+  replace: "$2$1\n"
+- file: crates/earthcraft-data/Cargo.toml
+  find: '^(reqwest\.workspace\s*=[^\n]*)\n([\s\S]*)$'
+  replace: "$2$1\n"
+- file: crates/earthcraft-data/Cargo.toml
+  find: '^(moka\.workspace\s*=[^\n]*)\n([\s\S]*)$'
+  replace: "$2$1\n"
+- file: crates/earthcraft-data/Cargo.toml
+  find: '^(rusqlite\.workspace\s*=[^\n]*)\n([\s\S]*)$'
+  replace: "$2$1\n"
+- file: crates/earthcraft-data/Cargo.toml
+  find: '^(tokio-rusqlite\.workspace\s*=[^\n]*)\n([\s\S]*)$'
+  replace: "$2$1\n"
+- file: crates/earthcraft-data/Cargo.toml
+  find: '^(self_update\.workspace\s*=[^\n]*)\n([\s\S]*)$'
+  replace: "$2$1\n"
+- file: crates/earthcraft-data/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nearthcraft-playground = { path = \"../earthcraft-playground\" }\nearthcraft-playground-tokio = { path = \"../earthcraft-playground/tokio\" }\nearthcraft-playground-reqwest = { path = \"../earthcraft-playground/reqwest\" }\n"
+- file: crates/earthcraft-core/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nearthcraft-playground = { path = \"../earthcraft-playground\" }\n"
+- file: apps/earthcraft/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n# Playground's web build (patches/google-earth.yaml): what has no browser side.\n[target.'cfg(not(target_arch = \"wasm32\"))'.dependencies]\n"
+- file: apps/earthcraft/Cargo.toml
+  find: '^(self_update\.workspace\s*=[^\n]*)\n([\s\S]*)$'
+  replace: "$2$1\n"
+- file: apps/earthcraft/Cargo.toml
+  find: "^\\[target\\.'cfg\\(not\\(any\\(target_os = \"linux\", target_os = \"freebsd\"\\)\\)\\)'\\.dependencies\\]"
+  replace: "[target.'cfg(not(any(target_os = \"linux\", target_os = \"freebsd\", target_arch = \"wasm32\")))'.dependencies]"
+- file: apps/earthcraft/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nearthcraft-playground = { path = \"../../crates/earthcraft-playground\" }\nwgpu = { workspace = true, features = [\"webgl\"] }\nsys-locale = { workspace = true, features = [\"js\"] }\nwasm-bindgen = \"0.2\"\nwasm-bindgen-futures = \"0.4\"\njs-sys = \"0.3\"\nweb-sys = { version = \"0.3\", features = [\"Window\", \"Document\", \"Element\", \"HtmlCanvasElement\", \"console\"] }\n"
+- file: crates/earthcraft-data/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: Tokio and reqwest as a page has them (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] extern crate earthcraft_playground_tokio as tokio;\n#[cfg(target_arch = \"wasm32\")] extern crate earthcraft_playground_reqwest as reqwest;\n"
+- file: crates/earthcraft-data/src/error.rs
+  find: '^([ \t]*)(#\[error\(transparent\)\]\s*Sqlite\(#\[from\] rusqlite::Error\),)'
+  replace: "$1#[cfg(not(target_arch = \"wasm32\"))]\n$1$2"
+- file: crates/earthcraft-data/src/error.rs
+  find: '^([ \t]*)(#\[error\(transparent\)\]\s*SqliteWorker\(#\[from\] tokio_rusqlite::Error\),)'
+  replace: "$1#[cfg(not(target_arch = \"wasm32\"))]\n$1$2"
+
+# Rules 17-46/79: the modules that use the clock, files, HOME, the temp folder, the process id or a thread take `std`
+# from crates/earthcraft-playground on wasm (see the top). Found with: every non-test module that names Instant,
+# SystemTime, fs::, File::, OpenOptions, thread::, env:: or process::id, except those whose code doesn't run on the web
+# (the workers and stand-ins below, mbtiles.rs, profiling.rs), updater.rs (its env:: calls don't panic) and fonts.rs
+# (its thread then fails to start, see the top). tiles/cache.rs takes Moka's stand-in from it too; app/mod.rs declares
+# the page. If upstream starts using these in another module, give it the same line; a missing one panics at the first
+# clock, file or temp-folder call (EarthCraft then never gets past "Loading EarthCraft…", or stops when that feature is
+# used).
+- file: crates/earthcraft-core/src/math.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/paths.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: HOME (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/settings.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/settings/writer.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files, and the writer's thread, which never runs here (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/files.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/files/session.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/files/images.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/files/screenshot.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/kml/mod.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/kml/kmz.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/planet.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/features.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files, the temp folder and the process id (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/boundaries/load.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/vessels.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/satellites.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/roads.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/traffic.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/live_maps/mod.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/live_maps/download.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/aircraft.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/aircraft/worker.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/aircraft/snapshot.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: crates/earthcraft-data/src/tiles/cache.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock, and Moka's cache without it (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::{moka, std};\n"
+- file: apps/earthcraft/src/app/mod.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the page, and the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] pub(crate) mod web;\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: apps/earthcraft/src/app/globe.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: apps/earthcraft/src/app/rendering.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: apps/earthcraft/src/app/navigation.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: apps/earthcraft/src/app/search.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: apps/earthcraft/src/app/controllers.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+- file: apps/earthcraft/src/app/cache.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
+
+# Rules 47-66/79: the threads that wait for work (the frame coordinator; overlay, live-layer and aircraft preparation;
+# the boundary merge) can't wait on a page's one thread. Each type is native-only, and its web.rs (see the top) takes its
+# name on wasm with the same calls. If upstream changes one of these types' calls, change its web.rs to match (the build
+# says where); if it renames one, follow.
+- file: crates/earthcraft-render/src/worker.rs
+  find: '^pub struct RenderWorker<T = \(\)> \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-render/src/worker.rs
+  find: '^impl RenderWorker \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-render/src/worker.rs
+  find: '^impl<T: Send \+ .static> RenderWorker<T> \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-render/src/worker.rs
+  find: '^impl<T> Drop for RenderWorker<T> \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-render/src/worker.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the coordinator without its thread (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] mod web;\n#[cfg(target_arch = \"wasm32\")] pub use web::RenderWorker;\n"
+- file: crates/earthcraft-render/src/overlays/worker.rs
+  find: '^pub struct OverlayWorker \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-render/src/overlays/worker.rs
+  find: '^impl OverlayWorker \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-render/src/overlays/worker.rs
+  find: '^impl Drop for OverlayWorker \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-render/src/overlays/worker.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the preparation without its thread (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] mod web;\n#[cfg(target_arch = \"wasm32\")] pub use web::OverlayWorker;\n"
+- file: crates/earthcraft-render/src/live_layers/worker.rs
+  find: '^pub struct LiveWorker \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-render/src/live_layers/worker.rs
+  find: '^impl LiveWorker \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-render/src/live_layers/worker.rs
+  find: '^impl Drop for LiveWorker \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-render/src/live_layers/worker.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the preparation without its thread (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] mod web;\n#[cfg(target_arch = \"wasm32\")] pub use web::LiveWorker;\n"
+- file: crates/earthcraft-render/src/aircraft/worker.rs
+  find: '^pub struct AircraftWorker \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-render/src/aircraft/worker.rs
+  find: '^impl AircraftWorker \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-render/src/aircraft/worker.rs
+  find: '^impl Drop for AircraftWorker \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-render/src/aircraft/worker.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the projection without its thread (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] mod web;\n#[cfg(target_arch = \"wasm32\")] pub use web::AircraftWorker;\n"
+- file: crates/earthcraft-data/src/boundaries/updates.rs
+  find: '^pub struct BoundaryUpdates \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-data/src/boundaries/updates.rs
+  find: '^impl BoundaryUpdates \{'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: crates/earthcraft-data/src/boundaries/updates.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the merge without its thread (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] mod web;\n#[cfg(target_arch = \"wasm32\")] pub use web::BoundaryUpdates;\n"
+
+# Rules 67-70/79: what has no browser side, given a stand-in on wasm (see the top): the imagery disk cache (mbtiles.rs,
+# SQLite) and the updater's release check (release.rs, self_update), each module swapped for its web.rs, with the
+# updater's one match on a self_update error native-only; and the decoders' CPU pools (Rayon pools of their own, whose
+# threads a page can't start), whose work runs in place. If upstream renames these, follow.
+- file: crates/earthcraft-data/src/tiles/disk.rs
+  find: '^mod mbtiles;'
+  replace: "#[cfg(not(target_arch = \"wasm32\"))]\nmod mbtiles;\n// Playground's browser build: no disk cache (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")]\n#[path = \"disk/web.rs\"]\nmod mbtiles;"
+- file: crates/earthcraft-data/src/updater.rs
+  find: '^mod release;'
+  replace: "#[cfg(not(target_arch = \"wasm32\"))]\nmod release;\n// Playground's browser build: no updates to install (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")]\n#[path = \"updater/web.rs\"]\nmod release;"
+- file: crates/earthcraft-data/src/updater.rs
+  find: 'Err\(error @ self_update::Error::InstallPathNotWritable'
+  before: "#[cfg(not(target_arch = \"wasm32\"))] "
+- file: crates/earthcraft-data/src/cpu.rs
+  find: '\bpub\(crate\) async fn run<[^{]*\{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")] return catch_panic(work);"
+
+# Rules 71-79/79: the page (apps/earthcraft/src/app/web.rs, see the top). main.rs takes eframe and self_update from it,
+# and presentation.rs eframe (for the desktop window's options, unused on the page); the modules with file dialogs take
+# rfd from it, and the Explorer's answers land in explorer/web.rs, which tells it when the sky's row is drawn (both of
+# its image pickers are alike). The aircraft checkbox (Layers, and the Explorer's) is greyed out on the web, saying why
+# (see the top). If upstream adds a dialog elsewhere, give that module the rfd line; if it renames what these anchor
+# on, follow.
+- file: apps/earthcraft/src/main.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: run_native starts the app on the page (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use app::web::{eframe, self_update};\n"
+- file: apps/earthcraft/src/presentation.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the desktop window's options, unused on the page (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::app::web::eframe;\n"
+- file: apps/earthcraft/src/app/files.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: Playground's dialogs (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use super::web::rfd;\n"
+- file: apps/earthcraft/src/app/update_restart.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: Playground's dialogs (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use super::web::rfd;\n"
+- file: apps/earthcraft/src/app/ui/settings/sections.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: Playground's dialogs (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::app::web::rfd;\n"
+- file: apps/earthcraft/src/app/explorer.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: Playground's dialogs, whose answers land in explorer/web.rs (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use super::web::rfd;\n#[cfg(target_arch = \"wasm32\")] mod web;\n"
+- file: apps/earthcraft/src/app/explorer.rs
+  find: '^[ \t]*ui\.heading\(lg\.text\("explorer-sky-galaxy"\)\);'
+  before: "#[cfg(target_arch = \"wasm32\")] super::web::sky_section();\n"
+- file: apps/earthcraft/src/app/explorer.rs
+  find: 'ui\.checkbox\(&mut self\.show_flights, lg\.text\("layers-flights-toggle"\)\);'
+  replace: "#[cfg(not(target_arch = \"wasm32\"))]\n                $&\n                #[cfg(target_arch = \"wasm32\")] super::web::no_flights(ui, lg.text(\"layers-flights-toggle\"));"
+- file: apps/earthcraft/src/app/ui/sidebar/layers.rs
+  find: 'ui\.checkbox\(&mut self\.show_flights, lg\.text\("layers-flights-toggle"\)\);'
+  replace: "#[cfg(not(target_arch = \"wasm32\"))]\n        $&\n        #[cfg(target_arch = \"wasm32\")] crate::app::web::no_flights(ui, lg.text(\"layers-flights-toggle\"));"

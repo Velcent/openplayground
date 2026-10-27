@@ -508,6 +508,26 @@ groups:
         accent: "#7A4ED6"
         base: "#1C0E3A"
 
+      - slug: google-earth
+        name: EarthCraft
+        alternative: Google Earth
+        blurb: Fly around a 3D globe of satellite imagery, with live weather, ships, satellites and your own places.
+        # KML/KMZ places (opening one adds them and flies there) and .earthplanet custom planets. Upstream's releases are
+        # desktop packages only (no web zip), so like MaterialCraft it has the head channel only;
+        # patches/google-earth.yaml adds the web build.
+        opens: [kml, kmz, earthplanet]
+        imports: []
+        repo: therichronicles/EarthCraft
+        license: MIT
+        copyright: "Copyright (c) 2026 @therichronicles @PixelSoftwareStudios"
+        # What the web build compiles (Cargo.lock: dependency changes): docs, packaging and script commits don't
+        # rebuild it. One GitHub API request per path per check.
+        paths: [apps, crates, assets, Cargo.toml, Cargo.lock]
+        patches: patches/google-earth.yaml
+        icon: icons/earthcraft.png
+        accent: "#11E8C8"
+        base: "#053B33"
+
   - name: Music
     tools:
       - slug: pro-tools
