@@ -73,20 +73,20 @@
   find: '(?![\s\S])'
   after: "\n// Live editing in a Playground session (used by the web app only).\npub mod live;\n"
 - live: true
-  file: crates/ui-egui/src/lib.rs
+  file: crates/ui-egui/src/**/*.rs
   find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\s*,\s*id\s*:\s*&str\b[^{]*\{'
   after: "\n        #[cfg(target_arch = \"wasm32\")] if crate::canvas::live::undo(self, id) { return Ok(Default::default()); }"
 - live: true
-  file: crates/ui-egui/src/canvas.rs
+  file: crates/ui-egui/src/**/*.rs
   find: 'fn\s+draw_selection\s*\([^{]*\{'
-  after: "\n    #[cfg(target_arch = \"wasm32\")] live::draw(app, painter, xf);"
+  after: "\n    #[cfg(target_arch = \"wasm32\")] crate::canvas::live::draw(app, painter, xf);"
 # Each document tab shows dots for the others on its document (before the tab strip moves on to the next tab); the
 # start screen lists the session's documents closed here, to open again (after its community card).
 - live: true
-  file: crates/ui-egui/src/chrome.rs
-  find: '^[ \t]*x\s*\+=\s*w;'
+  file: crates/ui-egui/src/**/*.rs
+  find: '^[ \t]*x\s*\+=\s*w;(?=\s*\}\s*if let Some\(i\) = close\b)'
   before: "        #[cfg(target_arch = \"wasm32\")] crate::canvas::live::tab(app, ui, i, r);\n"
 - live: true
-  file: crates/ui-egui/src/chrome.rs
+  file: crates/ui-egui/src/**/*.rs
   find: '^[ \t]*community_card\(app,\s*ui\);'
   after: "\n            #[cfg(target_arch = \"wasm32\")] crate::canvas::live::home(app, ui);"
