@@ -1,0 +1,24 @@
+diff --git a/playground/craft-ai/Cargo.toml b/playground/craft-ai/Cargo.toml
+new file mode 100644
+index 0000000..8b991b6
+--- /dev/null
++++ b/playground/craft-ai/Cargo.toml
+@@ -0,0 +1,11 @@
++# Playground's stand-in for craft-libs/crates/ai (patches/matlab.yaml): it only declares the package, for Cargo to
++# resolve the desktop-only dependency; the web build never compiles it.
++[package]
++name = "craft-ai"
++version = "0.1.0"
++edition = "2021"
++license = "MIT OR Apache-2.0"
++publish = false
++
++[features]
++local = []
+diff --git a/playground/craft-ai/src/lib.rs b/playground/craft-ai/src/lib.rs
+new file mode 100644
+index 0000000..0b09f0c
+--- /dev/null
++++ b/playground/craft-ai/src/lib.rs
+@@ -0,0 +1 @@
++//! Playground's stand-in for craft-libs/crates/ai (patches/matlab.yaml): empty; the web build never compiles it.

@@ -1,0 +1,15 @@
+# MatCraft builds beside its sibling repos (tools.yaml `beside:`): ../craft-libs and ../simcraft, as upstream does.
+# Its desktop AI panel's crate, craft-libs/crates/ai, is in no published craft-libs, and Cargo needs every
+# dependency's manifest even when a build doesn't compile it (craft-ai is a desktop-only dependency).
+# patches/matlab/web.diff adds playground/craft-ai, a stand-in that only declares the package and the `local` feature
+# the engine names; these rules point at it. The web build never compiles it. A desktop build of this checkout has no
+# craft-ai to compile against, so it fails: Playground builds the web app only.
+# If craft-libs publishes crates/ai, delete these rules and the stand-in.
+
+# Rules 1-2/2: the AI panel's crate from the stand-in, in the UI and engine crates.
+- file: crates/ui-egui/Cargo.toml
+  find: 'path = "\.\./\.\./\.\./craft-libs/crates/ai"'
+  replace: 'path = "../../playground/craft-ai"'
+- file: crates/engine/Cargo.toml
+  find: 'path = "\.\./\.\./\.\./craft-libs/crates/ai"'
+  replace: 'path = "../../playground/craft-ai"'

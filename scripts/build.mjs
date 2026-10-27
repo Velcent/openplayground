@@ -33,7 +33,7 @@ import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { cpSync, existsSync, globSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { parse } from 'yaml'
 import { LIVE_KIT, applyDiffs, diffDir, installLive, tidyDiffs } from './diffs.mjs'
 import { CHANNELS, JUNK, builtAssets, channelAssets, resolveVersion, tools } from './releases.mjs'
@@ -112,7 +112,9 @@ const prepare = async (slug, channel, { dir = 'src', patch = true, live = proces
   const work = process.env.BUILD_DIR ? resolve(process.env.BUILD_DIR, `${slug}-${channel}`) : mkdtempSync(join(tmpdir(), `build-${slug}-`))
   // A throwaway temp dir (1-2 GB of target/) goes when we're done, pass or fail; BUILD_DIR is kept as a cache.
   if (!process.env.BUILD_DIR) process.on('exit', () => rmSync(work, { recursive: true, force: true }))
-  const src = join(work, dir)
+  // A tool built beside sibling repos (tools.yaml `beside:`) is checked out under its repo's name, which they may
+  // point back at (SimCraft's ../matcraft).
+  const src = join(work, t.beside && dir === 'src' ? basename(t.repo) : dir)
   rmSync(src, { recursive: true, force: true })
   mkdirSync(join(work, '.cargo'), { recursive: true })
   writeFileSync(join(work, '.cargo', 'config.toml'), SIMD)
@@ -123,6 +125,11 @@ const prepare = async (slug, channel, { dir = 'src', patch = true, live = proces
     run('git', ['-C', src, 'checkout', '--quiet', 'FETCH_HEAD'])
   } else {
     run('git', ['clone', '--quiet', '--depth', '1', '--branch', release.tag_name, `https://github.com/${t.repo}.git`, src])
+  }
+  // Its sibling repos, at their newest commits, where its Cargo.toml paths expect them (../craft-libs).
+  for (const [name, repo] of Object.entries(t.beside ?? {})) {
+    rmSync(join(work, name), { recursive: true, force: true })
+    run('git', ['clone', '--quiet', '--depth', '1', `https://github.com/${repo}.git`, join(work, name)])
   }
   if (patch && live) installLive(src, t)
   const merged = patch ? applyDiffs(src, t, channel, live) : []

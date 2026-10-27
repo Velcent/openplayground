@@ -11,6 +11,8 @@
 #   branch: the branch the head channel builds (optional; default: main)
 #   paths:  only commits changing these paths count as new head versions (optional; default: any)
 #   commit: pins the head channel to this commit (optional; for an upstream whose newer commits dropped its web version)
+#   beside: sibling repos its build expects next to its checkout, {folder: owner/repo} (optional): cloned at their
+#           newest commits, and the tool is then checked out under its repo's name, which they may point back at
 #   asset:  regex matching the release asset name (optional; default: "-web-.*\.zip$")
 #   alternative: the commercial app it's an open-source alternative to, shown as "Alternative to …" and
 #           under the dashboard's "Alternative naming". Its icon there is icons/alternatives/<slug>.png: the product's
@@ -289,6 +291,30 @@ groups:
         theme: themes/acrobat.js
         accent: "#FA0F00"
         base: "#3A0400"
+
+      - slug: matlab
+        name: MatCraft
+        alternative: MATLAB
+        blurb: Matrices, .m scripts, a command window and 2D and 3D plots.
+        # Its browser build keeps no files (upstream: on wasm32 there is no file system): scripts are typed in
+        # its editor and command window. Upstream has no releases yet, so it has the head channel only.
+        opens: []
+        imports: []
+        repo: NibrasAz7/matcraft
+        branch: master
+        license: MIT OR Apache-2.0
+        # NOTICE names the MatCraft contributors; LICENSE-MIT still carries GridCraft's line, from the ArtCraft
+        # template MatCraft started from.
+        copyright: ["Copyright 2026 The MatCraft contributors", "Copyright (c) 2026 ArtCraft Team and the GridCraft contributors"]
+        # What the web build compiles: README, docs and examples don't rebuild it.
+        paths: [crates, apps, assets, Cargo.toml, Cargo.lock]
+        # Its Cargo.toml paths point at ../craft-libs and ../simcraft (which points back at ../matcraft). A change in
+        # those alone doesn't rebuild it.
+        beside: {craft-libs: NibrasAz7/craft-libs, simcraft: NibrasAz7/simcraft}
+        patches: patches/matlab.yaml
+        icon: icons/matcraft.png
+        accent: "#E16737"
+        base: "#3B1508"
 
   - name: Video
     tools:
