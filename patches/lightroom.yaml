@@ -122,15 +122,15 @@
 # history holds; LightcraftApp::run, which menus and shortcuts go through, hands them over. The Presets panel's
 # Amount slider re-applies a preset by undoing it natively: not offered while connected.
 - live: true
-  file: crates/engine/src/cmd/mod.rs
+  file: crates/engine/src/{cmd.rs,cmd/mod.rs}
   find: 'pub\s+fn\s+can_undo\s*\([^{]*\{'
   after: "\n    if lightcraft_catalog::playground::live() { return Ok(()); }"
 - live: true
-  file: crates/engine/src/cmd/mod.rs
+  file: crates/engine/src/{cmd.rs,cmd/mod.rs}
   find: 'pub\s+fn\s+can_redo\s*\([^{]*\{'
   after: "\n    if lightcraft_catalog::playground::live() { return Ok(()); }"
 - live: true
-  file: crates/ui-egui/src/lib.rs
+  file: crates/ui-egui/src/{lib.rs,app.rs}
   find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\b[^{]*\{'
   after: "\n        if matches!(id, \"edit.undo\" | \"edit.redo\") && lightcraft_catalog::playground::undo(id == \"edit.redo\") { return Ok(Default::default()); }"
 - live: true
