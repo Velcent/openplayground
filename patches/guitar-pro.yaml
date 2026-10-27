@@ -1,0 +1,236 @@
+# OxiGuitar in the browser. Upstream (github.com/mateusrdp/oxiguitar) is a Slint app whose formats, sound and audio
+# outputs are plugins (.oxp libraries the host finds in its plugin folders and dlopens), and releases desktop packages
+# only; these patches add the web build Playground serves, from its head commit: the desktop window on the page's canvas
+# (Slint's winit backend, FemtoVG on WebGL), with the plugins it needs linked in.
+#
+# patches/guitar-pro/web.diff adds new files only:
+#   index.html, Trunk.toml        the web build at the repository's root (build.mjs builds there): trunk builds
+#                                 crates/oxiguitar-app's `oxiguitar` binary for the page's #canvas, and the page starts
+#                                 the audio at the first click or key (browsers keep it off until then).
+#   crates/oxiguitar-app/src/web.rs   the page's side: the linked plugins registered where the host looks for plugin
+#                                 files; settings.json kept in localStorage; File > Open…, Save As… and Export PDF… are
+#                                 Playground's dialogs; what OxiGuitar writes outside its own folders goes to Files (or
+#                                 is downloaded: Save As > Download to device); "Open in OxiGuitar" and files dropped on
+#                                 the page open as a file dropped on the desktop window; links open in a new tab; and
+#                                 the sound set, fetched the first time Play is pressed (never at page load):
+#                                 GeneralUser GS 2.0.3 by S. Christian Collins (its licence: free to use, modify and
+#                                 repackage, no notice asked), as SpessaSynth packs it (SoundFont 3, 8.4 MB), from
+#                                 jsDelivr at a fixed commit, into the user's soundfonts folder.
+#   crates/oxiguitar-playground/  what wasm32-unknown-unknown lacks: `std` with web-time's clock, an in-memory file
+#                                 system (each change noted for web.rs to mirror), `thread::spawn` run once the event is
+#                                 done and `thread::task` for futures, an mpsc channel whose `recv` is awaited, HOME and
+#                                 the program's place, `process::id`; and a `libloading` whose libraries are the plugins
+#                                 linked into the page. The modules that use them take `std` (or `libloading`) from it
+#                                 on wasm through ONE `use` line at their end (a local `std` shadows the standard
+#                                 library's name in that module; everything else in it still comes from the real std).
+#   crates/oxiguitar-plugin/src/glue/web.rs   several plugins in one program: the export glue keeps one plugin per
+#                                 library, which here is one per plugin type.
+#   plugins/audio-web/            the audio-device plugin of the page: cpal's Web Audio host, its streams opened and
+#                                 closed in the call, rendering on the page's thread.
+#
+# Linked in: the Guitar Pro 3, 4, 5, 6 (.gpx) and 7-8 (.gp) readers, the .gp and .gp5 writers, the SoundFont player and
+# the Web Audio output. Off on the web: installing third-party plugins (Tools > Plugins says the plugins are built in;
+# the plugin manager and plugins' settings windows, second windows a page can't have, don't open), the system audio
+# outputs (PipeWire, ALSA, WASAPI, Core Audio), the command-line tool (oxiguitar-cli) and the command line itself
+# (--safe-mode, a file to open), the user's and the system's own sound sets and SFZ instruments, a score's plugin
+# settings beside it in Files (FILE.oxg; none of the linked plugins keeps any), and Quit (a tab is closed instead).
+# Native builds see none of this: every rule adds wasm-only lines.
+
+# The wasm-only dependencies, each in a table under a target spelling nobody else uses (`all(...)`), so it never meets
+# one of upstream's.
+- file: crates/oxiguitar-host/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\noxiguitar-playground = { path = \"../oxiguitar-playground\" }\n"
+- file: crates/oxiguitar-play/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\noxiguitar-playground = { path = \"../oxiguitar-playground\" }\n"
+- file: plugins/soundfont/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\noxiguitar-playground = { path = \"../../crates/oxiguitar-playground\" }\n"
+- file: crates/oxiguitar-app/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\noxiguitar-playground = { path = \"../oxiguitar-playground\" }\noxiguitar-gp3-plugin = { path = \"../../plugins/gp3\" }\noxiguitar-gp4-plugin = { path = \"../../plugins/gp4\" }\noxiguitar-gp5-plugin = { path = \"../../plugins/gp5\" }\noxiguitar-gpx-plugin = { path = \"../../plugins/gpx\" }\noxiguitar-gp-plugin = { path = \"../../plugins/gp\" }\noxiguitar-soundfont-plugin = { path = \"../../plugins/soundfont\" }\noxiguitar-audio-web-plugin = { path = \"../../plugins/audio-web\" }\nwasm-bindgen = \"0.2\"\nwasm-bindgen-futures = \"0.4\"\njs-sys = \"0.3\"\nweb-sys = { version = \"0.3\", features = [\"Window\", \"Document\", \"Storage\", \"Response\", \"DragEvent\", \"DataTransfer\", \"FileList\", \"File\", \"Blob\", \"Element\", \"HtmlElement\", \"Node\", \"console\"] }\n"
+
+# The plugin SDK: several plugins linked into one program. The glue's `PLUGIN` (one per library) becomes one per plugin
+# type on wasm (glue/web.rs), whose table's `start` and `call` say whose call it is; and `export_plugin!` gives each
+# plugin, built without its `oxp` feature, an entry function the page reaches by its Rust path (no `#[no_mangle]`, so
+# the plugins' entries don't collide). If upstream renames `PLUGIN`, `start`, `call` or the macro's test module, follow.
+- file: crates/oxiguitar-plugin/src/glue.rs
+  find: '^static PLUGIN: OnceLock<Box<dyn Plugin>> = OnceLock::new\(\);'
+  replace: "#[cfg(not(target_arch = \"wasm32\"))]\n$&\n// Playground's browser build: one plugin per type, as several are linked into the page (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nstatic PLUGIN: web::Plugins = web::Plugins;\n#[cfg(target_arch = \"wasm32\")]\nmod web;"
+- file: crates/oxiguitar-plugin/src/glue.rs
+  find: '^([ \t]*)start: start::<P>,\n[ \t]*call,'
+  replace: "$1#[cfg(not(target_arch = \"wasm32\"))]\n$1start: start::<P>,\n$1#[cfg(not(target_arch = \"wasm32\"))]\n$1call,\n$1#[cfg(target_arch = \"wasm32\")]\n$1start: web::start::<P>,\n$1#[cfg(target_arch = \"wasm32\")]\n$1call: web::call::<P>,"
+- file: crates/oxiguitar-plugin/src/lib.rs
+  find: '^[ \t]*#\[cfg\(test\)\]\n[ \t]*mod oxiguitar_plugin_checks \{'
+  before: "        /// The plugin's entry, in Playground's browser build: the plugin is linked into the page, and its entry\n        /// reached by its Rust path (patches/guitar-pro.yaml).\n        #[cfg(all(target_arch = \"wasm32\", not(feature = \"oxp\")))]\n        pub extern \"C\" fn oxiguitar_plugin_v1() -> *const $crate::api::abi::PluginTableV1 {\n            static TABLE: $crate::glue::Table = $crate::glue::table::<$plugin>(MANIFEST_JSON.as_bytes());\n            TABLE.get()\n        }\n\n"
+
+# The plugin host: the plugins linked into the page, in place of plugin files (found by `plugin_files`, their manifests
+# read by `read_manifest`, loaded by loader.rs through libloading), and its folders and settings.json in memory. A
+# Path's own is_file/is_dir/exists still ask the real std (always no on wasm): plugin_files is why that rule is there.
+# If upstream moves file or folder work into another module, give it the same `use` line; a missing one fails quietly
+# (no plugins found, settings not kept).
+- file: crates/oxiguitar-host/src/loader.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the plugins linked into the page, in place of plugin files (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::libloading;\n"
+- file: crates/oxiguitar-host/src/oxp.rs
+  find: 'pub\(crate\) fn read_manifest\(path: &Path\) -> Result<ManifestFile, String> \{'
+  after: "\n    // Playground's browser build: the manifests of the plugins linked into the page (patches/guitar-pro.yaml).\n    #[cfg(target_arch = \"wasm32\")]\n    if let Some(bytes) = oxiguitar_playground::libloading::manifest(path) {\n        return Ok(ManifestFile { manifest: Manifest::parse(&bytes)?, bytes });\n    }"
+- file: crates/oxiguitar-host/src/inventory.rs
+  find: 'pub\(crate\) fn plugin_files\(folder: &Path\) -> Vec<PathBuf> \{'
+  after: "\n    // Playground's browser build: the plugins linked into the page (patches/guitar-pro.yaml).\n    #[cfg(target_arch = \"wasm32\")]\n    return oxiguitar_playground::libloading::files(folder);"
+- file: crates/oxiguitar-host/src/folders.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the folders in memory, HOME and the program's place (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+- file: crates/oxiguitar-host/src/settings.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: settings.json in memory (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+- file: crates/oxiguitar-host/src/sidecar.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files in memory (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+- file: crates/oxiguitar-host/src/plugins.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the plugins' folders in memory (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+
+# The player's engine: the clock.
+- file: crates/oxiguitar-play/src/engine.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+
+# The SoundFont plugin: the sound sets in memory, and SoundFont 3 decoded on the page's one thread.
+- file: plugins/soundfont/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the sound sets in memory (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+- file: plugins/soundfont/src/sets.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the sound sets in memory (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+- file: plugins/soundfont/src/settings.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the sound sets in memory (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+- file: plugins/soundfont/src/sf3.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: decoding on the page's one thread (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+- file: plugins/soundfont/src/sfz/mod.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files in memory, read on the page's one thread (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+- file: plugins/soundfont/src/sfz/sample.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files in memory (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+- file: plugins/soundfont/src/sfz/text.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files in memory (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+
+# The app: the page's side (web.rs), the clock and files. `main` runs as on the desktop with web.rs's start first; File >
+# Open…, Save As… and Export PDF… hand over to web.rs (Playground's dialogs); Save of a score that was downloaded asks
+# where again; the unsaved state goes to Playground's leave warning; the plugin manager and plugins' settings windows
+# say the plugins are built in; Quit does nothing; links open in a new tab. If upstream renames what these anchor on,
+# follow.
+- file: crates/oxiguitar-app/src/main.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the page's side, the desktop's file dialogs it never opens, the clock (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nmod web;\n#[cfg(target_arch = \"wasm32\")]\nuse web::rfd;\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+- file: crates/oxiguitar-app/src/main.rs
+  find: '^fn main\(\) -> Result<\(\), slint::PlatformError> \{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")]\n    web::start();"
+- file: crates/oxiguitar-app/src/main.rs
+  find: 'oxiguitar_host::start\(oxiguitar_host::Folders::here\(\), display_system\(\), core\)\n[ \t]*\};'
+  after: "\n    #[cfg(target_arch = \"wasm32\")]\n    let startup = web::started(startup);"
+# Help > About: in the browser, Play downloads the sound set the first time; say so, and whose it is.
+- file: crates/oxiguitar-app/src/main.rs
+  find: '^[ \t]*about\.extend\(about_folders\('
+  before: "    #[cfg(target_arch = \"wasm32\")]\n    about.retain(|l| !l.starts_with(\"OxiGuitar never connects\"));\n    #[cfg(target_arch = \"wasm32\")]\n    about.push(\"In the browser (Playground), Play downloads the sound set the first time it is pressed: GeneralUser GS 2.0.3, by S. Christian Collins. Nothing else is fetched, and nothing is sent anywhere.\".to_owned());\n"
+- file: crates/oxiguitar-app/src/main.rs
+  find: '^[ \t]*ui\.run\(\)\?;'
+  before: "    #[cfg(target_arch = \"wasm32\")]\n    web::ready();\n"
+- file: crates/oxiguitar-app/src/main.rs
+  find: '^fn open_dialog\(app: &Shared\) \{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")]\n    return web::open_dialog(app);"
+- file: crates/oxiguitar-app/src/main.rs
+  find: '^fn save_as_dialog\(app: &Shared\) \{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")]\n    return web::save_as_dialog(app);"
+- file: crates/oxiguitar-app/src/main.rs
+  find: '^fn export_dialog\(app: &Shared\) \{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")]\n    return web::export_dialog(app);"
+- file: crates/oxiguitar-app/src/main.rs
+  find: '^fn save\(app: &Shared\) \{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")]\n    if web::downloaded(app) {\n        return save_as_dialog(app);\n    }"
+- file: crates/oxiguitar-app/src/main.rs
+  find: '^[ \t]*s\.modified = edit\.modified;'
+  after: "\n        #[cfg(target_arch = \"wasm32\")]\n        web::unsaved(edit.modified);"
+- file: crates/oxiguitar-app/src/main.rs
+  find: '^fn open_plugin_manager\(app: &Shared\) \{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")]\n    return web::no_plugin_windows(app);"
+- file: crates/oxiguitar-app/src/main.rs
+  find: '^fn open_settings_window\(app: &Shared, id: String\) \{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")]\n    return web::no_plugin_windows(app);"
+- file: crates/oxiguitar-app/src/main.rs
+  find: '^([ \t]*)Then::Quit => \{'
+  after: "\n            // A page isn't quit: its tab is closed.\n            #[cfg(target_arch = \"wasm32\")]\n            return;"
+- file: crates/oxiguitar-app/src/links.rs
+  find: 'pub\(crate\) fn open\(url: &str\) -> Result<\(\), String> \{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")]\n    return crate::web::open_link(url);"
+- file: crates/oxiguitar-app/src/editing.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+- file: crates/oxiguitar-app/src/document.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files in memory, the worker's channel (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+
+# The worker, the player's thread and the plugin tabs' thread: each `run` is a loop that sleeps on a channel, which the
+# page's one thread can't. On the web each is the same loop, copied whole as an async function whose one `recv()` is
+# awaited (oxiguitar-playground's channel), and started as a task of the page where upstream starts its thread. The
+# copies are made from upstream's code at build time, so its changes to the loops come along; if a loop gets a second
+# `recv()` (or a `recv_timeout`), await it too, and if upstream renames `run` or the thread's variables, follow.
+- file: crates/oxiguitar-app/src/worker.rs
+  find: '^fn run\(rx: &Receiver<Request>[\s\S]*?\n\}\n'
+  replace: "#[cfg(not(target_arch = \"wasm32\"))]\n$&\n// Playground's browser build: the same loop, as a task of the page (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nasync $&"
+- file: crates/oxiguitar-app/src/worker.rs
+  find: '(async fn run\(rx: &Receiver<Request>[\s\S]*?)rx\.recv\(\)'
+  replace: '$1rx.recv().await'
+- file: crates/oxiguitar-app/src/worker.rs
+  find: 'let thread = std::thread::Builder::new\(\)[\s\S]*?\.ok\(\);'
+  replace: "#[cfg(not(target_arch = \"wasm32\"))]\n        $&\n        #[cfg(target_arch = \"wasm32\")]\n        let thread = Some(std::thread::task(async move { run(&rx, plugins, open, &sink).await }));"
+- file: crates/oxiguitar-app/src/worker.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the channel, the task, the files in memory (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+- file: crates/oxiguitar-app/src/sound.rs
+  find: '^    (fn run\(mut self, from: &Receiver<ToSound>\) \{[\s\S]*?\n    \}\n)'
+  replace: "    #[cfg(not(target_arch = \"wasm32\"))]\n    $1\n    // Playground's browser build: the same loop, as a task of the page (patches/guitar-pro.yaml).\n    #[cfg(target_arch = \"wasm32\")]\n    async $1"
+- file: crates/oxiguitar-app/src/sound.rs
+  find: '(async fn run\(mut self, from: &Receiver<ToSound>\)[\s\S]*?)from\.recv\(\)'
+  replace: '$1from.recv().await'
+- file: crates/oxiguitar-app/src/sound.rs
+  find: 'let thread = std::thread::Builder::new\(\)\s*\.name\("oxiguitar-sound"\.into\(\)\)\s*\.spawn\(move \|\| \{([\s\S]*?)\.run\(&from\);\s*\}\)\s*\.ok\(\);'
+  replace: "#[cfg(not(target_arch = \"wasm32\"))]\n        $&\n        #[cfg(target_arch = \"wasm32\")]\n        let thread = Some(std::thread::task(async move {$1.run(&from).await }));"
+- file: crates/oxiguitar-app/src/sound.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the channel, the task (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+- file: crates/oxiguitar-app/src/plugin_tabs.rs
+  find: '^fn run\(rx: &Receiver<Request>, plugins: &Plugins[\s\S]*?\n\}\n'
+  replace: "#[cfg(not(target_arch = \"wasm32\"))]\n$&\n// Playground's browser build: the same loop, as a task of the page (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nasync $&"
+- file: crates/oxiguitar-app/src/plugin_tabs.rs
+  find: '(async fn run\(rx: &Receiver<Request>, plugins: &Plugins[\s\S]*?)rx\.recv\(\)'
+  replace: '$1rx.recv().await'
+- file: crates/oxiguitar-app/src/plugin_tabs.rs
+  find: 'let thread = std::thread::Builder::new\(\)[\s\S]*?\.ok\(\);'
+  replace: "#[cfg(not(target_arch = \"wasm32\"))]\n        $&\n        #[cfg(target_arch = \"wasm32\")]\n        let thread = Some(std::thread::task(async move { run(&rx, &plugins, dark, &sink).await }));"
+- file: crates/oxiguitar-app/src/plugin_tabs.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the channel, the task (patches/guitar-pro.yaml).\n#[cfg(target_arch = \"wasm32\")]\nuse oxiguitar_playground::std;\n"
+
+# The player: the sound set is fetched the first time Play is pressed (web.rs), so until then Play stays available
+# and the player doesn't say it has no sound set; once the instruments are ready, what was asked plays.
+- file: crates/oxiguitar-app/src/playing.rs
+  find: 'pub\(crate\) fn action\(app: &Shared, name: &str\) \{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")]\n    if crate::web::sound_set_first(name) {\n        return;\n    }"
+- file: crates/oxiguitar-app/src/playing.rs
+  find: '^[ \t]*FromSound::Ready\(ready\) => \{'
+  after: "\n            #[cfg(target_arch = \"wasm32\")]\n            crate::web::sound_ready(app);"
+- file: crates/oxiguitar-app/src/playing.rs
+  find: 'fn tell_once\(app: &Shared, level: Level, text: String, link: Option<\(&str, &str\)>\) \{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")]\n    if crate::web::quiet(&text) {\n        return;\n    }"
+- file: crates/oxiguitar-app/src/playing.rs
+  find: '^[ \t]*ui\.set_player_available\(available\);'
+  before: "    #[cfg(target_arch = \"wasm32\")]\n    let (available, why) = if has_score && s.outputs_available && crate::web::sound_set_missing() {\n        (true, String::new())\n    } else {\n        (available, why)\n    };\n"
+- file: crates/oxiguitar-app/src/playing.rs
+  find: '^[ \t]*if name == " " && !shift && !ctrl && !alt \{'
+  before: "    #[cfg(target_arch = \"wasm32\")]\n    if name == \" \" && !shift && !ctrl && !alt && crate::web::sound_set_missing() && app.borrow().track_count > 0 {\n        action(app, \"play\");\n        return true;\n    }\n"

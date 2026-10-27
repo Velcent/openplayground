@@ -581,6 +581,27 @@ groups:
         accent: "#4FB0F6"
         base: "#0B2140"
 
+      - slug: guitar-pro
+        name: OxiGuitar
+        alternative: Guitar Pro
+        blurb: Read, write and play guitar tablature and scores.
+        # Guitar Pro files, 3 to 8 (its format plugins read every one; .gp and .gp5 save). Upstream's releases are desktop
+        # packages only, so like Pro Wave it has the head channel only; patches/guitar-pro.yaml adds the web build. Play
+        # downloads the sound set the first time it is pressed: GeneralUser GS 2.0.3 by S. Christian Collins (its licence:
+        # free to use and repackage, no notice asked), as SpessaSynth packs it (SoundFont 3, 8.4 MB, from jsDelivr).
+        opens: [gp, gpx, gp5, gp4, gp3]
+        imports: []
+        repo: mateusrdp/oxiguitar
+        license: GPL-3.0-or-later
+        copyright: "Copyright (C) 2026 Mateus Rocha de Paula and the OxiGuitar contributors"
+        # What the web build compiles (Cargo.lock: dependency changes): docs, corpus, CI and packaging commits don't
+        # rebuild it. One GitHub API request per path per check.
+        paths: [crates, plugins, assets, Cargo.toml, Cargo.lock]
+        patches: patches/guitar-pro.yaml
+        icon: icons/oxiguitar.svg
+        accent: "#3F9D65"
+        base: "#123A22"
+
       - slug: transit
         name: Transit
         # No `alternative`: Transit is its own name under either naming.

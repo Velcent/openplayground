@@ -1,0 +1,1513 @@
+diff --git a/Trunk.toml b/Trunk.toml
+new file mode 100644
+--- /dev/null
++++ b/Trunk.toml
+@@ -0,0 +1,7 @@
++# OxiGuitar in the browser, for Playground (patches/guitar-pro.yaml in github.com/daijro/openplayground).
++# Build with: trunk build --release   (from the repository's root)
++[build]
++target = "index.html"
++public_url = "./"
++filehash = true
++dist = "target/trunk-dist"
+diff --git a/crates/oxiguitar-app/src/web.rs b/crates/oxiguitar-app/src/web.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/oxiguitar-app/src/web.rs
+@@ -0,0 +1,473 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! OxiGuitar in the browser, for Playground (patches/guitar-pro.yaml in github.com/daijro/openplayground): the
++//! desktop window on the page's canvas, its files in Playground's Files, its plugins linked in, and the browser's audio.
++//!
++//! `main` runs as on the desktop, with [`start`] first: the plugins the page links in (the Guitar Pro readers and
++//! writers, the SoundFont player and the Web Audio output) are registered where the host looks for plugin files, and
++//! settings.json comes back from the browser's storage. Files live in memory (oxiguitar-playground's `std::fs`): a score
++//! opened from Files comes in at its path (`browser:/Tabs/Song.gp5` is `/Tabs/Song.gp5` here); File > Open…, Save As…
++//! and Export PDF… are Playground's dialogs; whatever OxiGuitar writes outside its own folders (a saved score, a PDF)
++//! goes back to Files once the event is done ([`mirror`]), and what was asked for as a download is downloaded. "Open in
++//! OxiGuitar" and dropped files open as a file dropped on the desktop window does. The sound set is fetched the first
++//! time Play is pressed ([`sound_set_first`]).
++
++use std::cell::{Cell, RefCell};
++use std::path::{Path, PathBuf};
++use std::time::Duration;
++
++use oxiguitar_host::Level;
++use oxiguitar_playground::std::fs;
++use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
++
++use crate::document::FULLEST;
++use crate::worker::Request;
++use crate::{APP, Shared, Then, message};
++
++/// OxiGuitar's own folders in memory, never copied to Files: its settings, the plugins' folders, the sound set.
++const OWN: [&str; 3] = ["/home", "/tmp", "/usr"];
++/// What was saved or exported as a download (Save As > Download to device).
++const DOWNLOADS: &str = "/tmp/downloads";
++/// Where files opened from the computer and dropped files are kept (they go to Files when saved).
++const OPENED: &str = "/OxiGuitar/Opened";
++const DROPPED: &str = "/OxiGuitar/Dropped";
++/// settings.json, kept in the browser's storage under [`SETTINGS_KEY`].
++const SETTINGS: &str = "/home/web/.config/oxiguitar/settings.json";
++const SETTINGS_KEY: &str = "oxiguitar-settings";
++/// The sound set: GeneralUser GS 2.0.3 by S. Christian Collins (its licence: free to use, modify and repackage), as
++/// SpessaSynth packs it (SoundFont 3, 8.4 MB), at a fixed commit. It goes in the user's soundfonts folder, where the
++/// SoundFont plugin finds it.
++const SOUND_SET: &str =
++    "https://cdn.jsdelivr.net/gh/spessasus/SpessaSynth@6f7505087eba09bdbf345c97f5cf573fc547412e/soundfonts/GeneralUserGS.sf3";
++const SOUND_SET_AT: &str = "/home/web/.local/share/oxiguitar/soundfonts/GeneralUser GS 2.0.3.sf3";
++
++/// Where the sound set is.
++#[derive(Clone, Copy, PartialEq)]
++enum Sound {
++    Missing,
++    Fetching,
++    /// Here; the player's thread is getting it ready.
++    Preparing,
++    Ready,
++}
++
++thread_local! {
++    static SOUND: Cell<Sound> = const { Cell::new(Sound::Missing) };
++    /// The Player action that waits for the sound set.
++    static PLAY_WHEN_READY: RefCell<Option<String>> = const { RefCell::new(None) };
++}
++
++/// The page's side, before anything else in `main`.
++pub(crate) fn start() {
++    std::panic::set_hook(Box::new(|info| web_sys::console::error_1(&format!("OxiGuitar: {info}").into())));
++    macro_rules! link {
++        ($($name:literal => $plugin:ident),* $(,)?) => {
++            $(oxiguitar_playground::libloading::register($name, $plugin::MANIFEST_JSON, $plugin::oxiguitar_plugin_v1 as *const ());)*
++        };
++    }
++    link!(
++        "gp3" => oxiguitar_gp3_plugin,
++        "gp4" => oxiguitar_gp4_plugin,
++        "gp5" => oxiguitar_gp5_plugin,
++        "gpx" => oxiguitar_gpx_plugin,
++        "gp" => oxiguitar_gp_plugin,
++        "soundfont" => oxiguitar_soundfont_plugin,
++        "audio-web" => oxiguitar_audio_web_plugin,
++    );
++    if let Some(text) = storage().and_then(|s| s.get_item(SETTINGS_KEY).ok().flatten()) {
++        fs::put(Path::new(SETTINGS), text.into_bytes());
++    }
++    fs::on_change(mirror);
++}
++
++/// What the host found: the folders it made are made afresh in memory on every visit, so not worth a word.
++pub(crate) fn started(mut startup: oxiguitar_host::Startup) -> oxiguitar_host::Startup {
++    startup.notices.retain(|n| !n.text.starts_with("Created "));
++    startup
++}
++
++/// Once the window is up: files from Playground ("Open in OxiGuitar", `?open=`) and files dropped on the window.
++pub(crate) fn ready() {
++    call("onOpen", &[Closure::<dyn Fn(JsValue)>::new(|file: JsValue| opened(&file, OPENED)).into_js_value()]);
++    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
++        return;
++    };
++    if let Some(loading) = document.get_element_by_id("loading") {
++        loading.remove();
++    }
++    let over = Closure::<dyn Fn(web_sys::DragEvent)>::new(|e: web_sys::DragEvent| e.prevent_default());
++    let drop = Closure::<dyn Fn(web_sys::DragEvent)>::new(|e: web_sys::DragEvent| {
++        e.prevent_default();
++        let Some(file) = e.data_transfer().and_then(|d| d.files()).and_then(|f| f.get(0)) else {
++            return;
++        };
++        wasm_bindgen_futures::spawn_local(async move {
++            if let Ok(buffer) = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
++                let path = Path::new(DROPPED).join(file.name());
++                fs::put(&path, js_sys::Uint8Array::new(&buffer).to_vec());
++                open(path);
++            }
++        });
++    });
++    // On the window's canvas only: a file dropped on Playground's Files dialog is the dialog's.
++    if let Some(canvas) = document.get_element_by_id("canvas") {
++        let _ = canvas.add_event_listener_with_callback("dragover", over.into_js_value().unchecked_ref());
++        let _ = canvas.add_event_listener_with_callback("drop", drop.into_js_value().unchecked_ref());
++    }
++}
++
++fn shared() -> Option<Shared> {
++    APP.with(|a| a.borrow().clone())
++}
++
++/// Runs `f` with the app in Slint's event loop. What the page's callbacks and tasks do happens outside it, where a
++/// Slint timer or a change to the window can wait unseen until the next input.
++fn in_loop(f: impl FnOnce(&Shared) + Send + 'static) {
++    let _ = slint::invoke_from_event_loop(move || {
++        if let Some(app) = shared() {
++            f(&app);
++        }
++    });
++}
++
++/// Opens `path` as a file dropped on the window: unsaved changes are asked about first.
++fn open(path: PathBuf) {
++    in_loop(move |app| crate::unless_unsaved(app, Then::Open(path)));
++}
++
++fn get(o: &JsValue, k: &str) -> JsValue {
++    js_sys::Reflect::get(o, &k.into()).unwrap_or(JsValue::UNDEFINED)
++}
++
++/// `playgroundFiles[method](...args)`; None when the page has none or it threw.
++fn call(method: &str, args: &[JsValue]) -> Option<JsValue> {
++    let api = Some(get(&js_sys::global(), "playgroundFiles")).filter(JsValue::is_object)?;
++    let f = get(&api, method).dyn_into::<js_sys::Function>().ok()?;
++    f.apply(&api, &args.iter().collect::<js_sys::Array>()).ok()
++}
++
++async fn wait(v: Option<JsValue>) -> Option<JsValue> {
++    let promise = v?.dyn_into::<js_sys::Promise>().ok()?;
++    wasm_bindgen_futures::JsFuture::from(promise).await.ok().filter(|v| !v.is_null() && !v.is_undefined())
++}
++
++fn object(fields: &[(&str, JsValue)]) -> JsValue {
++    let o = js_sys::Object::new();
++    for (k, v) in fields {
++        let _ = js_sys::Reflect::set(&o, &(*k).into(), v);
++    }
++    o.into()
++}
++
++fn strings<'a>(list: impl IntoIterator<Item = &'a String>) -> JsValue {
++    list.into_iter().map(|s| JsValue::from(s.as_str())).collect::<js_sys::Array>().into()
++}
++
++fn storage() -> Option<web_sys::Storage> {
++    web_sys::window()?.local_storage().ok().flatten()
++}
++
++/// A file from Playground (`{ path, name, bytes }`) into memory at its path; one from the computer goes to `elsewhere`.
++fn bring_in(file: &JsValue, elsewhere: &str) -> Option<PathBuf> {
++    let name = get(file, "name").as_string()?;
++    let path = match get(file, "path").as_string().and_then(|p| p.strip_prefix("browser:").map(PathBuf::from)) {
++        Some(path) => path,
++        None => Path::new(elsewhere).join(Path::new(&name).file_name()?),
++    };
++    fs::put(&path, js_sys::Uint8Array::new(&get(file, "bytes")).to_vec());
++    Some(path)
++}
++
++fn opened(file: &JsValue, elsewhere: &str) {
++    if let Some(path) = bring_in(file, elsewhere) {
++        open(path);
++    }
++}
++
++/// Where Playground's Save As put a file named `name`: a place in Files, or [`DOWNLOADS`] for a download. None when it
++/// was cancelled.
++async fn saved_as(name: &str, types: JsValue) -> Option<PathBuf> {
++    let answer = wait(call("saveAs", &[object(&[("name", name.into()), ("types", types)])])).await?;
++    if get(&answer, "download").is_truthy() {
++        return Some(Path::new(DOWNLOADS).join(name));
++    }
++    get(&answer, "path").as_string()?.strip_prefix("browser:").map(PathBuf::from)
++}
++
++/// File → Open…: Playground's Open dialog, for the formats the plugins read.
++pub(crate) fn open_dialog(app: &Shared) {
++    let types = strings(&app.borrow().open_extensions);
++    let asked = call("open", &[object(&[("types", types)])]);
++    wasm_bindgen_futures::spawn_local(async move {
++        if let Some(file) = wait(asked).await.and_then(|p| js_sys::Array::from(&p).iter().next())
++            && let Some(path) = bring_in(&file, OPENED)
++        {
++            in_loop(move |app| app.borrow().worker.send(Request::Open(path)));
++        }
++    });
++}
++
++/// File → Save As…: Playground's Save As, in the format the name's extension says (the fullest when it says none), as
++/// the desktop's dialog does.
++pub(crate) fn save_as_dialog(app: &Shared) {
++    let (stem, mut formats) = {
++        let s = app.borrow();
++        let stem = s.doc_name.as_deref().map_or_else(
++            || "score".to_owned(),
++            |n| Path::new(n).file_stem().map_or_else(|| n.to_owned(), |x| x.to_string_lossy().into_owned()),
++        );
++        (stem, s.save_formats.clone())
++    };
++    if formats.is_empty() {
++        app.borrow_mut().after_save = None;
++        message(app, Level::Error, "No installed plugin writes files, so nothing can be saved.");
++        return;
++    }
++    formats.sort_by_key(|f| f.id != FULLEST);
++    let first = formats.first().and_then(|f| f.extensions.first()).cloned().unwrap_or_else(|| "gp".into());
++    let name = format!("{stem}.{first}");
++    let types = strings(formats.iter().flat_map(|f| &f.extensions));
++    wasm_bindgen_futures::spawn_local(async move {
++        let Some(mut path) = saved_as(&name, types).await else {
++            // Nothing waits on a save that won't happen.
++            in_loop(|app| app.borrow_mut().after_save = None);
++            return;
++        };
++        let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
++        let format = ext
++            .as_deref()
++            .and_then(|e| formats.iter().find(|f| f.extensions.iter().any(|x| x.eq_ignore_ascii_case(e))))
++            .unwrap_or(&formats[0]);
++        if !format.extensions.iter().any(|x| ext.as_deref().is_some_and(|e| x.eq_ignore_ascii_case(e)))
++            && let Some(e) = format.extensions.first()
++        {
++            path.set_extension(e);
++        }
++        let id = format.id.clone();
++        in_loop(move |app| app.borrow().worker.send(Request::Save(Some((path, id)))));
++    });
++}
++
++/// File → Export PDF…: Playground's Save As for the PDF.
++pub(crate) fn export_dialog(app: &Shared) {
++    let (name, settings) = {
++        let s = app.borrow();
++        (s.pdf_name.clone(), s.settings.clone())
++    };
++    wasm_bindgen_futures::spawn_local(async move {
++        let types = strings(&["pdf".to_owned()]);
++        let Some(mut path) = saved_as(&name, types).await else { return };
++        if path.extension().is_none() {
++            path.set_extension("pdf");
++        }
++        in_loop(move |app| app.borrow().worker.send(Request::ExportPdf(path, settings)));
++    });
++}
++
++/// A score saved as a download has no place in Files: its next Save asks where, as Playground's dialog promises.
++pub(crate) fn downloaded(app: &Shared) -> bool {
++    app.borrow().folder.as_deref() == Some(Path::new(DOWNLOADS))
++}
++
++/// The score's unsaved state, for Playground's leave warning.
++pub(crate) fn unsaved(modified: bool) {
++    call("setUnsaved", &[modified.into()]);
++}
++
++/// Copies what OxiGuitar wrote to where it belongs: settings.json to the browser's storage, a download to the
++/// computer, anything else outside its own folders to Files (or out of it, when removed).
++fn mirror() {
++    for p in fs::changes() {
++        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
++        // A file being saved, before it takes the real one's place.
++        if name.starts_with('.') {
++            continue;
++        }
++        if p == Path::new(SETTINGS) {
++            if let (Some(s), Ok(text)) = (storage(), fs::read_to_string(&p)) {
++                let _ = s.set_item(SETTINGS_KEY, &text);
++            }
++            continue;
++        }
++        if p.starts_with(DOWNLOADS) {
++            if let Ok(bytes) = fs::read(&p) {
++                call("download", &[name.into(), js_sys::Uint8Array::from(bytes.as_slice()).into()]);
++            }
++            continue;
++        }
++        if OWN.iter().any(|own| p.starts_with(own)) {
++            continue;
++        }
++        let target = JsValue::from(format!("browser:{}", p.display()));
++        match fs::metadata(&p) {
++            Ok(m) if m.is_file() => {
++                call("write", &[target, js_sys::Uint8Array::from(fs::read(&p).unwrap_or_default().as_slice()).into()]);
++            }
++            Ok(_) => {}
++            Err(_) => {
++                call("remove", &[target]);
++            }
++        }
++    }
++}
++
++/// Opens a link in a new tab (OxiGuitar's links are its help pages and its donation page).
++pub(crate) fn open_link(url: &str) -> Result<(), String> {
++    if !oxiguitar_host::is_https(url) {
++        return Err(format!("{url} is not a web address"));
++    }
++    web_sys::window()
++        .and_then(|w| w.open_with_url_and_target(url, "_blank").ok())
++        .map(|_| ())
++        .ok_or_else(|| format!("The link couldn't be opened. The address is {url}"))
++}
++
++/// Tools → Plugins: the page's plugins are linked into it; none can be added, removed or set up in a window of its own.
++pub(crate) fn no_plugin_windows(app: &Shared) {
++    message(
++        app,
++        Level::Warning,
++        "In the browser, OxiGuitar's plugins are built in: the Guitar Pro formats, the SoundFont player (GeneralUser GS) and Web Audio. Plugins can't be added or set up here.",
++    );
++}
++
++/// Whether Play still has to fetch the sound set (or wait for it to be ready).
++pub(crate) fn sound_set_missing() -> bool {
++    SOUND.get() != Sound::Ready
++}
++
++/// Play or Play Selection before the sound set is here: it is fetched now (once), and the action runs once the player
++/// has it. True when the action was taken here.
++pub(crate) fn sound_set_first(action: &str) -> bool {
++    if !matches!(action, "play" | "play-selection") || SOUND.get() == Sound::Ready {
++        return false;
++    }
++    PLAY_WHEN_READY.set(Some(action.to_owned()));
++    if SOUND.get() != Sound::Missing {
++        return true;
++    }
++    SOUND.set(Sound::Fetching);
++    status(Some("Downloading the sounds: GeneralUser GS, 8 MB…"));
++    wasm_bindgen_futures::spawn_local(async {
++        match fetch(SOUND_SET).await {
++            Ok(bytes) => {
++                fs::put(Path::new(SOUND_SET_AT), bytes);
++                SOUND.set(Sound::Preparing);
++                status(Some("Getting the sounds ready…"));
++                // Once that is drawn: the player's thread decodes the set (a few seconds) on this one.
++                in_loop(|app| {
++                    let app = app.clone();
++                    slint::Timer::single_shot(Duration::from_millis(100), move || crate::playing::score_changed(&app, false));
++                });
++            }
++            Err(e) => {
++                SOUND.set(Sound::Missing);
++                PLAY_WHEN_READY.take();
++                status(None);
++                let text = format!("The sounds couldn't be downloaded ({e}). Press Play to try again.");
++                in_loop(move |app| message(app, Level::Error, text));
++            }
++        }
++    });
++    true
++}
++
++/// What the sound set is doing, over the window's bottom right corner (OxiGuitar's footer holds only warnings and
++/// errors); `None` takes it away.
++fn status(text: Option<&str>) {
++    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
++        return;
++    };
++    let shown = document.get_element_by_id("oxiguitar-status");
++    let Some(text) = text else {
++        if let Some(el) = shown {
++            el.remove();
++        }
++        return;
++    };
++    let el = shown.or_else(|| {
++        let el = document.create_element("div").ok()?;
++        el.set_id("oxiguitar-status");
++        let _ = el.set_attribute(
++            "style",
++            "position:fixed;right:16px;bottom:40px;z-index:10;padding:6px 12px;border-radius:6px;background:#2d6a45;\
++             color:#fff;font:13px system-ui,sans-serif;pointer-events:none",
++        );
++        document.body()?.append_child(&el).ok()?;
++        Some(el)
++    });
++    if let Some(el) = el {
++        el.set_text_content(Some(text));
++    }
++}
++
++/// The player has its instruments: the sound set is ready, and what waited for it plays.
++pub(crate) fn sound_ready(app: &Shared) {
++    if SOUND.get() != Sound::Preparing {
++        return;
++    }
++    SOUND.set(Sound::Ready);
++    status(None);
++    if let Some(action) = PLAY_WHEN_READY.take() {
++        let app = app.clone();
++        slint::Timer::single_shot(Duration::ZERO, move || crate::playing::action(&app, &action));
++    }
++}
++
++/// Whether the player's `text` is to be left unsaid: that no sound set is found, before Play fetched it. Once it was
++/// fetched, the player says what it says.
++pub(crate) fn quiet(text: &str) -> bool {
++    match SOUND.get() {
++        Sound::Missing | Sound::Fetching => text.contains("sound set"),
++        Sound::Preparing => {
++            SOUND.set(Sound::Ready);
++            PLAY_WHEN_READY.take();
++            status(None);
++            false
++        }
++        Sound::Ready => false,
++    }
++}
++
++async fn fetch(url: &str) -> Result<Vec<u8>, String> {
++    let window = web_sys::window().ok_or("no window")?;
++    let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url)).await.map_err(|e| format!("{e:?}"))?;
++    let response: web_sys::Response = response.dyn_into().map_err(|_| "no response")?;
++    if !response.ok() {
++        return Err(format!("HTTP {}", response.status()));
++    }
++    let buffer = response.array_buffer().map_err(|e| format!("{e:?}"))?;
++    let buffer = wasm_bindgen_futures::JsFuture::from(buffer).await.map_err(|e| format!("{e:?}"))?;
++    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
++}
++
++/// The desktop's file dialogs, which the web build never opens (File → Open…, Save As… and Export PDF… use
++/// Playground's instead): main.rs compiles against these.
++pub(crate) mod rfd {
++    use std::path::{Path, PathBuf};
++
++    pub(crate) struct FileDialog;
++
++    impl FileDialog {
++        pub(crate) fn new() -> Self {
++            FileDialog
++        }
++        pub(crate) fn set_title(self, _title: impl Into<String>) -> Self {
++            self
++        }
++        pub(crate) fn set_file_name(self, _name: impl Into<String>) -> Self {
++            self
++        }
++        pub(crate) fn add_filter(self, _name: impl Into<String>, _extensions: &[impl ToString]) -> Self {
++            self
++        }
++        pub(crate) fn set_directory(self, _path: impl AsRef<Path>) -> Self {
++            self
++        }
++        pub(crate) fn pick_file(self) -> Option<PathBuf> {
++            None
++        }
++        pub(crate) fn save_file(self) -> Option<PathBuf> {
++            None
++        }
++    }
++}
+diff --git a/crates/oxiguitar-playground/Cargo.toml b/crates/oxiguitar-playground/Cargo.toml
+new file mode 100644
+--- /dev/null
++++ b/crates/oxiguitar-playground/Cargo.toml
+@@ -0,0 +1,13 @@
++# Playground's browser build of OxiGuitar (patches/guitar-pro.yaml in github.com/daijro/openplayground): what
++# wasm32-unknown-unknown lacks (std's clock, files, threads and channels; dlopen). Native builds compile it empty.
++[package]
++name = "oxiguitar-playground"
++version = "0.1.0"
++edition = "2021"
++description = "OxiGuitar in the browser: the clock, files, threads and plugin loading std lacks on wasm32-unknown-unknown"
++license = "GPL-3.0-or-later"
++publish = false
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++web-time = "1"
++wasm-bindgen-futures = "0.4"
+diff --git a/crates/oxiguitar-playground/src/lib.rs b/crates/oxiguitar-playground/src/lib.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/oxiguitar-playground/src/lib.rs
+@@ -0,0 +1,740 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! OxiGuitar in the browser, for Playground (patches/guitar-pro.yaml in github.com/daijro/openplayground).
++//!
++//! wasm32-unknown-unknown has no clock, no files, no threads and no dlopen: `Instant::now` panics there, every file call
++//! fails, `thread::spawn` panics and a channel's `recv` can never wait. The modules that use them take `std` from here
++//! instead, through one `#[cfg(target_arch = "wasm32")] use oxiguitar_playground::std;` line at each one's end (a local
++//! `std` shadows the standard library's name in that module; everything else in it still comes from the real std):
++//!   time     web-time's Instant and SystemTime;
++//!   fs       an in-memory file system (scores, settings.json, the sound set), each change noted for the page to mirror
++//!            into Playground's Files;
++//!   thread   `spawn` runs what it is given once the current event is done, on this thread; `task` runs a future (the
++//!            worker's, the player's and the plugin tabs' loops, made async on the web by the patches); `scope` runs
++//!            each part at once;
++//!   mpsc     a channel whose `recv` is awaited;
++//!   env      `HOME` is `/home/web`, the program is `/usr/bin/oxiguitar`, `temp_dir` is `/tmp`;
++//!   process  `id` is 1.
++//! And `libloading`: the plugins linked into the page, registered by name, in place of the `.oxp` files the desktop
++//! loads (the host's loader takes it on the web through the same kind of `use` line).
++#![cfg(target_arch = "wasm32")]
++
++pub mod std {
++    pub use ::std::*;
++
++    pub mod time {
++        pub use web_time::*;
++    }
++
++    pub mod process {
++        pub use ::std::process::*;
++
++        /// The page is one process (std's panics on wasm).
++        pub fn id() -> u32 {
++            1
++        }
++    }
++
++    pub mod env {
++        pub use ::std::env::*;
++        use ::std::ffi::{OsStr, OsString};
++        use ::std::path::PathBuf;
++
++        /// `HOME` is `/home/web` (settings live in memory, kept in the browser's storage by the page). Nothing else is
++        /// set.
++        pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
++            (key.as_ref() == "HOME").then(|| OsString::from("/home/web"))
++        }
++
++        pub fn var<K: AsRef<OsStr>>(key: K) -> Result<String, VarError> {
++            var_os(key).and_then(|v| v.into_string().ok()).ok_or(VarError::NotPresent)
++        }
++
++        /// Where the program is, as on Linux: its plugins are in /usr/lib/oxiguitar/plugins.
++        pub fn current_exe() -> ::std::io::Result<PathBuf> {
++            Ok(PathBuf::from("/usr/bin/oxiguitar"))
++        }
++
++        /// A folder in the in-memory files (std's panics on wasm).
++        pub fn temp_dir() -> PathBuf {
++            PathBuf::from("/tmp")
++        }
++    }
++
++    pub mod thread {
++        pub use ::std::thread::*;
++        use ::std::cell::RefCell;
++        use ::std::future::Future;
++        use ::std::num::NonZeroUsize;
++        use ::std::rc::Rc;
++
++        /// What [`spawn`] gives back: its result, once it has run.
++        pub struct JoinHandle<T>(Rc<RefCell<Option<T>>>);
++
++        // The page has one thread.
++        unsafe impl<T> Send for JoinHandle<T> {}
++        unsafe impl<T> Sync for JoinHandle<T> {}
++
++        impl<T> JoinHandle<T> {
++            /// Its result if it has run; nothing waits on the page.
++            pub fn join(self) -> Result<T> {
++                self.0.borrow_mut().take().ok_or_else(|| Box::new("it hasn't run yet") as _)
++            }
++
++            pub fn is_finished(&self) -> bool {
++                self.0.borrow().is_some()
++            }
++        }
++
++        /// Runs `f` once the current event is done, on this thread.
++        pub fn spawn<F, T>(f: F) -> JoinHandle<T>
++        where
++            F: FnOnce() -> T + Send + 'static,
++            T: Send + 'static,
++        {
++            let out = Rc::new(RefCell::new(None));
++            let filled = out.clone();
++            wasm_bindgen_futures::spawn_local(async move {
++                *filled.borrow_mut() = Some(f());
++            });
++            JoinHandle(out)
++        }
++
++        /// Runs `f` as a task of the page (the loops that wait on a channel, made async on the web).
++        pub fn task(f: impl Future<Output = ()> + 'static) -> JoinHandle<()> {
++            let out = Rc::new(RefCell::new(None));
++            let filled = out.clone();
++            wasm_bindgen_futures::spawn_local(async move {
++                f.await;
++                *filled.borrow_mut() = Some(());
++            });
++            JoinHandle(out)
++        }
++
++        /// Lets the page draw and take input before going on.
++        pub async fn yield_now() {
++            let mut yielded = false;
++            ::std::future::poll_fn(|cx| {
++                if yielded {
++                    return ::std::task::Poll::Ready(());
++                }
++                yielded = true;
++                cx.waker().wake_by_ref();
++                ::std::task::Poll::Pending
++            })
++            .await
++        }
++
++        pub struct Builder;
++
++        impl Builder {
++            pub fn new() -> Builder {
++                Builder
++            }
++            pub fn name(self, _name: String) -> Builder {
++                self
++            }
++            pub fn stack_size(self, _size: usize) -> Builder {
++                self
++            }
++            pub fn spawn<F, T>(self, f: F) -> ::std::io::Result<JoinHandle<T>>
++            where
++                F: FnOnce() -> T + Send + 'static,
++                T: Send + 'static,
++            {
++                Ok(spawn(f))
++            }
++        }
++
++        pub fn available_parallelism() -> ::std::io::Result<NonZeroUsize> {
++            Ok(NonZeroUsize::MIN)
++        }
++
++        /// A scope whose threads run at once, one after another.
++        pub struct Scope;
++
++        pub struct ScopedJoinHandle<T>(T);
++
++        impl<T> ScopedJoinHandle<T> {
++            pub fn join(self) -> Result<T> {
++                Ok(self.0)
++            }
++        }
++
++        impl Scope {
++            pub fn spawn<F: FnOnce() -> T, T>(&self, f: F) -> ScopedJoinHandle<T> {
++                ScopedJoinHandle(f())
++            }
++        }
++
++        pub fn scope<F: FnOnce(&Scope) -> T, T>(f: F) -> T {
++            f(&Scope)
++        }
++    }
++
++    pub mod sync {
++        pub use ::std::sync::*;
++
++        /// A channel on the page's one thread: `recv` is awaited (the loops that wait on one are async on the web).
++        pub mod mpsc {
++            pub use ::std::sync::mpsc::{RecvError, RecvTimeoutError, SendError, TryRecvError};
++            use ::std::cell::{Cell, RefCell};
++            use ::std::collections::VecDeque;
++            use ::std::future::Future;
++            use ::std::rc::Rc;
++            use ::std::task::{Poll, Waker};
++
++            struct Shared<T> {
++                queue: RefCell<VecDeque<T>>,
++                waker: RefCell<Option<Waker>>,
++                senders: Cell<usize>,
++            }
++
++            impl<T> Shared<T> {
++                fn wake(&self) {
++                    if let Some(w) = self.waker.borrow_mut().take() {
++                        w.wake();
++                    }
++                }
++            }
++
++            pub struct Sender<T>(Rc<Shared<T>>);
++            pub struct Receiver<T>(Rc<Shared<T>>);
++
++            // The page has one thread.
++            unsafe impl<T> Send for Sender<T> {}
++            unsafe impl<T> Sync for Sender<T> {}
++            unsafe impl<T> Send for Receiver<T> {}
++
++            pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
++                let shared = Rc::new(Shared { queue: RefCell::default(), waker: RefCell::default(), senders: Cell::new(1) });
++                (Sender(shared.clone()), Receiver(shared))
++            }
++
++            impl<T> Sender<T> {
++                pub fn send(&self, t: T) -> Result<(), SendError<T>> {
++                    if Rc::strong_count(&self.0) == self.0.senders.get() {
++                        return Err(SendError(t));
++                    }
++                    self.0.queue.borrow_mut().push_back(t);
++                    self.0.wake();
++                    Ok(())
++                }
++            }
++
++            impl<T> Clone for Sender<T> {
++                fn clone(&self) -> Self {
++                    self.0.senders.set(self.0.senders.get() + 1);
++                    Sender(self.0.clone())
++                }
++            }
++
++            impl<T> Drop for Sender<T> {
++                fn drop(&mut self) {
++                    self.0.senders.set(self.0.senders.get() - 1);
++                    self.0.wake();
++                }
++            }
++
++            impl<T> std::fmt::Debug for Sender<T> {
++                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++                    f.write_str("Sender")
++                }
++            }
++
++            impl<T> Receiver<T> {
++                /// The next message, once there is one; an error once every sender is gone.
++                pub fn recv(&self) -> impl Future<Output = Result<T, RecvError>> + '_ {
++                    ::std::future::poll_fn(move |cx| {
++                        if let Some(t) = self.0.queue.borrow_mut().pop_front() {
++                            return Poll::Ready(Ok(t));
++                        }
++                        if self.0.senders.get() == 0 {
++                            return Poll::Ready(Err(RecvError));
++                        }
++                        *self.0.waker.borrow_mut() = Some(cx.waker().clone());
++                        Poll::Pending
++                    })
++                }
++
++                pub fn try_recv(&self) -> Result<T, TryRecvError> {
++                    match self.0.queue.borrow_mut().pop_front() {
++                        Some(t) => Ok(t),
++                        None if self.0.senders.get() == 0 => Err(TryRecvError::Disconnected),
++                        None => Err(TryRecvError::Empty),
++                    }
++                }
++
++                pub fn try_iter(&self) -> impl Iterator<Item = T> + '_ {
++                    ::std::iter::from_fn(move || self.try_recv().ok())
++                }
++            }
++        }
++    }
++
++    pub mod fs {
++        pub use ::std::fs::*;
++        use ::std::cell::RefCell;
++        use ::std::collections::{BTreeMap, BTreeSet};
++        use ::std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
++        use ::std::path::{Component, Path, PathBuf};
++
++        enum Entry {
++            Dir,
++            File(Vec<u8>, web_time::SystemTime),
++        }
++
++        #[derive(Default)]
++        struct Tree {
++            entries: BTreeMap<PathBuf, Entry>,
++            /// Paths written, created or removed since the last [`changes`].
++            changed: BTreeSet<PathBuf>,
++            /// Told when a change is noted (the page then mirrors it once the event is done).
++            notify: Option<fn()>,
++        }
++
++        thread_local! {
++            static TREE: RefCell<Tree> = RefCell::default();
++        }
++
++        fn with<T>(f: impl FnOnce(&mut Tree) -> T) -> T {
++            TREE.with(|t| f(&mut t.borrow_mut()))
++        }
++
++        /// `/a/./b/../c` -> `/a/c`: one spelling per file (relative paths start at `/`).
++        pub fn key(p: &Path) -> PathBuf {
++            let mut out = PathBuf::from("/");
++            for c in p.components() {
++                match c {
++                    Component::ParentDir => {
++                        out.pop();
++                    }
++                    Component::Normal(n) => out.push(n),
++                    _ => {}
++                }
++            }
++            out
++        }
++
++        fn missing(p: &Path) -> io::Error {
++            io::Error::new(io::ErrorKind::NotFound, format!("{} does not exist", p.display()))
++        }
++
++        impl Tree {
++            fn mark(&mut self, p: PathBuf) {
++                self.changed.insert(p);
++                if let Some(f) = self.notify {
++                    // After this borrow: the page's callback only schedules its work.
++                    wasm_bindgen_futures::spawn_local(async move { f() });
++                }
++            }
++            fn parents(&mut self, p: &Path) {
++                for dir in p.ancestors().skip(1) {
++                    self.entries.entry(dir.to_path_buf()).or_insert(Entry::Dir);
++                }
++            }
++            fn put(&mut self, p: PathBuf, bytes: Vec<u8>) {
++                self.parents(&p);
++                self.entries.insert(p, Entry::File(bytes, web_time::SystemTime::now()));
++            }
++            /// `p` and everything below it.
++            fn below(&self, p: &Path) -> Vec<PathBuf> {
++                self.entries.range(p.to_path_buf()..).map(|(k, _)| k).take_while(|k| k.starts_with(p)).cloned().collect()
++            }
++        }
++
++        /// Stores a file without noting a change (files the page brings in from Files or the network).
++        pub fn put(p: &Path, bytes: Vec<u8>) {
++            with(|t| t.put(key(p), bytes));
++        }
++
++        /// The paths changed since the last call: each now holds what the page's storage should hold, or is gone.
++        pub fn changes() -> Vec<PathBuf> {
++            with(|t| ::std::mem::take(&mut t.changed).into_iter().collect())
++        }
++
++        /// `f` is called (once the current event is done) after each change.
++        pub fn on_change(f: fn()) {
++            with(|t| t.notify = Some(f));
++        }
++
++        pub fn exists<P: AsRef<Path>>(p: P) -> io::Result<bool> {
++            Ok(metadata(p).is_ok())
++        }
++
++        pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(p: P, bytes: C) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                t.put(p.clone(), bytes.as_ref().to_vec());
++                t.mark(p);
++            });
++            Ok(())
++        }
++
++        pub fn read<P: AsRef<Path>>(p: P) -> io::Result<Vec<u8>> {
++            TREE.with(|t| match t.borrow().entries.get(&key(p.as_ref())) {
++                Some(Entry::File(bytes, _)) => Ok(bytes.clone()),
++                _ => Err(missing(p.as_ref())),
++            })
++        }
++
++        pub fn read_to_string<P: AsRef<Path>>(p: P) -> io::Result<String> {
++            String::from_utf8(read(p)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
++        }
++
++        pub fn create_dir_all<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                if !t.entries.contains_key(&p) {
++                    t.parents(&p);
++                    t.entries.insert(p, Entry::Dir);
++                }
++            });
++            Ok(())
++        }
++
++        pub fn create_dir<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            if metadata(p.as_ref()).is_ok() {
++                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists", p.as_ref().display())));
++            }
++            create_dir_all(p)
++        }
++
++        pub fn remove_file<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| match t.entries.get(&p) {
++                Some(Entry::File(..)) => {
++                    t.entries.remove(&p);
++                    t.mark(p);
++                    Ok(())
++                }
++                _ => Err(missing(&p)),
++            })
++        }
++
++        pub fn remove_dir_all<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                let gone = t.below(&p);
++                if gone.is_empty() {
++                    return Err(missing(&p));
++                }
++                for g in gone {
++                    t.entries.remove(&g);
++                    t.mark(g);
++                }
++                Ok(())
++            })
++        }
++
++        pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
++            let (from, to) = (key(from.as_ref()), key(to.as_ref()));
++            let bytes = read(&from)?;
++            with(|t| {
++                t.entries.remove(&from);
++                t.mark(from);
++                t.put(to.clone(), bytes);
++                t.mark(to);
++            });
++            Ok(())
++        }
++
++        pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
++            let bytes = read(from)?;
++            let n = bytes.len() as u64;
++            write(to, bytes)?;
++            Ok(n)
++        }
++
++        pub fn canonicalize<P: AsRef<Path>>(p: P) -> io::Result<PathBuf> {
++            metadata(p.as_ref())?;
++            Ok(key(p.as_ref()))
++        }
++
++        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++        pub struct FileType(bool);
++        impl FileType {
++            pub fn is_file(&self) -> bool {
++                self.0
++            }
++            pub fn is_dir(&self) -> bool {
++                !self.0
++            }
++            pub fn is_symlink(&self) -> bool {
++                false
++            }
++        }
++
++        #[derive(Clone, Debug)]
++        pub struct Metadata(Option<(u64, web_time::SystemTime)>);
++        impl Metadata {
++            pub fn len(&self) -> u64 {
++                self.0.map_or(0, |(n, _)| n)
++            }
++            pub fn is_file(&self) -> bool {
++                self.0.is_some()
++            }
++            pub fn is_dir(&self) -> bool {
++                self.0.is_none()
++            }
++            pub fn is_symlink(&self) -> bool {
++                false
++            }
++            pub fn file_type(&self) -> FileType {
++                FileType(self.is_file())
++            }
++            pub fn modified(&self) -> io::Result<web_time::SystemTime> {
++                Ok(self.0.map_or(web_time::SystemTime::UNIX_EPOCH, |(_, t)| t))
++            }
++        }
++
++        pub fn metadata<P: AsRef<Path>>(p: P) -> io::Result<Metadata> {
++            TREE.with(|t| match t.borrow().entries.get(&key(p.as_ref())) {
++                Some(Entry::File(bytes, at)) => Ok(Metadata(Some((bytes.len() as u64, *at)))),
++                Some(Entry::Dir) => Ok(Metadata(None)),
++                None => Err(missing(p.as_ref())),
++            })
++        }
++
++        pub fn symlink_metadata<P: AsRef<Path>>(p: P) -> io::Result<Metadata> {
++            metadata(p)
++        }
++
++        pub struct DirEntry(PathBuf);
++        impl DirEntry {
++            pub fn path(&self) -> PathBuf {
++                self.0.clone()
++            }
++            pub fn file_name(&self) -> ::std::ffi::OsString {
++                self.0.file_name().unwrap_or_default().to_os_string()
++            }
++            pub fn metadata(&self) -> io::Result<Metadata> {
++                metadata(&self.0)
++            }
++            pub fn file_type(&self) -> io::Result<FileType> {
++                Ok(metadata(&self.0)?.file_type())
++            }
++        }
++
++        pub type ReadDir = ::std::vec::IntoIter<io::Result<DirEntry>>;
++
++        pub fn read_dir<P: AsRef<Path>>(p: P) -> io::Result<ReadDir> {
++            let dir = key(p.as_ref());
++            if !metadata(&dir)?.is_dir() {
++                return Err(io::Error::other(format!("{} is not a folder", dir.display())));
++            }
++            let entries = TREE.with(|t| {
++                t.borrow().below(&dir).into_iter().filter(|k| k.parent() == Some(&dir)).map(|k| Ok(DirEntry(k))).collect::<Vec<_>>()
++            });
++            Ok(entries.into_iter())
++        }
++
++        /// A file's bytes, read whole when it opens; one opened for writing is stored back when flushed or dropped.
++        pub struct File {
++            data: Cursor<Vec<u8>>,
++            /// Where written bytes go, for a file opened to write.
++            to: Option<PathBuf>,
++            dirty: bool,
++        }
++
++        impl File {
++            pub fn open<P: AsRef<Path>>(p: P) -> io::Result<File> {
++                Ok(File { data: Cursor::new(read(p)?), to: None, dirty: false })
++            }
++            pub fn create<P: AsRef<Path>>(p: P) -> io::Result<File> {
++                write(p.as_ref(), [])?;
++                Ok(File { data: Cursor::new(Vec::new()), to: Some(key(p.as_ref())), dirty: false })
++            }
++            pub fn metadata(&self) -> io::Result<Metadata> {
++                Ok(Metadata(Some((self.data.get_ref().len() as u64, web_time::SystemTime::now()))))
++            }
++            pub fn sync_all(&self) -> io::Result<()> {
++                Ok(())
++            }
++            fn store(&mut self) {
++                if let (true, Some(to)) = (self.dirty, &self.to) {
++                    let _ = write(to, self.data.get_ref());
++                    self.dirty = false;
++                }
++            }
++        }
++
++        impl Read for File {
++            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++                self.data.read(buf)
++            }
++        }
++
++        impl Seek for File {
++            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
++                self.data.seek(pos)
++            }
++        }
++
++        impl Write for File {
++            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++                if self.to.is_none() {
++                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the file is open to read"));
++                }
++                self.dirty = true;
++                self.data.write(buf)
++            }
++            fn flush(&mut self) -> io::Result<()> {
++                self.store();
++                Ok(())
++            }
++        }
++
++        impl Drop for File {
++            fn drop(&mut self) {
++                self.store();
++            }
++        }
++
++        /// std's options, for the few the program uses: create_new, create, write, append.
++        #[derive(Clone, Debug, Default)]
++        pub struct OpenOptions {
++            write: bool,
++            append: bool,
++            create: bool,
++            create_new: bool,
++            truncate: bool,
++        }
++
++        impl OpenOptions {
++            pub fn new() -> OpenOptions {
++                OpenOptions::default()
++            }
++            pub fn read(&mut self, _on: bool) -> &mut OpenOptions {
++                self
++            }
++            pub fn write(&mut self, on: bool) -> &mut OpenOptions {
++                self.write = on;
++                self
++            }
++            pub fn append(&mut self, on: bool) -> &mut OpenOptions {
++                self.append = on;
++                self
++            }
++            pub fn create(&mut self, on: bool) -> &mut OpenOptions {
++                self.create = on;
++                self
++            }
++            pub fn create_new(&mut self, on: bool) -> &mut OpenOptions {
++                self.create_new = on;
++                self
++            }
++            pub fn truncate(&mut self, on: bool) -> &mut OpenOptions {
++                self.truncate = on;
++                self
++            }
++            pub fn open<P: AsRef<Path>>(&self, p: P) -> io::Result<File> {
++                let p = p.as_ref();
++                let old = read(p).ok();
++                if self.create_new && old.is_some() {
++                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists", p.display())));
++                }
++                if old.is_none() && !(self.create || self.create_new) {
++                    return Err(missing(p));
++                }
++                let writes = self.write || self.append;
++                let made = old.is_none() || (writes && self.truncate);
++                let data = if made { Vec::new() } else { old.unwrap_or_default() };
++                let mut cursor = Cursor::new(data);
++                if self.append {
++                    cursor.seek(SeekFrom::End(0))?;
++                }
++                if made {
++                    write(p, [])?;
++                }
++                Ok(File { data: cursor, to: writes.then(|| key(p)), dirty: false })
++            }
++        }
++    }
++}
++
++/// The plugins linked into the page, in place of plugin files (`.oxp` libraries the desktop loads with libloading):
++/// each registered with its manifest and entry function at `/usr/lib/oxiguitar/plugins/<name>.oxp`, the folder the
++/// host looks in beside `/usr/bin/oxiguitar`. The host finds them with [`files`], reads their manifests with
++/// [`manifest`] and "loads" them through [`Library`].
++pub mod libloading {
++    use std::cell::RefCell;
++    use std::ffi::OsStr;
++    use std::path::{Path, PathBuf};
++
++    /// The system plugin folder of a program at /usr/bin/oxiguitar.
++    pub const FOLDER: &str = "/usr/lib/oxiguitar/plugins";
++
++    struct Linked {
++        path: PathBuf,
++        manifest: &'static [u8],
++        entry: *const (),
++    }
++
++    thread_local! {
++        static LINKED: RefCell<Vec<Linked>> = const { RefCell::new(Vec::new()) };
++    }
++
++    /// Registers the plugin `name` (its manifest.json and its entry function, `oxiguitar_plugin_v1`, as a pointer).
++    pub fn register(name: &str, manifest: &'static str, entry: *const ()) {
++        let path = Path::new(FOLDER).join(format!("{name}.oxp"));
++        LINKED.with_borrow_mut(|l| l.push(Linked { path, manifest: manifest.as_bytes(), entry }));
++    }
++
++    /// The plugins "in" `folder`, by name.
++    pub fn files(folder: &Path) -> Vec<PathBuf> {
++        let mut found: Vec<PathBuf> =
++            LINKED.with_borrow(|l| l.iter().filter(|p| p.path.parent() == Some(folder)).map(|p| p.path.clone()).collect());
++        found.sort();
++        found
++    }
++
++    /// The manifest of the plugin at `path`.
++    pub fn manifest(path: &Path) -> Option<Vec<u8>> {
++        LINKED.with_borrow(|l| l.iter().find(|p| p.path == path).map(|p| p.manifest.to_vec()))
++    }
++
++    #[derive(Debug)]
++    pub struct Error(String);
++
++    impl std::fmt::Display for Error {
++        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++            f.write_str(&self.0)
++        }
++    }
++
++    impl std::error::Error for Error {}
++
++    /// A plugin linked into the page.
++    #[derive(Debug)]
++    pub struct Library(*const ());
++
++    /// A symbol of it: its entry function.
++    pub struct Symbol<T>(T);
++
++    impl<T> std::ops::Deref for Symbol<T> {
++        type Target = T;
++        fn deref(&self) -> &T {
++            &self.0
++        }
++    }
++
++    impl Library {
++        /// # Safety
++        /// As libloading's: the plugin registered at `path` is trusted like the program (it is part of it).
++        pub unsafe fn new<P: AsRef<OsStr>>(path: P) -> Result<Library, Error> {
++            let path = Path::new(path.as_ref());
++            LINKED
++                .with_borrow(|l| l.iter().find(|p| p.path == path).map(|p| Library(p.entry)))
++                .ok_or_else(|| Error(format!("{} isn't one of this page's plugins", path.display())))
++        }
++
++        /// The entry function, whatever `symbol` is asked for (each plugin has that one).
++        ///
++        /// # Safety
++        /// `T` is the entry function's type, a function pointer.
++        pub unsafe fn get<T>(&self, _symbol: &[u8]) -> Result<Symbol<T>, Error> {
++            assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<*const ()>());
++            Ok(Symbol(unsafe { std::mem::transmute_copy::<*const (), T>(&self.0) }))
++        }
++    }
++}
+diff --git a/crates/oxiguitar-plugin/src/glue/web.rs b/crates/oxiguitar-plugin/src/glue/web.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/oxiguitar-plugin/src/glue/web.rs
+@@ -0,0 +1,68 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++//! Plugins linked into one program, for Playground's browser build (patches/guitar-pro.yaml in
++//! github.com/daijro/openplayground): a page can't load `.oxp` files, so the plugins it uses are linked into it, each
++//! sharing this crate. The glue's one plugin per library ([`super::PLUGIN`]) is one per plugin type here: the table of
++//! plugin `P` calls `start` and `call` through [`start`] and [`call`], which say whose call it is.
++
++use std::any::TypeId;
++use std::cell::{Cell, RefCell};
++
++use oxiguitar_plugin_api::abi::{HostTableV1, RawBytes, RawSink, Status};
++
++use crate::Plugin;
++
++thread_local! {
++    /// The plugin whose `start` or `call` runs (a plugin's call can reach another's through the host).
++    static CURRENT: Cell<Option<TypeId>> = const { Cell::new(None) };
++    /// Every plugin started, by type; never dropped, as a library is never unloaded.
++    static STARTED: RefCell<Vec<(TypeId, &'static Box<dyn Plugin>)>> = const { RefCell::new(Vec::new()) };
++}
++
++/// The plugin of the call running, as the glue's `PLUGIN` holds it in a plugin of its own.
++pub(super) struct Plugins;
++
++impl Plugins {
++    pub(super) fn get(&self) -> Option<&'static Box<dyn Plugin>> {
++        let current = CURRENT.get()?;
++        STARTED.with_borrow(|s| s.iter().find(|(t, _)| *t == current).map(|(_, p)| *p))
++    }
++
++    pub(super) fn set(&self, plugin: Box<dyn Plugin>) -> Result<(), Box<dyn Plugin>> {
++        let Some(current) = CURRENT.get() else {
++            return Err(plugin);
++        };
++        if self.get().is_some() {
++            return Err(plugin);
++        }
++        STARTED.with_borrow_mut(|s| s.push((current, Box::leak(Box::new(plugin)))));
++        Ok(())
++    }
++}
++
++/// Runs `f` as plugin `P`'s call.
++fn as_plugin<P: Plugin, T>(f: impl FnOnce() -> T) -> T {
++    let before = CURRENT.replace(Some(TypeId::of::<P>()));
++    let out = f();
++    CURRENT.set(before);
++    out
++}
++
++/// `PluginTableV1::start` for plugin `P`.
++///
++/// # Safety
++///
++/// As [`super::start`].
++pub(super) unsafe extern "C" fn start<P: Plugin>(host: *const HostTableV1, answer: *mut RawSink) -> Status {
++    // SAFETY: the caller's guarantees, passed on.
++    as_plugin::<P, _>(|| unsafe { super::start::<P>(host, answer) })
++}
++
++/// `PluginTableV1::call` for plugin `P`.
++///
++/// # Safety
++///
++/// As [`super::call`].
++pub(super) unsafe extern "C" fn call<P: Plugin>(request: RawBytes, answer: *mut RawSink) -> Status {
++    // SAFETY: the caller's guarantees, passed on.
++    as_plugin::<P, _>(|| unsafe { super::call(request, answer) })
++}
+diff --git a/index.html b/index.html
+new file mode 100644
+--- /dev/null
++++ b/index.html
+@@ -0,0 +1,34 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
++  <title>OxiGuitar</title>
++  <!-- OxiGuitar in the browser, for Playground (patches/guitar-pro.yaml in github.com/daijro/openplayground). -->
++  <link data-trunk rel="rust" href="crates/oxiguitar-app/Cargo.toml" data-bin="oxiguitar" data-wasm-opt="0" />
++  <link data-trunk rel="icon" href="assets/icon/png/oxiguitar-64.png" />
++  <style>
++    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #202020; }
++    /* Slint sizes the canvas to the window's preferred size; the page's size wins, and Slint follows it (Playground's
++       bar, above it, has its own rule for the app's canvas, which wins over this one). */
++    body > canvas { position: absolute; inset: 0; width: 100% !important; height: 100% !important; display: block; outline: none; }
++    #loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
++      color: #dcdcdc; font: 14px system-ui, sans-serif; pointer-events: none; }
++  </style>
++  <script>
++    // Browsers keep a page's audio off until the person clicks or types: the player's AudioContext starts then.
++    {
++      const contexts = []
++      if (window.AudioContext) window.AudioContext = class extends window.AudioContext {
++        constructor(...args) { super(...args); contexts.push(this) }
++      }
++      const resume = () => contexts.forEach((c) => c.state === 'suspended' && c.resume().catch(() => {}))
++      for (const type of ['pointerdown', 'keydown', 'touchend']) addEventListener(type, resume, { capture: true })
++    }
++  </script>
++</head>
++<body>
++  <canvas id="canvas"></canvas>
++  <div id="loading">Loading OxiGuitar&hellip;</div>
++</body>
++</html>
+diff --git a/plugins/audio-web/Cargo.toml b/plugins/audio-web/Cargo.toml
+new file mode 100644
+--- /dev/null
++++ b/plugins/audio-web/Cargo.toml
+@@ -0,0 +1,14 @@
++# Playground's browser build of OxiGuitar (patches/guitar-pro.yaml in github.com/daijro/openplayground): the
++# audio-device plugin of the page, linked into it. Native builds compile it empty.
++[package]
++name = "oxiguitar-audio-web-plugin"
++version = "0.1.0"
++edition = "2024"
++description = "The OxiGuitar audio-device plugin for the browser: plays OxiGuitar's sound through Web Audio."
++license = "GPL-3.0-or-later"
++publish = false
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++oxiguitar-plugin.workspace = true
++# cpal's Web Audio host; the version follows the other audio-device plugins'.
++cpal = { version = "0.18", default-features = false, features = ["wasm-bindgen"] }
+diff --git a/plugins/audio-web/manifest.json b/plugins/audio-web/manifest.json
+new file mode 100644
+--- /dev/null
++++ b/plugins/audio-web/manifest.json
+@@ -0,0 +1,20 @@
++{
++  "interface": "1.3",
++  "id": "playground.audio-web",
++  "name": "Web Audio",
++  "version": "0.1.0",
++  "description": "Plays OxiGuitar's sound through the browser's Web Audio, in Playground's browser build.",
++  "authors": [
++    "The Playground contributors"
++  ],
++  "license": "GPL-3.0-or-later",
++  "homepage": "https://github.com/daijro/openplayground",
++  "services": [
++    {
++      "interface": "audio-device",
++      "id": "web-audio",
++      "name": "Web Audio",
++      "priority": 10
++    }
++  ]
++}
+diff --git a/plugins/audio-web/src/lib.rs b/plugins/audio-web/src/lib.rs
+new file mode 100644
+--- /dev/null
++++ b/plugins/audio-web/src/lib.rs
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! The audio-device plugin of Playground's browser build of OxiGuitar (patches/guitar-pro.yaml in
++//! github.com/daijro/openplayground): the service `audio-device` `web-audio`, through cpal's Web Audio host. The page
++//! has one thread, so a stream is opened and closed right in the call (the desktop plugins keep a thread for that), and
++//! its callback, which hands the core its buffer (`AudioOut::render`), runs on the page's thread too. Browsers start a
++//! page's audio only once the person has clicked or typed (index.html resumes it then).
++#![cfg(target_arch = "wasm32")]
++// export_plugin! asks for the `oxp` feature, which a plugin linked into the page has no use for.
++#![allow(unexpected_cfgs)]
++
++use std::cell::RefCell;
++
++use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
++use oxiguitar_plugin::api::audio_device::{CLOSE, DEVICES, OPEN, Open, Opened};
++use oxiguitar_plugin::api::{decode, encode};
++use oxiguitar_plugin::{Availability, Error, ErrorKind, Host, Level, Plugin, Service};
++
++/// The output's name.
++const NAME: &str = "Web Audio";
++
++thread_local! {
++    /// The open streams, by number (a cpal stream stays on the thread that made it).
++    static STREAMS: RefCell<Vec<(u64, cpal::Stream)>> = const { RefCell::new(Vec::new()) };
++}
++
++/// The plugin.
++#[derive(Debug)]
++pub struct Audio {
++    host: Host,
++}
++
++impl Plugin for Audio {
++    fn start(host: Host) -> Result<Audio, Error> {
++        Ok(Audio { host })
++    }
++
++    fn service(&self, interface: &str, id: &str) -> Option<&dyn Service> {
++        (interface == "audio-device" && id == "web-audio").then_some(self as &dyn Service)
++    }
++}
++
++fn failed(what: &str, e: impl std::fmt::Display) -> Error {
++    Error::new(ErrorKind::Failed, format!("{what} ({e})"))
++}
++
++impl Audio {
++    fn open(&self, open: &Open) -> Result<Opened, Error> {
++        let out = self.host.audio_out().ok_or_else(|| Error::new(ErrorKind::Unsupported, "this OxiGuitar can't play sound"))?;
++        let device = cpal::default_host()
++            .default_output_device()
++            .ok_or_else(|| Error::new(ErrorKind::NotFound, "the browser has no audio output"))?;
++        let config = cpal::StreamConfig { channels: 2, sample_rate: open.rate, buffer_size: cpal::BufferSize::Default };
++        let stream_no = open.stream;
++        let errors = self.host.clone();
++        let stream = device
++            .build_output_stream(
++                config,
++                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
++                    let ts = info.timestamp();
++                    let delay = u64::try_from(ts.playback.duration_since(ts.callback).as_nanos()).unwrap_or(0);
++                    out.render(stream_no, data, 2, delay);
++                },
++                move |e: cpal::Error| errors.notify(Level::Error, format!("{NAME}: the sound stopped ({e}).")),
++                None,
++            )
++            .map_err(|e| failed("the output couldn't be opened", e))?;
++        stream.play().map_err(|e| failed("the output couldn't be started", e))?;
++        STREAMS.with_borrow_mut(|s| s.push((stream_no, stream)));
++        Ok(Opened { rate: open.rate, channels: 2, frames: 0, device: NAME.to_owned() })
++    }
++}
++
++impl Service for Audio {
++    fn probe(&self) -> Availability {
++        match cpal::default_host().default_output_device() {
++            Some(_) => Availability::Available,
++            None => Availability::Unavailable("the browser has no Web Audio".into()),
++        }
++    }
++
++    fn call(&self, method: &str, input: &[u8]) -> Result<Vec<u8>, Error> {
++        let invalid = |e: oxiguitar_plugin::api::DecodeError| Error::new(ErrorKind::Invalid, format!("the input can't be read ({e})"));
++        let unencoded = |e: oxiguitar_plugin::api::DecodeError| Error::new(ErrorKind::Failed, e.to_string());
++        match method {
++            OPEN => encode(&self.open(&decode::<Open>(input).map_err(invalid)?)?).map_err(unencoded),
++            CLOSE => {
++                let stream: u64 = decode(input).map_err(invalid)?;
++                // Dropping a cpal stream stops it: its callback isn't called again once this returns.
++                let closed: Vec<_> = STREAMS.with_borrow_mut(|s| s.extract_if(.., |(n, _)| *n == stream).collect());
++                drop(closed);
++                Ok(Vec::new())
++            }
++            DEVICES => encode(&vec![NAME.to_owned()]).map_err(unencoded),
++            _ => Err(Error::not_found(format!("no method {method:?}"))),
++        }
++    }
++}
++
++oxiguitar_plugin::export_plugin!(Audio);
