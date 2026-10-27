@@ -25,15 +25,15 @@
   find: '(?![\s\S])'
   after: "\n// Live editing in a Playground session (web only).\npub mod live_playground;\n"
 # Session::mark_saved: a save of the shared PDF keeps the shared graph (its /ModDate is not everyone's change).
-#   (Session lives in lib.rs or in session.rs, by version; the glob finds either.)
+#   (Session lives in lib.rs or in session/*.rs, by version; the glob finds either.)
 - live: true
-  file: crates/engine/src/*.rs
+  file: crates/engine/src/**/*.rs
   find: 'pub\s+fn\s+mark_saved\s*\([^{]*\{'
   after: "\n        if crate::live_playground::keeps_graph(id) { return self.live_mark_saved(id); }"
 # Session::show_released, which live_playground (a child of the crate root) calls after a failed refresh.
 - live: true
-  file: crates/engine/src/*.rs
-  find: '(?<!pub\(crate\) )\bfn\s+show_released\b'
+  file: crates/engine/src/**/*.rs
+  find: '(?<!pub\(crate\) )(?:pub\(super\)\s+)?\bfn\s+show_released\b'
   replace: 'pub(crate) fn show_released'
 # The app's live module (web, and the native tests), outside src/, and the playground-live crate (patches/live/kit:
 #   the session and the presence look, `egui`) it uses.
@@ -45,6 +45,11 @@
   file: crates/ui-egui/Cargo.toml
   find: '^\[dependencies\]\n'
   after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
+# App::finish_open, which live.rs (a child of the crate root) calls; private once it lives in a submodule (app/files.rs).
+- live: true
+  file: crates/ui-egui/src/**/*.rs
+  find: '(?<!pub\(crate\) )\bfn\s+finish_open\b'
+  replace: 'pub(crate) fn finish_open'
 # Undo and Redo of the shared PDF go to the session.
 - live: true
   file: crates/ui-egui/src/editing.rs
@@ -57,7 +62,7 @@
   after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if let Some(on) = crate::live::command_enabled(self, spec.id) { return on; }"
 # The others' pointers and selected comments, drawn after the pages (the find bar comes next, over them).
 - live: true
-  file: crates/ui-egui/src/canvas.rs
+  file: crates/ui-egui/src/canvas{,/find}.rs
   find: 'fn\s+find_bar\s*\([^{]*\{'
   after: "\n    #[cfg(target_arch = \"wasm32\")] crate::live::paint(view, area, ui);"
 # The web entry: the runner the session keeps, and the app wrapped so each frame ends with the session's frame hook.
