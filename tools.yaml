@@ -262,17 +262,15 @@ groups:
         name: MailCraft
         alternative: Outlook
         blurb: Mail, calendar, people and tasks.
-        # Its browser build opens a sample mailbox kept in the browser (no mail server), and takes no files.
+        # Its browser build can't reach mail servers: mail comes in through its own File › Import (.eml, .ics,
+        # .vcf), the mailbox lives in the browser's storage, and saving downloads. It follows the system theme itself.
         opens: []
         imports: []
-        repo: MonkeySaint/mailcraft
+        repo: UCS-Care-Group/mailcraft
         license: MIT OR Apache-2.0
-        copyright: "Copyright (c) 2026 the MailCraft contributors"
-        # Its web zip is mailcraft-<version>-web.zip; its branch is master.
-        asset: '-web\.zip$'
-        branch: master
-        icon: icons/mailcraft.svg
-        patches: patches/outlook.yaml
+        # NOTICE: parts started from WordCraft's source, under its copyright.
+        copyright: ["Copyright (c) 2026 the MailCraft contributors", "Copyright (c) 2026 ArtCraft Team and the WordCraft contributors"]
+        icon: icons/mailcraft.png
         accent: "#28A8EA"
         base: "#0A2767"
 

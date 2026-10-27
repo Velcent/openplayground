@@ -195,8 +195,11 @@ async function install(t, channel, name) {
   let ahead
   const latest = channel === 'head' && !gone && (await version(t, 'release'))
   if (latest) {
-    const compare = await github(`repos/${t.repo}/compare/${latest.release.tag_name}...${tag.replace(/^head-/, '')}`)
-    ahead = { commits: compare.ahead_by, of: latest.release.tag_name }
+    // (none for a build kept from the repo the tool used to come from: its commit isn't in this one)
+    const compare = await github(`repos/${t.repo}/compare/${latest.release.tag_name}...${tag.replace(/^head-/, '')}`).catch((e) => {
+      if (!/GitHub API 404/.test(e.message)) throw e
+    })
+    if (compare) ahead = { commits: compare.ahead_by, of: latest.release.tag_name }
   }
 
   const stamp = JSON.stringify({ tag, label: label ?? tag, date, ahead, asset: asset.name, updated_at: asset.updated_at, built: !!(local || ours || previous) }) + '\n'
