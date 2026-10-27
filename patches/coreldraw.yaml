@@ -1,0 +1,65 @@
+# TraceDraw in Playground. Upstream (github.com/igtoth/tracedraw) has a browser build of its own, published on its
+# GitHub Pages only (its releases are desktop packages: no web zip), so these patches build it from its head commit
+# and connect its files to Playground's Files. Native builds see none of this: every rule adds wasm-only lines.
+#
+# patches/coreldraw/web.diff adds new files only:
+#   scripts/build-web.sh            build.mjs runs it: upstream's web build (scripts/web/build.sh, its CI's `web` job)
+#                                   with the font folder, the font catalog and the Help, in the release profile (speed;
+#                                   build.mjs's wasm-opt -O3 follows) where upstream builds for size.
+#   apps/tracedraw/src/playground.rs   the page's side: upstream's file picker is Playground's Open, a drawing it
+#                                   downloads (Save As, .tdraw or .cdr) asks Playground's Save As (Keep in Files or
+#                                   Download; exports stay plain downloads, as in Playground's other apps), Save writes
+#                                   a drawing from Files back there, Files' "Open in TraceDraw" opens a drawing (.cdr,
+#                                   .tdraw, SVG, PDF...) in a tab or places a picture, and the unsaved state goes to
+#                                   Playground's leave warning.
+# Upstream's browser build keeps every file it reads in memory by path (files.rs: `/upload/<name>`) and downloads
+# every file it writes; the rules below hook that one module, so every dialog of the app follows. If upstream
+# rewrites files.rs, find its picker, its download and its whole-file write again and hook them the same way.
+
+# Rule 1/8: the module (wasm only).
+- file: apps/tracedraw/src/main.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: its Files (patches/coreldraw.yaml).\n#[cfg(target_arch = \"wasm32\")]\nmod playground;\n"
+
+# Rules 2-5/8: files.rs, upstream's file access for both builds. Its browser picker asks Playground's Open (the
+# dialog's job then runs with the file, kept in memory at its path in Files, on the next frame); its download of a
+# drawing asks Playground's Save As; its whole-file write of a file that is in Files writes it back; and each frame,
+# where upstream runs its finished dialogs, playground::frame runs Playground's. Without playgroundFiles on the page
+# each hook gives way to upstream's code. Verify: File > Open shows Playground's Open; File > Save As > Save asks
+# "Keep in browser storage / Download to device"; File > Export downloads. If upstream renames web_pick, download,
+# write or run_finished, follow.
+- file: apps/tracedraw/src/files.rs
+  find: '\bfn\s+web_pick\s*\(\s*self\s*,\s*then\s*:\s*Job\s*\)\s*\{'
+  after: "\n        // Playground's Open (patches/coreldraw.yaml).\n        #[cfg(target_arch = \"wasm32\")]\n        let Err(then) = crate::playground::pick(&self.filters, then) else {\n            return;\n        };"
+- file: apps/tracedraw/src/files.rs
+  find: '\bfn\s+download\s*\(\s*name\s*:\s*&str\s*,\s*bytes\s*:\s*&\[u8\]\s*\)\s*->\s*std::io::Result<\(\)>\s*\{'
+  after: "\n    // Playground's Save As (patches/coreldraw.yaml).\n    #[cfg(target_arch = \"wasm32\")]\n    if crate::playground::save_as(name, bytes) {\n        return Ok(());\n    }"
+- file: apps/tracedraw/src/files.rs
+  find: '\bpub\s+fn\s+write\s*\(\s*path\s*:\s*impl\s+AsRef<Path>\s*,\s*bytes\s*:\s*impl\s+AsRef<\[u8\]>\s*\)\s*->\s*std::io::Result<\(\)>\s*\{\s*let\s+path\s*=\s*path\.as_ref\(\);'
+  after: "\n    // A file in Playground's Files goes back there (patches/coreldraw.yaml).\n    #[cfg(target_arch = \"wasm32\")]\n    if crate::playground::write(path, bytes.as_ref()) {\n        return Ok(());\n    }"
+- file: apps/tracedraw/src/files.rs
+  find: '\bpub\s+fn\s+run_finished\s*\(\s*app\s*:\s*&mut\s+App\s*\)\s*\{'
+  after: "\n    // Playground's dialogs and Files' \"Open in TraceDraw\" (patches/coreldraw.yaml).\n    #[cfg(target_arch = \"wasm32\")]\n    crate::playground::frame(app);"
+
+# Rule 6/8: Save. In upstream's browser build every Save asks Save As (a download has no file to write back to); a
+# drawing opened from Files, or kept there by Save As, saves back to it, as on the desktop. Placed just before
+# upstream's own write-back, after its checks (a drawing from GitHub, an old .cdr version). Verify: open a .tdraw from
+# Files, change it, Ctrl+S: no dialog, and the file's time in Files changes. If upstream changes that condition,
+# anchor on its new spelling.
+- file: apps/tracedraw/src/app.rs
+  find: 'if\s+!save_as\s*&&\s*!crate::files::WEB\s*\{'
+  before: "// Playground: a drawing in its Files saves back there (patches/coreldraw.yaml).\n        #[cfg(target_arch = \"wasm32\")]\n        if let Some(path) = self.file.clone().filter(|p| !save_as && crate::playground::in_files(p)) {\n            self.save_to(path);\n            return;\n        }\n        "
+
+# Rule 7/8: the Help. Upstream's links open its published Help (igtoth.github.io); this build ships the Help of its own
+# version next to the page (scripts/build-web.sh, help/), which the links open instead. If upstream renames BASE, follow.
+- file: apps/tracedraw/src/help.rs
+  find: 'pub\s+const\s+BASE\s*:\s*&str\s*=\s*"[^"]*";'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+  after: "\n/// Playground's browser build: the Help next to the page (patches/coreldraw.yaml).\n#[cfg(target_arch = \"wasm32\")]\npub const BASE: &str = \"help/\";"
+
+# Rule 8/8: upstream's browser build greets each visit with a message that files open and save by upload and download
+# and that the desktop app is faster; in Playground files are in Files, so it isn't shown. If upstream renames
+# show_web_notice, follow.
+- file: apps/tracedraw/src/app.rs
+  find: '\bpub\s+fn\s+show_web_notice\s*\(\s*&mut\s+self\s*\)\s*\{'
+  after: "\n        // Playground: files are in its Files, not uploads and downloads (patches/coreldraw.yaml).\n        #[cfg(target_arch = \"wasm32\")]\n        return;"

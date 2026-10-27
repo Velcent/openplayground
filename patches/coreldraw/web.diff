@@ -1,0 +1,244 @@
+diff --git a/apps/tracedraw/src/playground.rs b/apps/tracedraw/src/playground.rs
+new file mode 100644
+index 0000000..e0365df
+--- /dev/null
++++ b/apps/tracedraw/src/playground.rs
+@@ -0,0 +1,189 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++//! TraceDraw in Playground (patches/coreldraw.yaml in github.com/daijro/openplayground): the browser build's file
++//! dialogs and drawings go through Playground's Files (`globalThis.playgroundFiles`, its shell/files.js), and Files'
++//! "Open in TraceDraw" opens drawings here. On a page without Playground everything stays as upstream's.
++//!
++//! A file from Files is kept in memory at its place there (`browser:/Art/logo.tdraw` is `/Art/logo.tdraw`), as
++//! `files.rs` keeps an upload under `/upload`, so Save writes a drawing opened from Files back to it. A drawing upstream
++//! downloads (`/download/<name>.tdraw` or `.cdr`: Save As) asks Playground's Save As instead: kept in Files (it then
++//! saves back there) or downloaded. Exports stay downloads, as in Playground's other apps.
++
++use crate::app::{App, OPEN_EXTENSIONS};
++use std::cell::{Cell, RefCell};
++use std::collections::HashSet;
++use std::path::{Path, PathBuf};
++use wasm_bindgen::{closure::Closure, JsCast as _, JsValue};
++
++type Job = Box<dyn FnOnce(&mut App, PathBuf)>;
++
++thread_local! {
++    /// Paths of files in Files: opened from there, or kept there by Save As.
++    static IN_FILES: RefCell<HashSet<PathBuf>> = RefCell::default();
++    /// Files picked in Playground's Open, with what their dialog does with them, for the next frame.
++    static PICKED: RefCell<Vec<(Job, PathBuf)>> = RefCell::default();
++    /// Files' "Open in TraceDraw", for the next frame.
++    static OPENED: RefCell<Vec<PathBuf>> = RefCell::default();
++    /// Save As answered: the download path upstream saved to, and the file's place in Files (None: cancelled).
++    static ANSWERED: RefCell<Vec<(PathBuf, Option<PathBuf>)>> = RefCell::default();
++    static LISTENING: Cell<bool> = const { Cell::new(false) };
++    static UNSAVED: Cell<Option<bool>> = const { Cell::new(None) };
++}
++
++fn get(o: &JsValue, k: &str) -> JsValue {
++    js_sys::Reflect::get(o, &k.into()).unwrap_or(JsValue::UNDEFINED)
++}
++
++fn api() -> Option<JsValue> {
++    Some(get(&js_sys::global(), "playgroundFiles")).filter(JsValue::is_object)
++}
++
++/// `playgroundFiles[method](...args)`; None without Playground, or when it threw.
++fn call(method: &str, args: &[JsValue]) -> Option<JsValue> {
++    let api = api()?;
++    let f = get(&api, method).dyn_into::<js_sys::Function>().ok()?;
++    f.apply(&api, &args.iter().collect::<js_sys::Array>()).ok()
++}
++
++/// What a call's promise gives; None when it fails or gives nothing (a cancelled dialog).
++async fn answer(v: Option<JsValue>) -> Option<JsValue> {
++    let promise = v?.dyn_into::<js_sys::Promise>().ok()?;
++    wasm_bindgen_futures::JsFuture::from(promise).await.ok().filter(|v| !v.is_null() && !v.is_undefined())
++}
++
++fn object(entries: &[(&str, JsValue)]) -> JsValue {
++    let o = js_sys::Object::new();
++    for (k, v) in entries {
++        let _ = js_sys::Reflect::set(&o, &JsValue::from(*k), v);
++    }
++    o.into()
++}
++
++fn extension(path: &Path) -> String {
++    path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
++}
++
++/// A file from Playground (`{ path, name, bytes }`) into memory: at its place in Files, or under `/upload` (one from
++/// the computer, as upstream keeps it).
++fn bring_in(file: &JsValue) -> Option<PathBuf> {
++    let name = get(file, "name").as_string()?;
++    let in_files = get(file, "path").as_string().and_then(|p| p.strip_prefix("browser:").map(PathBuf::from));
++    let path = in_files.clone().unwrap_or_else(|| Path::new("/upload").join(&name));
++    crate::files::store(&path, js_sys::Uint8Array::new(&get(file, "bytes")).to_vec());
++    if in_files.is_some() {
++        IN_FILES.with_borrow_mut(|f| f.insert(path.clone()));
++    }
++    Some(path)
++}
++
++/// True for a file in Files, which Save writes back to.
++pub fn in_files(path: &Path) -> bool {
++    IN_FILES.with_borrow(|f| f.contains(path))
++}
++
++/// Upstream's file picker (`files::Dialog`): Playground's Open, with the dialog's types; the dialog's job runs with
++/// the file on a later frame. Gives the job back without Playground.
++pub fn pick(filters: &[(String, Vec<String>)], then: Job) -> Result<(), Job> {
++    if api().is_none() {
++        return Err(then);
++    }
++    let mut types: Vec<&str> = filters.iter().flat_map(|(_, e)| e.iter().map(String::as_str)).filter(|e| *e != "*").collect();
++    types.sort_unstable();
++    types.dedup();
++    let types: js_sys::Array = types.into_iter().map(JsValue::from).collect();
++    let asked = call("open", &[object(&[("types", types.into())])]);
++    wasm_bindgen_futures::spawn_local(async move {
++        let Some(file) = answer(asked).await.and_then(|a| js_sys::Array::from(&a).iter().next()) else {
++            return;
++        };
++        if let Some(path) = bring_in(&file) {
++            PICKED.with_borrow_mut(|p| p.push((then, path)));
++            crate::web::request_repaint();
++        }
++    });
++    Ok(())
++}
++
++/// Upstream's download of a drawing: Playground's Save As, which keeps it in Files or downloads it. False for any other
++/// file (an export), or without Playground: upstream downloads it.
++pub fn save_as(name: &str, bytes: &[u8]) -> bool {
++    if !matches!(extension(Path::new(name)).as_str(), "tdraw" | "cdr") {
++        return false;
++    }
++    let data = js_sys::Uint8Array::from(bytes);
++    let types = js_sys::Array::of1(&JsValue::from(extension(Path::new(name))));
++    let entries = [("name", JsValue::from(name)), ("types", types.into()), ("bytes", data.clone().into())];
++    let Some(asked) = call("saveAs", &[object(&entries)]) else {
++        return false;
++    };
++    let from = Path::new("/download").join(name);
++    wasm_bindgen_futures::spawn_local(async move {
++        let answered = answer(Some(asked)).await;
++        let kept = answered.as_ref().and_then(|a| get(a, "path").as_string());
++        if let Some(path) = &kept {
++            call("write", &[path.into(), data.into()]);
++        }
++        let to = kept.and_then(|p| p.strip_prefix("browser:").map(PathBuf::from));
++        if let Some(to) = &to {
++            IN_FILES.with_borrow_mut(|f| f.insert(to.clone()));
++        }
++        // Downloaded: as upstream, the drawing stays saved and the next Save asks again.
++        if answered.is_some() && to.is_none() {
++            return;
++        }
++        ANSWERED.with_borrow_mut(|a| a.push((from, to)));
++        crate::web::request_repaint();
++    });
++    true
++}
++
++/// Upstream's write of a whole file: one in Files goes back there. False for any other path (upstream downloads it).
++pub fn write(path: &Path, bytes: &[u8]) -> bool {
++    in_files(path)
++        && call("write", &[format!("browser:{}", path.display()).into(), js_sys::Uint8Array::from(bytes).into()]).is_some()
++}
++
++/// Each frame, before the interface: Files' "Open in TraceDraw" (listened for once Playground is there), the files
++/// picked and the Save As answers since the last frame, and the unsaved state for Playground's leave warning.
++pub fn frame(app: &mut App) {
++    if !LISTENING.get() && api().is_some() {
++        LISTENING.set(true);
++        let opened = Closure::<dyn Fn(JsValue)>::new(|file: JsValue| {
++            if let Some(path) = bring_in(&file) {
++                OPENED.with_borrow_mut(|o| o.push(path));
++                crate::web::request_repaint();
++            }
++        });
++        call("onOpen", &[opened.into_js_value()]);
++    }
++    for (job, path) in PICKED.take() {
++        job(app, path.clone());
++        crate::files::forget(&path);
++    }
++    // A drawing opens in a tab of its own (File > Open); a picture goes into the drawing shown, or a new one (a drop).
++    for path in OPENED.take() {
++        if OPEN_EXTENSIONS.contains(&extension(&path).as_str()) {
++            app.open_path(path.clone());
++        } else {
++            let into_drawing = app.drawing_shown();
++            app.drop_file(&path, into_drawing);
++        }
++        crate::files::forget(&path);
++    }
++    // ponytail: only the drawing shown follows its Save As (the dialog is modal, so it is the one saved).
++    for (from, to) in ANSWERED.take() {
++        if app.file.as_ref() != Some(&from) {
++            continue;
++        }
++        match to {
++            Some(to) => {
++                app.status = crate::i18n::trf("status.saved", &[("p", &to.display().to_string())]);
++                app.file = Some(to);
++            }
++            None => app.engine.mark_unsaved(),
++        }
++    }
++    let unsaved = !app.dirty_documents().is_empty();
++    if UNSAVED.replace(Some(unsaved)) != Some(unsaved) {
++        call("setUnsaved", &[unsaved.into()]);
++    }
++}
+diff --git a/scripts/build-web.sh b/scripts/build-web.sh
+new file mode 100755
+index 0000000..0ec5c8f
+--- /dev/null
++++ b/scripts/build-web.sh
+@@ -0,0 +1,43 @@
++#!/usr/bin/env bash
++# SPDX-License-Identifier: MIT OR Apache-2.0
++# Playground's browser build of TraceDraw (patches/coreldraw.yaml in github.com/daijro/openplayground), into the
++# folder given ($1): upstream's own (scripts/web/build.sh, and the `web` job of .github/workflows/build.yml) with the
++# font folder, the font catalog and the Help, built for speed (the release profile; build.mjs then runs wasm-opt -O3)
++# where upstream builds for size (profile.web and wasm-opt -Oz).
++set -euo pipefail
++DIST=$(realpath -m "$1")
++ROOT=$(cd "$(dirname "$0")/.." && pwd)
++TARGET=${CARGO_TARGET_DIR:-$ROOT/target}
++cd "$ROOT"
++
++# build.rs bundles Liberation, DejaVu Sans and Noto Sans Devanagari and Bengali into the module (a page has no system
++# fonts) and font_folder.py copies TeX Gyre and more DejaVu: on CI they are installed first, as upstream's CI does.
++# Found wherever this machine keeps them (build.rs looks in Debian's folders only).
++if [ -n "${CI:-}" ] && command -v apt-get >/dev/null; then
++  { sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends fonts-liberation fonts-dejavu-core \
++    fonts-dejavu-extra fonts-noto-core fonts-texgyre; } >/dev/null || echo "::warning::TraceDraw: could not install its fonts"
++fi
++TRACEDRAW_WEB_FONTS=$(find /usr/share/fonts \( -name 'Liberation*.ttf' -o -name 'DejaVuSans*.ttf' \
++  -o -name 'NotoSansDevanagari-Regular.ttf' -o -name 'NotoSansBengali-Regular.ttf' \) -printf '%h\n' 2>/dev/null | sort -u | paste -sd: || true)
++export TRACEDRAW_WEB_FONTS
++
++cargo build --release --target wasm32-unknown-unknown -p tracedraw
++mkdir -p "$DIST"
++wasm-bindgen --target web --no-typescript --out-dir "$DIST" "$TARGET/wasm32-unknown-unknown/release/tracedraw.wasm"
++
++# The page with the module's size (its splash shows the download) and the version, as upstream's CI writes them.
++version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
++git describe --tags --exact-match >/dev/null 2>&1 || version="$version-dev.$(git rev-parse --short=7 HEAD)"
++size=$(wc -c < "$DIST/tracedraw_bg.wasm" | tr -d ' ')
++sed -e "s/data-wasm-size=\"0\"/data-wasm-size=\"$size\"/" -e "s/@VERSION@/$version/" web/index.html > "$DIST/index.html"
++cp web/FONTS.md "$DIST/"
++cp assets/icon/tracedraw-256.png "$DIST/icon-256.png"
++
++# The font folder (free fonts from google/fonts and this machine, fetched by the page as text needs them), the font
++# catalog (every other google/fonts family, fetched from GitHub) and the Help in every interface language. The page
++# works without the fonts' lists (the bundled fonts only), so a download that fails twice leaves them out.
++python3 web/font_folder.py web/fonts.txt "$DIST/fonts" || python3 web/font_folder.py web/fonts.txt "$DIST/fonts" ||
++  { echo "::warning::TraceDraw: no font folder"; rm -rf "$DIST/fonts"; }
++python3 web/font_catalog.py web/fonts.txt "$DIST/fonts" || python3 web/font_catalog.py web/fonts.txt "$DIST/fonts" ||
++  echo "::warning::TraceDraw: no font catalog"
++python3 web/help_site.py docs/help apps/tracedraw/lang "$DIST/help"
