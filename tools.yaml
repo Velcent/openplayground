@@ -143,8 +143,10 @@ groups:
         repo: aliasfoxkde/FireCraft
         license: MIT OR Apache-2.0
         copyright: "Copyright (c) 2026 FireCraft contributors"
-        # Its web build is a release target of its own (trunk --release); Playground serves it as it is.
-        build: false
+        # Built here from its releases and head commit (patches/fireworks.yaml: its web/ bundle, with relative paths).
+        # What the web build compiles: docs, corpus and CI commits don't rebuild it.
+        paths: [crates, web, assets, Cargo.toml, Cargo.lock]
+        patches: patches/fireworks.yaml
         icon: icons/firecraft.svg
         accent: "#E3D21E"
         base: "#2B2700"

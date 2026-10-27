@@ -1,0 +1,16 @@
+diff --git a/scripts/build-web.sh b/scripts/build-web.sh
+new file mode 100755
+index 0000000..abf4291
+--- /dev/null
++++ b/scripts/build-web.sh
+@@ -0,0 +1,10 @@
++#!/usr/bin/env bash
++# SPDX-License-Identifier: MIT OR Apache-2.0
++# Playground's build of FireCraft's web bundle (patches/fireworks.yaml in github.com/daijro/openplayground), into the
++# folder given ($1): trunk in web/, as upstream's `cargo xtask dist --web` runs it, but with relative paths (the app is
++# served from its own folder) and without trunk's own wasm-opt (Playground's build runs wasm-opt -O3 on the result).
++set -euo pipefail
++DIST=$(realpath -m "$1")
++cd "$(dirname "$0")/../web"
++sed -i 's/data-wasm-opt="[^"]*"/data-wasm-opt="0"/' index.html
++trunk build --release --dist "$DIST" --public-url ./

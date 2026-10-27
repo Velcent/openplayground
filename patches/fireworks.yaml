@@ -1,0 +1,10 @@
+# FireCraft built here. Upstream (github.com/aliasfoxkde/FireCraft) publishes a web zip with each release; Playground
+# builds the bundle too, from its releases and its head commit, so it has a latest-commit build like the others. While
+# a build is missing, the release's web zip is served instead (fetch.mjs points its root paths at the app's folder).
+#
+# patches/fireworks/web.diff adds new files only:
+#   scripts/build-web.sh   build.mjs runs it: trunk in web/ (upstream's web crate, outside the Cargo workspace), as
+#                          upstream's `cargo xtask dist --web` runs it, but with relative paths (the app is served from
+#                          its own folder) and without trunk's own wasm-opt (build.mjs runs -O3 on the result).
+# No rules: the app needs no source changes.
+[]
