@@ -172,7 +172,7 @@
 - live: true
   file: crates/ui-studio/Cargo.toml
   find: '(?![\s\S])'
-  after: "\n[target.'cfg(any(target_arch = \"wasm32\"))'.dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\nsoundcraft-audio-io = { workspace = true }\n\n[target.'cfg(not(target_arch = \"wasm32\"))'.dev-dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\nsoundcraft-audio-io = { workspace = true }\n"
+  after: "\n[target.'cfg(any(target_arch = \"wasm32\"))'.dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\ntransit-audio-io = { workspace = true }\n\n[target.'cfg(not(target_arch = \"wasm32\"))'.dev-dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\ntransit-audio-io = { workspace = true }\n"
 - live: true
   file: crates/ui-studio/src/lib.rs
   find: '(?![\s\S])'

@@ -68,8 +68,8 @@ new file mode 100644
 +use playground_live::{Live, Presence, presence};
 +use serde::Deserialize as _;
 +use serde_json::{Value, json};
-+use soundcraft_audio_io::{BitDepth, EncodeOptions, FileFormat, SampleFormat};
-+use soundcraft_model::{EditState, Session, Source, SourceAudio, SourceId, Track};
++use transit_audio_io::{BitDepth, EncodeOptions, FileFormat, SampleFormat};
++use transit_model::{EditState, Session, Source, SourceAudio, SourceId, Track};
 +use std::cell::Cell;
 +use std::sync::Arc;
 +
@@ -155,7 +155,7 @@ new file mode 100644
 +
 +/// The arrangement's drag preview this frame (arrange.rs `clips` calls it): the clip being moved or trimmed and where
 +/// it would land.
-+pub(crate) fn dragging(preview: Option<(soundcraft_model::ClipId, soundcraft_model::TrackId, i64, i64, bool)>) {
++pub(crate) fn dragging(preview: Option<(transit_model::ClipId, transit_model::TrackId, i64, i64, bool)>) {
 +    DRAG.set(preview.map(|(_, t, a, b, _)| (t.0, a, b)));
 +}
 +
@@ -496,7 +496,7 @@ new file mode 100644
 +    }
 +
 +    fn live_assets(&self) -> Vec<(String, String, bool)> {
-+        let (s, demo) = (self.engine.session(), soundcraft_engine::demo::cached_demo_session());
++        let (s, demo) = (self.engine.session(), transit_engine::demo::cached_demo_session());
 +        let built_in = |id| matches!((s.pool.get(id), demo.pool.get(id)), (Some(a), Some(b)) if Arc::ptr_eq(a, b));
 +        s.sources
 +            .iter()
@@ -514,7 +514,7 @@ new file mode 100644
 +    fn live_read_asset(&self, id: &str) -> Option<Vec<u8>> {
 +        let audio = self.engine.session().pool.get(SourceId(id.parse().ok()?))?;
 +        let wav = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Float32, dither: false, bwf: None };
-+        soundcraft_audio_io::encode(&audio.buffer, &wav).ok()
++        transit_audio_io::encode(&audio.buffer, &wav).ok()
 +    }
 +
 +    /// Into the pool, as opening a bundle decodes it, if it is the audio the source describes and none is here yet (a late
@@ -525,13 +525,13 @@ new file mode 100644
 +        let Some(src) = id.parse().ok().and_then(|id| s.source(SourceId(id))) else { return };
 +        let most = src.frames.saturating_mul(u64::from(src.channels)).saturating_mul(4).saturating_add(65536);
 +        let f32_wav = || {
-+            soundcraft_audio_io::detect_format(&bytes, None) == FileFormat::Wav
-+                && soundcraft_audio_io::probe(&bytes, None).is_ok_and(|i| (i.format, i.sample_format) == (FileFormat::Wav, SampleFormat::Float32))
++            transit_audio_io::detect_format(&bytes, None) == FileFormat::Wav
++                && transit_audio_io::probe(&bytes, None).is_ok_and(|i| (i.format, i.sample_format) == (FileFormat::Wav, SampleFormat::Float32))
 +        };
 +        if s.pool.contains(src.id) || bytes.len() as u64 > most || !f32_wav() {
 +            return;
 +        }
-+        let Ok((_, buf)) = soundcraft_audio_io::decode(&bytes, Some("wav")) else { return };
++        let Ok((_, buf)) = transit_audio_io::decode(&bytes, Some("wav")) else { return };
 +        if (buf.num_channels(), buf.frames() as u64, buf.sample_rate) == (usize::from(src.channels), src.frames, src.sample_rate) {
 +            let id = src.id;
 +            self.engine.session_mut().pool.insert(id, Arc::new(SourceAudio::new(buf)));
@@ -544,9 +544,9 @@ new file mode 100644
 +    use super::*;
 +    use crate::Services;
 +    use serde_json::json;
-+    use soundcraft_engine::Engine;
++    use transit_engine::Engine;
 +    use playground_live::{self as live, canonical};
-+    use soundcraft_model::{ChannelFormat, Clip, ClipId, TrackHeight, TrackKind};
++    use transit_model::{ChannelFormat, Clip, ClipId, TrackHeight, TrackKind};
 +
 +    fn two_tracks() -> StudioApp {
 +        let mut engine = Engine::default();
@@ -625,11 +625,11 @@ new file mode 100644
 +    #[test]
 +    fn imported_audio_travels_by_source_id_and_installs_without_an_edit() {
 +        let with_import = |level: f32, frames: usize| {
-+            let mut app = StudioApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
-+            let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![level; frames]] };
++            let mut app = StudioApp::new(transit_engine::demo::demo_engine(), None, Services::default());
++            let buf = transit_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![level; frames]] };
 +            let wav = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Float32, dither: false, bwf: None };
-+            let bytes = soundcraft_audio_io::encode(&buf, &wav).unwrap();
-+            soundcraft_engine::io::import_audio_bytes(&mut app.engine, "a.wav", &bytes, None, None, 0).unwrap();
++            let bytes = transit_audio_io::encode(&buf, &wav).unwrap();
++            transit_engine::io::import_audio_bytes(&mut app.engine, "a.wav", &bytes, None, None, 0).unwrap();
 +            app
 +        };
 +        let (owner, mut peer) = (with_import(0.5, 480), with_import(-0.25, 960));

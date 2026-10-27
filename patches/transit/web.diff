@@ -15,7 +15,7 @@ new file mode 100644
 +//!   - the browser panel's folders, plug-in presets and the Sampler's file picker are not offered.
 +
 +use serde_json::json;
-+use soundcraft_engine::{Engine, io};
++use transit_engine::{Engine, io};
 +use std::cell::{OnceCell, RefCell};
 +use std::collections::HashMap;
 +use std::rc::Rc;
@@ -68,8 +68,8 @@ new file mode 100644
 +        }
 +        let creator = move |cc: &eframe::CreationContext<'_>| -> Result<Box<dyn eframe::App>, _> {
 +            CTX.with(|c| c.set(cc.egui_ctx.clone()).ok());
-+            let engine = if query().contains("empty") { Engine::default() } else { soundcraft_engine::demo::demo_engine() };
-+            let player = soundcraft_playback::Player::new(Arc::new(engine.session().clone()));
++            let engine = if query().contains("empty") { Engine::default() } else { transit_engine::demo::demo_engine() };
++            let player = transit_playback::Player::new(Arc::new(engine.session().clone()));
 +            let mut app = StudioApp::new(engine, Some(player), services());
 +            app.about.app_version = env!("CARGO_PKG_VERSION").to_string();
 +            Ok(wrap(Shell { app, inbox: Rc::default(), fonts: false, unsaved: None }))
@@ -133,7 +133,7 @@ new file mode 100644
 +}
 +
 +async fn pick_session() {
-+    let types = [soundcraft_model::BUNDLE_EXTENSION, soundcraft_model::SESSION_EXTENSION];
++    let types = [transit_model::BUNDLE_EXTENSION, transit_model::SESSION_EXTENSION];
 +    let picked = match wait(files("open", &[options(&[("types", strings(&types))])])).await {
 +        Some(list) => js_sys::Array::from(&list).iter().next().map(|f| (get(&f, "name").as_string().unwrap_or_default(), js_sys::Uint8Array::new(&get(&f, "bytes")).to_vec())),
 +        None if get(&js_sys::global(), "playgroundFiles").is_object() => None,
@@ -217,7 +217,7 @@ new file mode 100644
 +    /// A session opens, MIDI and audio import at the cursor (each import one undo step, as the commands are).
 +    fn handle(&mut self, name: &str, bytes: &[u8]) {
 +        let ext = name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
-+        let session = [soundcraft_model::BUNDLE_EXTENSION, soundcraft_model::SESSION_EXTENSION].contains(&ext.as_str());
++        let session = [transit_model::BUNDLE_EXTENSION, transit_model::SESSION_EXTENSION].contains(&ext.as_str());
 +        if session && transit_ui_studio::finish::refuses(&mut self.app, "session.open") {
 +            return;
 +        }
@@ -286,7 +286,7 @@ new file mode 100644
 +/// named families, over SoundCraft's definitions.
 +fn font_definitions() -> egui::FontDefinitions {
 +    use egui::FontFamily;
-+    let mut defs = soundcraft_ui_egui::fonts::definitions();
++    let mut defs = transit_ui_egui::fonts::definitions();
 +    let faces = [
 +        ("inter-regular", font!("inter/Inter-Regular.ttf")),
 +        ("inter-medium", font!("inter/Inter-Medium.ttf")),
@@ -345,7 +345,7 @@ new file mode 100644
 +
 +    #[derive(Clone, Debug, PartialEq, Eq)]
 +    pub struct TrackOutput {
-+        pub track: soundcraft_model::TrackId,
++        pub track: transit_model::TrackId,
 +        pub port: String,
 +        pub state: DestinationState,
 +    }
