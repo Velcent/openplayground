@@ -31,7 +31,7 @@
   "pluraleyes@head": "head-73aea0b+010fb76b",
   "autocad": "v0.13.0+7444d6e6",
   "autocad@head": "head-c3b8e7b+7444d6e6",
-  "fusion-360": "v0.23.1+c170555b",
+  "fusion-360": "v0.24.0+c170555b",
   "fusion-360@head": "head-afd6a5c+c170555b",
   "substance-painter@head": "head-71e49fd+83c8b742",
   "substance-designer@head": "head-34cbfff+f219bc18",
@@ -43,6 +43,6 @@
   "fl-studio-mobile@head": "head-8c7bddf+8d45d178",
   "ableton-live@head": "head-3067d90+6ff1fb75",
   "logic-pro@head": "head-34afc76+aca3f040",
-  "transit@head": "head-5d20cb4+71bdb4dc",
+  "transit@head": "head-748d6c5+71bdb4dc",
   "artcraft-store": "dff1898"
 }
