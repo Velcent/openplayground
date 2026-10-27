@@ -54,11 +54,11 @@
   find: '(?![\s\S])'
   after: "\n// Live editing in a Playground session (web, and debug builds for the native tests).\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))]\npub mod live;\n"
 - live: true
-  file: crates/engine/src/lib.rs
+  file: crates/engine/src/**/*.rs
   find: 'pub\s+fn\s+undo\s*\(\s*&mut\s+self\s*\)[^{]*\{'
   after: "\n        #[cfg(target_arch = \"wasm32\")] if let Some(r) = self.live_undo(false) { return r; }"
 - live: true
-  file: crates/engine/src/lib.rs
+  file: crates/engine/src/**/*.rs
   find: 'pub\s+fn\s+redo\s*\(\s*&mut\s+self\s*\)[^{]*\{'
   after: "\n        #[cfg(target_arch = \"wasm32\")] if let Some(r) = self.live_undo(true) { return r; }"
 
