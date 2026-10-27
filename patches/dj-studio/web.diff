@@ -1,0 +1,1133 @@
+diff --git a/.cargo/config.toml b/.cargo/config.toml
+new file mode 100644
+index 0000000..44a5069
+--- /dev/null
++++ b/.cargo/config.toml
+@@ -0,0 +1,10 @@
++# Playground's browser build of MixStudio (patches/dj-studio.yaml in github.com/daijro/openplayground): Key lock's C++
++# (the signalsmith-stretch crate) for wasm32-unknown-unknown. Native builds read none of this (every name ends in the
++# wasm target).
++[env]
++# clang with wasi-sdk's C++ headers (playground-cxx.sh).
++CXX_wasm32_unknown_unknown = { value = ".cargo/playground-cxx.sh", relative = true }
++# No C++ library to link: src/playground.rs has the few pieces it uses.
++CXXSTDLIB_wasm32_unknown_unknown = ""
++# clang hides a wasm32 header's functions by default, and bindgen leaves hidden ones out.
++BINDGEN_EXTRA_CLANG_ARGS_wasm32_unknown_unknown = "-fvisibility=default"
+diff --git a/.cargo/playground-cxx.sh b/.cargo/playground-cxx.sh
+new file mode 100755
+index 0000000..bfb6f97
+--- /dev/null
++++ b/.cargo/playground-cxx.sh
+@@ -0,0 +1,14 @@
++#!/bin/sh
++# Key lock's C++ (the signalsmith-stretch crate) for wasm32-unknown-unknown, for Playground's browser build of MixStudio
++# (patches/dj-studio.yaml in github.com/daijro/openplayground): clang with the C++ standard library headers of wasi-sdk
++# 22's sysroot (LLVM 18's libc++; newer clang reads them too), fetched once into the target folder unless $WASI_SYSROOT
++# names one. Only the headers are used: nothing of wasi-libc is linked.
++set -e
++sysroot=${WASI_SYSROOT:-${CARGO_TARGET_DIR:-$(dirname "$0")/../target}/wasi-sysroot-22}
++if [ ! -d "$sysroot/include/wasm32-wasi" ]; then
++  mkdir -p "$sysroot.part"
++  curl -sSfL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-22/wasi-sysroot-22.0.tar.gz \
++    | tar -xz -C "$sysroot.part" --strip-components=1 wasi-sysroot/include
++  rm -rf "$sysroot" && mv "$sysroot.part" "$sysroot"
++fi
++exec "${CLANG:-clang}" "$@" --target=wasm32-wasi --sysroot="$sysroot" -fno-exceptions -fno-rtti -Wno-deprecated
+diff --git a/Trunk.toml b/Trunk.toml
+new file mode 100644
+index 0000000..a8fa92a
+--- /dev/null
++++ b/Trunk.toml
+@@ -0,0 +1,7 @@
++# MixStudio in the browser, for Playground (patches/dj-studio.yaml in github.com/daijro/openplayground).
++# Build with: trunk build --release   (from the repository's root)
++[build]
++target = "index.html"
++public_url = "./"
++filehash = true
++dist = "target/trunk-dist"
+diff --git a/index.html b/index.html
+new file mode 100644
+index 0000000..8d4b6ca
+--- /dev/null
++++ b/index.html
+@@ -0,0 +1,31 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
++  <title>MixStudio</title>
++  <!-- MixStudio in the browser, for Playground (patches/dj-studio.yaml in github.com/daijro/openplayground). -->
++  <link data-trunk rel="rust" href="Cargo.toml" data-bin="mixstudio" data-wasm-opt="0" />
++  <style>
++    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #1a1b1f; }
++    #mixstudio_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
++    #mixstudio_loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
++      color: #dcdee2; font: 14px system-ui, sans-serif; pointer-events: none; }
++  </style>
++  <script>
++    // Browsers keep a page's audio off until the person clicks or types: the mix's AudioContext starts then.
++    {
++      const contexts = []
++      if (window.AudioContext) window.AudioContext = class extends window.AudioContext {
++        constructor(...args) { super(...args); contexts.push(this) }
++      }
++      const resume = () => contexts.forEach((c) => c.state === 'suspended' && c.resume().catch(() => {}))
++      for (const type of ['pointerdown', 'keydown', 'touchend']) addEventListener(type, resume, { capture: true })
++    }
++  </script>
++</head>
++<body>
++  <canvas id="mixstudio_canvas"></canvas>
++  <div id="mixstudio_loading">Loading MixStudio&hellip;</div>
++</body>
++</html>
+diff --git a/src/app/web.rs b/src/app/web.rs
+new file mode 100644
+index 0000000..0670545
+--- /dev/null
++++ b/src/app/web.rs
+@@ -0,0 +1,323 @@
++// SPDX-License-Identifier: MIT
++//! MixStudio in the browser, for Playground (patches/dj-studio.yaml in github.com/daijro/openplayground): the desktop
++//! window on the page's canvas, its files in Playground's Files, and the browser's audio.
++//!
++//! `app::run` starts [`Web`] on the canvas: the desktop's App, made as on the desktop with the demo mix (`mixstudio
++//! --demo`), and the page's side after each frame. Files live in memory (src/playground.rs): a file from Files comes in
++//! at its path (`browser:/Track.mp3` is `/Track.mp3` here), so a mix saved in Files names its tracks by their place in
++//! Files, and opening it brings them in again. The desktop's dialogs (each on a thread of its own, which
++//! sends the app a message with the answer) are Playground's here: the app's dialog functions call the ones below,
++//! which ask after the frame and send the same message. Whatever MixStudio writes outside its own folders (a mix, an
++//! export, a dropped file) goes to Files after the frame. Work it hands to a thread runs once the frame is drawn.
++
++use super::{App, Msg};
++use crate::playground::std::{fs, thread};
++use eframe::egui;
++use std::cell::{Cell, OnceCell, RefCell};
++use std::path::{Path, PathBuf};
++use wasm_bindgen::{closure::Closure, JsCast as _, JsValue};
++
++/// MixStudio's own folders in memory, never copied to Files: the demo's tracks, settings, the analysis cache.
++const OWN: [&str; 2] = ["/tmp", "/home"];
++/// Where the demo's generated tracks go.
++const DEMO: &str = "/tmp/MixStudio demo";
++/// Where dropped files are kept: in Files (which lists them at its top), so a mix saved there finds them again.
++pub(super) const DROPPED: &str = "/MixStudio/Dropped";
++/// Where a file opened from the computer is kept, in Files too (a folder, so it never replaces a file of its name).
++const OPENED_FROM_COMPUTER: &str = "/MixStudio/Opened";
++/// Where an export to download is written first.
++const DOWNLOADING: &str = "/tmp/MixStudio exports";
++pub(super) const NO_STEMS: &str = "Stem separation isn't available in MixStudio's browser version: it needs ONNX Runtime and a 166 MB model.";
++
++thread_local! {
++    static CTX: OnceCell<egui::Context> = const { OnceCell::new() };
++    /// Files from Playground ("Open in MixStudio"), in memory now, for the next frame.
++    static OPENED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
++    /// Exports to hand to the browser's downloads once they are written.
++    static DOWNLOADS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
++    /// Whether queued work has a turn booked.
++    static BOOKED: Cell<bool> = const { Cell::new(false) };
++}
++
++fn repaint() {
++    CTX.with(|c| c.get().map(egui::Context::request_repaint));
++}
++
++fn get(o: &JsValue, k: &str) -> JsValue {
++    js_sys::Reflect::get(o, &k.into()).unwrap_or(JsValue::UNDEFINED)
++}
++
++/// `playgroundFiles[method](...args)`; None when the page has none or it threw.
++fn call(method: &str, args: &[JsValue]) -> Option<JsValue> {
++    let api = Some(get(&js_sys::global(), "playgroundFiles")).filter(JsValue::is_object)?;
++    let f = get(&api, method).dyn_into::<js_sys::Function>().ok()?;
++    f.apply(&api, &args.iter().collect::<js_sys::Array>()).ok()
++}
++
++async fn wait(v: Option<JsValue>) -> Option<JsValue> {
++    let promise = v?.dyn_into::<js_sys::Promise>().ok()?;
++    wasm_bindgen_futures::JsFuture::from(promise).await.ok().filter(|v| !v.is_null() && !v.is_undefined())
++}
++
++fn options(fields: &[(&str, JsValue)]) -> JsValue {
++    let o = js_sys::Object::new();
++    for (k, v) in fields {
++        let _ = js_sys::Reflect::set(&o, &(*k).into(), v);
++    }
++    o.into()
++}
++
++fn types(exts: &[&str]) -> JsValue {
++    exts.iter().map(|e| JsValue::from(*e)).collect::<js_sys::Array>().into()
++}
++
++fn is_mix(p: &Path) -> bool {
++    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"))
++}
++
++/// A file from Playground (`{ path, name, bytes }`) into memory at its path in Files; one from the computer is kept in
++/// Files at `/MixStudio/Opened`.
++fn bring_in(file: &JsValue) -> Option<PathBuf> {
++    let name = get(file, "name").as_string()?;
++    let bytes = js_sys::Uint8Array::new(&get(file, "bytes")).to_vec();
++    match get(file, "path").as_string().and_then(|p| p.strip_prefix("browser:").map(PathBuf::from)) {
++        Some(path) => {
++            fs::put(&path, bytes);
++            Some(path)
++        }
++        None => {
++            let path = Path::new(OPENED_FROM_COMPUTER).join(Path::new(&name).file_name()?);
++            fs::write(&path, bytes).ok()?;
++            Some(path)
++        }
++    }
++}
++
++/// Playground's Open dialog for one of `exts`; the file it gives, in memory.
++async fn pick(exts: &[&str]) -> Option<PathBuf> {
++    let files = wait(call("open", &[options(&[("types", types(exts))])])).await?;
++    bring_in(&js_sys::Array::from(&files).get(0))
++}
++
++/// The tracks a mix names, brought in from Files where they are not in memory yet. Files keeps one flat list (it moves
++/// a file saved in a folder, a dropped one, to the top when its list opens), so a track not at its path is looked for
++/// there under its name.
++// ponytail: by name alone; two tracks of one name from different folders would need Files to remember where each was.
++async fn bring_tracks(mix: &Path) {
++    let Some(mix) = fs::read(mix).ok().and_then(|b| serde_json::from_slice::<crate::model::Mix>(&b).ok()) else { return };
++    let mut paths: Vec<PathBuf> = mix.tracks.into_iter().map(|t| PathBuf::from(t.path)).collect();
++    paths.sort();
++    paths.dedup();
++    for p in paths.into_iter().filter(|p| fs::metadata(p).is_err()) {
++        let flat = p.file_name().map(|name| Path::new("/").join(name));
++        for place in std::iter::once(p.clone()).chain(flat) {
++            if let Some(bytes) = wait(call("read", &[format!("browser:{}", place.display()).into()])).await {
++                fs::put(&p, js_sys::Uint8Array::new(&bytes).to_vec());
++                break;
++            }
++        }
++    }
++}
++
++/// A file Playground hands to MixStudio ("Open in MixStudio", or `?open=` at startup).
++fn opened(file: JsValue) {
++    let Some(path) = bring_in(&file) else { return };
++    wasm_bindgen_futures::spawn_local(async move {
++        if is_mix(&path) {
++            bring_tracks(&path).await;
++        }
++        OPENED.with_borrow_mut(|o| o.push(path));
++        repaint();
++    });
++}
++
++/// The desktop's dialog functions on the web (app.rs and persistence.rs call these instead).
++impl App {
++    /// Add tracks: Playground's Open, for one audio file.
++    pub(super) fn web_pick_files(&self, sample: Option<usize>) {
++        let (tx, id) = (self.tx.clone(), self.persistence.id.clone());
++        wasm_bindgen_futures::spawn_local(async move {
++            if let Some(path) = pick(crate::library::EXTS).await {
++                let _ = tx.send(Msg::Picked(vec![path], sample, id));
++                repaint();
++            }
++        });
++    }
++
++    /// Open mix… (kind 0), Save as… (1) and Export (2).
++    pub(super) fn web_dialog(&self, save: bool, kind: u8) {
++        let (tx, id) = (self.tx.clone(), self.persistence.id.clone());
++        if !save {
++            return wasm_bindgen_futures::spawn_local(async move {
++                if let Some(path) = pick(&["json"]).await {
++                    bring_tracks(&path).await;
++                    let _ = tx.send(Msg::Opened(path));
++                    repaint();
++                }
++            });
++        }
++        // The mix as Save would write it, for "Download to device"; an export is rendered after the choice.
++        let (name, ext, bytes) = if kind == 1 {
++            let bytes = serde_json::to_vec_pretty(&self.mix).unwrap_or_default();
++            (format!("{}.mixstudio.json", self.mix.name), "json", Some(bytes))
++        } else {
++            let ext = crate::export::FORMATS[self.export_fmt as usize].1;
++            (format!("{}.{ext}", self.mix.name), ext, None)
++        };
++        let mut fields = vec![("name", JsValue::from(name.as_str())), ("types", types(&[ext]))];
++        if let Some(bytes) = &bytes {
++            fields.push(("bytes", js_sys::Uint8Array::from(bytes.as_slice()).into()));
++        }
++        let asked = call("saveAs", &[options(&fields)]);
++        wasm_bindgen_futures::spawn_local(async move {
++            let Some(answer) = wait(asked).await else { return };
++            let path = get(&answer, "path").as_string().and_then(|p| p.strip_prefix("browser:").map(PathBuf::from));
++            let _ = match (path, kind) {
++                (Some(path), 1) => tx.send(Msg::SaveTo(path, id)),
++                (Some(path), _) => tx.send(Msg::ExportTo(path, id)),
++                // Downloaded: the mix went with the answer; an export is downloaded once it is written.
++                (None, 1) => return,
++                (None, _) => {
++                    let path = Path::new(DOWNLOADING).join(&name);
++                    DOWNLOADS.with_borrow_mut(|d| d.push(path.clone()));
++                    tx.send(Msg::ExportTo(path, id))
++                }
++            };
++            repaint();
++        });
++    }
++
++    /// Add music folder: a page has no folders of music to watch.
++    pub(super) fn web_pick_folder(&self) {
++        let _ = self.tx.send(Msg::Status("Music folders aren't available in the browser: add tracks from Files, or drop audio files on the window.".into()));
++    }
++
++    /// Import DJ library: Playground's Open, for a Rekordbox/iTunes XML, Traktor NML, Serato crate or Engine database.
++    pub(super) fn web_pick_import(&self) {
++        let tx = self.tx.clone();
++        wasm_bindgen_futures::spawn_local(async move {
++            if let Some(path) = pick(&["xml", "nml", "crate", "db"]).await {
++                let _ = tx.send(Msg::ImportPick(path));
++                repaint();
++            }
++        });
++    }
++
++    /// Locate a missing source: Playground's Open, then the file read as the desktop's dialog thread does it.
++    pub(super) fn web_choose_relink(&mut self, old: String) {
++        if self.persistence.relink_busy {
++            return;
++        }
++        self.persistence.relink_busy = true;
++        self.persistence.candidate = None;
++        let (tx, id) = (self.tx.clone(), self.persistence.id.clone());
++        wasm_bindgen_futures::spawn_local(async move {
++            let picked = pick(crate::library::EXTS).await;
++            thread::spawn(move || {
++                let result = match picked {
++                    None => Ok(None),
++                    Some(path) => crate::analysis::load(&path).map(|(a, n)| Some((path, a, n))).map_err(|e| e.to_string()),
++                };
++                let _ = tx.send(Msg::RelinkReady(id, old, result));
++            });
++            repaint();
++        });
++    }
++}
++
++/// The page's app: the window, then what it asked of the page.
++struct Web {
++    app: App,
++    unsaved: Option<bool>,
++}
++
++impl Web {
++    /// After the window's frame: the audio's commands, files that came in, what MixStudio wrote, its unsaved state,
++    /// and a turn for the work it queued.
++    fn after(&mut self, ctx: &egui::Context) {
++        crate::audio::web::pump();
++        for path in OPENED.take() {
++            if is_mix(&path) {
++                self.app.open(path);
++            } else if crate::library::is_audio(&path) {
++                self.app.load_files(vec![path], None);
++            }
++        }
++        let downloads = DOWNLOADS.take();
++        for p in fs::changes().into_iter().filter(|p| !OWN.iter().any(|own| p.starts_with(own))) {
++            let target = JsValue::from(format!("browser:{}", p.display()));
++            match fs::metadata(&p) {
++                Ok(m) if m.is_file() => {
++                    call("write", &[target, js_sys::Uint8Array::from(fs::read(&p).unwrap_or_default().as_slice()).into()]);
++                }
++                Ok(_) => {}
++                Err(_) => {
++                    call("remove", &[target]);
++                }
++            }
++        }
++        let waiting = downloads.into_iter().filter(|p| match fs::read(p) {
++            Ok(bytes) => {
++                let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
++                call("download", &[name.into(), js_sys::Uint8Array::from(bytes.as_slice()).into()]);
++                let _ = fs::remove_file(p);
++                false
++            }
++            Err(_) => true,
++        });
++        DOWNLOADS.with_borrow_mut(|d| d.extend(waiting));
++        // ponytail: the mix compared each frame something happened; a change counter if long mixes stutter.
++        if ctx.input(|i| !i.events.is_empty()) || self.unsaved.is_none() {
++            let unsaved = serde_json::to_string(&self.app.mix).ok().as_deref() != Some(self.app.persistence.saved_body());
++            if self.unsaved.replace(unsaved) != Some(unsaved) {
++                call("setUnsaved", &[unsaved.into()]);
++            }
++        }
++        if thread::queued() && !BOOKED.replace(true) {
++            // After this frame is on screen: analysis and exports hold the page while they run.
++            let turn = Closure::once_into_js(|| {
++                BOOKED.set(false);
++                thread::run_spawned();
++                repaint();
++            });
++            if let Some(window) = web_sys::window() {
++                let _ = window.set_timeout_with_callback(turn.unchecked_ref());
++            }
++        }
++    }
++}
++
++impl eframe::App for Web {
++    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
++        eframe::App::update(&mut self.app, ctx, frame);
++        self.after(ctx);
++    }
++}
++
++/// `app::run` on the web: the app on the page's canvas, with the demo mix unless asked for another folder.
++pub(super) fn start(demo: Option<String>) {
++    let demo = demo.or_else(|| Some(DEMO.into()));
++    wasm_bindgen_futures::spawn_local(async move {
++        let document = web_sys::window().and_then(|w| w.document()).expect("no document");
++        let canvas = document
++            .get_element_by_id("mixstudio_canvas")
++            .and_then(|c| c.dyn_into::<web_sys::HtmlCanvasElement>().ok())
++            .expect("no #mixstudio_canvas");
++        let creator = move |cc: &eframe::CreationContext<'_>| {
++            CTX.with(|c| c.set(cc.egui_ctx.clone()).ok());
++            let mut app = App::new(cc, demo);
++            // The demo is where every page starts, not unsaved work.
++            let mix = app.mix.clone();
++            app.persistence.saved(&mix);
++            call("onOpen", &[Closure::<dyn Fn(JsValue)>::new(opened).into_js_value()]);
++            Ok(Box::new(Web { app, unsaved: None }) as Box<dyn eframe::App>)
++        };
++        let started = eframe::WebRunner::new().start(canvas, eframe::WebOptions::default(), Box::new(creator)).await;
++        if let Some(loading) = document.get_element_by_id("mixstudio_loading") {
++            match started {
++                Ok(()) => loading.remove(),
++                Err(e) => loading.set_text_content(Some(&format!("MixStudio could not start: {e:?}"))),
++            }
++        }
++    });
++}
+diff --git a/src/audio/web.rs b/src/audio/web.rs
+new file mode 100644
+index 0000000..75a9209
+--- /dev/null
++++ b/src/audio/web.rs
+@@ -0,0 +1,71 @@
++// SPDX-License-Identifier: MIT
++//! The browser's audio, for Playground (patches/dj-studio.yaml in github.com/daijro/openplayground): a page cannot
++//! start the audio worker thread, so its loop runs in turns instead ([`pump`]): at the start of each Web Audio
++//! callback (cpal's webaudio host calls the device reader on the page's one thread), and after each frame, so commands
++//! never pile up while the browser keeps the audio off (until the first click). Same work as the thread's loop: the
++//! commands handled, then blocks rendered ahead into every free slot, without its waiting.
++
++use super::{AudioBlock, WorkerGuard, WorkerState};
++use crate::engine::Cmd;
++use crossbeam_channel::{Receiver, Sender};
++use std::cell::RefCell;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::Arc;
++
++struct Pump {
++    worker: WorkerState,
++    commands: Receiver<Cmd>,
++    stale: Receiver<Box<AudioBlock>>,
++    recycle: Sender<Box<AudioBlock>>,
++    free: Receiver<Box<AudioBlock>>,
++    ready: Sender<Box<AudioBlock>>,
++    stop: Arc<AtomicBool>,
++}
++
++thread_local! {
++    static PUMP: RefCell<Option<Pump>> = const { RefCell::new(None) };
++}
++
++/// [`WorkerGuard::start`] on the web: the worker's state and queues are kept for [`pump`] instead of a thread.
++#[allow(clippy::too_many_arguments)]
++pub(super) fn start(
++    guard: WorkerGuard,
++    worker: WorkerState,
++    commands: Receiver<Cmd>,
++    stale: Receiver<Box<AudioBlock>>,
++    recycle: Sender<Box<AudioBlock>>,
++    free: Receiver<Box<AudioBlock>>,
++    ready: Sender<Box<AudioBlock>>,
++    stop: Arc<AtomicBool>,
++) -> WorkerGuard {
++    PUMP.set(Some(Pump { worker, commands, stale, recycle, free, ready, stop }));
++    guard
++}
++
++/// One turn of the worker's loop.
++pub(crate) fn pump() {
++    PUMP.with_borrow_mut(|slot| {
++        let Some(p) = slot else { return };
++        if p.stop.load(Ordering::Acquire) {
++            *slot = None;
++            return;
++        }
++        while let Ok(command) = p.commands.try_recv() {
++            let previous = p.worker.epoch;
++            p.worker.handle(command);
++            if p.worker.epoch != previous {
++                while let Ok(block) = p.stale.try_recv() {
++                    let _ = p.recycle.try_send(block);
++                }
++            }
++        }
++        while p.worker.playing {
++            let Ok(mut block) = p.free.try_recv() else { break };
++            p.worker.render(&mut block);
++            // Room for every block there is, so this never waits.
++            if p.ready.try_send(block).is_err() {
++                break;
++            }
++        }
++    });
++}
+diff --git a/src/playground.rs b/src/playground.rs
+new file mode 100644
+index 0000000..b00a5fa
+--- /dev/null
++++ b/src/playground.rs
+@@ -0,0 +1,635 @@
++// SPDX-License-Identifier: MIT
++//! MixStudio in the browser, for Playground (patches/dj-studio.yaml in github.com/daijro/openplayground).
++//!
++//! wasm32-unknown-unknown has no clock, no files, no threads and no process: `Instant::now` and `SystemTime::now`
++//! panic there, every file call fails, and so does `thread::spawn`. The modules that use them take `std` from here
++//! instead, through one `#[cfg(target_arch = "wasm32")] use crate::playground::std;` line at each one's end (a local
++//! `std` shadows the standard library's name in that module; everything else in it still comes from the real std):
++//!   time     web-time's clock (its Instant a day on, so the app can step a few seconds back from `now`);
++//!   fs       an in-memory file system (the demo's tracks, audio from Files or dropped, mixes, settings, the analysis
++//!            cache), each change noted for the page to mirror into Files (app/web.rs);
++//!   thread   `spawn` (and `Builder::spawn`) queue the work for the page to run once the frame is drawn, on this thread;
++//!   env      `HOME` is `/home` (settings and caches live in memory, so every page starts afresh); nothing else is set;
++//!   process  `id` is 1.
++//! Below them: what Signalsmith Stretch's C++ (Key lock) asks of a C++ runtime, which this target has none of.
++
++// Not every part of std's API that is here gets used.
++#![allow(dead_code)]
++
++pub mod std {
++    pub use ::std::*;
++
++    pub mod time {
++        pub use web_time::*;
++        use ::std::ops::{Add, AddAssign, Sub, SubAssign};
++
++        /// web-time's Instant, a day on from the page's start: the app sets clocks a few seconds in the past
++        /// (`Instant::now() - 15 s`), which web-time's clock, 0 when the page opened, cannot go below.
++        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
++        pub struct Instant(web_time::Instant);
++
++        impl Instant {
++            pub fn now() -> Self {
++                Self(web_time::Instant::now() + Duration::from_secs(86_400))
++            }
++            pub fn elapsed(&self) -> Duration {
++                Self::now().saturating_duration_since(*self)
++            }
++            pub fn duration_since(&self, earlier: Self) -> Duration {
++                self.0.duration_since(earlier.0)
++            }
++            pub fn saturating_duration_since(&self, earlier: Self) -> Duration {
++                self.0.saturating_duration_since(earlier.0)
++            }
++            pub fn checked_duration_since(&self, earlier: Self) -> Option<Duration> {
++                self.0.checked_duration_since(earlier.0)
++            }
++            pub fn checked_add(&self, d: Duration) -> Option<Self> {
++                self.0.checked_add(d).map(Self)
++            }
++            pub fn checked_sub(&self, d: Duration) -> Option<Self> {
++                self.0.checked_sub(d).map(Self)
++            }
++        }
++        impl Add<Duration> for Instant {
++            type Output = Self;
++            fn add(self, d: Duration) -> Self {
++                Self(self.0 + d)
++            }
++        }
++        impl Sub<Duration> for Instant {
++            type Output = Self;
++            fn sub(self, d: Duration) -> Self {
++                Self(self.0 - d)
++            }
++        }
++        impl Sub for Instant {
++            type Output = Duration;
++            fn sub(self, earlier: Self) -> Duration {
++                self.saturating_duration_since(earlier)
++            }
++        }
++        impl AddAssign<Duration> for Instant {
++            fn add_assign(&mut self, d: Duration) {
++                self.0 += d;
++            }
++        }
++        impl SubAssign<Duration> for Instant {
++            fn sub_assign(&mut self, d: Duration) {
++                self.0 -= d;
++            }
++        }
++    }
++
++    pub mod process {
++        pub use ::std::process::*;
++
++        /// The page is one process (std's panics on wasm).
++        pub fn id() -> u32 {
++            1
++        }
++    }
++
++    pub mod env {
++        pub use ::std::env::*;
++        use ::std::ffi::{OsStr, OsString};
++        use ::std::path::PathBuf;
++
++        /// A folder in the in-memory files (std's panics on wasm).
++        pub fn temp_dir() -> PathBuf {
++            PathBuf::from("/tmp")
++        }
++
++        /// `HOME` is `/home`: settings and caches go to the in-memory files. Nothing else is set.
++        pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
++            (key.as_ref() == "HOME").then(|| OsString::from("/home"))
++        }
++
++        pub fn var<K: AsRef<OsStr>>(key: K) -> Result<String, VarError> {
++            var_os(key).and_then(|v| v.into_string().ok()).ok_or(VarError::NotPresent)
++        }
++    }
++
++    pub mod thread {
++        pub use ::std::thread::*;
++        use ::std::cell::RefCell;
++
++        thread_local! {
++            static QUEUED: RefCell<Vec<Box<dyn FnOnce()>>> = RefCell::default();
++        }
++
++        /// Queues `f` for [`run_spawned`]: a page has one thread, and the frame should be drawn before it waits.
++        pub fn spawn<F, T>(f: F) -> Queued
++        where
++            F: FnOnce() -> T + Send + 'static,
++            T: Send + 'static,
++        {
++            QUEUED.with_borrow_mut(|q| q.push(Box::new(move || drop(f()))));
++            Queued
++        }
++
++        /// What [`spawn`] gives back: the work waits for [`run_spawned`].
++        pub struct Queued;
++
++        /// std's thread builder (the library's helper threads), queuing like [`spawn`].
++        pub struct Builder;
++        impl Builder {
++            pub fn new() -> Self {
++                Builder
++            }
++            pub fn name(self, _name: String) -> Self {
++                self
++            }
++            pub fn spawn<F, T>(self, f: F) -> ::std::io::Result<Queued>
++            where
++                F: FnOnce() -> T + Send + 'static,
++                T: Send + 'static,
++            {
++                Ok(spawn(f))
++            }
++        }
++
++        /// Whether work is waiting.
++        pub fn queued() -> bool {
++            QUEUED.with_borrow(|q| !q.is_empty())
++        }
++
++        /// Runs what was spawned, and what that spawns in turn (the page calls it after a frame is drawn).
++        pub fn run_spawned() {
++            loop {
++                let jobs = QUEUED.take();
++                if jobs.is_empty() {
++                    break;
++                }
++                for job in jobs {
++                    job();
++                }
++            }
++        }
++    }
++
++    pub mod fs {
++        pub use ::std::fs::*;
++        use ::std::cell::RefCell;
++        use ::std::collections::{BTreeMap, BTreeSet};
++        use ::std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
++        use ::std::path::{Component, Path, PathBuf};
++
++        enum Entry {
++            Dir,
++            File(Vec<u8>, web_time::SystemTime),
++        }
++
++        #[derive(Default)]
++        struct Tree {
++            entries: BTreeMap<PathBuf, Entry>,
++            /// Paths written, created or removed since the last [`changes`].
++            changed: BTreeSet<PathBuf>,
++        }
++
++        thread_local! {
++            static TREE: RefCell<Tree> = RefCell::default();
++        }
++
++        fn with<T>(f: impl FnOnce(&mut Tree) -> T) -> T {
++            TREE.with(|t| f(&mut t.borrow_mut()))
++        }
++
++        /// `/a/./b/../c` -> `/a/c`: one spelling per file (relative paths start at `/`).
++        pub fn key(p: &Path) -> PathBuf {
++            let mut out = PathBuf::from("/");
++            for c in p.components() {
++                match c {
++                    Component::ParentDir => {
++                        out.pop();
++                    }
++                    Component::Normal(n) => out.push(n),
++                    _ => {}
++                }
++            }
++            out
++        }
++
++        fn missing(p: &Path) -> io::Error {
++            io::Error::new(io::ErrorKind::NotFound, format!("{} does not exist", p.display()))
++        }
++
++        impl Tree {
++            fn mark(&mut self, p: PathBuf) {
++                self.changed.insert(p);
++            }
++            fn parents(&mut self, p: &Path) {
++                for dir in p.ancestors().skip(1) {
++                    self.entries.entry(dir.to_path_buf()).or_insert(Entry::Dir);
++                }
++            }
++            fn put(&mut self, p: PathBuf, bytes: Vec<u8>) {
++                self.parents(&p);
++                self.entries.insert(p, Entry::File(bytes, web_time::SystemTime::now()));
++            }
++            /// `p` and everything below it.
++            fn below(&self, p: &Path) -> Vec<PathBuf> {
++                self.entries.range(p.to_path_buf()..).map(|(k, _)| k).take_while(|k| k.starts_with(p)).cloned().collect()
++            }
++        }
++
++        /// Stores a file without noting a change (files the page brings in from Files or a drop).
++        pub fn put(p: &Path, bytes: Vec<u8>) {
++            with(|t| t.put(key(p), bytes));
++        }
++
++        /// The paths changed since the last call: each now holds what Files should hold, or is gone.
++        pub fn changes() -> Vec<PathBuf> {
++            with(|t| ::std::mem::take(&mut t.changed).into_iter().collect())
++        }
++
++        pub fn exists<P: AsRef<Path>>(p: P) -> io::Result<bool> {
++            Ok(metadata(p).is_ok())
++        }
++
++        pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(p: P, bytes: C) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                t.put(p.clone(), bytes.as_ref().to_vec());
++                t.mark(p);
++            });
++            Ok(())
++        }
++
++        pub fn read<P: AsRef<Path>>(p: P) -> io::Result<Vec<u8>> {
++            TREE.with(|t| match t.borrow().entries.get(&key(p.as_ref())) {
++                Some(Entry::File(bytes, _)) => Ok(bytes.clone()),
++                _ => Err(missing(p.as_ref())),
++            })
++        }
++
++        pub fn read_to_string<P: AsRef<Path>>(p: P) -> io::Result<String> {
++            String::from_utf8(read(p)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
++        }
++
++        pub fn create_dir_all<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                if !t.entries.contains_key(&p) {
++                    t.parents(&p);
++                    t.entries.insert(p.clone(), Entry::Dir);
++                    t.mark(p);
++                }
++            });
++            Ok(())
++        }
++
++        pub fn create_dir<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            if metadata(p.as_ref()).is_ok() {
++                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists", p.as_ref().display())));
++            }
++            create_dir_all(p)
++        }
++
++        pub fn remove_file<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| match t.entries.get(&p) {
++                Some(Entry::File(..)) => {
++                    t.entries.remove(&p);
++                    t.mark(p);
++                    Ok(())
++                }
++                _ => Err(missing(&p)),
++            })
++        }
++
++        /// Removes an empty folder.
++        pub fn remove_dir<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                if t.below(&p).len() != 1 || !matches!(t.entries.get(&p), Some(Entry::Dir)) {
++                    return Err(io::Error::other(format!("{} is not an empty folder", p.display())));
++                }
++                t.entries.remove(&p);
++                t.mark(p);
++                Ok(())
++            })
++        }
++
++        pub fn remove_dir_all<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                let gone = t.below(&p);
++                if gone.is_empty() {
++                    return Err(missing(&p));
++                }
++                for g in gone {
++                    t.entries.remove(&g);
++                    t.mark(g);
++                }
++                Ok(())
++            })
++        }
++
++        pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
++            let (from, to) = (key(from.as_ref()), key(to.as_ref()));
++            let bytes = read(&from)?;
++            with(|t| {
++                t.entries.remove(&from);
++                t.mark(from);
++                t.put(to.clone(), bytes);
++                t.mark(to);
++            });
++            Ok(())
++        }
++
++        pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
++            let bytes = read(from)?;
++            let n = bytes.len() as u64;
++            write(to, bytes)?;
++            Ok(n)
++        }
++
++        pub fn canonicalize<P: AsRef<Path>>(p: P) -> io::Result<PathBuf> {
++            let p = key(p.as_ref());
++            metadata(&p).map(|_| p)
++        }
++
++        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++        pub struct FileType(bool);
++        impl FileType {
++            pub fn is_file(&self) -> bool {
++                self.0
++            }
++            pub fn is_dir(&self) -> bool {
++                !self.0
++            }
++            pub fn is_symlink(&self) -> bool {
++                false
++            }
++        }
++
++        /// Every file can be written.
++        #[derive(Clone, Debug, PartialEq, Eq)]
++        pub struct Permissions;
++        impl Permissions {
++            pub fn readonly(&self) -> bool {
++                false
++            }
++        }
++
++        #[derive(Clone, Debug)]
++        pub struct Metadata(Option<(u64, web_time::SystemTime)>);
++        impl Metadata {
++            pub fn len(&self) -> u64 {
++                self.0.map_or(0, |(n, _)| n)
++            }
++            pub fn is_file(&self) -> bool {
++                self.0.is_some()
++            }
++            pub fn is_dir(&self) -> bool {
++                self.0.is_none()
++            }
++            pub fn is_symlink(&self) -> bool {
++                false
++            }
++            pub fn file_type(&self) -> FileType {
++                FileType(self.is_file())
++            }
++            pub fn modified(&self) -> io::Result<web_time::SystemTime> {
++                Ok(self.0.map_or(web_time::SystemTime::UNIX_EPOCH, |(_, t)| t))
++            }
++            pub fn permissions(&self) -> Permissions {
++                Permissions
++            }
++        }
++
++        pub fn metadata<P: AsRef<Path>>(p: P) -> io::Result<Metadata> {
++            TREE.with(|t| match t.borrow().entries.get(&key(p.as_ref())) {
++                Some(Entry::File(bytes, at)) => Ok(Metadata(Some((bytes.len() as u64, *at)))),
++                Some(Entry::Dir) => Ok(Metadata(None)),
++                None => Err(missing(p.as_ref())),
++            })
++        }
++
++        pub struct DirEntry(PathBuf);
++        impl DirEntry {
++            pub fn path(&self) -> PathBuf {
++                self.0.clone()
++            }
++            pub fn file_name(&self) -> ::std::ffi::OsString {
++                self.0.file_name().unwrap_or_default().to_os_string()
++            }
++            pub fn metadata(&self) -> io::Result<Metadata> {
++                metadata(&self.0)
++            }
++            pub fn file_type(&self) -> io::Result<FileType> {
++                Ok(metadata(&self.0)?.file_type())
++            }
++        }
++
++        pub type ReadDir = ::std::vec::IntoIter<io::Result<DirEntry>>;
++
++        pub fn read_dir<P: AsRef<Path>>(p: P) -> io::Result<ReadDir> {
++            let dir = key(p.as_ref());
++            if !metadata(&dir)?.is_dir() {
++                return Err(io::Error::other(format!("{} is not a folder", dir.display())));
++            }
++            let entries = TREE.with(|t| {
++                t.borrow().below(&dir).into_iter().filter(|k| k.parent() == Some(&dir)).map(|k| Ok(DirEntry(k))).collect::<Vec<_>>()
++            });
++            Ok(entries.into_iter())
++        }
++
++        /// How a file opens: for reading, or for writing (from empty, or after what it holds when appending).
++        #[derive(Clone, Default)]
++        pub struct OpenOptions {
++            write: bool,
++            append: bool,
++            create: bool,
++            create_new: bool,
++            truncate: bool,
++        }
++        impl OpenOptions {
++            pub fn new() -> Self {
++                Self::default()
++            }
++            pub fn read(&mut self, _read: bool) -> &mut Self {
++                self
++            }
++            pub fn write(&mut self, write: bool) -> &mut Self {
++                self.write = write;
++                self
++            }
++            pub fn append(&mut self, append: bool) -> &mut Self {
++                self.append = append;
++                self
++            }
++            pub fn create(&mut self, create: bool) -> &mut Self {
++                self.create = create;
++                self
++            }
++            pub fn create_new(&mut self, create_new: bool) -> &mut Self {
++                self.create_new = create_new;
++                self
++            }
++            pub fn truncate(&mut self, truncate: bool) -> &mut Self {
++                self.truncate = truncate;
++                self
++            }
++            pub fn open<P: AsRef<Path>>(&self, p: P) -> io::Result<File> {
++                let p = key(p.as_ref());
++                let old = read(&p);
++                if self.create_new && metadata(&p).is_ok() {
++                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists", p.display())));
++                }
++                if !(self.write || self.append) {
++                    return File::open(&p);
++                }
++                let data = match old {
++                    Ok(bytes) if !self.truncate => bytes,
++                    Ok(_) => Vec::new(),
++                    Err(_) if self.create || self.create_new => Vec::new(),
++                    Err(e) => return Err(e),
++                };
++                write(&p, &data)?;
++                let mut data = Cursor::new(data);
++                if self.append {
++                    data.seek(SeekFrom::End(0))?;
++                }
++                Ok(File { data, to: Some(p), dirty: false })
++            }
++        }
++
++        /// A file's bytes, read whole when it opens; one opened for writing is stored back when flushed or dropped.
++        pub struct File {
++            data: Cursor<Vec<u8>>,
++            /// Where written bytes go, for a file opened to write.
++            to: Option<PathBuf>,
++            dirty: bool,
++        }
++
++        impl File {
++            pub fn open<P: AsRef<Path>>(p: P) -> io::Result<File> {
++                Ok(File { data: Cursor::new(read(p)?), to: None, dirty: false })
++            }
++            pub fn create<P: AsRef<Path>>(p: P) -> io::Result<File> {
++                OpenOptions::new().write(true).create(true).truncate(true).open(p)
++            }
++            pub fn metadata(&self) -> io::Result<Metadata> {
++                Ok(Metadata(Some((self.data.get_ref().len() as u64, web_time::SystemTime::now()))))
++            }
++            pub fn set_permissions(&self, _permissions: Permissions) -> io::Result<()> {
++                Ok(())
++            }
++            /// The bytes are stored when the file is flushed or dropped.
++            pub fn sync_all(&self) -> io::Result<()> {
++                Ok(())
++            }
++            fn store(&mut self) {
++                if let (true, Some(to)) = (self.dirty, &self.to) {
++                    let _ = write(to, self.data.get_ref());
++                    self.dirty = false;
++                }
++            }
++        }
++
++        impl Read for File {
++            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++                self.data.read(buf)
++            }
++        }
++
++        impl Seek for File {
++            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
++                self.data.seek(pos)
++            }
++        }
++
++        impl Write for File {
++            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++                if self.to.is_none() {
++                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the file is open to read"));
++                }
++                self.dirty = true;
++                self.data.write(buf)
++            }
++            fn flush(&mut self) -> io::Result<()> {
++                self.store();
++                Ok(())
++            }
++        }
++
++        /// symphonia decodes a file here as it does std's.
++        impl symphonia::core::io::MediaSource for File {
++            fn is_seekable(&self) -> bool {
++                true
++            }
++            fn byte_len(&self) -> Option<u64> {
++                Some(self.data.get_ref().len() as u64)
++            }
++        }
++
++        impl Drop for File {
++            fn drop(&mut self) {
++                self.store();
++            }
++        }
++    }
++}
++
++/// What Signalsmith Stretch's C++ (Key lock: the `signalsmith-stretch` crate, built for this target by
++/// .cargo/playground-cxx.sh) asks of a C++ runtime: operator new and sized delete over Rust's allocator,
++/// `std::random_device` (it only seeds the stretcher's phase randomisation) and libc++'s abort message. Its maths
++/// (sinf, cosf, exp, exp2, roundf) come from Rust's compiler-builtins.
++mod cxx {
++    use ::std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
++    use ::std::ffi::{c_char, CStr};
++
++    /// max_align_t on wasm32.
++    const ALIGN: usize = 16;
++
++    fn layout(size: usize) -> Layout {
++        Layout::from_size_align(size.max(1), ALIGN).expect("C++ allocation too large")
++    }
++
++    /// `operator new(size_t)`.
++    #[no_mangle]
++    extern "C" fn _Znwm(size: usize) -> *mut u8 {
++        let p = unsafe { alloc(layout(size)) };
++        if p.is_null() {
++            handle_alloc_error(layout(size));
++        }
++        p
++    }
++
++    /// `operator delete(void*, size_t)`: C++14's sized delete gets the size `new` was given.
++    #[no_mangle]
++    unsafe extern "C" fn _ZdlPvm(p: *mut u8, size: usize) {
++        if !p.is_null() {
++            dealloc(p, layout(size));
++        }
++    }
++
++    /// `std::__libcpp_verbose_abort(const char*, ...)` (the varargs arrive as one pointer on wasm).
++    #[no_mangle]
++    unsafe extern "C" fn _ZNSt3__222__libcpp_verbose_abortEPKcz(message: *const c_char, _args: *const u8) -> ! {
++        panic!("Signalsmith Stretch: {}", CStr::from_ptr(message).to_string_lossy())
++    }
++
++    /// `std::random_device::random_device(const std::string&)`.
++    #[no_mangle]
++    extern "C" fn _ZNSt3__213random_deviceC2ERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE(
++        this: *mut u8,
++        _token: *const u8,
++    ) -> *mut u8 {
++        this
++    }
++
++    /// `std::random_device::~random_device()`.
++    #[no_mangle]
++    extern "C" fn _ZNSt3__213random_deviceD1Ev(this: *mut u8) -> *mut u8 {
++        this
++    }
++
++    /// `std::random_device::operator()()`.
++    #[no_mangle]
++    extern "C" fn _ZNSt3__213random_deviceclEv(_this: *mut u8) -> u32 {
++        (js_sys::Math::random() * f64::from(u32::MAX)) as u32
++    }
++}

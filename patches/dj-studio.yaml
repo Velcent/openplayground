@@ -1,0 +1,217 @@
+# MixStudio in the browser. Upstream (github.com/soulspin/MixStudio) releases Linux packages only; these patches add the
+# web build Playground serves, from its head commit.
+#
+# patches/dj-studio/web.diff adds new files only:
+#   index.html, Trunk.toml     the web build at the repository's root (build.mjs builds there): trunk builds the
+#                              `mixstudio` binary for the page's canvas, and the page starts the audio at the first
+#                              click or key (browsers keep it off until then).
+#   src/app/web.rs             the page's side: `app::run` starts the desktop's App on the canvas with its demo mix
+#                              (`mixstudio --demo`: four generated tracks and their transitions); Add tracks, Open mix…,
+#                              Save as…, Export, Import DJ library and Locate (a missing source) are Playground's
+#                              dialogs; "Open in MixStudio" opens a mix (bringing the tracks it names in from Files) or
+#                              adds an audio file to the mix; what MixStudio writes outside its own folders (a mix, an
+#                              export, a dropped file) goes to Files after the frame, and an export to download is handed
+#                              to the browser once written; dropped files import as on the desktop; work the app gives a
+#                              thread runs once the frame is drawn.
+#   src/audio/web.rs           the audio worker without its thread: its loop runs in turns, at the start of each Web
+#                              Audio callback (cpal's webaudio host) and after each frame.
+#   src/playground.rs          what wasm32-unknown-unknown lacks: `std` with web-time's clock, an in-memory file
+#                              system, `thread::spawn` queued until the frame is drawn, `HOME` (settings in memory),
+#                              `env::temp_dir` and `process::id`. The modules that use them take `std` from it on wasm
+#                              through ONE `use` line at their end (a local `std` shadows the standard library's name in
+#                              that module; everything else in it still comes from the real std). Also the pieces of a
+#                              C++ runtime Signalsmith Stretch uses (operator new/delete, random_device), in Rust.
+#   .cargo/config.toml, .cargo/playground-cxx.sh   Key lock: the `signalsmith-stretch` crate's C++ built for wasm32 with
+#                              clang and the C++ headers of wasi-sdk 22's sysroot (27 MB, fetched from github.com once
+#                              into the target folder, unless $WASI_SYSROOT names one), its bindings generated with
+#                              default visibility, and no C++ library linked. Needs clang and libclang on the builder (as
+#                              the signalsmith-stretch crate does natively, and ring's C does for other apps).
+# Off on the web: stem separation and its 166 MB model download (ONNX Runtime; "Separate stems" says it isn't
+# available), Engine DJ import (SQLite; Rekordbox, Traktor, Serato and iTunes libraries still import), MP3 export
+# (ffmpeg, which `has_ffmpeg` doesn't find; WAV and FLAC export work), music folders (a page has none: tracks come from
+# Files or a drop), recovery autosave (off upstream for the demo mix every page starts with; Playground warns before
+# leaving unsaved work instead), updates (MixStudio has no update check; Playground serves new builds). Native builds see
+# none of this: every rule adds wasm-only lines, or moves a native-only dependency into a native-only table.
+
+# Rules 1-6/48: the dependencies. ONNX Runtime (stems), ureq (the model download), SQLite (Engine DJ) and rfd (native
+# file dialogs) have no browser side: rule 1 opens a native-only table at the end and rules 2-5 move each one's line
+# into it. Rule 6 adds the wasm-only ones, under a target spelling nobody else uses (`all(...)`): web-time's clock,
+# wasm-bindgen for the page, and cpal's `wasm-bindgen` feature, its Web Audio host (the version follows upstream's). If
+# upstream drops or renames one of the moved dependencies, drop its rule.
+- file: Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n# Playground's web build (patches/dj-studio.yaml): what has no browser side.\n[target.'cfg(not(target_arch = \"wasm32\"))'.dependencies]\n"
+- file: Cargo.toml
+  find: '^(ort\s*=[^\n]*)\n([\s\S]*)$'
+  replace: "$2$1\n"
+- file: Cargo.toml
+  find: '^(ureq\s*=[^\n]*)\n([\s\S]*)$'
+  replace: "$2$1\n"
+- file: Cargo.toml
+  find: '^(rusqlite\s*=[^\n]*)\n([\s\S]*)$'
+  replace: "$2$1\n"
+- file: Cargo.toml
+  find: '^(rfd\s*=[^\n]*)\n([\s\S]*)$'
+  replace: "$2$1\n"
+- file: Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nweb-time = \"1\"\nwasm-bindgen = \"0.2\"\nwasm-bindgen-futures = \"0.4\"\njs-sys = \"0.3\"\nweb-sys = { version = \"0.3\", features = [\"Window\", \"Document\", \"Element\", \"HtmlCanvasElement\"] }\ncpal = { version = \"*\", features = [\"wasm-bindgen\"] }\n"
+
+# Rules 7-22/48: the modules that use the clock, files, threads, HOME or the process id take `std` from src/playground.rs
+# on wasm (see the top), and main.rs declares it. Found with: every non-test module that names Instant, SystemTime,
+# fs::, File::, OpenOptions, thread::spawn / Builder, env:: or process::id, except stems.rs (its file use is all behind
+# stem separation, off here), dialogs.rs and main.rs (desktop dialogs and command-line modes; the demo's files are
+# written by engine.rs). app.rs's submodules that `use super::*` and name `std::` (library_ui, comparison, sample_ui) take
+# it too, by name: the glob would otherwise make `std` ambiguous there. If upstream starts using these in another module,
+# give it the same line; a missing one panics at the first clock, file or thread call (MixStudio then never gets past
+# "Loading MixStudio…", or stops when that feature is used), and a missing submodule line is a compile error.
+- file: src/main.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock, files and threads std lacks there (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] mod playground;\n"
+- file: src/app.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the page, and the clock, files and threads (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n#[cfg(target_arch = \"wasm32\")] mod web;\n"
+- file: src/app/persistence.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock and threads (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/app/levels_ui.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: threads (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/app/library_drop.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: threads (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/app/library_listen.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: threads (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/app/library_ui.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: app.rs's std, named here so it isn't ambiguous with `use super::*` (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/app/comparison.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: app.rs's std, named here so it isn't ambiguous with `use super::*` (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/app/sample_ui.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: app.rs's std, named here so it isn't ambiguous with `use super::*` (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/analysis.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files and HOME (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/engine.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/export.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/fx.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock and files (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/import.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock, files and HOME (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/library.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock, files, threads and HOME (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: src/recovery.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock, files and process id (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+
+# Rules 23-25/48: the audio worker on the web (src/audio/web.rs): no thread is started, and its loop runs in turns at the
+# start of each Web Audio callback (and after each frame, from app/web.rs). If upstream renames WorkerGuard::start's
+# queues or DeviceReader::fill, follow.
+- file: src/audio.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the worker's loop in turns (patches/dj-studio.yaml).\n#[cfg(target_arch = \"wasm32\")] pub(crate) mod web;\n"
+- file: src/audio.rs
+  find: 'let\s+stale\s*=\s*ready\.clone\(\)\s*;\s*let\s+recycle\s*=\s*returned\.clone\(\)\s*;'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] return Ok(web::start(Self {stop,lifecycles:Vec::new(),thread:None,ready,returned,shared,transport}, WorkerState::new(sr,worker_shared,worker_transport), commands, stale, recycle, returned_rx, ready_tx, worker_stop));"
+- file: src/audio.rs
+  find: '\bfn\s+fill<T:\s*Copy>\s*\([\s\S]*?\)\s*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] web::pump();"
+
+# Rules 26-35/48: the app (src/app/web.rs). `app::run` starts the page instead of a window; the stem-separation worker
+# (a thread waiting on its queue) is not started, and "Separate stems" says it isn't available here instead of offering
+# the model download; Add tracks, Open mix… / Save as… / Export, Import DJ library and Locate (persistence.rs) use
+# Playground's dialogs: each asks, then sends the app the same message as the desktop's dialog thread, and Add music
+# folder says a page has none; a dropped file is kept in Files (MixStudio/Dropped) rather than in the settings folder, so a saved mix finds it
+# again. If upstream renames what these anchor on, follow.
+- file: src/app.rs
+  find: '\bpub\s+fn\s+run\s*\(\s*demo\s*:\s*Option<String>\s*\)'
+  before: "#[cfg(target_arch = \"wasm32\")] pub fn run(demo: Option<String>) { web::start(demo) }\n#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: src/app.rs
+  find: '\{\s*let\s+tx\s*=\s*tx\.clone\(\)\s*;\s*let\s+dl\s*=\s*dl_prog\.clone\(\)\s*;'
+  before: "#[cfg(not(target_arch = \"wasm32\"))] "
+- file: src/app.rs
+  find: '\bfn\s+request_stems\s*\(\s*&mut\s+self\s*,\s*i\s*:\s*usize\s*\)\s*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] return self.status = web::NO_STEMS.into();"
+- file: src/app.rs
+  find: 'if\s+crate::stems::model_path\(\)\.exists\(\)\s*\{\s*self\.request_stems\(ti\)'
+  replace: 'if cfg!(target_arch = "wasm32") || crate::stems::model_path().exists() { self.request_stems(ti)'
+- file: src/app.rs
+  find: '\bfn\s+pick_files\s*\(\s*&self\s*,\s*sample\s*:\s*Option<usize>\s*\)\s*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] return self.web_pick_files(sample);"
+- file: src/app.rs
+  find: '\bfn\s+dialog\s*\(\s*&self\s*,\s*save\s*:\s*bool\s*,\s*kind\s*:\s*u8\s*\)\s*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] return self.web_dialog(save, kind);"
+- file: src/app.rs
+  find: '\bfn\s+pick_folder\s*\(\s*&self\s*\)\s*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] return self.web_pick_folder();"
+- file: src/app.rs
+  find: '\bfn\s+pick_import\s*\(\s*&self\s*\)\s*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] return self.web_pick_import();"
+- file: src/app/persistence.rs
+  find: '\bfn\s+choose_relink\s*\(\s*&mut\s+self\s*,\s*old\s*:\s*String\s*\)\s*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] return self.web_choose_relink(old);"
+- file: src/app.rs
+  find: 'let\s+dir\s*=\s*crate::library::config_dir\(\)\.join\("sources"\)\s*;'
+  after: "\n                #[cfg(target_arch = \"wasm32\")] let dir = std::path::PathBuf::from(web::DROPPED);"
+
+# Rules 36-38/48: background work that waits on a channel cannot wait on a page's one thread. The recovery worker (a
+# thread serving its queue for the whole session) is not started: autosave is off with the demo mix, which every page
+# starts with, so nothing is queued that needs it. The library's helper threads with a timeout (DJ library imports,
+# "Find DJ libraries") run in place, since crossbeam's timed wait reads std's clock. Adding an imported library checks the file
+# through `std::fs` (Path::exists asks the real file system, which has none of the page's files). If upstream changes
+# these, follow.
+- file: src/recovery.rs
+  find: 'std::thread::spawn\(\s*move\s*\|\|\s*for\s+job\s+in\s+jobs\b'
+  before: "#[cfg(not(target_arch = \"wasm32\"))] "
+- file: src/library.rs
+  find: '\bpub\s+fn\s+with_timeout\b[^{]*->\s*Option<T>\s*\{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")] return { let _ = t; Some(f()) };"
+- file: src/library.rs
+  find: 'if\s+!p\.exists\(\)\s*\{\s*return\s+Err\(format!\("\{\}\s+not\s+found"'
+  replace: 'if std::fs::metadata(p).is_err() { return Err(format!("{} not found"'
+
+# Rules 39-48/48: what has no browser side, given a stand-in on wasm (the native code is kept as it is, behind
+# `cfg(not(target_arch = "wasm32"))`). FLAC export encodes on this thread (flacenc's multithreaded encoder starts
+# threads); Engine DJ databases (SQLite; also main.rs's command-line self-test of them) and rfd's portal dialog report
+# they aren't available; so do stem separation (ONNX Runtime) and its model download (ureq), which the app never asks
+# for here (rule 28). If upstream renames one of these functions, follow.
+- file: src/export.rs
+  find: 'flacenc::config::Encoder::default\(\)\.into_verified\(\)'
+  replace: '{ #[allow(unused_mut)] let mut c = flacenc::config::Encoder::default(); #[cfg(target_arch = "wasm32")] { c.multithread = false; } c }.into_verified()'
+- file: src/import.rs
+  find: '\bpub\s+fn\s+engine\s*\(\s*db\s*:\s*&Path\s*\)'
+  before: "#[cfg(target_arch = \"wasm32\")] pub fn engine(_db: &Path) -> Result<(Vec<ExtTrack>, Node), String> { Err(\"Engine DJ libraries need SQLite, which MixStudio's browser version leaves out\".into()) }\n#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: src/main.rs
+  find: '\bfn\s+import_tests_core\s*\(\s*\)\s*->\s*bool'
+  before: "#[cfg(target_arch = \"wasm32\")] fn import_tests_core() -> bool { false }\n#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: src/dialogs.rs
+  find: '\bfn\s+via_rfd\s*\('
+  before: "#[cfg(target_arch = \"wasm32\")] fn via_rfd(_: &Req) -> Result<Option<Vec<PathBuf>>, String> { Err(\"no desktop portal in a browser\".into()) }\n#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: src/stems.rs
+  find: '\bpub\s+fn\s+ensure_model\s*\('
+  before: "#[cfg(target_arch = \"wasm32\")] pub fn ensure_model(_: &AtomicU32) -> anyhow::Result<PathBuf> { anyhow::bail!(\"stem separation isn't available in MixStudio's browser version\") }\n#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: src/stems.rs
+  find: '^static\s+ENV\s*:'
+  before: "#[cfg(not(target_arch = \"wasm32\"))] "
+- file: src/stems.rs
+  find: '^static\s+SESSION\s*:'
+  before: "#[cfg(not(target_arch = \"wasm32\"))] "
+- file: src/stems.rs
+  find: '^fn\s+env\s*\(\s*\)'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: src/stems.rs
+  find: '\bpub\s+fn\s+session_info\s*\(\s*\)'
+  before: "#[cfg(target_arch = \"wasm32\")] pub fn session_info() -> Result<String, String> { Err(\"stem separation isn't available in MixStudio's browser version\".into()) }\n#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: src/stems.rs
+  find: '\bpub\s+fn\s+separate_raw\s*\('
+  before: "#[cfg(target_arch = \"wasm32\")] pub fn separate_raw(_: &Audio, _: &AtomicU32) -> Result<Vec<[Vec<f32>; 2]>, String> { Err(\"stem separation isn't available in MixStudio's browser version\".into()) }\n#[cfg(not(target_arch = \"wasm32\"))]\n"

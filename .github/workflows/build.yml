@@ -81,6 +81,11 @@ jobs:
           curl -sSfL "$url" | tar -xz -C ~/tools
           echo "$HOME/tools/bin" >> "$GITHUB_PATH"
           echo "WASM_OPT=$(ls ~/tools/binaryen-*/bin/wasm-opt)" >> "$GITHUB_ENV"
+      # bindgen loads libclang (MixStudio's Key lock, patches/dj-studio.yaml): installed only if the image lacks it.
+      - name: Make sure libclang is installed
+        run: |
+          compgen -G '/usr/lib/llvm-*/lib/libclang*.so*' >/dev/null || compgen -G '/usr/lib/x86_64-linux-gnu/libclang*.so*' >/dev/null \
+            || { sudo apt-get update -q && sudo apt-get install -yq libclang-dev; }
 
       - id: build
         name: Build

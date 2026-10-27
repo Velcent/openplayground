@@ -604,3 +604,23 @@ groups:
         icon: icons/transit.svg
         accent: "#4CB1F0"
         base: "#0B2A3D"
+
+      - slug: dj-studio
+        name: MixStudio
+        alternative: DJ.Studio
+        blurb: Plan DJ mixes on a timeline, with beatmatched transitions, key lock and effects.
+        # Its mixes (.mixstudio.json; opening one brings in the tracks it names from Files) and audio files, which join
+        # the mix. Upstream's releases are Linux packages only (no web zip), so like Pro Wave it has the head channel only;
+        # patches/dj-studio.yaml adds the web build, which starts with MixStudio's demo mix.
+        opens: []
+        imports: [json, mp3, wav, wave, flac, ogg, oga, m4a, mp4, aac, alac, aif, aiff, aifc]
+        repo: soulspin/MixStudio
+        license: MIT
+        copyright: "Copyright (c) 2026 soulspin"
+        # What the web build compiles (Cargo.lock: dependency changes): docs, tools and test fixture commits don't
+        # rebuild it. One GitHub API request per path per check.
+        paths: [src, Cargo.toml, Cargo.lock]
+        patches: patches/dj-studio.yaml
+        icon: icons/mixstudio.png
+        accent: "#E8E000"
+        base: "#37350A"
