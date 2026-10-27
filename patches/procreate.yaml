@@ -1,0 +1,155 @@
+# ProCraft in the browser. Upstream (github.com/surfrpt1/procraft) releases Android, iOS and Windows packages only;
+# these patches add the web build Playground serves, from its head commit.
+#
+# patches/procreate/web.diff adds new files only:
+#   index.html, Trunk.toml     the web build at the repository's root (build.mjs builds there): trunk builds the
+#                              `procraft` binary for the page's canvas, and the page keeps a pen's pressure
+#                              (PointerEvent.pressure) for the brushes: egui passes touch force on (Apple Pencil in
+#                              Safari) but not a pen's pointer pressure (a Wacom pen in Chrome).
+#   apps/procraft/src/web.rs   the page's side: `run` starts the desktop's app on the canvas; the open dialogs (Open
+#                              image, Open project, Open PSD, the Gallery's Open…, Reference, and the brush, dual tip,
+#                              palette, palette-from-image, font and GIF imports) are Playground's Open, taking the iOS
+#                              build's route, which waits for the file across frames (rfd-shim's `pick_file` and
+#                              `poll_pick`); the save dialogs give a path in memory at once, and what the app writes
+#                              there goes to Playground's Save As (Files or the device's downloads) after the frame; the
+#                              Gallery lists the paintings in Files; "Open in ProCraft" and dropped files open as the
+#                              matching Open… does (a painting, image or PSD replaces the canvas; brushes, palettes and
+#                              fonts import); what the app writes beside a file from Files (the Gallery's Duplicate)
+#                              goes to Files.
+#   crates/engine/src/playground.rs   what wasm32-unknown-unknown lacks: `std` with web-time's clock, an in-memory
+#                              file system and `HOME` (settings in memory), and the `image` crate's `open`,
+#                              `ImageReader::open` and `save_buffer` through those files. The modules that use them
+#                              take them from it on wasm through ONE `use` line at their end (a local name shadows the
+#                              crate's in that module; everything else in it still comes from the real one).
+# Off on the web: crash recovery (its snapshot stays in memory, so a reloaded page has nothing to offer; Playground
+# warns before leaving unsaved work instead), settings across visits (each page starts with upstream's defaults), the
+# Windows symbol font (the UI uses its plain-text labels, as upstream does elsewhere). Native builds see none of this:
+# every rule adds wasm-only lines, or widens an iOS-only cfg to wasm.
+
+# Rules 1-2/33: the wasm-only dependencies, each in a table under a target spelling nobody else uses (`all(...)`), so
+# it never meets one of upstream's: web-time's clock for the engine, and the page's side for the app (eframe and its
+# web runner come from upstream's desktop table, which a browser build matches).
+- file: crates/engine/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nweb-time = \"1\"\n"
+- file: apps/procraft/Cargo.toml
+  find: '(?![\s\S])'
+  after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nwasm-bindgen = \"0.2\"\nwasm-bindgen-futures = \"0.4\"\njs-sys = \"0.3\"\nweb-sys = { version = \"0.3\", features = [\"Window\", \"Document\", \"Element\", \"HtmlCanvasElement\"] }\n"
+
+# Rules 3-10/33: the modules that use the clock or files take `std` (and those that hand the `image` crate a path, its
+# `image`) from crates/engine/src/playground.rs on wasm (see the top); the engine declares it, and the app's root also
+# takes web.rs and its `rfd`. Found with: every non-test module that names Instant, fs::, File::, env:: or image::open,
+# ImageReader, save_buffer or .save(. If upstream starts using these in another module, give it the same line; a missing
+# one panics at the first clock call (ProCraft then never gets past "Loading ProCraft…"), or fails that file's open or
+# save ("operation not supported on this platform").
+- file: crates/engine/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the clock and files std lacks there (patches/procreate.yaml).\n#[cfg(target_arch = \"wasm32\")] pub mod playground;\n"
+- file: crates/engine/src/document.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files, the image crate's included (patches/procreate.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::{image, std};\n"
+- file: crates/engine/src/probrush.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files, the image crate's included (patches/procreate.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::{image, std};\n"
+- file: crates/engine/src/psd.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/procreate.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: crates/engine/src/palette.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/procreate.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: crates/engine/src/brush.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files (patches/procreate.yaml).\n#[cfg(target_arch = \"wasm32\")] use crate::playground::std;\n"
+- file: apps/procraft/src/settings.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the files and HOME (patches/procreate.yaml).\n#[cfg(target_arch = \"wasm32\")] use procraft_engine::playground::std;\n"
+- file: apps/procraft/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n// Playground's browser build: the page, its file dialogs, and the clock and files (patches/procreate.yaml).\n#[cfg(target_arch = \"wasm32\")] use procraft_engine::playground::{image, std};\n#[cfg(target_arch = \"wasm32\")] mod web;\n#[cfg(target_arch = \"wasm32\")] use web::rfd;\n"
+
+# Rule 11/33: Export tip PNG writes through `image::save_buffer` (the files above) instead of the image's own `save`.
+- file: crates/engine/src/probrush.rs
+  find: '\bimg\.save\(path\)(\.map_err\()'
+  replace: '{ #[cfg(target_arch = "wasm32")] let saved = image::save_buffer(path, &img, img.width(), img.height(), image::ColorType::L8); #[cfg(not(target_arch = "wasm32"))] let saved = img.save(path); saved }$1'
+
+# Rules 12-15/33: `run` starts the app on the page (web.rs) instead of a window; the window's options, runner and icon
+# have no browser side.
+- file: apps/procraft/src/lib.rs
+  find: '\bpub\s+fn\s+run\s*\(\s*\)\s*\{'
+  before: "#[cfg(target_arch = \"wasm32\")] pub fn run() { web::start() }\n#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: apps/procraft/src/lib.rs
+  find: '\bfn\s+build_options\s*\(\s*\)\s*->\s*eframe::NativeOptions'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: apps/procraft/src/lib.rs
+  find: '\bfn\s+run_with\s*\(\s*options\s*:\s*eframe::NativeOptions\s*\)'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+- file: apps/procraft/src/lib.rs
+  find: '\bfn\s+app_icon\s*\(\s*\)'
+  before: "#[cfg(not(target_arch = \"wasm32\"))]\n"
+
+# Rules 16-31/33: the open dialogs take the iOS build's route on the web, which waits for a file across frames: what
+# kind of file is wanted (PendingOpen), the field holding it, the frame's check of `rfd::poll_pick`, `open_picked`, and
+# each Open…/Import… button's iOS branch (11 of them, one rule each: every rule turns the first one left). The desktop
+# branch beside each still runs, as on Android: its `pick_file` asks Playground's Open and gives nothing now. Found
+# with: grep -c 'pending_open = Some(PendingOpen::' (one more: the frame's check). If upstream drops an Open… button, drop a
+# rule (the build fails until then); if it adds one, add a rule (without, its Open dialog opens nothing).
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(any\(target_os = "ios", target_os = "android"\)\)\](\s*#\[derive\([^)]*\)\]\s*enum\s+PendingOpen\b)'
+  replace: '#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(any\(target_os = "ios", target_os = "android"\)\)\](\s*fn\s+open_picked\b)'
+  replace: '#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(target_os = "ios"\)\](\s*pending_open\s*:\s*Option<PendingOpen>)'
+  replace: '#[cfg(any(target_os = "ios", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(target_os = "ios"\)\](\s*pending_open\s*:\s*None\b)'
+  replace: '#[cfg(any(target_os = "ios", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(target_os = "ios"\)\](\s*if\s+let\s+Some\(kind\)\s*=\s*self\.pending_open\.take\(\))'
+  replace: '#[cfg(any(target_os = "ios", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(target_os = "ios"\)\](\s*\{\s*let\s+_\s*=\s*rfd::FileDialog::new\(\))'
+  replace: '#[cfg(any(target_os = "ios", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(target_os = "ios"\)\](\s*\{\s*let\s+_\s*=\s*rfd::FileDialog::new\(\))'
+  replace: '#[cfg(any(target_os = "ios", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(target_os = "ios"\)\](\s*\{\s*let\s+_\s*=\s*rfd::FileDialog::new\(\))'
+  replace: '#[cfg(any(target_os = "ios", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(target_os = "ios"\)\](\s*\{\s*let\s+_\s*=\s*rfd::FileDialog::new\(\))'
+  replace: '#[cfg(any(target_os = "ios", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(target_os = "ios"\)\](\s*\{\s*let\s+_\s*=\s*rfd::FileDialog::new\(\))'
+  replace: '#[cfg(any(target_os = "ios", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(target_os = "ios"\)\](\s*\{\s*let\s+_\s*=\s*rfd::FileDialog::new\(\))'
+  replace: '#[cfg(any(target_os = "ios", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(target_os = "ios"\)\](\s*\{\s*let\s+_\s*=\s*rfd::FileDialog::new\(\))'
+  replace: '#[cfg(any(target_os = "ios", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(target_os = "ios"\)\](\s*\{\s*let\s+_\s*=\s*rfd::FileDialog::new\(\))'
+  replace: '#[cfg(any(target_os = "ios", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(target_os = "ios"\)\](\s*\{\s*let\s+_\s*=\s*rfd::FileDialog::new\(\))'
+  replace: '#[cfg(any(target_os = "ios", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(target_os = "ios"\)\](\s*\{\s*let\s+_\s*=\s*rfd::FileDialog::new\(\))'
+  replace: '#[cfg(any(target_os = "ios", target_arch = "wasm32"))]$1'
+- file: apps/procraft/src/lib.rs
+  find: '#\[cfg\(target_os = "ios"\)\](\s*\{\s*let\s+_\s*=\s*rfd::FileDialog::new\(\))'
+  replace: '#[cfg(any(target_os = "ios", target_arch = "wasm32"))]$1'
+
+# Rule 32/33: a pen's pressure (web.rs, from the page's PointerEvents) comes first where the brushes read the touch
+# force egui passes on. If upstream renames latest_touch_force, follow.
+- file: apps/procraft/src/lib.rs
+  find: '\bfn\s+latest_touch_force\s*\(\s*ctx\s*:\s*&egui::Context\s*\)\s*->\s*Option<f32>\s*\{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")] if let Some(p) = web::pen_pressure() { return Some(p); }"
+
+# Rule 33/33: the Gallery's Duplicate looks for a free name through `std::fs` (Path::exists asks the real file system,
+# which has none of the page's files), so it never writes over an earlier copy in Files.
+- file: apps/procraft/src/lib.rs
+  find: 'if\s+!dest\.exists\(\)\s*\{'
+  replace: 'if !(dest.exists() || cfg!(target_arch = "wasm32") && std::fs::metadata(&dest).is_ok()) {'

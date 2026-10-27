@@ -39,7 +39,7 @@ const source = (t, s) => {
   return {
     repo: t.repo, ref, url: `https://github.com/${t.repo}/tree/${ref}`, license: t.license ?? null, commit: s.commit ?? null,
     licenses: ids.map((id) => {
-      const file = ids.length > 1 ? `LICENSE-${id.split('-')[0].toUpperCase()}` : 'LICENSE'
+      const file = ids.length > 1 ? `LICENSE-${id.split('-')[0].toUpperCase()}` : (t.license_file ?? 'LICENSE')
       return { id, file, url: `https://github.com/${t.repo}/blob/${ref}/${file}` }
     }),
     patches: !s.built ? [] : [t.patches, diffDir(t) && `${diffDir(t)}/`, t.live && 'patches/live/playground_live.rs'].filter(Boolean).map((path) => ({

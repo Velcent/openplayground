@@ -1,0 +1,808 @@
+diff --git a/Trunk.toml b/Trunk.toml
+new file mode 100644
+--- /dev/null
++++ b/Trunk.toml
+@@ -0,0 +1,7 @@
++# ProCraft in the browser, for Playground (patches/procreate.yaml in github.com/daijro/openplayground).
++# Build with: trunk build --release   (from the repository's root)
++[build]
++target = "index.html"
++public_url = "./"
++filehash = true
++dist = "target/trunk-dist"
+diff --git a/apps/procraft/src/web.rs b/apps/procraft/src/web.rs
+new file mode 100644
+--- /dev/null
++++ b/apps/procraft/src/web.rs
+@@ -0,0 +1,371 @@
++// SPDX-License-Identifier: MIT
++//! ProCraft in the browser, for Playground (patches/procreate.yaml in github.com/daijro/openplayground): the desktop
++//! app on the page's canvas, its files in Playground's Files.
++//!
++//! [`start`] runs the desktop's app on the page. Files live in memory (procraft-engine's `playground::std::fs`): a
++//! file from Files comes in at its path (`browser:/Art/Sky.procraft` is `/Art/Sky.procraft` here). The open dialogs
++//! take the iOS build's route: [`rfd::FileDialog::pick_file`] asks Playground's Open and gives nothing now, and the
++//! app's frame checks [`rfd::poll_pick`] until the file is in memory. A save dialog gives a path in `/ProCraft/Saving`
++//! at once; what the app writes there goes to Playground's Save As after the frame, then to the place in Files picked
++//! (or the device's downloads). What the app writes elsewhere outside its own folder (a Gallery Duplicate, beside its
++//! original) goes to Files too. "Open in ProCraft" and dropped files open as the matching Open… would. The Gallery
++//! lists the paintings in Files. A pen's pressure (PointerEvent.pressure, kept by index.html) reaches the brushes as
++//! Apple Pencil's touch force does.
++
++use crate::{PendingOpen, ProCraftApp, MAX_RECENT};
++use eframe::egui;
++use procraft_engine::playground::std::fs;
++use std::cell::{OnceCell, RefCell};
++use std::path::{Path, PathBuf};
++use wasm_bindgen::{closure::Closure, JsCast as _, JsValue};
++
++/// ProCraft's own folder in memory (`HOME`), never copied to Files: settings and the recovery snapshot.
++const OWN: &str = "/home";
++/// Where the save dialogs point: what lands here goes to Playground's Save As.
++const SAVING: &str = "/ProCraft/Saving";
++/// Where a file from the computer (Open's "From computer…", a drop) is kept.
++const OPENED: &str = "/ProCraft/Opened";
++
++/// Where Save As put an export.
++enum Saved {
++    InFiles(PathBuf),
++    Downloaded,
++    Cancelled,
++}
++
++enum Pick {
++    Idle,
++    Waiting,
++    Done(Option<PathBuf>),
++}
++
++thread_local! {
++    static CTX: OnceCell<egui::Context> = const { OnceCell::new() };
++    /// The open dialog's state, for [`rfd::poll_pick`].
++    static PICK: RefCell<Pick> = const { RefCell::new(Pick::Idle) };
++    /// Files for the app to open ("Open in ProCraft", drops), on the next frame.
++    static INCOMING: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
++    /// Exports that went through Save As: where the app wrote each, and where it went.
++    static SAVED: RefCell<Vec<(PathBuf, Saved)>> = const { RefCell::new(Vec::new()) };
++    /// The paintings in Files, for the Gallery.
++    static LISTED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
++    /// The name Save As suggests: the last painting opened or saved.
++    static NAME: RefCell<String> = RefCell::new("Untitled".into());
++}
++
++fn repaint() {
++    CTX.with(|c| c.get().map(egui::Context::request_repaint));
++}
++
++/// The desktop's file dialogs (the iOS build's shape: rfd-shim's).
++pub mod rfd {
++    use std::path::{Path, PathBuf};
++
++    pub struct FileDialog {
++        types: Vec<String>,
++    }
++
++    impl FileDialog {
++        pub fn new() -> Self {
++            Self { types: Vec::new() }
++        }
++        pub fn add_filter(mut self, _name: &str, extensions: &[&str]) -> Self {
++            self.types.extend(extensions.iter().map(|e| e.to_ascii_lowercase()));
++            self
++        }
++        /// Asks Playground's Open (unless it is up already) and gives nothing now: the file comes through
++        /// [`poll_pick`].
++        pub fn pick_file(self) -> Option<PathBuf> {
++            super::ask_open(&self.types);
++            None
++        }
++        /// A path in /ProCraft/Saving, named after the last painting, with the first type's extension. What the app
++        /// writes there goes to Playground's Save As after the frame.
++        pub fn save_file(self) -> Option<PathBuf> {
++            let name = super::NAME.with_borrow(Clone::clone);
++            let file = match self.types.first() {
++                Some(ext) => format!("{name}.{ext}"),
++                None => name,
++            };
++            Some(Path::new(super::SAVING).join(file))
++        }
++    }
++
++    /// An open's state (rfd-shim's).
++    pub enum PickPoll {
++        NoRequest,
++        Waiting,
++        Picked(PathBuf),
++        Cancelled(Option<&'static str>),
++    }
++
++    /// Whether the file asked for is in memory yet. Call once per frame after `pick_file`.
++    pub fn poll_pick() -> PickPoll {
++        match super::PICK.replace(super::Pick::Idle) {
++            super::Pick::Idle => PickPoll::NoRequest,
++            super::Pick::Waiting => {
++                super::PICK.set(super::Pick::Waiting);
++                PickPoll::Waiting
++            }
++            super::Pick::Done(Some(path)) => PickPoll::Picked(path),
++            super::Pick::Done(None) => PickPoll::Cancelled(None),
++        }
++    }
++}
++
++/// A pen's pressure on the canvas now (index.html keeps it while a pen is down), for `latest_touch_force`.
++pub fn pen_pressure() -> Option<f32> {
++    get(&js_sys::global(), "procraftPenPressure").as_f64().map(|p| (p as f32).clamp(0.0, 1.0))
++}
++
++fn get(o: &JsValue, k: &str) -> JsValue {
++    js_sys::Reflect::get(o, &k.into()).unwrap_or(JsValue::UNDEFINED)
++}
++
++/// `playgroundFiles[method](...args)`; None when the page has none or it threw.
++fn call(method: &str, args: &[JsValue]) -> Option<JsValue> {
++    let api = Some(get(&js_sys::global(), "playgroundFiles")).filter(JsValue::is_object)?;
++    let f = get(&api, method).dyn_into::<js_sys::Function>().ok()?;
++    f.apply(&api, &args.iter().collect::<js_sys::Array>()).ok()
++}
++
++async fn wait(v: Option<JsValue>) -> Option<JsValue> {
++    let promise = v?.dyn_into::<js_sys::Promise>().ok()?;
++    wasm_bindgen_futures::JsFuture::from(promise).await.ok().filter(|v| !v.is_null() && !v.is_undefined())
++}
++
++fn options(fields: &[(&str, JsValue)]) -> JsValue {
++    let o = js_sys::Object::new();
++    for (k, v) in fields {
++        let _ = js_sys::Reflect::set(&o, &(*k).into(), v);
++    }
++    o.into()
++}
++
++fn types(types: &[String]) -> JsValue {
++    types.iter().map(|t| JsValue::from(t.as_str())).collect::<js_sys::Array>().into()
++}
++
++fn bytes(b: &[u8]) -> JsValue {
++    js_sys::Uint8Array::from(b).into()
++}
++
++/// The `path` of a file Playground gives (`browser:/a/b`), as a path here (`/a/b`).
++fn path_in(o: &JsValue) -> Option<PathBuf> {
++    get(o, "path").as_string().and_then(|p| p.strip_prefix("browser:").map(PathBuf::from))
++}
++
++fn in_files(path: &Path) -> JsValue {
++    format!("browser:{}", path.display()).into()
++}
++
++/// A painting's name, for the next Save As to suggest.
++fn remember_name(path: &Path) {
++    let painting = matches!(kind(path), Some(PendingOpen::Project | PendingOpen::Psd | PendingOpen::Image));
++    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()).filter(|_| painting) {
++        NAME.set(stem.to_string());
++    }
++}
++
++/// A file from Playground (`{ path, name, bytes }`) into memory at its path in Files; one from the computer goes to
++/// /ProCraft/Opened.
++fn bring_in(file: &JsValue) -> Option<PathBuf> {
++    let name = get(file, "name").as_string()?;
++    let path = match path_in(file) {
++        Some(path) => path,
++        None => Path::new(OPENED).join(Path::new(&name).file_name()?),
++    };
++    fs::put(&path, js_sys::Uint8Array::new(&get(file, "bytes")).to_vec());
++    remember_name(&path);
++    Some(path)
++}
++
++/// Playground's Open, for [`rfd::FileDialog::pick_file`].
++fn ask_open(kinds: &[String]) {
++    if PICK.with_borrow(|p| matches!(p, Pick::Waiting)) {
++        return;
++    }
++    PICK.set(Pick::Waiting);
++    let asked = call("open", &[options(&[("types", types(kinds))])]);
++    wasm_bindgen_futures::spawn_local(async move {
++        let file = wait(asked).await.and_then(|list| js_sys::Array::from(&list).iter().next());
++        PICK.set(Pick::Done(file.as_ref().and_then(bring_in)));
++        repaint();
++    });
++}
++
++/// What an Open… of the file's type does with it ("Open in ProCraft", a drop).
++fn kind(path: &Path) -> Option<PendingOpen> {
++    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
++    Some(match ext.as_str() {
++        "procraft" => PendingOpen::Project,
++        "psd" => PendingOpen::Psd,
++        "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "tif" | "tiff" => PendingOpen::Image,
++        "pcpalette" | "gpl" => PendingOpen::Palette,
++        "ttf" | "otf" => PendingOpen::Font,
++        "pcbrush" | "abr" | "brush" | "brushset" | "kpp" | "bundle" | "sut" | "gbr" => PendingOpen::Brushes,
++        _ => return None,
++    })
++}
++
++fn opened(file: JsValue) {
++    if let Some(path) = bring_in(&file) {
++        INCOMING.with_borrow_mut(|o| o.push(path));
++        repaint();
++    }
++}
++
++/// An export the app wrote to /ProCraft/Saving: Playground's Save As, then into Files where it was put.
++fn save_as(written: PathBuf, data: Vec<u8>) {
++    let name = written.file_name().and_then(|n| n.to_str()).unwrap_or("Untitled").to_string();
++    let ext = written.extension().and_then(|e| e.to_str()).map(str::to_string);
++    let asked = call(
++        "saveAs",
++        &[options(&[("name", name.as_str().into()), ("types", types(ext.as_slice())), ("bytes", bytes(&data))])],
++    );
++    wasm_bindgen_futures::spawn_local(async move {
++        let answer = wait(asked).await;
++        let saved = match answer.as_ref().and_then(path_in) {
++            Some(to) => {
++                call("write", &[in_files(&to), bytes(&data)]);
++                fs::put(&to, data);
++                remember_name(&to);
++                Saved::InFiles(to)
++            }
++            None if answer.is_some() => Saved::Downloaded,
++            None => Saved::Cancelled,
++        };
++        SAVED.with_borrow_mut(|s| s.push((written, saved)));
++        repaint();
++    });
++}
++
++/// The Gallery's paintings: the `.procraft` files in Files (the first few the Gallery can show), brought into memory.
++fn list_paintings() {
++    wasm_bindgen_futures::spawn_local(async {
++        let Some(list) = wait(call("files", &["browser:/".into()])).await else { return };
++        let found: Vec<String> = js_sys::Array::from(&list).iter().filter_map(|p| p.as_string()).collect();
++        for p in found.into_iter().filter(|p| p.to_ascii_lowercase().ends_with(".procraft")).take(MAX_RECENT) {
++            let Some(path) = p.strip_prefix("browser:").map(PathBuf::from) else { continue };
++            if fs::metadata(&path).is_err() {
++                let Some(data) = wait(call("read", &[p.as_str().into()])).await else { continue };
++                fs::put(&path, js_sys::Uint8Array::new(&data).to_vec());
++            }
++            LISTED.with_borrow_mut(|l| l.push(path));
++        }
++        repaint();
++    });
++}
++
++/// The page's app: the desktop's, then what it asked of the page.
++struct Web {
++    app: ProCraftApp,
++    gallery_open: bool,
++}
++
++impl Web {
++    /// After the app's frame: files that came in, saves that landed, the Gallery's list, and what the app wrote.
++    fn after(&mut self, ctx: &egui::Context) {
++        let app = &mut self.app;
++        for path in INCOMING.take() {
++            match kind(&path) {
++                Some(kind) => app.open_picked(kind, path),
++                None => app.status = format!("ProCraft can't open {}.", path.display()),
++            }
++            ctx.request_repaint();
++        }
++        for (written, saved) in SAVED.take() {
++            let name = written.file_name().unwrap_or_default().to_string_lossy().to_string();
++            let written = written.to_string_lossy().to_string();
++            match saved {
++                Saved::InFiles(to) => {
++                    let to = to.to_string_lossy().to_string();
++                    app.recent.iter_mut().filter(|r| **r == written).for_each(|r| *r = to.clone());
++                    app.status = format!("Saved {to}");
++                }
++                Saved::Downloaded => app.status = format!("Downloaded {name}"),
++                Saved::Cancelled => app.status = format!("{name} not saved."),
++            }
++            // A project saved to Files is in the Gallery at its place there; one that wasn't isn't anywhere.
++            app.recent.retain(|r| *r != written);
++            app.gallery_keys.clear();
++        }
++        if app.gallery_open && !self.gallery_open {
++            list_paintings();
++        }
++        self.gallery_open = app.gallery_open;
++        for path in LISTED.take() {
++            let path = path.to_string_lossy().to_string();
++            if app.recent.len() < MAX_RECENT && !app.recent.contains(&path) {
++                app.recent.push(path);
++            }
++        }
++        for path in fs::changes() {
++            if path.starts_with(OWN) || fs::metadata(&path).map_or(true, |m| !m.is_file()) {
++                continue;
++            }
++            if path.starts_with(SAVING) {
++                if let Some(data) = fs::take(&path) {
++                    save_as(path, data);
++                }
++            } else if let Ok(data) = fs::read(&path) {
++                call("write", &[in_files(&path), bytes(&data)]);
++            }
++        }
++    }
++}
++
++impl eframe::App for Web {
++    /// A dropped file is only a name on the web: once its bytes are in memory (at /ProCraft/Opened/<name>), the app
++    /// opens it as "Open in ProCraft" does.
++    fn raw_input_hook(&mut self, _: &egui::Context, raw_input: &mut egui::RawInput) {
++        for f in std::mem::take(&mut raw_input.dropped_files) {
++            wasm_bindgen_futures::spawn_local(async move {
++                if let (Ok(data), Some(name)) = (f.bytes_async().await, f.path().file_name()) {
++                    let path = Path::new(OPENED).join(name);
++                    fs::put(&path, data);
++                    remember_name(&path);
++                    INCOMING.with_borrow_mut(|o| o.push(path));
++                    repaint();
++                }
++            });
++        }
++    }
++
++    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
++        eframe::App::ui(&mut self.app, ui, frame);
++        self.after(&ui.ctx().clone());
++    }
++
++    fn save(&mut self, storage: &mut dyn eframe::Storage) {
++        eframe::App::save(&mut self.app, storage);
++    }
++}
++
++/// `run` on the web: the app on the page's #procraft_canvas, and Playground's "Open in ProCraft".
++pub fn start() {
++    call("onOpen", &[Closure::<dyn Fn(JsValue)>::new(opened).into_js_value()]);
++    wasm_bindgen_futures::spawn_local(async {
++        let document = web_sys::window().and_then(|w| w.document()).expect("no document");
++        let canvas = document
++            .get_element_by_id("procraft_canvas")
++            .and_then(|c| c.dyn_into::<web_sys::HtmlCanvasElement>().ok())
++            .expect("no #procraft_canvas");
++        let started = eframe::WebRunner::new()
++            .start(
++                canvas,
++                eframe::WebOptions::default(),
++                Box::new(|cc| {
++                    CTX.with(|c| c.set(cc.egui_ctx.clone()).ok());
++                    Ok(Box::new(Web { app: ProCraftApp::new(cc), gallery_open: false }))
++                }),
++            )
++            .await;
++        if let Some(loading) = document.get_element_by_id("procraft_loading") {
++            match started {
++                Ok(()) => loading.remove(),
++                Err(e) => loading.set_text_content(Some(&format!("ProCraft could not start: {e:?}"))),
++            }
++        }
++    });
++}
+diff --git a/crates/engine/src/playground.rs b/crates/engine/src/playground.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/engine/src/playground.rs
+@@ -0,0 +1,380 @@
++// SPDX-License-Identifier: MIT
++//! ProCraft in the browser, for Playground (patches/procreate.yaml in github.com/daijro/openplayground).
++//!
++//! wasm32-unknown-unknown has no clock and no files: `Instant::now` panics there, and every file call fails, the
++//! `image` crate's own `open` and `save_buffer` included. The modules that use them take `std` (and `image`) from here
++//! instead, through one `#[cfg(target_arch = "wasm32")] use …::playground::…;` line at each one's end (a local name
++//! shadows the crate's in that module; everything else in it still comes from the real one):
++//!   std::time  web-time's clock (its Instant a day on, so the app can step back from `now`);
++//!   std::fs    an in-memory file system (paintings, exports, brushes, palettes, settings, the recovery snapshot), each
++//!              write noted for the page to mirror into Files (apps/procraft/src/web.rs);
++//!   std::env   `HOME` is `/home` (settings live in memory, so every page starts afresh); nothing else is set;
++//!   image      `open`, `ImageReader::open` and `save_buffer` through those files.
++
++// Not every part of std's API that is here gets used.
++#![allow(dead_code)]
++
++pub mod std {
++    pub use ::std::*;
++
++    pub mod time {
++        use ::std::ops::{Add, AddAssign, Sub, SubAssign};
++        pub use web_time::*;
++
++        /// web-time's Instant, a day on from the page's start: the app sets clocks in the past
++        /// (`Instant::now() - PREVIEW_MIN_DT`), which web-time's clock, 0 when the page opened, cannot go below.
++        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
++        pub struct Instant(web_time::Instant);
++
++        impl Instant {
++            pub fn now() -> Self {
++                Self(web_time::Instant::now() + Duration::from_secs(86_400))
++            }
++            pub fn elapsed(&self) -> Duration {
++                Self::now().saturating_duration_since(*self)
++            }
++            pub fn duration_since(&self, earlier: Self) -> Duration {
++                self.0.duration_since(earlier.0)
++            }
++            pub fn saturating_duration_since(&self, earlier: Self) -> Duration {
++                self.0.saturating_duration_since(earlier.0)
++            }
++            pub fn checked_duration_since(&self, earlier: Self) -> Option<Duration> {
++                self.0.checked_duration_since(earlier.0)
++            }
++            pub fn checked_add(&self, d: Duration) -> Option<Self> {
++                self.0.checked_add(d).map(Self)
++            }
++            pub fn checked_sub(&self, d: Duration) -> Option<Self> {
++                self.0.checked_sub(d).map(Self)
++            }
++        }
++        impl Add<Duration> for Instant {
++            type Output = Self;
++            fn add(self, d: Duration) -> Self {
++                Self(self.0 + d)
++            }
++        }
++        impl Sub<Duration> for Instant {
++            type Output = Self;
++            fn sub(self, d: Duration) -> Self {
++                Self(self.0 - d)
++            }
++        }
++        impl Sub for Instant {
++            type Output = Duration;
++            fn sub(self, earlier: Self) -> Duration {
++                self.saturating_duration_since(earlier)
++            }
++        }
++        impl AddAssign<Duration> for Instant {
++            fn add_assign(&mut self, d: Duration) {
++                self.0 += d;
++            }
++        }
++        impl SubAssign<Duration> for Instant {
++            fn sub_assign(&mut self, d: Duration) {
++                self.0 -= d;
++            }
++        }
++    }
++
++    pub mod env {
++        pub use ::std::env::*;
++        use ::std::ffi::{OsStr, OsString};
++
++        /// `HOME` is `/home`: settings and the recovery snapshot go to the in-memory files. Nothing else is set.
++        pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
++            (key.as_ref() == "HOME").then(|| OsString::from("/home"))
++        }
++
++        pub fn var<K: AsRef<OsStr>>(key: K) -> Result<String, VarError> {
++            var_os(key).and_then(|v| v.into_string().ok()).ok_or(VarError::NotPresent)
++        }
++    }
++
++    pub mod fs {
++        pub use ::std::fs::*;
++        use ::std::cell::RefCell;
++        use ::std::collections::{BTreeMap, BTreeSet};
++        use ::std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
++        use ::std::path::{Component, Path, PathBuf};
++
++        enum Entry {
++            Dir,
++            File(Vec<u8>, web_time::SystemTime),
++        }
++
++        #[derive(Default)]
++        struct Tree {
++            entries: BTreeMap<PathBuf, Entry>,
++            /// Paths written, created or removed since the last [`changes`].
++            changed: BTreeSet<PathBuf>,
++        }
++
++        thread_local! {
++            static TREE: RefCell<Tree> = RefCell::default();
++        }
++
++        fn with<T>(f: impl FnOnce(&mut Tree) -> T) -> T {
++            TREE.with(|t| f(&mut t.borrow_mut()))
++        }
++
++        /// `/a/./b/../c` -> `/a/c`: one spelling per file (relative paths start at `/`).
++        pub fn key(p: &Path) -> PathBuf {
++            let mut out = PathBuf::from("/");
++            for c in p.components() {
++                match c {
++                    Component::ParentDir => {
++                        out.pop();
++                    }
++                    Component::Normal(n) => out.push(n),
++                    _ => {}
++                }
++            }
++            out
++        }
++
++        fn missing(p: &Path) -> io::Error {
++            io::Error::new(io::ErrorKind::NotFound, format!("{} does not exist", p.display()))
++        }
++
++        impl Tree {
++            fn mark(&mut self, p: PathBuf) {
++                self.changed.insert(p);
++            }
++            fn parents(&mut self, p: &Path) {
++                for dir in p.ancestors().skip(1) {
++                    self.entries.entry(dir.to_path_buf()).or_insert(Entry::Dir);
++                }
++            }
++            fn put(&mut self, p: PathBuf, bytes: Vec<u8>) {
++                self.parents(&p);
++                self.entries.insert(p, Entry::File(bytes, web_time::SystemTime::now()));
++            }
++        }
++
++        /// Stores a file without noting a change (files the page brings in from Files or a drop).
++        pub fn put(p: &Path, bytes: Vec<u8>) {
++            with(|t| t.put(key(p), bytes));
++        }
++
++        /// Removes a file without noting a change, giving back what it held (an export on its way to Save As).
++        pub fn take(p: &Path) -> Option<Vec<u8>> {
++            with(|t| match t.entries.remove(&key(p)) {
++                Some(Entry::File(bytes, _)) => Some(bytes),
++                _ => None,
++            })
++        }
++
++        /// The paths changed since the last call: each now holds what Files should hold, or is gone.
++        pub fn changes() -> Vec<PathBuf> {
++            with(|t| ::std::mem::take(&mut t.changed).into_iter().collect())
++        }
++
++        pub fn exists<P: AsRef<Path>>(p: P) -> io::Result<bool> {
++            Ok(metadata(p).is_ok())
++        }
++
++        pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(p: P, bytes: C) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                t.put(p.clone(), bytes.as_ref().to_vec());
++                t.mark(p);
++            });
++            Ok(())
++        }
++
++        pub fn read<P: AsRef<Path>>(p: P) -> io::Result<Vec<u8>> {
++            TREE.with(|t| match t.borrow().entries.get(&key(p.as_ref())) {
++                Some(Entry::File(bytes, _)) => Ok(bytes.clone()),
++                _ => Err(missing(p.as_ref())),
++            })
++        }
++
++        pub fn read_to_string<P: AsRef<Path>>(p: P) -> io::Result<String> {
++            String::from_utf8(read(p)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
++        }
++
++        pub fn create_dir_all<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| {
++                if !t.entries.contains_key(&p) {
++                    t.parents(&p);
++                    t.entries.insert(p.clone(), Entry::Dir);
++                    t.mark(p);
++                }
++            });
++            Ok(())
++        }
++
++        pub fn remove_file<P: AsRef<Path>>(p: P) -> io::Result<()> {
++            let p = key(p.as_ref());
++            with(|t| match t.entries.get(&p) {
++                Some(Entry::File(..)) => {
++                    t.entries.remove(&p);
++                    t.mark(p);
++                    Ok(())
++                }
++                _ => Err(missing(&p)),
++            })
++        }
++
++        pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
++            let (from, to) = (key(from.as_ref()), key(to.as_ref()));
++            let bytes = read(&from)?;
++            with(|t| {
++                t.entries.remove(&from);
++                t.mark(from);
++                t.put(to.clone(), bytes);
++                t.mark(to);
++            });
++            Ok(())
++        }
++
++        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++        pub struct FileType(bool);
++        impl FileType {
++            pub fn is_file(&self) -> bool {
++                self.0
++            }
++            pub fn is_dir(&self) -> bool {
++                !self.0
++            }
++            pub fn is_symlink(&self) -> bool {
++                false
++            }
++        }
++
++        #[derive(Clone, Debug)]
++        pub struct Metadata(Option<(u64, web_time::SystemTime)>);
++        impl Metadata {
++            pub fn len(&self) -> u64 {
++                self.0.map_or(0, |(n, _)| n)
++            }
++            pub fn is_file(&self) -> bool {
++                self.0.is_some()
++            }
++            pub fn is_dir(&self) -> bool {
++                self.0.is_none()
++            }
++            pub fn file_type(&self) -> FileType {
++                FileType(self.is_file())
++            }
++            pub fn modified(&self) -> io::Result<web_time::SystemTime> {
++                Ok(self.0.map_or(web_time::SystemTime::UNIX_EPOCH, |(_, t)| t))
++            }
++        }
++
++        pub fn metadata<P: AsRef<Path>>(p: P) -> io::Result<Metadata> {
++            TREE.with(|t| match t.borrow().entries.get(&key(p.as_ref())) {
++                Some(Entry::File(bytes, at)) => Ok(Metadata(Some((bytes.len() as u64, *at)))),
++                Some(Entry::Dir) => Ok(Metadata(None)),
++                None => Err(missing(p.as_ref())),
++            })
++        }
++
++        /// A file's bytes, read whole when it opens; one created to write is stored when flushed or dropped.
++        pub struct File {
++            data: Cursor<Vec<u8>>,
++            /// Where written bytes go, for a file created to write.
++            to: Option<PathBuf>,
++            dirty: bool,
++        }
++
++        impl File {
++            pub fn open<P: AsRef<Path>>(p: P) -> io::Result<File> {
++                Ok(File { data: Cursor::new(read(p)?), to: None, dirty: false })
++            }
++            pub fn create<P: AsRef<Path>>(p: P) -> io::Result<File> {
++                let p = key(p.as_ref());
++                write(&p, [])?;
++                Ok(File { data: Cursor::new(Vec::new()), to: Some(p), dirty: false })
++            }
++            pub fn metadata(&self) -> io::Result<Metadata> {
++                Ok(Metadata(Some((self.data.get_ref().len() as u64, web_time::SystemTime::now()))))
++            }
++            /// The bytes are stored when the file is flushed or dropped.
++            pub fn sync_all(&self) -> io::Result<()> {
++                Ok(())
++            }
++            fn store(&mut self) {
++                if let (true, Some(to)) = (self.dirty, &self.to) {
++                    let _ = write(to, self.data.get_ref());
++                    self.dirty = false;
++                }
++            }
++        }
++
++        impl Read for File {
++            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++                self.data.read(buf)
++            }
++        }
++
++        impl Seek for File {
++            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
++                self.data.seek(pos)
++            }
++        }
++
++        impl Write for File {
++            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++                if self.to.is_none() {
++                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the file is open to read"));
++                }
++                self.dirty = true;
++                self.data.write(buf)
++            }
++            fn flush(&mut self) -> io::Result<()> {
++                self.store();
++                Ok(())
++            }
++        }
++
++        impl Drop for File {
++            fn drop(&mut self) {
++                self.store();
++            }
++        }
++    }
++}
++
++/// The `image` crate, with what reads or writes a path going through the in-memory files above.
++pub mod image {
++    use super::std::fs;
++    pub use ::image::*;
++    use ::std::io::Cursor;
++    use ::std::path::Path;
++
++    /// `image::open`: the format from the extension, as image's own.
++    pub fn open<P: AsRef<Path>>(p: P) -> ImageResult<DynamicImage> {
++        ImageReader::open(p)?.decode()
++    }
++
++    /// `image::save_buffer`: the format from the extension, as image's own.
++    pub fn save_buffer<P: AsRef<Path>>(
++        p: P,
++        buf: &[u8],
++        width: u32,
++        height: u32,
++        color: impl Into<ExtendedColorType>,
++    ) -> ImageResult<()> {
++        let mut out = Cursor::new(Vec::new());
++        write_buffer_with_format(&mut out, buf, width, height, color, ImageFormat::from_path(p.as_ref())?)?;
++        fs::write(p, out.into_inner())?;
++        Ok(())
++    }
++
++    /// `ImageReader::open`, giving image's own reader over the file's bytes.
++    pub struct ImageReader;
++    impl ImageReader {
++        pub fn open<P: AsRef<Path>>(p: P) -> ::std::io::Result<::image::ImageReader<Cursor<Vec<u8>>>> {
++            let mut reader = ::image::ImageReader::new(Cursor::new(fs::read(p.as_ref())?));
++            if let Ok(format) = ImageFormat::from_path(p) {
++                reader.set_format(format);
++            }
++            Ok(reader)
++        }
++    }
++}
+diff --git a/index.html b/index.html
+new file mode 100644
+--- /dev/null
++++ b/index.html
+@@ -0,0 +1,30 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
++  <title>ProCraft</title>
++  <!-- ProCraft in the browser, for Playground (patches/procreate.yaml in github.com/daijro/openplayground). -->
++  <link data-trunk rel="rust" href="apps/procraft/Cargo.toml" data-bin="procraft" data-wasm-opt="0" />
++  <link data-trunk rel="icon" href="assets/icon-256.png" />
++  <style>
++    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #f4eee4; }
++    #procraft_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
++    #procraft_loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
++      color: #555; font: 14px system-ui, sans-serif; pointer-events: none; }
++  </style>
++  <script>
++    // A pen's pressure while it is down, for the brushes (apps/procraft/src/web.rs): egui hands touch force on (Apple
++    // Pencil in Safari) but not a pen's PointerEvent.pressure.
++    for (const type of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel']) {
++      addEventListener(type, (e) => {
++        globalThis.procraftPenPressure = e.pointerType === 'pen' && e.buttons ? e.pressure : undefined
++      }, { capture: true, passive: true })
++    }
++  </script>
++</head>
++<body>
++  <canvas id="procraft_canvas"></canvas>
++  <div id="procraft_loading">Loading ProCraft&hellip;</div>
++</body>
++</html>
