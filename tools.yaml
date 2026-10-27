@@ -687,7 +687,7 @@ groups:
         accent: "#E8E000"
         base: "#37350A"
 
-  - name: Others
+  - name: Other
     tools:
       - slug: google-earth
         name: EarthCraft
