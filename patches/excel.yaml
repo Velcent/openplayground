@@ -7,36 +7,6 @@
     let mut app = app;
     let dark = web_sys::window().and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten()).is_some_and(|m| m.matches());
     let _ = app.run("view.darkMode", serde_json::json!({"on": dark}));
-# Editing a cell must not panic in the browser build.
-# What it's for: every edit goes through cmd::commit, which starts a profiling timer with
-#   std::time::Instant::now() even when profiling is off; std has no clock on wasm32-unknown-unknown, so the
-#   first cell edit panicked ("time not implemented on this platform") and froze the app.
-# How: on wasm32 the timer is a stub whose elapsed() is zero (it is only printed under GRIDCRAFT_PROFILE).
-# Verify: type in a cell in the browser: no panic in the console; the e2e Excel test edits cells.
-# If upstream changes: delete this once every channel's commit avoids Instant::now on wasm (newer head
-#   already skips it with cfg!(wasm32), where this is a harmless no-op: the stub is Copy and only elapsed()
-#   is used; a web-time Instant would do too).
-- file: crates/engine/src/cmd/mod.rs
-  find: 'std::time::Instant::now\(\)'
-  replace: |-
-    {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                std::time::Instant::now()
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                #[derive(Clone, Copy)]
-                struct NoClock;
-                impl NoClock {
-                    fn elapsed(&self) -> std::time::Duration {
-                        std::time::Duration::ZERO
-                    }
-                }
-                NoClock
-            }
-        }
-
 # ══ Browser storage ══════════════════════════════════════════════════════════════════════════════════════
 # Rules 1–7 connect GridCraft's browser build to openplayground's file storage. The site's shell
 # (shell/files.js in github.com/daijro/openplayground) gives every app page `globalThis.playgroundFiles`:
@@ -59,7 +29,7 @@
 #   `file.saveAs {path}` on the control channel (rule 6).
 # Verify: rule 2 compiles and uses it.
 # If upstream changes: put it on whatever struct carries the web services (open_async, download, inbox).
-- file: crates/ui-egui/src/lib.rs
+- file: crates/ui-egui/src/**/*.rs
   find: 'pub inbox: Option<Inbox>,'
   replace: |-
     $&
@@ -78,7 +48,7 @@
 # Verify: new workbook → type in a cell → Ctrl+S → the Keep/Download dialog; Keep → name → Save; edit,
 #   Ctrl+S → no dialog, and the file's time in Files changes.
 # If upstream changes: anchor on the web build's handling of the "saveAs" dialog request.
-- file: crates/ui-egui/src/lib.rs
+- file: crates/ui-egui/src/**/*.rs
   find: '\} else if (?:let Some\(dl\) = &self\.services\.download|self\.services\.download\.is_some\(\))'
   replace: |-
     } else if let Some(ask) = &self.services.save_as_async
@@ -100,7 +70,7 @@
 # Verify: Open a stored workbook from the explorer, edit, Ctrl+S: no dialog, and the stored file changes.
 #   Open the same one again (Ctrl+O, or "Open in Excel" from Files): it switches to the open tab.
 # If upstream changes: anchor on where inbox files are opened.
-- file: crates/ui-egui/src/lib.rs
+- file: crates/ui-egui/src/**/*.rs
   find: '(self(?:\.session)?)\.run\("file\.open", json!\(\{"name": &?name, "base64": &?b64\}\)\)'
   replace: |-
     $1.run(
@@ -140,13 +110,15 @@
 #   Newer head's now_ms already reads Date.now on wasm (core::date::unix_now_ms); there the hook is only a
 #   preferred override, kept so the bridge compiles on both channels.
 # If upstream changes: once every channel has a real wasm clock, delete this and the bridge's WEB_NOW_MS line.
-- file: crates/ui-egui/src/lib.rs
+- file: crates/ui-egui/src/**/*.rs
   find: '(pub fn now_ms\(\) -> f64 \{\s*)(?:((?:(?!\n\}\n)[\s\S])*?#\[cfg\(target_arch = "wasm32"\)\]\s*\{\s*)(0\.0)|(gridcraft_engine::core::date::unix_now_ms\(\)\.unwrap_or\(0\.0\)))'
   replace: |-
-    /// playground (patches/excel.yaml): the browser clock (`Date.now`), set by the web crate's bridge.
-    pub static WEB_NOW_MS: std::sync::OnceLock<fn() -> f64> = std::sync::OnceLock::new();
+    $1$2crate::WEB_NOW_MS.get().map_or($3$4, |now| now())
 
-    $1$2WEB_NOW_MS.get().map_or($3$4, |now| now())
+# Rule 5b/7: the hook rule 5 reads, at the crate root (now_ms lives in lib.rs or clock.rs, by channel).
+- file: crates/ui-egui/src/lib.rs
+  find: '(?![\s\S])'
+  after: "\n/// playground (patches/excel.yaml): the browser clock (`Date.now`), set by the web crate's bridge.\npub static WEB_NOW_MS: std::sync::OnceLock<fn() -> f64> = std::sync::OnceLock::new();\n"
 
 # Rule 6/7: switch it on at startup.
 # What it's for: the control channel Save As answers come back on, and the bridge (rule 7) installed.
@@ -346,12 +318,12 @@
   after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n\n[target.'cfg(all(not(target_arch = \"wasm32\")))'.dev-dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 # SheetApp::run, which every command goes through: Undo and Redo in the shared workbook go to the session.
 - live: true
-  file: crates/ui-egui/src/lib.rs
-  find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\b[^{]*\{'
+  file: crates/ui-egui/src/**/*.rs
+  find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\s*,\s*id\b[^{]*\bparams\b[^{]*\{'
   after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if let Some(r) = crate::live::undo(self, id, &params) { return r; }"
 # The grid's overlays: the others' selections, active cells and pointers, painted first (under this person's own).
 - live: true
-  file: crates/ui-egui/src/grid.rs
+  file: crates/ui-egui/src/**/*.rs
   find: '\bfn\s+paint_overlays\s*\([^{]*\{'
   after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] crate::live::draw_presence(app, p, geo, sh);"
 # The web entry keeps its runner for the adapter and wraps its app (web/live.rs, a child module so it reaches

@@ -132,9 +132,26 @@ index 0000000..e3f4174
 +use serde::{Deserialize, Serialize};
 +use serde_json::{Map, Value, json};
 +
-+use crate::grid::{Drag, Geo, outline_bands};
++use crate::grid::{Drag, Geo};
 +use crate::{SheetApp, theme};
 +use playground_live::{Live, Presence, presence};
++
++/// The four sides of a `width` wide outline centred on `rect`, cut to `clip` (the grid's own helper moved
++/// between modules across versions, so the adapter keeps a copy).
++fn outline_bands(rect: Rect, width: f32, clip: Rect) -> Vec<Rect> {
++    if !rect.is_finite() || !clip.is_finite() {
++        return Vec::new();
++    }
++    let h = width / 2.0;
++    let clip = clip.expand(width * 2.0);
++    let sides = [
++        Rect::from_min_max(pos2(rect.left() - h, rect.top() - h), pos2(rect.left() + h, rect.bottom() + h)),
++        Rect::from_min_max(pos2(rect.right() - h, rect.top() - h), pos2(rect.right() + h, rect.bottom() + h)),
++        Rect::from_min_max(pos2(rect.left() - h, rect.top() - h), pos2(rect.right() + h, rect.top() + h)),
++        Rect::from_min_max(pos2(rect.left() - h, rect.bottom() - h), pos2(rect.right() + h, rect.bottom() + h)),
++    ];
++    sides.into_iter().map(|s| s.intersect(clip)).filter(|s| s.is_finite() && s.width() > 0.0 && s.height() > 0.0).collect()
++}
 +
 +/// Sheet fields that are this person's view.
 +const VIEW: [&str; 7] = ["zoom", "view", "view_active", "view_top_left", "show_gridlines", "show_headings", "show_formulas"];
