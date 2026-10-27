@@ -128,7 +128,7 @@ index 0000000..5c04968
 +use serde_json::{Map, Value, json};
 +
 +use crate::FilmcraftApp;
-+use crate::panels::timeline::{Drag, Layout, Row, preview_drag};
++use crate::panels::timeline::{Drag, Layout, Row, preview_drag_live};
 +use crate::theme::Tokens;
 +
 +thread_local! {
@@ -257,11 +257,11 @@ index 0000000..5c04968
 +    }
 +}
 +
-+/// The clips a drag under way has elsewhere so far ([`preview_drag`], what this person's Timeline shows), each as
++/// The clips a drag under way has elsewhere so far ([`preview_drag_live`], what this person's Timeline shows), each as
 +/// `[track, start, duration]` (ticks), in clip order; and a transition dragged by its middle or an end.
 +fn dragged(app: &FilmcraftApp, seq: &Sequence, state: &mut Map<String, Value>) {
 +    let (mut moved, mut edited) = (HashMap::new(), HashMap::new());
-+    preview_drag(app, seq, &mut moved, &mut edited);
++    preview_drag_live(app, seq, &mut moved, &mut edited);
 +    let mut ghosts: Vec<_> = moved.into_iter().filter_map(|(c, (start, len, to))| Some((c, to.or(seq.find_item(c).map(|f| f.0))?, start, len))).collect();
 +    ghosts.sort_by_key(|g| g.0.0);
 +    if !ghosts.is_empty() {
