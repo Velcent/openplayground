@@ -100,15 +100,33 @@ addEventListener(
 )
 
 // The app's .wasm files are stored gzipped (.wasm.gz) to fit the host's 25 MiB file limit: fetch the .gz and
-// unzip it on the fly, so the app's loader still sees a normal application/wasm response. Other .wasm files
-// (the plug-ins in plugins/) are fetched as they are.
+// unzip it on the fly, so the app's loader still sees a normal application/wasm response. One still over the
+// limit is split into parts (.wasm.gz.0, .1, …: tool.parts), fetched together and joined in order first. Other
+// .wasm files (the plug-ins in plugins/) are fetched as they are.
 const fetchOriginal = window.fetch
+const fetchParts = (url, init, parts) =>
+  Promise.all(Array.from({ length: parts }, (_, i) => fetchOriginal(`${url}.${i}`, init))).then((all) => {
+    const failed = all.find((res) => !res.ok)
+    if (failed) return failed
+    const body = new ReadableStream({
+      async start(c) {
+        for (const res of all) {
+          const reader = res.body.getReader()
+          for (let read; !(read = await reader.read()).done; ) c.enqueue(read.value)
+        }
+        c.close()
+      },
+    })
+    return new Response(body, { headers: { 'content-length': String(all.reduce((n, res) => n + Number(res.headers.get('content-length')), 0)) } })
+  })
 window.fetch = (input, init) => {
   const url = new URL(input instanceof Request ? input.url : input, location.href)
-  const total = tool.wasm[url.pathname.split('/').pop()]
+  const name = url.pathname.split('/').pop()
+  const total = tool.wasm[name]
   if (!url.pathname.endsWith('.wasm') || total === undefined) return fetchOriginal(input, init)
   url.pathname += '.gz'
-  return fetchOriginal(url, init).then((res) => {
+  const parts = tool.parts?.[name]
+  return (parts ? fetchParts(url, init, parts) : fetchOriginal(url, init)).then((res) => {
     if (!res.ok) return res
     const ui = progressUI(total, Number(res.headers.get('content-length')))
     // A host that sends Content-Encoding: gzip (Vite's dev server does) has had the browser unzip it already.

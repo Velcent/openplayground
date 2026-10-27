@@ -25,16 +25,22 @@ const patch = (t, dir) => {
   // The icon of the app it's an alternative to, for the shell's "Alternative naming" (shell/apps.js).
   const altIcon = alternativeIcon(t)
   if (altIcon) cpSync(altIcon, join(dir, `alternative-icon${extname(altIcon)}`))
-  // Unzipped size of each .wasm, for the progress bar: a gzip file ends with it (mod 2^32).
+  // Unzipped size of each .wasm, for the progress bar: a gzip file ends with it (mod 2^32), in its last part when
+  // it's split (install, below). And the parts of each split one, for page-prelude.js to join.
   const wasm = {}
+  const parts = {}
   for (const f of readdirSync(dir, { recursive: true })) {
-    if (f.endsWith('.wasm.gz')) wasm[basename(f, '.gz')] = readFileSync(join(dir, f)).readUInt32LE(statSync(join(dir, f)).size - 4)
+    const [, path, part] = f.match(/^(.*\.wasm)\.gz(?:\.(\d+))?$/) ?? []
+    if (!path) continue
+    if (part !== undefined) parts[basename(path)] = Math.max(parts[basename(path)] ?? 0, Number(part) + 1)
+    if (part === undefined || !existsSync(join(dir, `${path}.gz.${Number(part) + 1}`)))
+      wasm[basename(path)] = readFileSync(join(dir, f)).readUInt32LE(statSync(join(dir, f)).size - 4)
   }
   // The injected script: the prelude, then the tool's theme script (tools.yaml `theme:`), sharing `tool`.
   // Our builds of tools whose patches set the theme in the app itself (they follow prefers-color-scheme) skip it.
   const { tag, built } = JSON.parse(readFileSync(join(dir, '.release'), 'utf8'))
   const script = [
-    `const tool = ${JSON.stringify({ name: t.name, accent: t.accent, tag, wasm })}\n`,
+    `const tool = ${JSON.stringify({ name: t.name, accent: t.accent, tag, wasm, parts })}\n`,
     prelude,
     lazyPipelines,
     t.theme && !(built && t.patches && readFileSync(t.patches, 'utf8').includes('prefers-color-scheme')) && readFileSync(t.theme, 'utf8'),
@@ -221,10 +227,15 @@ async function install(t, channel, name) {
       // Prepare the finished build in tmp, then sync it in below.
       const next = join(tmp, 'next')
       for (const f of readdirSync(root)) if (!JUNK.test(f)) cpSync(join(root, f), join(next, f), { recursive: true })
-      // Gzip the .wasm files to fit MAX_FILE; page-prelude.js unzips them in the browser.
+      // Gzip the .wasm files to fit MAX_FILE; page-prelude.js unzips them in the browser. One still over it is
+      // split into parts (.wasm.gz.0, .1, …), which the page joins before unzipping.
+      // ponytail: EffectCraft's service worker (patch, above) precaches the .wasm.gz by name; list the parts there if
+      // its .wasm ever needs splitting.
       for (const f of readdirSync(next, { recursive: true })) {
         if (!f.endsWith('.wasm')) continue
-        writeFileSync(join(next, `${f}.gz`), gzipSync(readFileSync(join(next, f)), { level: 9 }))
+        const gz = gzipSync(readFileSync(join(next, f)), { level: 9 })
+        if (gz.length <= MAX_FILE) writeFileSync(join(next, `${f}.gz`), gz)
+        else for (let i = 0; i * MAX_FILE < gz.length; i++) writeFileSync(join(next, `${f}.gz.${i}`), gz.subarray(i * MAX_FILE, (i + 1) * MAX_FILE))
         rmSync(join(next, f))
       }
       writeFileSync(join(next, '.release'), stamp)
