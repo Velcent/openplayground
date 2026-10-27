@@ -31,7 +31,7 @@
 #   `file.saveAs {path}` on the control channel (rule 5).
 # Verify: rule 2 compiles and uses it.
 # If upstream changes: put it on whatever struct carries the web services (open_async, download, inbox).
-- file: crates/ui-egui/src/lib.rs
+- file: crates/ui-egui/src/**/*.rs
   find: 'pub inbox: Option<Inbox>,'
   replace: |-
     $&
@@ -49,7 +49,7 @@
 # Verify: Ctrl+S on the sample deck → the Keep/Download dialog; Keep → name → Save; Ctrl+S again → no dialog,
 #   and the file's time in Files changes.
 # If upstream changes: anchor on the web branch of the Save As flow.
-- file: crates/ui-egui/src/lib.rs
+- file: crates/ui-egui/src/**/*.rs
   find: '\} else if let Some\(dl\) = self\.services\.download\.as_mut\(\)'
   replace: |-
     } else if let Some(ask) = self.services.save_as_async.as_mut()
@@ -379,11 +379,11 @@
   find: '(?![\s\S])'
   after: "\n/// Live editing in a Playground session: draws the others' marks on the canvas, under this person's own overlays.\npub static LIVE_PAINT: std::sync::OnceLock<fn(&SlideApp, &egui::Painter, canvas::Xf)> = std::sync::OnceLock::new();\n/// Live editing in a Playground session: lists the session's presentations on File › Home; true when one was chosen.\npub static LIVE_HOME: std::sync::OnceLock<fn(&mut SlideApp, &mut egui::Ui) -> bool> = std::sync::OnceLock::new();\n/// Live editing in a Playground session: marks a slide thumbnail (its image, its slide's index) with the others on it.\npub static LIVE_THUMB: std::sync::OnceLock<fn(&SlideApp, &egui::Ui, egui::Rect, usize)> = std::sync::OnceLock::new();\n"
 - live: true
-  file: crates/ui-egui/src/canvas.rs
+  file: crates/ui-egui/src/**/*.rs
   find: '\bfn\s+overlays\s*\(\s*app\b[^{]*\bpainter\b[^{]*\bxf\b[^{]*\{'
   after: "\n    if let Some(paint) = crate::LIVE_PAINT.get() { paint(app, painter, xf); }"
 - live: true
-  file: crates/ui-egui/src/backstage.rs
+  file: crates/ui-egui/src/**/*.rs
   find: '\bfn\s+home\s*\(\s*app\b[^{]*\bui\b[^{]*\bout\b[^{]*\{'
   after: "\n    if crate::LIVE_HOME.get().is_some_and(|list| list(app, ui)) { out.close = true; }"
 # Each slide thumbnail, in the Slides pane and in the Slide Sorter, gets the others' badges (one per person on that
@@ -391,7 +391,7 @@
 # menu: anchored on that menu's call of `slide_menu(app, ui, <index>)` (a pub fn both share), the index named as there.
 # It also uses the thumbnail image's rect, `img` in both; if upstream renames it, follow it here.
 - live: true
-  file: crates/ui-egui/src/thumbs.rs
+  file: crates/ui-egui/src/**/thumbs.rs
   find: '\bresp\.context_menu\(\s*\|\s*ui\s*\|\s*(?:crate::thumbs::)?slide_menu\(\s*app\s*,\s*ui\s*,\s*(\w+)'
   replace: "if let Some(badges) = crate::LIVE_THUMB.get() { badges(app, ui, img, $1); }\n        $&"
 - live: true
