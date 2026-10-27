@@ -58,7 +58,7 @@ test('"Alternative naming" shows each card under the name and icon of the app it
   assert.equal(await card.locator('.name').innerText(), 'PhotoCraft')
   assert.equal(await card.getByText('Alternative to Photoshop').isVisible(), true)
   // The sections are kinds of work, the same under either naming.
-  const sections = ['IMAGE', 'OFFICE', 'VIDEO', '3D', 'MUSIC']
+  const sections = ['IMAGE', 'OFFICE', 'VIDEO', '3D', 'MUSIC', 'OTHERS']
   assert.deepEqual(await page.locator('section > h2').allInnerTexts(), sections)
   await page.getByRole('switch', { name: 'Alternative naming' }).click()
   assert.deepEqual(await page.locator('section > h2').allInnerTexts(), sections)

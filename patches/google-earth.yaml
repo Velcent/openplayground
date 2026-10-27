@@ -53,7 +53,7 @@
 # tours' system speech, and updates. Native builds see none of this: every rule adds wasm-only lines, or moves a
 # native-only dependency into a native-only table.
 
-# Rules 1-16/79: the dependencies. Tokio (threads, sockets, files), reqwest, Moka, SQLite (the tile cache) and
+# Rules 1-16/81: the dependencies. Tokio (threads, sockets, files), reqwest, Moka, SQLite (the tile cache) and
 # self_update have no browser side: a native-only table opens at the end of each manifest and each one's line moves into
 # it, and rfd's non-Linux table leaves out wasm (a page's dialogs are Playground's). The wasm-only ones go under a target
 # spelling nobody else uses (`all(...)`): the playground crates, wgpu's WebGL2 backend, sys-locale's browser language
@@ -110,7 +110,7 @@
   find: '^([ \t]*)(#\[error\(transparent\)\]\s*SqliteWorker\(#\[from\] tokio_rusqlite::Error\),)'
   replace: "$1#[cfg(not(target_arch = \"wasm32\"))]\n$1$2"
 
-# Rules 17-46/79: the modules that use the clock, files, HOME, the temp folder, the process id or a thread take `std`
+# Rules 17-46/81: the modules that use the clock, files, HOME, the temp folder, the process id or a thread take `std`
 # from crates/earthcraft-playground on wasm (see the top). Found with: every non-test module that names Instant,
 # SystemTime, fs::, File::, OpenOptions, thread::, env:: or process::id, except those whose code doesn't run on the web
 # (the workers and stand-ins below, mbtiles.rs, profiling.rs), updater.rs (its env:: calls don't panic) and fonts.rs
@@ -209,7 +209,7 @@
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: the clock (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] use earthcraft_playground::std;\n"
 
-# Rules 47-66/79: the threads that wait for work (the frame coordinator; overlay, live-layer and aircraft preparation;
+# Rules 47-66/81: the threads that wait for work (the frame coordinator; overlay, live-layer and aircraft preparation;
 # the boundary merge) can't wait on a page's one thread. Each type is native-only, and its web.rs (see the top) takes its
 # name on wasm with the same calls. If upstream changes one of these types' calls, change its web.rs to match (the build
 # says where); if it renames one, follow.
@@ -274,7 +274,7 @@
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: the merge without its thread (patches/google-earth.yaml).\n#[cfg(target_arch = \"wasm32\")] mod web;\n#[cfg(target_arch = \"wasm32\")] pub use web::BoundaryUpdates;\n"
 
-# Rules 67-70/79: what has no browser side, given a stand-in on wasm (see the top): the imagery disk cache (mbtiles.rs,
+# Rules 67-70/81: what has no browser side, given a stand-in on wasm (see the top): the imagery disk cache (mbtiles.rs,
 # SQLite) and the updater's release check (release.rs, self_update), each module swapped for its web.rs, with the
 # updater's one match on a self_update error native-only; and the decoders' CPU pools (Rayon pools of their own, whose
 # threads a page can't start), whose work runs in place. If upstream renames these, follow.
@@ -291,7 +291,7 @@
   find: '\bpub\(crate\) async fn run<[^{]*\{'
   after: "\n    #[cfg(target_arch = \"wasm32\")] return catch_panic(work);"
 
-# Rules 71-79/79: the page (apps/earthcraft/src/app/web.rs, see the top). main.rs takes eframe and self_update from it,
+# Rules 71-79/81: the page (apps/earthcraft/src/app/web.rs, see the top). main.rs takes eframe and self_update from it,
 # and presentation.rs eframe (for the desktop window's options, unused on the page); the modules with file dialogs take
 # rfd from it, and the Explorer's answers land in explorer/web.rs, which tells it when the sky's row is drawn (both of
 # its image pickers are alike). The aircraft checkbox (Layers, and the Explorer's) is greyed out on the web, saying why
@@ -324,3 +324,15 @@
 - file: apps/earthcraft/src/app/ui/sidebar/layers.rs
   find: 'ui\.checkbox\(&mut self\.show_flights, lg\.text\("layers-flights-toggle"\)\);'
   replace: "#[cfg(not(target_arch = \"wasm32\"))]\n        $&\n        #[cfg(target_arch = \"wasm32\")] crate::app::web::no_flights(ui, lg.text(\"layers-flights-toggle\"));"
+
+# Rules 80-81/81: the globe's raster size. The CPU ray-caster runs on the page's one thread (the desktop spreads it over
+# every core), and its cost is the pixel count: up to 2000 px wide, a 1440p window drew at 11 frames a second while
+# dragging, with half-second freezes whenever the pointer paused (the full-size draw). On the web the raster is at most
+# 560 px wide while the view moves and 1600 px once it settles (egui scales it up to the window); the desktop's limit
+# is kept as it is. If upstream renames raster_size or the limit, follow.
+- file: crates/earthcraft-render/src/view.rs
+  find: 'pub\s+fn\s+raster_size\([^{]*\{'
+  after: "\n    #[cfg(target_arch = \"wasm32\")] let max_width: usize = if idle { 1600 } else { 560 };\n    #[cfg(not(target_arch = \"wasm32\"))] let max_width: usize = MAX_RENDER_WIDTH_PX;"
+- file: crates/earthcraft-render/src/view.rs
+  find: '\.clamp\(MIN_RENDER_WIDTH_PX,\s*MAX_RENDER_WIDTH_PX\)'
+  replace: '.clamp(MIN_RENDER_WIDTH_PX, max_width)'
