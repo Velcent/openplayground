@@ -31,7 +31,7 @@
 #   `file.save {path}` on the control channel (rule 6). open_path_async(path) reads the file into `inbox`.
 # Verify: rules 2 and 5 compile and use them.
 # If upstream changes: put them on whatever struct carries the web services (open_async, download, inbox).
-- file: crates/ui-egui/src/lib.rs
+- file: crates/ui-egui/src/**/*.rs
   find: 'pub inbox: Option<Inbox>,'
   replace: |-
     $&
@@ -56,7 +56,7 @@
 #   dialog, and the file's time in Files changes. File → Export → PDF downloads a .pdf with no dialog.
 # If upstream changes: anchor on whatever handles file.save / file.saveAs in the web build before it
 #   downloads.
-- file: crates/ui-egui/src/lib.rs
+- file: crates/ui-egui/src/**/*.rs
   find: 'if self\.services\.download\.is_some\(\) && matches!\(id, "file\.save"'
   before: |
     // playground (patches/word.yaml): Save / Save As against browser storage, before the download branch.
@@ -95,6 +95,8 @@
     /// playground (patches/word.yaml): where `browser:` paths are written in the browser build. The web
     /// crate's bridge sets it to openplayground's `playgroundFiles.write`; unset, saving errors as upstream.
     pub static WEB_WRITE: std::sync::OnceLock<fn(&str, &[u8]) -> Result<(), String>> = std::sync::OnceLock::new();
+    /// playground (patches/word.yaml): the browser clock (`Date.now`), set by the web crate's bridge (rule 4).
+    pub static WEB_NOW_MS: std::sync::OnceLock<fn() -> f64> = std::sync::OnceLock::new();
 
     $1
         if let Some(write) = WEB_WRITE.get()
@@ -107,20 +109,17 @@
 # Rule 4/9: a working clock in the browser build.
 # What it's for: AutoSave waits for a pause after the last edit, timed with now_ms(), which returns 0.0 in
 #   the browser build, so AutoSave could never fire there. (Status messages time out with it too.)
-# How: the wasm arm returns Date.now() through WEB_NOW_MS, a fn pointer the bridge (rule 7) sets.
+# How: now_ms returns Date.now() through io::WEB_NOW_MS (declared by rule 3), a fn pointer the bridge (rule 7) sets.
 # Verify: with a browser-storage document, type and wait ~3 s: the stored file updates by itself.
 # Newer upstream already has a working monotonic browser clock (web_time); the rule is then redundant but
 #   harmless (the bridge's clock takes over), and can be deleted together with the WEB_NOW_MS line in rule 7.
 # If upstream changes: once the newest release has a real wasm clock, delete this and the WEB_NOW_MS line
 #   in rule 7.
-- file: crates/ui-egui/src/lib.rs
+- file: crates/ui-egui/src/**/*.rs
   find: 'pub fn now_ms\(\) -> f64 \{'
   replace: |-
-    /// playground (patches/word.yaml): the browser clock (`Date.now`), set by the web crate's bridge.
-    pub static WEB_NOW_MS: std::sync::OnceLock<fn() -> f64> = std::sync::OnceLock::new();
-
     $&
-        if let Some(now) = WEB_NOW_MS.get() {
+        if let Some(now) = wordcraft_engine::io::WEB_NOW_MS.get() {
             return now();
         }
 
@@ -134,7 +133,7 @@
 # If upstream changes: anchor on the Recent list's click handler. The anchor is the `file.open {path}` call
 #   open_recent function (named by its signature, since its body calls file.open directly in releases and
 #   through open_file in newer commits); a `browser:` path returns early, the rest runs as upstream.
-- file: crates/ui-egui/src/backstage.rs
+- file: crates/ui-egui/src/**/*.rs
   find: 'fn open_recent\((\w+): &mut WordApp, (\w+): &str\) -> Result<\(\), String> \{'
   replace: |-
     $&
@@ -195,7 +194,7 @@
             }
             let Some(inbox) = services.inbox.clone() else { return };
             let _ = wordcraft_engine::io::WEB_WRITE.set(write);
-            let _ = wordcraft_ui_egui::WEB_NOW_MS.set(js_sys::Date::now);
+            let _ = wordcraft_engine::io::WEB_NOW_MS.set(js_sys::Date::now);
             let (i, c) = (inbox.clone(), ctx.clone());
             services.open_async = Some(Box::new(move |purpose: &str| {
                 open(if purpose == "picture" { super::IMAGE_EXTS } else { super::DOC_EXTS }, i.clone(), c.clone());
@@ -326,7 +325,7 @@
 # Verify: open a stored document, type, File → Export → ODT: the title keeps its dot, and Ctrl+S (or
 #   AutoSave) still writes the edit to the stored file.
 # If upstream changes: anchor on whatever clears dirty after a download; delete once exports no longer do.
-- file: crates/ui-egui/src/lib.rs
+- file: crates/ui-egui/src/**/*.rs
   find: '(if (?:marked_saved|matches!\(id, "file\.save" \| "file\.saveAs"\) && keeps_everything\(&name\))) \{'
   replace: '$1 && self.services.save_as_async.is_none() {'
 
@@ -338,7 +337,7 @@
 #   the Backstage, so the document on screen stays as it is.
 # Verify: open a stored document, type, Ctrl+O, open the same file: the typing is still there.
 # If upstream changes: anchor on the start of drain_inbox's loop; delete if opening an open path becomes a no-op.
-- file: crates/ui-egui/src/lib.rs
+- file: crates/ui-egui/src/**/*.rs
   find: '(for \(name, bytes\) in files \{)(\s*let lower = name\.to_ascii_lowercase\(\);)'
   replace: |-
     $1
