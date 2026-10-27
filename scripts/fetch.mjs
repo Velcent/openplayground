@@ -45,6 +45,10 @@ const patch = (t, dir) => {
     .replace(/<title>.*?<\/title>/, `<title>${t.name}</title>\n  <link rel="icon" href="${icon}">`)
     // The preload would fetch the raw .wasm, which is now .wasm.gz.
     .replace(/<link rel="preload" href="[^"]*\.wasm"[^>]*>/g, '')
+    // A page built for the site root (FireCraft's) loads its own files as "/name.js": the app is served from
+    // its own folder, so point those at it. Only files that are there, so the shell's own paths stay as they are.
+    .replace(/(["'])\/([\w.-]+\.(?:js|wasm))\1/g, (m, q, f) =>
+      existsSync(join(dir, f)) || existsSync(join(dir, `${f}.gz`)) ? `${q}./${f}${q}` : m)
     .replace(/\s*<script id="playground-prelude">[\s\S]*?<\/script>/, '')
     .replace(/\s*<link rel="stylesheet" href="\/shell\/shell\.css">/g, '')
     .replace(/\s*<script type="module" src="\/shell\/app\.js"><\/script>/g, '')

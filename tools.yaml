@@ -130,6 +130,23 @@ groups:
         accent: "#02DA96"
         base: "#062E22"
 
+      - slug: fireworks
+        name: FireCraft
+        alternative: Fireworks
+        blurb: Vector and bitmap screen graphics, symbols, slices and real Fireworks PNGs.
+        # Its own Open dialog and downloads: nothing in it talks to Files yet (its host-page bridge,
+        # docs/WEBOS.md upstream, could).
+        opens: []
+        imports: []
+        repo: aliasfoxkde/FireCraft
+        license: MIT OR Apache-2.0
+        copyright: "Copyright (c) 2026 FireCraft contributors"
+        # Its web build is a release target of its own (trunk --release); Playground serves it as it is.
+        build: false
+        icon: icons/firecraft.svg
+        accent: "#E3D21E"
+        base: "#2B2700"
+
       - slug: mspaint
         name: PaintCraft
         alternative: Microsoft Paint
