@@ -49,16 +49,16 @@
   after: "playground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 # Session::undo and Session::redo: in the shared document they go to the session.
 - live: true
-  file: crates/engine/src/lib.rs
+  file: crates/engine/src/**/*.rs
   find: 'pub\s+fn\s+undo\s*\(\s*&mut\s+self\s*\)[^{]*\{'
   after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if crate::live_playground::undo(self, false) { return Ok(true); }"
 - live: true
-  file: crates/engine/src/lib.rs
+  file: crates/engine/src/**/*.rs
   find: 'pub\s+fn\s+redo\s*\(\s*&mut\s+self\s*\)[^{]*\{'
   after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if crate::live_playground::undo(self, true) { return Ok(true); }"
 # Branches, refused in a native live session, are refused in the shared document too (their id spaces are per file).
 - live: true
-  file: crates/engine/src/*.rs
+  file: crates/engine/src/**/*.rs
   find: 'fn\s+(?:refuse_live|live_client_id)\s*\(\s*(?:&(self)|(s)\s*:\s*&Session)\s*,\s*(\w+)\s*:\s*&str\s*,\s*(\w+)\s*:\s*u64\s*\)[^{]*\{'
   replace: "$&\n        #[cfg(any(target_arch = \"wasm32\", test))] crate::live_playground::refuse_branches($1$2, $3, $4)?;"
 # The Playground drawing (crates/ui-egui/src/live/playground.rs): the others' marks on the canvas, after the document
