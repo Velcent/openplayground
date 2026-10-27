@@ -74,7 +74,7 @@
 - file: crates/ui-studio/Cargo.toml
   find: '(?![\s\S])'
   after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\ntransit-playground = { path = \"../transit-playground\" }\n"
-- file: crates/mix/src/lib.rs
+- file: crates/mix/src/instance.rs
   find: 'let\s+started\s*=\s*std::time::Instant::now\(\);'
   replace: 'let started = { #[cfg(target_arch = "wasm32")] use transit_playground::std; std::time::Instant::now() };'
 - file: crates/plugin-host/src/lib.rs
