@@ -41,10 +41,10 @@
 # long-standing module, and Session::execute's first step: Undo, Redo and History jumps go to the session.
 - live: true
   file: crates/engine/src/lib.rs
-  find: '^pub\s+mod\s+commands;'
+  find: '^pub\s+mod\s+menus;'
   after: "\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))] pub mod playground;"
 - live: true
-  file: crates/engine/src/lib.rs
+  file: crates/engine/src/**/*.rs
   find: 'pub\s+fn\s+execute\s*\([^{]*\{'
   after: "\n        #[cfg(any(target_arch = \"wasm32\", debug_assertions))] if let Some(r) = self.live_execute(id, &params) { return r; }"
 # The playground-live crate (patches/live/kit, copied to the checkout's playground-live/): a dependency of the engine
@@ -89,7 +89,13 @@
 # press inside, and later the box spans the path so far). A `use` in the function shadows the viewer's own
 # selectable_layers there. If layers_at stops calling selectable_layers, put the `use` in whatever
 # function now lists the layers a press can hit.
+# ShapeDrag's fields are private to the module that declares it, so an accessor next to the struct hands the band
+# (kind, centre, size) to viewer_playground.rs. If ShapeDrag is renamed, follow it here and in viewer_playground.rs.
 - live: true
-  file: crates/ui-egui/src/panels/viewer.rs
+  file: crates/ui-egui/src/panels/**/*.rs
+  find: '\bstruct\s+ShapeDrag\b[^{]*\{[^}]*\}'
+  after: "\n#[cfg(any(target_arch = \"wasm32\", debug_assertions))] impl ShapeDrag { pub(crate) fn live_band(&self) -> (&'static str, [f64; 4]) { (self.kind, [self.centre[0], self.centre[1], self.size[0], self.size[1]]) } }"
+- live: true
+  file: crates/ui-egui/src/panels/**/*.rs
   find: '(?:pub(?:\([^)]*\))?\s+)?fn\s+layers_at\b[^{]*\{'
   after: "\n    #[cfg(any(target_arch = \"wasm32\", debug_assertions))] use crate::playground::selectable_layers;"

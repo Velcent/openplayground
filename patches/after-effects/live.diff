@@ -87,7 +87,7 @@ index 0000000..9927650
 +pub(crate) fn band(ctx: &egui::Context, app: &EffectcraftApp, map: &ViewerMap) -> Option<(&'static str, [f64; 4])> {
 +    let Some(Gesture::Create { tool, start }) = ctx.data(|d| d.get_temp(egui::Id::new("viewer-gesture"))) else { return None };
 +    let d = shape_drag(app, tool, start, map.to_comp(ctx.pointer_latest_pos()?), ctx.input(|i| i.modifiers))?;
-+    Some((d.kind, [d.centre[0], d.centre[1], d.size[0], d.size[1]]))
++    Some(d.live_band())
 +}
 diff --git a/crates/ui-egui/src/playground.rs b/crates/ui-egui/src/playground.rs
 new file mode 100644
