@@ -84,7 +84,10 @@ index 0000000..e82d167
 +//! Live editing in a Playground session (web only): new ids nobody else in the session picks, so that people adding
 +//! objects to one document at once give them different ids.
 +
-+use crate::{Document, MAX_NEXT_ID, NodeId};
++use crate::{Document, NodeId};
++
++/// Upstream's limit on the id counter (its `MAX_NEXT_ID`, whose home has moved between releases).
++const MAX_NEXT_ID: u64 = 1 << 62;
 +
 +/// Where [`Document::alloc_id`] takes ids from once set (`playground_live::fresh_id`, from the counter).
 +pub static FRESH_ID: std::sync::OnceLock<fn(&mut u64) -> u64> = std::sync::OnceLock::new();

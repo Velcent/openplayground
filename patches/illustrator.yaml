@@ -37,13 +37,19 @@
 #   its styles.
 # If upstream changes: keep add_web_fonts filling whatever the native scan fills (catalog, PostScript names,
 #   aliases); drop it once the web build lists installed fonts itself.
-- file: crates/text/src/fontdb.rs
+- file: crates/text/src/fontdb{,/db}.rs
   find: '^impl FontDb \{\n'
   before: |
     /// playground (patches/illustrator.yaml): the browser's fonts: `load` (a face's file, by PostScript name)
     /// and `request` (the list), set by the web crate's bridge ([`FontDb::use_web_fonts`]).
     #[cfg(target_arch = "wasm32")]
     static WEB_FONTS: std::sync::OnceLock<(fn(&str), fn())> = std::sync::OnceLock::new();
+
+    /// playground: a name as the font database keys it: lowercase letters and digits only.
+    #[cfg(target_arch = "wasm32")]
+    fn web_norm(s: &str) -> String {
+        s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+    }
 
   after: |2
         /// playground: read the fonts installed on the user's computer through the browser: `load(PostScript
@@ -71,8 +77,8 @@
                 let mut postscript = self.postscript.write().unwrap_or_else(|e| e.into_inner());
                 let mut aliases = self.aliases.write().unwrap_or_else(|e| e.into_inner());
                 for (family, style, ps) in fonts {
-                    postscript.insert(norm(ps), (family.clone(), style.clone()));
-                    aliases.entry(norm(ps)).or_default().push(Alias { family: family.clone(), style: Some(style.clone()), paired: None });
+                    postscript.insert(web_norm(ps), (family.clone(), style.clone()));
+                    aliases.entry(web_norm(ps)).or_default().push(Alias { family: family.clone(), style: Some(style.clone()), paired: None });
                     let entry = catalog.entry(family.to_ascii_lowercase()).or_default();
                     if entry.name.is_empty() {
                         entry.name = family.clone();
@@ -89,20 +95,31 @@
         /// playground: start loading the browser's font for `family` / `style`: that style, else (`any_style`)
         /// the family's closest. Whoever asked gets a stand-in meanwhile.
         #[cfg(target_arch = "wasm32")]
-        fn load_web(&self, family: &str, style: &str, any_style: bool) {
+        pub(super) fn load_web(&self, family: &str, style: &str, any_style: bool) {
             let Some((load, _)) = WEB_FONTS.get() else { return };
             let name = {
                 let catalog = self.read_catalog();
                 let Some(c) = catalog.get(&family.to_ascii_lowercase()) else { return };
-                let (ns, tw, ti) = (norm(style), style_weight(style), style_italic(style));
+                let (ns, tw, ti) = (web_norm(style), style_weight(style), style_italic(style));
                 let off = |f: &&CatalogFace| (f.weight - tw).abs() + if f.italic != ti { 1000.0 } else { 0.0 };
-                let exact = c.faces.iter().find(|f| norm(&f.style) == ns);
+                let exact = c.faces.iter().find(|f| web_norm(&f.style) == ns);
                 let Some(f) = exact.or_else(|| c.faces.iter().filter(|_| any_style).min_by(|a, b| off(a).total_cmp(&off(b)))) else { return };
                 f.path.to_string_lossy().into_owned()
             };
             load(&name);
         }
 
+
+# Rule 1b/11: the names rule 1's code uses, in the module where upstream's font database lives.
+# What it's for: where upstream has split its font database into modules (fontdb/db.rs), the wasm build there
+#   imports the catalog types only for native builds; where it is one file, they are all in scope.
+# How: drops the native-only condition from those imports (the alternative at the end of the file matches, and
+#   changes nothing, where the types are defined in the file itself).
+# Verify: the wasm build compiles.
+# If upstream changes: delete once the imports are unconditional, or with rule 1.
+- file: crates/text/src/fontdb{,/db}.rs
+  find: '^#\[cfg\(not\(target_arch = "wasm32"\)\)\]\n(use super::build::\{style_italic, style_weight\};\n)#\[cfg\(not\(target_arch = "wasm32"\)\)\]\n(use super::cache::CatalogFace;\n)|^(?=struct CatalogFace \{)'
+  replace: '$1$2'
 
 # Rule 2/11: a browser font loads when something first uses it.
 # What it's for: type set in an installed family, a document naming one, and the font menu's samples get the
@@ -112,7 +129,7 @@
 #   loaded style, else Source Sans 3). The bridge (rule 5) reads each face once and redraws when it arrives.
 # Verify: type text, pick an installed family: it shows in Source Sans 3 for a moment, then in that family.
 # If upstream changes: anchor on face()'s native lazy-load branch.
-- file: crates/text/src/fontdb.rs
+- file: crates/text/src/**/*.rs
   find: '#\[cfg\(not\(target_arch = "wasm32"\)\)\]\s*if found\.is_none\(\) \|\| self\.is_cataloged\(family, style\)'
   replace: |-
     // playground (patches/illustrator.yaml): a browser font, read in the background.
@@ -350,7 +367,7 @@
   after: "\n[target.'cfg(all(target_arch = \"wasm32\"))'.dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\njs-sys = \"0.3\"\nwasm-bindgen = \"0.2\"\n\n[target.'cfg(not(target_arch = \"wasm32\"))'.dev-dependencies]\nplayground-live = { path = \"../../playground-live\", features = [\"egui\"] }\n"
 # VectorcraftApp::run, which every command goes through: Undo and Redo in the shared document go to the session.
 - live: true
-  file: crates/ui-egui/src/lib.rs
+  file: crates/ui-egui/src/{lib,app/commands}.rs
   find: 'pub\s+fn\s+run\s*\(\s*&mut\s+self\b[^{]*\{'
   after: "\n        #[cfg(any(target_arch = \"wasm32\", test))] if let Some(r) = crate::playground::run(self, id) { return r; }"
 # Document::alloc_id, the one id allocator (objects, slices, assets): while connected, ids no one adding at once picks.
@@ -359,7 +376,7 @@
   find: '(?![\s\S])'
   after: "\n// Live editing in a Playground session (web only): new ids nobody else in the session picks.\n#[cfg(target_arch = \"wasm32\")]\npub mod playground_ids;\n"
 - live: true
-  file: crates/doc/src/lib.rs
+  file: crates/doc/src/{lib,document}.rs
   find: 'pub\s+fn\s+alloc_id\s*\(\s*&mut\s+self\s*\)[^{]*\{'
   after: "\n        #[cfg(target_arch = \"wasm32\")] if let Some(id) = self.playground_alloc_id() { return id; }"
 # Session::refresh_text_bounds made public (whatever its visibility was): an adopted document's type gets its layout
@@ -389,10 +406,10 @@
   find: '^[ \t]*if\s+app\.ui\.view\.edges\b'
   before: "    #[cfg(any(target_arch = \"wasm32\", test))] playground_presence::draw(app, ui.ctx(), &painter, &xf);\n"
 - live: true
-  file: crates/ui-egui/src/canvas.rs
+  file: crates/ui-egui/src/canvas{,/home}.rs
   find: '^[ \t]*recent\(app,\s*ui\);'
-  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] playground_presence::home(app, ui);"
+  after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] crate::canvas::playground_presence::home(app, ui);"
 - live: true
-  file: crates/ui-egui/src/chrome.rs
+  file: crates/ui-egui/src/{chrome,chrome/tabs}.rs
   find: '^[ \t]*x\s*\+=\s*w;'
   before: "        #[cfg(any(target_arch = \"wasm32\", test))] crate::canvas::playground_presence::tab(app, ui, i, r);\n"
