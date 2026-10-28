@@ -53,7 +53,7 @@
 - live: true
   file: crates/ui-egui/src/{,panels/}midi_editor.rs
   find: '^[ \t]*let\s+resp\s*=\s*ui\.interact\(\s*roll\b'
-  before: "    #[cfg(any(target_arch = \"wasm32\", test))] crate::edit_window::live::midi(ui, cid, roll, &x_of, &y_of);\n"
+  before: "    #[cfg(any(target_arch = \"wasm32\", test))] crate::edit_window::live::midi(ui, cid, roll, px_per_tick, app.midi.scroll, ROW_H);\n"
 - live: true
   file: crates/ui-egui/src/mix_window.rs
   find: 'let\s+\(r,\s*_\)\s*=\s*ui\.allocate_exact_size\(vec2\(w,\s*h\)[^;\n]*;'

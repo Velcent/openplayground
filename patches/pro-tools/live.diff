@@ -483,15 +483,16 @@ index 0000000..3ef6251
 +
 +/// The others in the MIDI Editor when they edit `clip` there too: the notes they drag as ghosts, outlines around those
 +/// they selected, and their pointers. The editor calls it after drawing its notes, with its roll and its own mapping
-+/// of ticks and pitches to the roll; this records them for [`Live::live_presence`].
-+pub(crate) fn midi(ui: &Ui, clip: ClipId, roll: Rect, x_of: &dyn Fn(i64) -> f32, y_of: &dyn Fn(i32) -> f32) {
++/// of ticks and pitches to the roll (pixels per tick, scroll and row height); this records them for [`Live::live_presence`].
++pub(crate) fn midi(ui: &Ui, clip: ClipId, roll: Rect, px_per_tick: f32, scroll: f32, row_h: f32) {
 +    let ctx = ui.ctx();
-+    let (x0, y0) = (x_of(0), y_of(0));
++    // The editor's mapping: x = roll.min.x + tick * px_per_tick; y = roll.min.y + (127 - pitch) * row_h - scroll.
++    let (x0, y0) = (roll.min.x, roll.min.y + 127.0 * row_h - scroll);
 +    // The velocity lane comes after this (as the editor laid it out the pass before): end_frame draws over it.
 +    let vel = ctx.read_response(ui.id().with(("vel", clip.0))).map(|r| r.rect).filter(|v| v.height() > 4.0 && v.width() > 0.0);
 +    let (layer, area) = (ui.layer_id(), ui.clip_rect());
 +    let r =
-+        Roll { pass: ctx.cumulative_pass_nr(), clip: clip.0, rect: roll, vel, layer, area, x0, kx: (x_of(960) - x0) / 960.0, y0, ky: y_of(1) - y0 };
++        Roll { pass: ctx.cumulative_pass_nr(), clip: clip.0, rect: roll, vel, layer, area, x0, kx: px_per_tick, y0, ky: -row_h };
 +    ROLL.set(Some(r));
 +    if !(r.kx > 0.0 && r.ky < 0.0) {
 +        return;
