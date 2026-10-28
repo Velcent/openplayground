@@ -121,6 +121,16 @@
   find: '^#\[cfg\(not\(target_arch = "wasm32"\)\)\]\n(use super::build::\{style_italic, style_weight\};\n)#\[cfg\(not\(target_arch = "wasm32"\)\)\]\n(use super::cache::CatalogFace;\n)|^(?=struct CatalogFace \{)'
   replace: '$1$2'
 
+# Rule 1c/11: the alias type rule 1's code uses, in the module where upstream's font database lives.
+# What it's for: add_web_fonts files PostScript-name aliases; the wasm build imports Alias only for native builds.
+# How: drops the native-only condition from the import of Alias (nothing matches, and nothing changes, where
+#   the import has no condition or Alias is defined in the file itself).
+# Verify: the wasm build compiles.
+# If upstream changes: delete once the import is unconditional, or with rule 1.
+- file: crates/text/src/fontdb{,/db}.rs
+  find: '^#\[cfg\(not\(target_arch = "wasm32"\)\)\]\n(?=use super::traits::\{Alias, FaceStyle\};)'
+  replace: ''
+
 # Rule 2/11: a browser font loads when something first uses it.
 # What it's for: type set in an installed family, a document naming one, and the font menu's samples get the
 #   real font, read from the computer only when needed (there are often thousands of faces).
@@ -404,7 +414,7 @@
 - live: true
   file: crates/ui-egui/src/canvas.rs
   find: '^[ \t]*if\s+app\.ui\.view\.edges\b'
-  before: "    #[cfg(any(target_arch = \"wasm32\", test))] playground_presence::draw(app, ui.ctx(), &painter, &xf);\n"
+  before: "    #[cfg(any(target_arch = \"wasm32\", test))] playground_presence::draw(app, painter.ctx(), &painter, &xf);\n"
 - live: true
   file: crates/ui-egui/src/canvas{,/home}.rs
   find: '^[ \t]*recent\(app,\s*ui\);'
