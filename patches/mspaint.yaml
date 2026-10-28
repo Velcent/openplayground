@@ -86,7 +86,7 @@
   after: "\n// Live editing in a Playground session (web only, and its native tests).\n#[cfg(any(target_arch = \"wasm32\", test))]\nmod live;\n"
 - live: true
   file: apps/paintcraft-web/src/paintcraft-web/lib.rs
-  find: '\.start\(\s*canvas,[^;]*?\.await'
+  find: '\.start\(\s*canvas\b[^;]*?\.await'
   after: '.inspect(|()| crate::live::attach(&self.runner))'
 # Session::install_remote (session/live.rs), a child of the session module so it reaches the published state.
 - live: true
