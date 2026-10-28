@@ -170,8 +170,12 @@ index 0000000..e0365df
 +        if OPEN_EXTENSIONS.contains(&extension(&path).as_str()) {
 +            app.open_path(path.clone());
 +        } else {
-+            let into_drawing = app.drawing_shown();
-+            app.drop_file(&path, into_drawing);
++            let on = if app.drawing_shown() {
++                crate::drop_files::DropOn::Drawing
++            } else {
++                crate::drop_files::DropOn::NoDrawing
++            };
++            app.drop_file(&path, on);
 +        }
 +        crate::files::forget(&path);
 +    }
