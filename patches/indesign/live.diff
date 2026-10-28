@@ -109,7 +109,9 @@ index 0000000..394604b
 +//! session and that look are the playground-live crate's (patches/live/kit); outlines that are not rectangles (ghosts,
 +//! strokes, bands, rotated frames) are drawn here, in its colors.
 +
-+use super::{Xf, current_slot, item_canvas_xf, path_screen};
++use super::frames::{item_canvas_xf, path_screen};
++use super::view::current_slot;
++use super::Xf;
 +use crate::DesignApp;
 +use designcraft_doc::{Document, Item, ItemId, SpreadRef};
 +use designcraft_engine::DocState;
