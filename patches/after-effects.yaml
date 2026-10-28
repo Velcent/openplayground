@@ -81,7 +81,7 @@
 # timeline::show after the rows are drawn and before the CTI.
 - live: true
   file: crates/ui-egui/src/panels/timeline.rs
-  find: '^\s*let\s+cx\s*=\s*tm\.x\(time\.seconds\(\)\)\s*;'
+  find: '^\s*(?:let\s+cx\s*=\s*tm\.x\(time\.seconds\(\)\)\s*;|current_time_indicator\()'
   before: "    #[cfg(any(target_arch = \"wasm32\", debug_assertions))] crate::playground::timeline(app, ui);\n"
 # Every press's hit test in the viewer (layers_at: Selection, Rotate, Pan Behind, drops, Puppet, Object Matte) takes
 # the frontend's selectable_layers, which leaves out a layer someone else's Pen is still drawing a path in (the
