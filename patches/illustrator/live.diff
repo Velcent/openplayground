@@ -705,7 +705,8 @@ index 0000000..d8fc711
 +use vectorcraft_geom::{Affine, BezPath, PathEl, Point};
 +use vectorcraft_tools::Overlay;
 +
-+use super::{Xf, kurbo_flatten, node_outline, stroke_path, to_screen_path, too_many_anchors};
++use super::Xf;
++use super::outline::{node_outline, stroke_path, to_screen_path, too_many_anchors};
 +use crate::VectorcraftApp;
 +
 +/// The most objects, outlines and selected objects a presence carries, or is drawn with.
@@ -817,7 +818,7 @@ index 0000000..d8fc711
 +/// starts.
 +fn rings(bp: &BezPath, zoom: f64) -> Vec<Vec<Point>> {
 +    let mut out: Vec<Vec<Point>> = Vec::new();
-+    kurbo_flatten(bp, 0.1 / zoom, &mut |el| match el {
++    vectorcraft_geom::flatten(bp.elements().iter().copied(), 0.1 / zoom, &mut |el| match el {
 +        PathEl::MoveTo(p) => out.push(vec![p]),
 +        PathEl::LineTo(p) => out.last_mut().into_iter().for_each(|r| r.push(p)),
 +        PathEl::ClosePath => out.last_mut().into_iter().filter(|r| r.last() != r.first()).for_each(|r| r.push(r[0])),
