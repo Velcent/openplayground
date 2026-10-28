@@ -324,7 +324,7 @@
 # The grid's overlays: the others' selections, active cells and pointers, painted first (under this person's own).
 - live: true
   file: crates/ui-egui/src/**/*.rs
-  find: '\bfn\s+paint_overlays\s*\([^{]*\{'
+  find: '\bfn\s+paint_overlays\s*\([^{]*\{(?:\s*let\s+OverlayInput\s*\{[^}]*\}\s*=\s*input;)?'
   after: "\n    #[cfg(any(target_arch = \"wasm32\", test))] crate::live::draw_presence(app, p, geo, sh);"
 # The web entry keeps its runner for the adapter and wraps its app (web/live.rs, a child module so it reaches
 # WebShell's fields).
