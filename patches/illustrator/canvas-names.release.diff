@@ -1,0 +1,26 @@
+Playground (not an upstream pull request): the canvas module's outline helpers, for live editing's presence marks.
+
+The others' marks over the canvas (live/presence.rs, a child module of the canvas, see live.diff) outline objects
+with the helpers the canvas outlines its own selection with, and name them through `super::`. Where upstream keeps
+them in canvas.rs this holds as is; where it has moved them to canvas/outline.rs, this brings them into the canvas
+module's namespace (kurbo_flatten, private there, made visible to it).
+
+diff --git a/crates/ui-egui/src/canvas.rs b/crates/ui-egui/src/canvas.rs
+--- a/crates/ui-egui/src/canvas.rs
++++ b/crates/ui-egui/src/canvas.rs
+@@ -50,3 +50,5 @@
+ use outline::KEY_OUTLINE;
+ #[cfg(test)]
+-use outline::{OVERLAY_MAX_ANCHORS, c32, node_outline, walk_drawn};
++use outline::{OVERLAY_MAX_ANCHORS, c32, walk_drawn};
++#[allow(unused_imports)]
++use outline::{kurbo_flatten, node_outline, stroke_path, to_screen_path, too_many_anchors};
+ #[cfg(test)]
+diff --git a/crates/ui-egui/src/canvas/outline.rs b/crates/ui-egui/src/canvas/outline.rs
+--- a/crates/ui-egui/src/canvas/outline.rs
++++ b/crates/ui-egui/src/canvas/outline.rs
+@@ -197,3 +197,3 @@
+-fn kurbo_flatten(p: &BezPath, tol: f64, f: &mut impl FnMut(PathEl)) {
++pub(super) fn kurbo_flatten(p: &BezPath, tol: f64, f: &mut impl FnMut(PathEl)) {
+     // Bounded per curve: a document's far-out handles, zoomed onto the screen, made kurbo
+     // reserve gigabytes for the selection outline.
